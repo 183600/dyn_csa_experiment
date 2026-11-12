@@ -143,8 +143,11 @@ def signflip(deltas):
     # Delegate to the repository-wide deterministic implementation: exact
     # enumeration up to n=20, exact meet-in-the-middle up to n=40, and a
     # deterministic normal approximation beyond that.  This keeps the result
-    # poolable with the exact p-values used by the other panels.
-    r = L.exact_signflip_p([float(x) for x in np.asarray(deltas, dtype=float).reshape(-1)])
+    # poolable with the exact p-values used by the other panels.  Keep the
+    # original scalar types so a boolean flag is rejected by exp_lib instead
+    # of being converted to a paired effect of 0/1 here.
+    _flat = np.asarray(deltas, dtype=object).reshape(-1).tolist()
+    r = L.exact_signflip_p(_flat)
     if r.get('method') == 'none':
         return None
     return r['p']
@@ -317,10 +320,13 @@ def main(argv=None):
             _n_same = int(((d_f1 != 0) & ((d_f1 > 0) == (_d_f1m > 0))).sum())
             lines.append(f'- 层均边界 F1：Δ = {_d_f1m:+.4f} ± {sample_std(d_f1):.4f}，{_n_same}/{_n_f1} 同向，p({_rf1["method"]}) = {p_f1:.3f}')
             _n_ppl = len(d_ppl)
-            _ppl_floor0 = (2.0 / (1 << _n_ppl) if _n_ppl <= 20
-                           else (1.0 / (1 << _n_ppl) if _n_ppl <= 40 else 0.0))
-            _floor_txt = (f'（n={_n_ppl} 时 p 分辨率下限 {_ppl_floor0:.3f}）'
-                          if _ppl_floor0 > 0 else f'（n={_n_ppl} 使用确定性正态近似，无离散分辨率下限）')
+            # Both the exact enumeration and the meet-in-the-middle branch
+            # have the two-sided floor 2/2**n; the saddlepoint branch for
+            # n>40 is clamped to the same floor.
+            _ppl_floor0 = L.signflip_p_floor(_n_ppl)
+            _floor_txt = (f'（n={_n_ppl} 时 p 分辨率下限 {_ppl_floor0:.3g}）'
+                          if math.isfinite(_ppl_floor0) and _ppl_floor0 > 0
+                          else f'（n={_n_ppl} 使用确定性鞍点近似，p 已钳制在精确下限之上）')
             lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {sample_std(d_ppl):.2f}，p({_rppl["method"]}) = {p_ppl:.3f}{_floor_txt}\n')
         elif not _ok_seeds:
             p_f1 = p_ppl = None
@@ -596,7 +602,7 @@ def main(argv=None):
     elif _f1_sig:
         _c1 = f'1. **同面板配对下 fuse 显著改变了边界 F1**：hybrid 栈按 seed 配对（n={_n_p}），ΔF1 = **{_pv('d_f1')}**（±{_psd('sd_f1')}），p(exact) = **{_pv('p_f1', '{:.3f}')}** < 0.05——「F1 差不稳固」的读法在本轮产物上不成立。\n'
     else:
-        _f1_floor = (2.0 / (1 << _n_p) if _n_p <= 20 else 1.0 / 200001.0) if isinstance(_n_p, int) and _n_p > 0 else float('nan')
+        _f1_floor = L.signflip_p_floor(_n_p) if isinstance(_n_p, int) and _n_p > 0 else float('nan')
         _f1_floor_txt = f'p 值打在 n={_n_p} 的分辨率下限上，不能排除是噪声' if _f1_p is not None and math.isfinite(_f1_floor) and (abs(_f1_p - _f1_floor) < 1e-12) else f'p={_pv('p_f1', '{:.3f}')}，高于 n={_n_p or '?'} 的分辨率下限 {_f1_floor:.3f}，不能排除是噪声'
         _x_f1 = probe.get('x_d_f1')
         if _x_f1 is None or not np.isfinite(_x_f1):
@@ -609,7 +615,7 @@ def main(argv=None):
     elif _ppl_sig:
         _c3 = f'3. **PPL 存在可分辨的差异**：同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')} < 0.05），「PPL 不变」的读法在本轮产物上不成立。\n'
     else:
-        _ppl_floor = (2.0 / (1 << _n_pp) if _n_pp <= 20 else 1.0 / 200001.0) if isinstance(_n_pp, int) and _n_pp > 0 else float('nan')
+        _ppl_floor = L.signflip_p_floor(_n_pp) if isinstance(_n_pp, int) and _n_pp > 0 else float('nan')
         _ppl_floor_txt = f'配对符号翻转 p 值打在 n={_n_pp} 的分辨率下限上，任何差异不能排除是种子噪声' if _ppl_p is not None and math.isfinite(_ppl_floor) and (abs(_ppl_p - _ppl_floor) < 1e-12) else f'配对符号翻转 p={_pv('p_ppl', '{:.3f}')}，高于 n={_n_pp or '?'} 的分辨率下限 {_ppl_floor:.3f}，任何差异不能排除是种子噪声'
         _x_ppl = probe.get('x_d_ppl_csa')
         _x_ppl_txt = f'，跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL' if _x_ppl is not None and np.isfinite(_x_ppl) else '，跨面板纯 CSA 对比未测量'

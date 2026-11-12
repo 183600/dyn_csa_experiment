@@ -147,7 +147,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         cfg = self.cfg
         # Eval-only fused q/k/v projection (same cache contract as
         # exp_lib.HybridAttention._full_batched).  Training uses the three
-        # separate projections so no concatenated weight is rebuilt per step.
+        # separate projections.
         _nhq = self.nh * self.hd
         if x.device.type == 'cuda' and not torch.is_grad_enabled():
             # eval-only weight-concat cache, keyed on the source weights'
@@ -759,7 +759,7 @@ def install_patches():
     # Fall back to SmallGPTRoPE's actual base (the class it was defined
     # against at import time) rather than the current L.SmallGPT: if another
     # patcher replaced L.SmallGPT before this install, capturing it here while
-    # SmallGPTRoPE keeps the older base would make the two factory branches
+    # SmallGPTRoPE uses its own base would make the two factory branches
     # inherit from different class chains.
     _orig_smallgpt = L.__dict__.get('_v7_orig_smallgpt', SmallGPTRoPE.__mro__[1])
     L.__dict__['_v7_orig_smallgpt'] = _orig_smallgpt
@@ -975,7 +975,10 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
                 _nan_events.append({'step': step + 1, 'kind': 'param', 'loss': _loss_item,
                                     'grad_norm': _gn_pre, 'lr': base})
                 raise FloatingPointError(f'non-finite parameter values after step {step + 1}; aborting instead of training on corrupted weights')
-            if _ce_d is not None:
+            if _ce_d is not None and bool(torch.isfinite(_ce_d)):
+                # Never write a non-finite CE into the REINFORCE baseline:
+                # the next step's PG term would then be non-finite for every
+                # sample and poison all subsequent updates.
                 _ce_baseline.mul_(0.99).add_(_ce_d, alpha=0.01)
             _lbuf.append(ce.detach())
             _tail.append(ce.detach())
@@ -1065,7 +1068,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     if _save_mode and ckpt_dir:
         try:
             os.makedirs(ckpt_dir, exist_ok=True)
-            _ck = os.path.join(ckpt_dir, f'{variant}_seed{seed}_final.pt')
+            _ck = os.path.join(ckpt_dir, L.ckpt_file_name(variant, seed, 'final'))
             _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mlp_ratio, 'vocab': vocab, 'd': d,
                                 'n_layers': n_layers, 'n_heads': n_heads, 'd_head': d_head,
                                 'train_len': seq_len, 'max_seq': seq_len, 'code': CKPT_CODE,
@@ -1513,8 +1516,7 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
         correct = np.zeros_like(tgt, dtype=bool)
         span = min(seq_len, max_pos) if getattr(model, 'use_abs_pe', True) else seq_len
         tail = 2 * n_pairs
-        # targets uploaded once and the per-chunk comparison done on-device:
-        # only the [n_seq, tail-1] bool strip crosses the bus at the end.
+        # targets are uploaded and the per-chunk comparison is done on-device.
         tgt_dev = L._h2d_async(tgt, torch.int64, device)
         correct_dev = torch.zeros(n_seq, tail - 1, dtype=torch.bool, device=device)
         i = 0
@@ -1567,18 +1569,31 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
         model.train(was)
 
 def exact_sign_permutation(deltas):
-    d = np.asarray(deltas, dtype=float)
+    # Boolean flags are not paired effects: float(True)==1.0 would turn six
+    # flags into six identical 'significant' deltas.  Keep the same scalar
+    # contract as exp_lib.exact_signflip_p.
+    _vals = []
+    for _x in (deltas if deltas is not None else []):
+        if isinstance(_x, (bool, np.bool_)):
+            _vals.append(float('nan'))
+            continue
+        try:
+            _vals.append(float(_x))
+        except (TypeError, ValueError, OverflowError):
+            _vals.append(float('nan'))
+    d = np.asarray(_vals, dtype=float)
     d_in = d
     d = d[np.isfinite(d)]
     n = len(d)
     n_dropped = int(len(d_in) - n)
 
-    def _extras(res, d, n):
+    def _extras(res, d, n, floor_n=None):
         """效应量与逐种子差值：报告必须给出逐种子 Δ 与
         d_z（配对差均值/样本标准差），并把该 n 下的 p 值分辨率下限
         一并写出，避免把分辨率上限误读为数据结论。纯增量字段。"""
         res['per_seed'] = [float(x) for x in d.tolist()]
-        res['p_floor'] = math.ldexp(2.0, -int(n)) if n > 0 else float('nan')
+        _fn = int(n if floor_n is None else floor_n)
+        res['p_floor'] = math.ldexp(2.0, -_fn) if _fn > 0 else float('nan')
         _sd = res.get('std', 0.0)
         _mu = res.get('mean', float('nan'))
         if (not isinstance(_sd, (int, float))) or (not math.isfinite(_mu)):
@@ -1607,12 +1622,17 @@ def exact_sign_permutation(deltas):
         # Monte-Carlo draw, beyond that).  Do not label a sampled p-value as
         # an exact sign-flip p.
         _r = L.exact_signflip_p(d)
+        # The saddlepoint branch drops zero deltas (they do not change the
+        # null distribution), so its attainable floor is 2/2**m with m the
+        # number of NONZERO deltas — not 2/2**n.  Report the floor of the
+        # test that actually ran.  MITM/enumeration keep all n slots.
+        _m_nonzero = int(np.count_nonzero(d)) if str(_r.get('method', '')).startswith('saddlepoint') else n
         return _extras({'n': n, 'mean': float(d.mean()),
                         'std': float(d.std(ddof=1)) if n > 1 else 0.0,
                         'p_exact_signflip': float(_r['p']),
                         'n_flips': (int(1 << n) if _r.get('method', '').startswith('exact') else 0),
                         'method': _r.get('method'),
-                        'n_dropped': n_dropped}, d, n)
+                        'n_dropped': n_dropped}, d, n, floor_n=_m_nonzero)
     cnt = 0
     total = 1 << n
     bitpos = np.arange(n, dtype=np.int64)[None, :]
@@ -1713,9 +1733,13 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
         except Exception as e:
             print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — its panel is EXCLUDED from these statistics')
             continue
+        if not isinstance(s, dict):
+            print(f'[stats] WARNING: {sp} is valid JSON but not an object ({type(s).__name__}) — its panel is EXCLUDED from these statistics')
+            continue
         _legacy_ok = L.legacy_warm_tags(s)
         for k, r in s.items():
-            if isinstance(r, dict) and 'seed' in r and (not r.get('synthesized')) and L.ppl_is_usable(r.get('ppl')):
+            _seed = L._as_seed_int(r.get('seed')) if isinstance(r, dict) else None
+            if isinstance(r, dict) and _seed is not None and (not r.get('synthesized')) and L.ppl_is_usable(r.get('ppl')):
                 tag = f'{od.split('/')[-1]}::{r.get('variant')}'
                 if r.get('warm_steps') is not None:
                     tag += f'::w{r['warm_steps']}'
@@ -1724,22 +1748,22 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
                     if _wt:
                         tag += f'::{_wt}'
                 _slot = recs.setdefault(tag, {})
-                _old = _slot.get(r['seed'])
+                _old = _slot.get(_seed)
                 if _old is not None:
                     if _old.get('_dup'):
                         continue
                     _new_cur = r.get('_code') == CKPT_CODE
                     _old_cur = _old.get('_code') == CKPT_CODE
                     if _new_cur and not _old_cur:
-                        print(f'[stats] WARNING: {tag} seed {r['seed']} holds TWO measurable records — the PPL is ambiguous; the one stamped with the current code semantics is kept and the duplicate is dropped')
-                        _slot[r['seed']] = r
+                        print(f'[stats] WARNING: {tag} seed {_seed} holds TWO measurable records — the PPL is ambiguous; the one stamped with the current code semantics is kept and the duplicate is dropped')
+                        _slot[_seed] = r
                     elif _new_cur == _old_cur:
-                        print(f'[stats] WARNING: {tag} seed {r['seed']} holds TWO measurable records with identical stamp status — the seed is EXCLUDED from every comparison rather than quoting an arbitrarily picked PPL')
+                        print(f'[stats] WARNING: {tag} seed {_seed} holds TWO measurable records with identical stamp status — the seed is EXCLUDED from every comparison rather than quoting an arbitrarily picked PPL')
                         _dup = dict(_old)
                         _dup['_dup'] = True
-                        _slot[r['seed']] = _dup
+                        _slot[_seed] = _dup
                     continue
-                _slot[r['seed']] = r
+                _slot[_seed] = r
     pairs = [('warmup w=5000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w5000', 'results_lm_v7_warmup::csa_fixed::w0'), ('warmup w=10000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w10000', 'results_lm_v7_warmup::csa_fixed::w0'), ('CSA+RoPE vs CSA absPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::csa_fixed'), ('CSA+RoPE vs dense+RoPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::full_rope'), ('hybrid+RoPE vs dense+RoPE', 'results_lm_v7_rope::hybrid_fixed_rope', 'results_lm_v7_rope::full_rope')]
     per_variant = {}
     for k, v in recs.items():
@@ -1756,6 +1780,11 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
             _dropped = [s for _g, _ss in _ranked[1:] for s in _ss]
             print(f'[stats] WARNING: {k}: seed(s) {_dropped} were measured under a DIFFERENT run_cfg group than seed(s) {_keep_seeds} — the per-variant mean pools only one configuration group ({len(_keep_seeds)} seed(s), current code stamp preferred); pooling across configurations is not allowed')
             _m = {s: _m[s] for s in _keep_seeds}
+        # The comparisons below must use the SAME single configuration group
+        # that supplies the per-variant mean.  Keeping the unfiltered records
+        # here would pair seed 0 from cfgA with seed 1 from cfgB even though
+        # the printed mean excludes one of them.
+        recs[k] = _m
         per_variant[k] = {'ppls': {s: r['ppl'] for s, r in _m.items()}, 'mean': float(np.mean([r['ppl'] for r in _m.values()]))}
     out_d = {'per_variant': per_variant, 'comparisons': {}}
     for name, a, b in pairs:
@@ -1960,7 +1989,7 @@ def run_niah_phase(payload, guard=None, label=''):
             }, vocab=int(vocab))
             _niah_knobs = _v7_knobs(L.DEVICE, 12)
             _prov_by_seed[int(seed)] = _niah_prov
-            ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
+            ck = os.path.join(ckpt_dir, L.direct_ckpt_name(v, seed))
             stale = False
             _ckp_pre = None
             if os.path.exists(ck):
@@ -2393,7 +2422,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     need = max(eval_lens) + 1
     if val_ids is None:
         val_ids = L.load_wikitext(max(train_len, need), 8000000)[1]
-    # v11.128: the p1l recipe must describe the implementation that ACTUALLY
+    # The p1l recipe must describe the implementation that ACTUALLY
     # runs and the training corpus it actually reads.  Both are derived
     # explicitly before training and carried into the checkpoint/record.
     train_ids = L.load_wikitext(train_len, 8000000)[0]
@@ -2405,8 +2434,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
          'batch_size': batch_size}, device=L.DEVICE)
     # The ACTUAL per-arm dispatch, not the backend capability: every frozen
     # rope arm takes the per-row `_single_rope` loop even when the CUDA batched
-    # twin exists.  Using the backend default here wrote eager_batch=True into
-    # the recipe while train_variant recorded False (and vice versa).
+    # twin exists.  The recipe and train_variant must record the same value.
     _plan_cfgs = L.make_layer_cfgs(6, v)
     _eager_mode = L._uses_batched_eager(_plan_cfgs, L.DEVICE, batch_size)
     _tk_fp = L.training_knobs_fingerprint(amp_dtype=_amp_mode, eager_batch=_eager_mode)
@@ -2431,7 +2459,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
                           'amp_dtype': _amp_mode, 'eager_batch': _eager_mode,
                           'mlp_match_ref': 'csa_fixed_rope'},
                          256, 6, 8, 32, vocab, train_ids, val_ids, device=L.DEVICE)
-    ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
+    ck = os.path.join(ckpt_dir, L.direct_ckpt_name(v, seed))
     stale = False
     _ckp_pre = None
     if os.path.exists(ck):
@@ -2624,7 +2652,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             _rec['data_version'] = _prov['data'].get('data_version')
         except Exception as _pe:
             print(f'[p1l] WARNING: could not attach provenance to {key} ({type(_pe).__name__}: {_pe})')
-        # v11.128: never fabricate a train_knobs descriptor on resume.  The
+        # Never fabricate a train_knobs descriptor on resume.  The
         # weights may have been trained under a different numeric path, which
         # would make the frozen implementation binding certify a false
         # descriptor.
@@ -2754,7 +2782,7 @@ def _lenplot(summary, eval_lens, outdir):
         per, trunc_flags = ([], [])
         for Ln in eval_lens:
             recs = L.by_len_cells(list(summary.values()), Ln, variant=v)
-            ok = [x for x in recs if not x.get('truncated')]
+            ok = [x for x in recs if isinstance(x.get('truncated'), (bool, np.bool_)) and not bool(x.get('truncated'))]
             use, is_tr = (ok, False) if ok else (recs, bool(recs))
             vals = [x['ppl'] for x in use]
             per.append(float(np.mean(vals)) if vals else np.nan)

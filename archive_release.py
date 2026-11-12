@@ -45,6 +45,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DIRS = ['results_lm_test', 'analysis_v12']
+_CKPT_EXTS = ('.pt', '.ckpt', '.pth', '.safetensors')
 ENV_FILES = ['confirmation_frozen.json', 'DECISION_LOG.md', 'RELEASES.md', 'requirements.txt',
             'requirements.lock', 'pyproject.toml',
             # data/cache provenance: a tokenizer or cache that changes the ids
@@ -97,27 +98,56 @@ def _env_snapshot():
     return env
 
 
+def _dir_inside_repo(d):
+    """True only when `d` resolves to a directory inside REPO."""
+    try:
+        root = os.path.realpath(REPO)
+        base = os.path.realpath(os.path.join(REPO, d))
+        return os.path.isdir(base) and os.path.commonpath([root, base]) == root
+    except (OSError, ValueError):
+        return False
+
+
 def _collect(dirs, include_ckpt=False):
     """Files that would enter the archive, with sizes and hashes (lazily)."""
     files = []
     for d in dirs:
-        base = os.path.join(REPO, d)
-        if not os.path.isdir(base):
-            print(f'[archive] WARNING: {d} does not exist locally — skipped (run on the experiment machine)')
+        if not _dir_inside_repo(d):
+            print(f'[archive] WARNING: {d} does not resolve to a directory inside the repository — skipped (archive members must stay repo-relative)')
             continue
+        base = os.path.join(REPO, d)
         for root, _dirs, names in os.walk(base):
             for n in names:
                 p = os.path.join(root, n)
-                if not include_ckpt and (n.endswith('.pt') or n.endswith('.ckpt') or n.endswith('.pth') or n.endswith('.safetensors')):
+                if os.path.islink(p) or not os.path.isfile(p):
+                    # tarfile would store a symlink/device member, but the
+                    # verifier only attests regular-file content.  Packing it
+                    # would make `make` produce an archive its own `verify`
+                    # rejects.  Leave it out instead of following it outside
+                    # the repository.
+                    print(f'[archive] WARNING: skipping non-regular file {os.path.relpath(p, REPO)} — only regular files are content-attested')
+                    continue
+                if not include_ckpt and n.endswith(_CKPT_EXTS):
                     continue
                 files.append(p)
     for f in ENV_FILES:
         p = os.path.join(REPO, f)
-        if os.path.exists(p):
+        if os.path.exists(p) and not os.path.islink(p) and os.path.isfile(p):
             files.append(p)
+    # The loaders write tag-suffixed metadata/tokenizer files (e.g.
+    # meta_v5_sl512_....json), not the fixed names above.  Pack those
+    # small provenance files too; otherwise a release silently omits the cache
+    # and tokenizer identity its own documentation promises.
+    import glob as _glob
+    for _pat in ('wt103_cache/meta_v5_*.json', 'wt103_cache/test_meta_v2_*.json',
+                 'wt103_cache/tok_v5_*.json', 'wt103_cache/test_tok_v2_*.json',
+                 'fineweb_cache/meta_v2_*.json'):
+        for _p in sorted(_glob.glob(os.path.join(REPO, _pat))):
+            if os.path.isfile(_p) and not os.path.islink(_p):
+                files.append(_p)
     for f in ('results_lm_test/.freeze_lock.json',):
         p = os.path.join(REPO, f)
-        if os.path.exists(p):
+        if os.path.exists(p) and not os.path.islink(p) and os.path.isfile(p):
             files.append(p)
     # Training logs (gitignored, so they only exist on the experiment machine).
     # Pack every per-seed log in the evidence release; pack every
@@ -147,13 +177,15 @@ def _ckpt_hash_table(dirs):
     .pt bodies are not packed) — the weights stay auditable by hash."""
     rows = {}
     for d in dirs:
-        base = os.path.join(REPO, d)
-        if not os.path.isdir(base):
+        if not _dir_inside_repo(d):
             continue
+        base = os.path.join(REPO, d)
         for root, _dirs, names in os.walk(base):
             for n in names:
-                if n.endswith('.pt'):
+                if n.endswith(_CKPT_EXTS):
                     p = os.path.join(root, n)
+                    if os.path.islink(p) or not os.path.isfile(p):
+                        continue
                     rows[os.path.relpath(p, REPO)] = _sha256(p)
     return rows
 
@@ -168,16 +200,51 @@ def cmd_plan(tag, dirs, include_ckpt=False):
         print(f'  {sz:>12,d} B  {os.path.relpath(p, REPO)}')
     ck = _ckpt_hash_table(dirs)
     if ck:
-        print(f'[archive] checkpoints found: {len(ck)} (.pt) — hashed into the manifest' + (' and packed' if include_ckpt else ' (bodies NOT packed; use --include-ckpt to embed them)'))
+        print(f'[archive] checkpoints found: {len(ck)} — hashed into the manifest' + (' and packed' if include_ckpt else ' (bodies NOT packed; use --include-ckpt to embed them)'))
     print(f'[archive] total: {total:,d} B (~{total / (1 << 20):.1f} MiB)')
     return files
 
 
+def _safe_tag(tag):
+    """A release tag used in filenames must be a single path component."""
+    if not isinstance(tag, str) or not tag or tag in ('.', '..'):
+        return None
+    if any(_c in tag for _c in ('/', '\\', '\x00', os.sep, os.altsep or os.sep)):
+        return None
+    return tag
+
+
 def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
+    if _safe_tag(tag) is None:
+        print(f'[archive] REFUSE: release tag {tag!r} is not a single safe filename component (path separators / empty / dot segments are not allowed)')
+        return 1
+    _unsafe = [d for d in dirs if not _dir_inside_repo(d) and os.path.isdir(os.path.join(REPO, d))]
+    if _unsafe:
+        print(f'[archive] REFUSE: result dir(s) {_unsafe} resolve outside the repository — archive members must stay repo-relative')
+        return 1
     _required = ['DECISION_LOG.md', 'RELEASES.md', 'confirmation_frozen.json']
     _missing = [f for f in _required if not os.path.exists(os.path.join(REPO, f))]
     if _missing:
         print(f'[archive] REFUSE: formal release is missing required provenance file(s): {_missing}')
+        return 1
+    # Provenance files alone are not an evidence release.  _collect always
+    # adds them, so the later `not files` guard could never fire when every
+    # requested result directory is missing.  Require at least one actual
+    # artifact under the requested dirs.
+    _n_artifacts = 0
+    for d in dirs:
+        if not _dir_inside_repo(d):
+            continue
+        base = os.path.join(REPO, d)
+        for root, _walk_dirs, names in os.walk(base):
+            for n in names:
+                if not include_ckpt and n.endswith(_CKPT_EXTS):
+                    continue
+                _p = os.path.join(root, n)
+                if os.path.isfile(_p) and not os.path.islink(_p):
+                    _n_artifacts += 1
+    if not _n_artifacts:
+        print('[archive] REFUSE: nothing to archive — the named result dirs do not exist here (or contain no files); run this on the machine holding the artifacts')
         return 1
     files = _collect(dirs, include_ckpt)
     if not files:
@@ -187,6 +254,16 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
     stamp = time.strftime('%Y%m%dT%H%M%S')
     base_name = f'release_{tag}'
     tar_path = os.path.join(REPO, outdir, f'{base_name}.tar.gz')
+    _existing = [p for p in (tar_path, tar_path + '.sha256',
+                             os.path.join(REPO, outdir, f'{base_name}.MANIFEST.sha256'),
+                             os.path.join(REPO, outdir, f'{base_name}.release_record.json'))
+                 if os.path.exists(p)]
+    if _existing:
+        print('[archive] REFUSE: release artifacts already exist for tag '
+              f'{tag!r} ({[os.path.basename(p) for p in _existing]}) — an '
+              'evidence archive is immutable; choose a new tag or move the old '
+              'release aside explicitly')
+        return 1
     man = {'release': base_name, 'tag': tag, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'created_by': 'archive_release.py', 'git': _git_state(), 'environment': _env_snapshot(), 'dirs': list(dirs), 'include_ckpt_bodies': bool(include_ckpt), 'files': {}, 'checkpoint_hashes': _ckpt_hash_table(dirs)}
     with tarfile.open(tar_path, 'w:gz') as tf:
         for p in files:
@@ -221,24 +298,76 @@ def cmd_verify(tar_path):
         print(f'[archive] REFUSE: {tar_path} not found')
         return 1
     side = tar_path + '.sha256'
-    if os.path.exists(side):
-        want = open(side, encoding='utf-8').read().split()[0]
-        got = _sha256(tar_path)
-        print(f'[archive] archive sha256: {got}  {"OK" if got == want else "MISMATCH (expected " + want + ")"}')
-        if got != want:
-            return 1
-    with tarfile.open(tar_path, 'r:gz') as tf:
+    if not os.path.exists(side):
+        # The manifest travels INSIDE the tar, so without the external
+        # checksum sidecar an attacker can rewrite the archive and its
+        # manifest together and still pass this verifier.  A missing sidecar
+        # is therefore a refusal, not an optional extra.
+        print(f'[archive] REFUSE: external checksum sidecar {side} is missing — '
+              'without it the archive and its in-archive manifest are not '
+              'anchored to any independently published digest')
+        return 1
+    try:
+        _parts = open(side, encoding='utf-8').read().split()
+    except OSError as _e:
+        print(f'[archive] REFUSE: cannot read {side} ({type(_e).__name__}: {_e})')
+        return 1
+    want = _parts[0] if _parts else ''
+    if not want:
+        print(f'[archive] REFUSE: {side} is empty or malformed — cannot verify the archive hash')
+        return 1
+    got = _sha256(tar_path)
+    print(f'[archive] archive sha256: {got}  {"OK" if got == want else "MISMATCH (expected " + want + ")"}')
+    if got != want:
+        return 1
+    try:
+        tf = tarfile.open(tar_path, 'r:gz')
+    except (tarfile.TarError, OSError, EOFError) as _e:
+        print(f'[archive] REFUSE: {tar_path} is not a readable tar.gz archive '
+              f'({type(_e).__name__}: {_e}) — the checksum anchor cannot rescue '
+              'a corrupt file; rebuild or re-download the release')
+        return 1
+    with tf:
         names = tf.getnames()
-        man_name = next((n for n in names if n.endswith('.MANIFEST.sha256')), None)
-        if man_name is None:
-            print('[archive] REFUSE: no MANIFEST inside the archive')
+        # The manifest written by `make` is named after the archive itself.
+        # Picking the first `*.MANIFEST.sha256` member would let an ordinary
+        # collected file (e.g. a stray results_*/aaa.MANIFEST.sha256) hijack
+        # verification and make a valid release fail its own check.
+        _base = os.path.basename(tar_path)
+        for _suf in ('.tar.gz', '.tgz'):
+            if _base.endswith(_suf):
+                _base = _base[:-len(_suf)]
+                break
+        else:
+            _base = os.path.splitext(_base)[0]
+        man_name = f'{_base}.MANIFEST.sha256'
+        _hits = [n for n in names if n == man_name]
+        if len(_hits) != 1:
+            print(f'[archive] REFUSE: expected exactly one {man_name!r} inside the archive, found {len(_hits)}')
             return 1
-        man = json.load(tf.extractfile(man_name))
+        try:
+            man = json.load(tf.extractfile(man_name))
+        except Exception as _e:
+            print(f'[archive] REFUSE: the archive manifest is not valid JSON ({type(_e).__name__}: {_e})')
+            return 1
+        if not isinstance(man, dict) or not isinstance(man.get('files'), dict):
+            print('[archive] REFUSE: the archive manifest is not an object with a `files` mapping')
+            return 1
         bad = []
         for member in tf.getmembers():
-            if member.name == man_name or not member.isfile():
+            if member.name == man_name:
+                continue
+            if not member.isfile():
+                # A symlink/hardlink/device is not a content member.  The
+                # manifest cannot attest its target, so silently skipping it
+                # would let the member's name satisfy the presence check while
+                # its bytes are never hashed.
+                bad.append(f'{member.name}: non-regular tar member ({member.type!r}) is not allowed')
                 continue
             f = tf.extractfile(member)
+            if f is None:
+                bad.append(f'{member.name}: in tar but its content cannot be read')
+                continue
             h = hashlib.sha256()
             while True:
                 b = f.read(1 << 20)
@@ -246,9 +375,16 @@ def cmd_verify(tar_path):
                     break
                 h.update(b)
             got = h.hexdigest()
-            want = (man['files'].get(member.name) or {}).get('sha256')
-            if want is None:
+            _entry = man['files'].get(member.name)
+            if _entry is None:
                 bad.append(f'{member.name}: in tar but NOT in manifest')
+                continue
+            if not isinstance(_entry, dict):
+                bad.append(f'{member.name}: manifest entry is {type(_entry).__name__}, not an object')
+                continue
+            want = _entry.get('sha256')
+            if not isinstance(want, str) or not want:
+                bad.append(f'{member.name}: manifest entry has no usable sha256')
             elif got != want:
                 bad.append(f'{member.name}: hash mismatch (manifest {want[:12]}…, actual {got[:12]}…)')
         missing = [n for n in man['files'] if n not in names]

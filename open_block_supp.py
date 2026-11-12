@@ -138,9 +138,16 @@ def _load_summary(outdir):
         try:
             with open(p, encoding='utf-8') as f:
                 d = json.load(f)
-            return d if isinstance(d, dict) else {}
         except Exception as e:
             print(f'[open-block] WARNING: unreadable summary {p} ({type(e).__name__}: {e}); starting a fresh one')
+            return {}
+        if not isinstance(d, dict):
+            # Valid JSON but the wrong shape is corrupt evidence, not an empty
+            # panel: silently returning {} would let the next save overwrite
+            # whatever records the file still holds.
+            raise ValueError(f'open-block summary {p} is valid JSON but not an object '
+                             f'({type(d).__name__}); refusing to overwrite it')
+        return d
     return {}
 
 
@@ -155,8 +162,14 @@ def _is_current(rec, fp):
         return False
     if rec.get('code') != L.code_stamp():
         return False
+    if rec.get('synthesized'):
+        return False
     ppl = rec.get('ppl')
-    return isinstance(ppl, (int, float)) and not isinstance(ppl, bool) and math.isfinite(float(ppl)) and float(ppl) > 0
+    if not (isinstance(ppl, (int, float)) and not isinstance(ppl, bool) and math.isfinite(float(ppl)) and float(ppl) > 0):
+        return False
+    # Resume must agree with the analysis predicate: a record without usable
+    # per-token NLL is not a completed cell even if it has a positive PPL.
+    return _nll_per_token(rec) is not None
 
 
 def _synthetic_data(cfg, vocab=97, n_train=40000, val_rows=8):
@@ -264,14 +277,13 @@ def run_panel(cfg, matrix, *, device, synthetic=False, max_hours=None, label='ma
 # ---------------------------------------------------------------------------
 
 def _nll_per_token(rec):
-    try:
-        n = float(rec['n_tokens'])
-        v = float(rec['nll_sum'])
-        if n > 0 and math.isfinite(v):
-            return v / n
-    except Exception:
-        pass
-    return None
+    if not isinstance(rec, dict):
+        return None
+    n = L._as_seed_int(rec.get('n_tokens'))
+    v = L._finite_scalar(rec.get('nll_sum'))
+    if n is None or n <= 0 or v is None:
+        return None
+    return v / n
 
 
 def _rec_by_cell(summary, run_fingerprint=None):
@@ -281,14 +293,19 @@ def _rec_by_cell(summary, run_fingerprint=None):
             continue
         if run_fingerprint is not None and rec.get('run_fingerprint') != run_fingerprint:
             continue
-        if (isinstance(rec.get('ppl'), bool)
-                or not isinstance(rec.get('ppl'), (int, float))
-                or not math.isfinite(float(rec['ppl'])) or float(rec['ppl']) <= 0.0):
+        if rec.get('synthesized') or not L.ppl_is_usable(rec.get('ppl')):
             continue
         v, _, s = key.partition('::seed')
-        try:
-            seed = int(s)
-        except Exception:
+        seed = L._as_seed_int(s)
+        if seed is None:
+            continue
+        # The key is not the identity: a record whose own variant/seed fields
+        # disagree with its summary key would otherwise be paired as a
+        # different cell than the one it was actually run for.
+        if rec.get('variant') is not None and str(rec.get('variant')) != str(v):
+            continue
+        _rec_seed = L._as_seed_int(rec.get('seed'))
+        if rec.get('seed') is not None and _rec_seed != seed:
             continue
         nll = _nll_per_token(rec)
         if nll is None:
@@ -299,13 +316,20 @@ def _rec_by_cell(summary, run_fingerprint=None):
 
 def _paired(cells, va, vb, seeds):
     ds, ppl_ds, used = [], [], []
+    seen = set()
     for s in seeds:
+        s = int(s)
+        if s in seen:
+            # One seed is one paired observation.  Repeating a requested seed
+            # must not fabricate extra n and shrink the exact-test p floor.
+            continue
+        seen.add(s)
         a, b = cells.get((va, s)), cells.get((vb, s))
         if a is None or b is None:
             continue
         ds.append(float(a['nll'] - b['nll']))
         ppl_ds.append(float(a['ppl'] - b['ppl']))
-        used.append(int(s))
+        used.append(s)
     return ds, ppl_ds, used
 
 
@@ -375,7 +399,12 @@ def _controlled_reason(a, b):
     """Only the declared experimental factors may differ between two arms."""
     if not isinstance(a, dict) or not isinstance(b, dict):
         return 'missing record'
-    ha, hb = a.get('hyperparams') or {}, b.get('hyperparams') or {}
+    ha, hb = a.get('hyperparams'), b.get('hyperparams')
+    if (ha is None) != (hb is None):
+        return 'unverifiable hyperparams (only one record carries the descriptor)'
+    if ha is not None and (not isinstance(ha, dict) or not isinstance(hb, dict)):
+        return 'unverifiable hyperparams (not an object)'
+    ha, hb = (ha or {}), (hb or {})
     keys = ('steps', 'tokens_seen', 'n_train_tokens', 'seq_len', 'batch_size',
             'lr', 'weight_decay', 'warmup', 'comp_lambda', 'delta_lr_mult',
             'd', 'n_layers', 'n_heads', 'd_head', 'mlp_ratio', 'vocab_size',
@@ -383,27 +412,42 @@ def _controlled_reason(a, b):
             'code', 'amp_dtype', 'eager_batch')
     for k in keys:
         va, vb = ha.get(k), hb.get(k)
-        if va is not None and vb is not None and va != vb:
+        if va is None or vb is None:
+            if va is None and vb is None:
+                continue
+            return f'unverifiable {k} (only one record carries it)'
+        if va != vb:
             return f'{k} differs ({va!r} != {vb!r})'
-    if a.get('code') != b.get('code'):
+    if (a.get('code') is None) != (b.get('code') is None):
+        return 'unverifiable code stamp (only one record carries it)'
+    if a.get('code') is not None and a.get('code') != b.get('code'):
         return f"code stamp differs ({a.get('code')!r} != {b.get('code')!r})"
-    if a.get('params') is not None and b.get('params') is not None and a.get('params') != b.get('params'):
+    if (a.get('params') is None) != (b.get('params') is None):
+        return 'unverifiable parameter count (only one record carries it)'
+    if a.get('params') is not None and a.get('params') != b.get('params'):
         return f"parameter count differs ({a.get('params')!r} != {b.get('params')!r})"
-    if a.get('run_fingerprint') != b.get('run_fingerprint'):
+    if (a.get('run_fingerprint') is None) != (b.get('run_fingerprint') is None):
+        return 'unverifiable run_fingerprint (only one record carries it)'
+    if a.get('run_fingerprint') is not None and a.get('run_fingerprint') != b.get('run_fingerprint'):
         return 'run_fingerprint differs (recipe/backend/matrix changed)'
     for k in ('data_fp', 'val_fp', 'eval_fp', 'eval_subset_fp', 'rng_fp'):
         va, vb = a.get(k), b.get(k)
-        if va is not None and vb is not None and va != vb:
+        if (va is None) != (vb is None):
+            return f'unverifiable {k} (only one record carries it)'
+        if va is not None and va != vb:
             return f'{k} differs ({va!r} != {vb!r})'
-    oa = a.get('open_block_config') or {}
-    ob = b.get('open_block_config') or {}
+    if not isinstance(a.get('open_block_config'), dict) or not isinstance(b.get('open_block_config'), dict):
+        return 'unverifiable open_block_config (at least one record omits it)'
+    oa = a.get('open_block_config')
+    ob = b.get('open_block_config')
     if oa.get('fingerprint') is not None and oa.get('fingerprint') == ob.get('fingerprint'):
         return None
     # The only allowed layer-level differences are max_block/open mode/scope.
     la, lb = oa.get('layers') or [], ob.get('layers') or []
     if len(la) != len(lb):
         return 'different layer counts'
-    allowed = {'max_block', 'open_block_mode', 'open_block_scope'}
+    # max_block_tokens is the same factor under its public alias.
+    allowed = {'max_block', 'max_block_tokens', 'open_block_mode', 'open_block_scope'}
     for i, (x, y) in enumerate(zip(la, lb)):
         for k in set(x) | set(y):
             if k in allowed:
@@ -416,8 +460,7 @@ def _controlled_reason(a, b):
 def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     summary = _load_summary(outdir)
     _fps = {rec.get('run_fingerprint') for rec in summary.values()
-            if isinstance(rec, dict) and isinstance(rec.get('ppl'), (int, float))
-            and math.isfinite(float(rec.get('ppl')) or float('nan'))}
+            if isinstance(rec, dict) and L.ppl_is_usable(rec.get('ppl'))}
     _fps.discard(None)
     if len(_fps) > 1:
         raise SystemExit(
@@ -429,7 +472,17 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     if not cells:
         raise SystemExit(f'no usable records in {outdir}/summary.json')
     avail_seeds = sorted({s for (_, s) in cells})
-    seeds = [int(s) for s in (seeds or avail_seeds)]
+    # A caller may repeat a seed on the command line; deduplicate while
+    # preserving the requested order so n stays the number of unique seeds.
+    _seen_seeds = set()
+    seeds = []
+    for s in (seeds or avail_seeds):
+        s = L._as_seed_int(s)
+        if s is None:
+            raise SystemExit(f'open-block: invalid seed identifier {s!r} — seeds must be integers')
+        if s not in _seen_seeds:
+            _seen_seeds.add(s)
+            seeds.append(s)
     results = {}
 
     def variant(mb, mode, scope='full_prefix'):
@@ -439,12 +492,22 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
         if name in results:
             return results[name]
         ds, ppl_ds, used = _paired(cells, va, vb, seeds)
-        # Controlled-comparator check on the first paired seed.
+        # A seed whose two records differ in an undeclared factor is not a
+        # controlled observation.  Report the violation AND exclude that seed
+        # from the test; keeping it would let an uncontrolled run decide the
+        # paired statistic while the table merely records a warning.
         reasons = []
+        controlled = []
         for s in used:
             r = _controlled_reason(cells[(va, s)]['record'], cells[(vb, s)]['record'])
             if r:
                 reasons.append(f'seed{s}: {r}')
+            else:
+                controlled.append(s)
+        if len(controlled) != len(used):
+            ds = [float(cells[(va, s)]['nll'] - cells[(vb, s)]['nll']) for s in controlled]
+            ppl_ds = [float(cells[(va, s)]['ppl'] - cells[(vb, s)]['ppl']) for s in controlled]
+            used = controlled
         st = L.paired_effect_stats(ds, alpha=0.05, min_n=3) if ds else {'n': 0}
         st = dict(st)
         st.update({
@@ -466,12 +529,24 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     # Interaction: (summary - closed at None) - (summary - closed at 128),
     # computed seed-wise as Δ_none - Δ_128.
     d_int, p_int, used_int = [], [], []
+    _int_reasons = []
     for s in seeds:
         a = cells.get((variant(None, 'summary'), s))
         b = cells.get((variant(None, 'closed'), s))
         c = cells.get((variant(128, 'summary'), s))
         d = cells.get((variant(128, 'closed'), s))
-        if None in (a, b, c, d):
+        _bad = False
+        for _lbl, _x, _y in (('none summary/closed', a, b),
+                             ('128 summary/closed', c, d)):
+            if _x is None or _y is None:
+                _int_reasons.append(f'seed{s}: {_lbl} record missing')
+                _bad = True
+                continue
+            _why = _controlled_reason(_x['record'], _y['record'])
+            if _why:
+                _int_reasons.append(f'seed{s}: {_lbl}: {_why}')
+                _bad = True
+        if _bad:
             continue
         d_int.append(float((a['nll'] - b['nll']) - (c['nll'] - d['nll'])))
         p_int.append(float((a['ppl'] - b['ppl']) - (c['ppl'] - d['ppl'])))
@@ -482,7 +557,7 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
                'b': 'summary-128 - closed-128', 'seeds': used_int,
                'per_seed_delta_nll': d_int, 'per_seed_delta_ppl': p_int,
                'delta_convention': 'negative = prefix summary gains more when no cap',
-               'controlled_violations': [], 'p_holm': None})
+               'controlled_violations': _int_reasons, 'p_holm': None})
     results[st['name']] = st
 
     # Secondary descriptive cells.
@@ -529,9 +604,11 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
         if e is not None:
             efficiency[f'{v}::seed{s}'] = e
     _prim_n = [int(results[n].get('n') or 0) for n in prim_names if results[n].get('n')]
-    _prim_n_min = min(_prim_n) if _prim_n else 0
-    _holm_floor = (L.holm_min_attainable_p(_prim_n_min, len(prim_names), 0.05)
-                   if _prim_n_min and prim_names else None)
+    # The family's finest attainable p is set by the best-resolved (largest-n)
+    # comparison, not the smallest one.
+    _prim_n_max = max(_prim_n) if _prim_n else 0
+    _holm_floor = (L.holm_min_attainable_p(_prim_n_max, len(prim_names), 0.05)
+                   if _prim_n_max and prim_names else None)
     _holm_min_n = (L.signflip_min_n_for_holm(len(prim_names), 0.05)
                    if prim_names else None)
     os.makedirs(analysis_dir, exist_ok=True)
@@ -611,7 +688,7 @@ def _render_markdown(stats):
                 _fmt(e.get('peak_mem_allocated_mb'), 1)))
     lines += ['', '## How to read the primary comparisons', '',
               '- `summary - closed @128`: does a causal summary of the open block help under the default cap?',
-              '- `singletons - summary @128`: representation granularity at a fixed top-k budget.',
+              '- `singletons - summary @128`: representation granularity at a fixed top-k quota.',
               '- `interaction`: does removing the cap make the summary benefit larger? A negative value is consistent with a waiting bottleneck, but only alongside block-length, prefix-selection and window-coverage statistics.',
               '- Prefix candidates compete for the same K slots; an empty/rare prefix selection is a selection-path fact, not evidence that prefix information is useless.',
               '- 4 seeds cannot reach p<0.05 (floor 0.125); report the effect and its uncertainty. '

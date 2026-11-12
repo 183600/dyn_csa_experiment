@@ -38,15 +38,19 @@ import numpy as np
 
 __all__ = [
     'SPLIT_NAMES',
+    'LeakageSafeCategoricalEncoder',
     'LeakageSafePreprocessor',
     'SafeScaler',
     'assert_no_split_leakage',
     'categorical_shift_report',
     'chronological_split',
     'chronological_split_indices',
+    'clean_training_rows',
     'data_quality_report',
     'duplicate_mask',
+    'fit_categorical_encoder',
     'fit_preprocessor',
+    'prepare_categorical_features',
     'grouped_chronological_split',
     'grouped_chronological_split_indices',
     'prepare_features',
@@ -64,6 +68,10 @@ _EPS = 1e-12
 # ---------------------------------------------------------------------------
 
 def _check_fraction(name, value):
+    # Booleans are not fractions: float(True) == 1.0 would silently turn a
+    # mistaken flag into a 100% split.  Same contract as _check_count.
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f'{name} must be a number in [0, 1], got {value!r}')
     try:
         value = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -149,23 +157,38 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
     if abs(frac_sum - 1.0) > 1e-6:
         raise ValueError(
             f'train_frac + val_frac + test_frac must sum to 1, got {frac_sum}')
-    sizes = [int(math.floor(n * f)) for f in (train_frac, val_frac, test_frac)]
-    # Small n: guarantee one row for every requested non-empty split.  Larger
-    # splits are reduced first (from the end) so the chronological order is
-    # never broken.
-    requested = [f > 0 for f in (train_frac, val_frac, test_frac)]
+    # The tolerance accepts sums within 1e-6 of 1.  At scale, n*frac can then
+    # overshoot n by thousands of rows and the floor sum could exceed n
+    # (negative remainder).  Renormalising the accepted fractions keeps the
+    # targets summing to n exactly for every n; the deviation is already
+    # inside the declared tolerance.
+    fracs = tuple(f / frac_sum for f in (train_frac, val_frac, test_frac))
+    requested = [f > 0 for f in fracs]
     if n < sum(requested):
         raise ValueError(
             f'n={n} is too small for {sum(requested)} non-empty chronological splits')
+    # Largest-remainder apportionment: floor every target, then give the
+    # leftover rows to the splits with the largest fractional parts.  This
+    # keeps small-n splits close to their requested proportions and never
+    # puts rows into a split whose requested fraction is zero.
+    targets = [n * f for f in fracs]
+    sizes = [int(math.floor(t)) for t in targets]
+    remaining = n - sum(sizes)
+    order = sorted(range(3), key=lambda i: (-(targets[i] - sizes[i]), -i))
+    eligible = [i for i in order if requested[i]]
+    for k in range(remaining):
+        sizes[eligible[k % len(eligible)]] += 1
+    # A requested split that still rounds to zero (very small n) must borrow
+    # one row from the largest split that can spare it.
     for i in range(3):
         if requested[i] and sizes[i] == 0:
+            donors = [j for j in range(3) if j != i and sizes[j] > 1]
+            if not donors:
+                raise ValueError(f'inconsistent split sizes {sizes} for n={n}')
+            j = max(donors, key=lambda k: (sizes[k], -k))
+            sizes[j] -= 1
             sizes[i] = 1
-            for j in (2, 1, 0):
-                if j != i and sizes[j] > 1:
-                    sizes[j] -= 1
-                    break
-    sizes[2] = n - sizes[0] - sizes[1]
-    if sizes[2] < 0 or sizes[0] < 0 or sizes[1] < 0:
+    if sum(sizes) != n or any(v < 0 for v in sizes):
         raise ValueError(f'inconsistent split sizes {sizes} for n={n}')
     return tuple(int(v) for v in sizes)
 
@@ -377,11 +400,16 @@ def _assert_order_finite(order, *, name='order'):
             # cannot sort to an arbitrary position and silently define the
             # split.  Non-numeric/string keys are left to the caller's order.
             for value in arr.tolist():
-                if isinstance(value, np.datetime64):
+                if isinstance(value, (np.datetime64, np.timedelta64)):
                     if np.isnat(value):
                         raise ValueError(
                             f'{name} contains NaT; a temporal split needs a '
                             'well-defined order')
+                    continue
+                # Only real numeric scalars can be missing.  Calling float()
+                # on every object turned the legitimate string key "nan" (or
+                # "inf") into a spurious NaN timestamp.
+                if not isinstance(value, numbers.Real) or isinstance(value, (bool, np.bool_)):
                     continue
                 try:
                     f = float(value)
@@ -491,12 +519,17 @@ def _group_order(groups, order=None):
         raise ValueError('order must be a 1-D array with one value per row')
     _assert_order_finite(order)
     key = {}
-    for i, g in enumerate(groups.tolist()):
-        g = _group_key(g)
-        v = order[i]
-        if g not in key or v < key[g]:
-            key[g] = v
-    return sorted(first, key=lambda g: (key[g], first[g])), first
+    try:
+        for i, g in enumerate(groups.tolist()):
+            g = _group_key(g)
+            v = order[i]
+            if g not in key or v < key[g]:
+                key[g] = v
+        return sorted(first, key=lambda g: (key[g], first[g])), first
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            'order values are not mutually orderable; cannot order groups '
+            'chronologically') from None
 
 
 def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
@@ -540,7 +573,23 @@ def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
                len(out[SPLIT_NAMES[current]]) >= targets[current]):
             current += 1
         out[SPLIT_NAMES[current]].extend(int(i) for i in members[g])
-    res = {name: np.asarray(sorted(v), dtype=np.int64) for name, v in out.items()}
+    # Preserve chronological order within each split when an ordering key is
+    # supplied: sorting only by row index would hand back a shuffled
+    # time-series split (the non-grouped path explicitly preserves time
+    # order).  Without an order key, ascending row index is the deterministic
+    # first-appearance order.
+    res = {}
+    for name, v in out.items():
+        arr = np.asarray(v, dtype=np.int64)
+        if arr.size and order is not None:
+            _ord = np.asarray(order)
+            try:
+                arr = arr[np.argsort(_ord[arr], kind='stable')]
+            except (TypeError, ValueError, OverflowError):
+                arr = np.sort(arr)
+        else:
+            arr = np.sort(arr)
+        res[name] = arr
     # A requested non-empty split must not silently be empty.  An empty
     # validation set is not a harmless corner case: selection/early stopping
     # then has no legal data and callers are tempted to fall back to test.
@@ -602,7 +651,12 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
     if time is not None:
         time = _as_1d(time, 'time', n)
         _assert_order_finite(time, name='time')
-        order = np.argsort(time, kind='stable')
+        try:
+            order = np.argsort(time, kind='stable')
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                'time values are not mutually orderable; cannot build a '
+                'chronological split') from None
         sorted_time = time[order]
         sizes = _resolve_sizes(n, train_frac, val_frac, test_frac,
                                train_size, val_size, test_size)
@@ -637,11 +691,25 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
             ))
         blocks = []
         start = 0
+        start_pos = 0
         cumulative = 0
-        for size in sizes:
+        _cuts_arr = np.asarray(cuts)
+        for _si, size in enumerate(sizes):
             cumulative += int(size)
-            pos = int(np.searchsorted(np.asarray(cuts), cumulative, side='left'))
-            pos = min(max(pos, 0), len(cuts) - 1)
+            # Reserve one legal cut for every later non-empty split, so an
+            # earlier legal boundary can satisfy every split instead of
+            # consuming the last timestamp block for the first one.
+            _later = sum(1 for _s in sizes[_si + 1:] if int(_s) > 0)
+            max_pos = len(cuts) - 1 - _later
+            pos = int(np.searchsorted(_cuts_arr, cumulative, side='left'))
+            # Never move backwards, and force progress for a non-empty split.
+            pos = max(pos, start_pos + (1 if int(size) > 0 else 0))
+            pos = min(max(pos, 0), max_pos)
+            if pos <= start_pos and int(size) > 0:
+                raise ValueError(
+                    'cannot form the requested non-empty chronological split '
+                    'without cutting an equal-timestamp block; supply groups '
+                    '(grouped_chronological_split_indices) or fewer split rows')
             end = int(cuts[pos])
             end = max(end, start)
             if int(size) > 0 and end <= start:
@@ -655,6 +723,7 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
             # [7, 6]) instead of time order.
             blocks.append(order[start:end].copy())
             start = end
+            start_pos = pos
         return _purge_tail(dict(zip(SPLIT_NAMES, blocks)), purge)
     return chronological_split_indices(
         n, train_frac, val_frac, test_frac,
@@ -673,15 +742,20 @@ def _group_key(value):
         f = float(value)
         if math.isnan(f):
             return ('__nan__',)
-    if isinstance(value, np.datetime64) and np.isnat(value):
+    if isinstance(value, (np.datetime64, np.timedelta64)) and np.isnat(value):
         return ('__nat__',)
+    try:
+        hash(value)
+    except TypeError:
+        # Group ids are normally hashable scalars, but an object column of
+        # lists/arrays should still be groupable by a stable identity rather
+        # than crashing inside a set/dict downstream.
+        return ('__unhashable__', type(value).__name__, repr(value))
     return value
 
 
 def _assert_index_and_group_disjoint(split_idx, groups=None):
-    # Row-index disjointness is a pure set operation; intersecting the int64
-    # arrays avoids materialising every index as a Python int (the set form
-    # costs ~28 bytes/row and dominates memory on a scale-up split).
+    # Row-index disjointness is a pure set operation on the int64 arrays.
     arrays = {name: np.asarray(split_idx[name]).reshape(-1)
               for name in SPLIT_NAMES}
     for i, a in enumerate(SPLIT_NAMES):
@@ -752,9 +826,18 @@ def assert_no_split_leakage(train_idx, val_idx, test_idx, *, groups=None,
             # future/past into the other split even though the row indices are
             # disjoint.  Callers must pass groups (or split at a timestamp
             # boundary) when timestamps repeat.
-            earlier_max = _order_extreme(time[ia], maximum=True)
-            later_min = _order_extreme(time[ib], maximum=False)
-            if earlier_max >= later_min:
+            try:
+                earlier_max = _order_extreme(time[ia], maximum=True)
+                later_min = _order_extreme(time[ib], maximum=False)
+                leaked = bool(earlier_max >= later_min)
+            except (TypeError, ValueError, OverflowError):
+                # Mixed/unorderable object timestamps cannot prove a monotone
+                # partition; fail closed rather than letting a TypeError
+                # escape from what is supposed to be a verification helper.
+                raise ValueError(
+                    f'temporal leakage cannot be verified for {a}/{b}: '
+                    'time values are not mutually orderable') from None
+            if leaked:
                 raise ValueError(
                     f'temporal leakage: max {a} time '
                     f'{earlier_max!r} >= min {b} time {later_min!r} '
@@ -777,6 +860,14 @@ def _as_numeric_2d(X, *, name='X'):
 
 def _as_float_2d(X, *, name='X'):
     arr = _as_numeric_2d(X, name=name)
+    if np.iscomplexobj(arr):
+        # NumPy would cast complex -> float64 with only a warning, silently
+        # discarding the imaginary part.  Two different complex rows could
+        # then collapse into the same "duplicate" and the fitted statistics
+        # would describe data the caller never supplied.
+        raise TypeError(
+            f'{name} must be real-valued; complex features are not supported '
+            'by the leakage-safe preprocessor')
     try:
         arr = arr.astype(np.float64, copy=False)
     except (TypeError, ValueError, OverflowError):
@@ -787,8 +878,13 @@ def _as_float_2d(X, *, name='X'):
 
 
 def _col_float64(arr, j, name='X'):
+    col = arr[:, j]
+    if np.iscomplexobj(col):
+        raise TypeError(
+            f'{name} must be real-valued; complex features are not supported '
+            'by the leakage-safe preprocessor')
     try:
-        return np.asarray(arr[:, j], dtype=np.float64)
+        return np.asarray(col, dtype=np.float64)
     except (TypeError, ValueError, OverflowError):
         raise TypeError(
             f'{name} must be numeric; encode categorical features before '
@@ -823,6 +919,10 @@ class LeakageSafePreprocessor:
                  clip_quantiles=(0.001, 0.999), clip_z=None, eps=_EPS):
         if scale not in ('standard', 'robust', 'minmax', 'none'):
             raise ValueError(f'unknown scale={scale!r}')
+        if isinstance(missing, (bool, np.bool_)):
+            raise ValueError(
+                f'missing must be a finite constant or one of '
+                f"'median'/'mean'/'zero', got {missing!r}")
         if isinstance(missing, (numbers.Real, np.integer, np.floating)):
             missing = float(missing)
             if not math.isfinite(missing):
@@ -834,17 +934,28 @@ class LeakageSafePreprocessor:
             raise ValueError(f'unknown missing={missing!r}')
         if clip_quantiles is not None:
             lo, hi = clip_quantiles
+            if any(isinstance(v, (bool, np.bool_)) for v in (lo, hi)):
+                raise ValueError('clip_quantiles must be numeric, not booleans')
             lo, hi = float(lo), float(hi)
             if not (0.0 <= lo < hi <= 1.0):
                 raise ValueError('clip_quantiles must satisfy 0 <= lo < hi <= 1')
             clip_quantiles = (lo, hi)
-        if clip_z is not None and not (float(clip_z) > 0.0):
-            raise ValueError('clip_z must be positive or None')
+        if isinstance(clip_z, (bool, np.bool_)):
+            raise ValueError('clip_z must be positive or None, not a boolean')
+        if clip_z is not None:
+            clip_z = float(clip_z)
+            if not (math.isfinite(clip_z) and clip_z > 0.0):
+                raise ValueError('clip_z must be a finite positive number or None')
+        if isinstance(eps, (bool, np.bool_)):
+            raise ValueError('eps must be a finite non-negative number, not a boolean')
+        eps = float(eps)
+        if not (math.isfinite(eps) and eps >= 0.0):
+            raise ValueError(f'eps must be a finite non-negative number, got {eps!r}')
         self.scale = scale
         self.missing = missing
         self.clip_quantiles = clip_quantiles
         self.clip_z = None if clip_z is None else float(clip_z)
-        self.eps = float(eps)
+        self.eps = eps
         self.fitted_ = False
 
     # -- fitting ----------------------------------------------------------
@@ -1000,6 +1111,201 @@ class LeakageSafePreprocessor:
         return obj
 
 
+def _as_categorical_2d(X, *, name='X'):
+    arr = np.asarray(X, dtype=object)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    if arr.ndim != 2:
+        raise ValueError(f'{name} must be 1-D or 2-D, got shape {arr.shape}')
+    return arr
+
+
+def _category_is_missing(value):
+    if value is None:
+        return True
+    if isinstance(value, (float, np.floating)):
+        return bool(math.isnan(float(value)))
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        return bool(np.isnat(value))
+    return False
+
+
+def _sorted_categories(values):
+    unique = {}
+    for value in values:
+        if _category_is_missing(value):
+            continue
+        unique.setdefault(_hashable_label(value), value)
+    return sorted(unique.values(),
+                  key=lambda v: (type(v).__name__, repr(v)))
+
+
+def _categorical_fingerprint(X):
+    h = hashlib.sha256()
+    arr = np.asarray(X, dtype=object)
+    h.update(str(arr.shape).encode('ascii'))
+    for row in arr.tolist():
+        h.update(repr(row).encode('utf-8', errors='replace'))
+        h.update(b'\x1f')
+    return h.hexdigest()[:16]
+
+
+class LeakageSafeCategoricalEncoder:
+    """Ordinal/one-hot encode categories learned from training rows only.
+
+    ``fit`` records the category set of each column from the training split.
+    ``transform`` maps validation/test values into that fixed space and never
+    adds a level, so an unseen holdout category cannot widen the feature matrix
+    or shift the encoding of a training row.  Missing values and unknown
+    categories always have their own reserved level.
+    """
+
+    def __init__(self, *, encoding='ordinal', handle_unknown='unknown'):
+        if encoding not in ('ordinal', 'onehot'):
+            raise ValueError(f"encoding must be 'ordinal' or 'onehot', got {encoding!r}")
+        if handle_unknown not in ('unknown', 'error'):
+            raise ValueError(
+                f"handle_unknown must be 'unknown' or 'error', got {handle_unknown!r}")
+        self.encoding = encoding
+        self.handle_unknown = handle_unknown
+        self.fitted_ = False
+
+    def fit(self, X, y=None):
+        Xarr = _as_categorical_2d(X)
+        n, p = Xarr.shape
+        if n == 0:
+            raise ValueError('cannot fit a categorical encoder on zero training rows')
+        stats = []
+        for j in range(p):
+            categories = _sorted_categories(Xarr[:, j].tolist())
+            stats.append({
+                'categories': categories,
+                'n_categories': int(len(categories)),
+                'unknown_index': int(len(categories)),
+                'missing_index': int(len(categories) + 1),
+            })
+        self.feature_stats_ = stats
+        self.n_features_in_ = int(p)
+        self.n_train_ = int(n)
+        self.train_fp_ = _categorical_fingerprint(Xarr)
+        self.fitted_ = True
+        return self
+
+    def _check_transform_input(self, X):
+        if not self.fitted_:
+            raise RuntimeError(
+                'LeakageSafeCategoricalEncoder.transform called before fit')
+        Xarr = _as_categorical_2d(X)
+        if Xarr.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f'X has {Xarr.shape[1]} features, but the encoder was fitted '
+                f'on {self.n_features_in_}')
+        return Xarr
+
+    def transform(self, X):
+        Xarr = self._check_transform_input(X)
+        n = int(Xarr.shape[0])
+        if self.encoding == 'ordinal':
+            out = np.empty((n, self.n_features_in_), dtype=np.float64)
+            for j, st in enumerate(self.feature_stats_):
+                lookup = {_hashable_label(c): i
+                          for i, c in enumerate(st['categories'])}
+                for i, value in enumerate(Xarr[:, j].tolist()):
+                    if _category_is_missing(value):
+                        out[i, j] = st['missing_index']
+                        continue
+                    code = lookup.get(_hashable_label(value))
+                    if code is None:
+                        if self.handle_unknown == 'error':
+                            raise ValueError(
+                                f'unseen category {value!r} in column {j}; '
+                                'the encoder was fitted on training rows only')
+                        code = st['unknown_index']
+                    out[i, j] = code
+            return out
+        width = sum(s['n_categories'] + 2 for s in self.feature_stats_)
+        out = np.zeros((n, width), dtype=np.float64)
+        offset = 0
+        for j, st in enumerate(self.feature_stats_):
+            lookup = {_hashable_label(c): i
+                      for i, c in enumerate(st['categories'])}
+            span = st['n_categories'] + 2
+            for i, value in enumerate(Xarr[:, j].tolist()):
+                if _category_is_missing(value):
+                    out[i, offset + st['missing_index']] = 1.0
+                    continue
+                code = lookup.get(_hashable_label(value))
+                if code is None:
+                    if self.handle_unknown == 'error':
+                        raise ValueError(
+                            f'unseen category {value!r} in column {j}; '
+                            'the encoder was fitted on training rows only')
+                    code = st['unknown_index']
+                out[i, offset + code] = 1.0
+            offset += span
+        return out
+
+    def fit_transform(self, X, y=None):
+        """Fit on **training** categories and transform them (never test)."""
+        return self.fit(X, y).transform(X)
+
+    def get_feature_names(self):
+        if not self.fitted_:
+            raise RuntimeError('encoder has not been fitted')
+        if self.encoding == 'ordinal':
+            return [f'x{j}' for j in range(self.n_features_in_)]
+        names = []
+        for j, st in enumerate(self.feature_stats_):
+            names.extend(f'x{j}={c!r}' for c in st['categories'])
+            names.append(f'x{j}=__unknown__')
+            names.append(f'x{j}=__missing__')
+        return names
+
+    def get_stats(self):
+        if not self.fitted_:
+            raise RuntimeError('encoder has not been fitted')
+        return {
+            'encoding': self.encoding,
+            'handle_unknown': self.handle_unknown,
+            'n_features_in': self.n_features_in_,
+            'n_train': self.n_train_,
+            'train_fp': self.train_fp_,
+            # Copy the category lists too: a caller mutating the returned
+            # snapshot must not change the fitted encoder (and vice versa).
+            'features': [dict(s, categories=list(s.get('categories') or []))
+                         for s in self.feature_stats_],
+        }
+
+    @classmethod
+    def from_stats(cls, stats):
+        """Rebuild a fitted encoder from :meth:`get_stats` output."""
+        obj = cls(encoding=stats['encoding'],
+                  handle_unknown=stats.get('handle_unknown', 'unknown'))
+        obj.feature_stats_ = [dict(s, categories=list(s.get('categories') or []))
+                              for s in stats['features']]
+        obj.n_features_in_ = int(stats['n_features_in'])
+        obj.n_train_ = int(stats.get('n_train', 0))
+        obj.train_fp_ = stats.get('train_fp')
+        obj.fitted_ = True
+        return obj
+
+
+def fit_categorical_encoder(X_train, **kwargs):
+    """Fit a categorical encoder on training rows only."""
+    return LeakageSafeCategoricalEncoder(**kwargs).fit(X_train)
+
+
+def prepare_categorical_features(X_train, X_val=None, X_test=None, **kwargs):
+    """Encode train categories first, then transform the holdouts."""
+    encoder = LeakageSafeCategoricalEncoder(**kwargs).fit(X_train)
+    out = {'train': encoder.transform(X_train), 'encoder': encoder}
+    if X_val is not None:
+        out['val'] = encoder.transform(X_val)
+    if X_test is not None:
+        out['test'] = encoder.transform(X_test)
+    return out
+
+
 # Conventional short alias.
 SafeScaler = LeakageSafePreprocessor
 
@@ -1024,10 +1330,121 @@ def prepare_features(X_train, X_val=None, X_test=None, **kwargs):
     return out
 
 
+def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
+                        label_conflicts='drop'):
+    """Remove duplicate/ambiguous rows from the training split only.
+
+    The holdout indices are not accepted by this function, so no validation or
+    test row can be dropped, imputed or used to decide which duplicate to keep.
+    Rows are grouped by their exact feature key; the first occurrence in the
+    supplied training order is retained.  When duplicate rows carry different
+    non-missing labels, ``label_conflicts='drop'`` removes the whole ambiguous
+    cluster (the safe choice before fitting), ``'keep'`` retains it and
+    ``'raise'`` refuses to continue.
+
+    Returns ``train_idx`` (the cleaned index array), the dropped rows and
+    counts suitable for a run manifest.
+    """
+    Xraw = _as_numeric_2d(X)
+    Xarr = _as_float_2d(Xraw)
+    n = int(Xarr.shape[0])
+    train_rows = _validated_index(train_idx, name='train_idx')
+    if train_rows.size == 0:
+        raise ValueError('clean_training_rows: the training split is empty')
+    if int(train_rows.max()) >= n:
+        raise ValueError(
+            f'clean_training_rows: train_idx reaches {int(train_rows.max())} '
+            f'but X has {n} rows')
+    if label_conflicts not in ('drop', 'keep', 'raise'):
+        raise ValueError(
+            f"label_conflicts must be 'drop', 'keep' or 'raise', "
+            f"got {label_conflicts!r}")
+    labels = None
+    if y is not None:
+        yarr = np.asarray(y)
+        if yarr.ndim == 0 or yarr.shape[0] != n:
+            raise ValueError(
+                f'clean_training_rows: y has '
+                f'{yarr.shape[0] if yarr.ndim else 1} rows, expected {n}')
+        train_rows_needed = np.unique(train_rows).tolist()
+        if yarr.ndim == 1:
+            labels = {int(i): _label_key(yarr[i])
+                      for i in train_rows_needed}
+        else:
+            rows = yarr.reshape(n, -1)
+            labels = {int(i): tuple(_label_key(v) for v in rows[i].tolist())
+                      for i in train_rows_needed}
+
+    def _missing(lab):
+        # Any missing output makes the multi-output label unusable, matching
+        # data_quality_report / _label_key.  Requiring every output to be
+        # missing let a partially missing label masquerade as a real label and
+        # trigger a false duplicate-label conflict.
+        return lab is None or (isinstance(lab, tuple)
+                               and any(v is None for v in lab))
+
+    keys = _row_keys(Xraw)
+    clusters = {}
+    for pos, row in enumerate(train_rows.tolist()):
+        clusters.setdefault(keys[row], []).append(pos)
+    drop = np.zeros(train_rows.size, dtype=bool)
+    n_duplicate_rows = 0
+    n_conflict_rows = 0
+    n_conflict_clusters = 0
+    for positions in clusters.values():
+        if len(positions) < 2:
+            continue
+        valid = set()
+        if labels is not None:
+            valid = {_hashable_label(labels[int(train_rows[p])])
+                     for p in positions
+                     if not _missing(labels[int(train_rows[p])])}
+        if labels is not None and len(valid) > 1:
+            n_conflict_clusters += 1
+            if label_conflicts == 'raise':
+                raise ValueError(
+                    f'clean_training_rows: {len(positions)} duplicate training '
+                    f'rows carry {len(valid)} different labels; resolve them '
+                    'or use label_conflicts="drop"')
+            if label_conflicts == 'drop':
+                drop[positions] = True
+                n_conflict_rows += len(positions)
+                continue
+            continue
+        if drop_duplicates:
+            keep = positions[0]
+            if labels is not None:
+                for p in positions:
+                    if not _missing(labels[int(train_rows[p])]):
+                        keep = p
+                        break
+            for p in positions:
+                if p != keep:
+                    drop[p] = True
+                    n_duplicate_rows += 1
+    out_idx = train_rows[~drop].copy()
+    if out_idx.size == 0:
+        raise ValueError(
+            'clean_training_rows: every training row was dropped; refusing to '
+            'fit on an empty split')
+    return {
+        'train_idx': out_idx,
+        'dropped_idx': train_rows[drop].copy(),
+        'n_train_rows_in': int(train_rows.size),
+        'n_train_rows_out': int(out_idx.size),
+        'n_duplicate_rows_dropped': int(n_duplicate_rows),
+        'n_label_conflict_rows_dropped': int(n_conflict_rows),
+        'n_label_conflict_clusters': int(n_conflict_clusters),
+        'drop_duplicates': bool(drop_duplicates),
+        'label_conflicts': label_conflicts,
+    }
+
+
 def split_and_prepare(X, y=None, *, time=None, groups=None,
                       train_frac=0.8, val_frac=0.1, test_frac=0.1,
                       train_size=None, val_size=None, test_size=None,
                       purge=0, preprocess=True, quality_report=False,
+                      clean_train=False, label_conflicts='drop',
                       quality_kwargs=None, **preprocessor_kwargs):
     """Split first, then fit every preprocessing statistic on train only.
 
@@ -1043,10 +1460,15 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
     Passing ``quality_report=True`` additionally runs
     :func:`data_quality_report` on the raw table with the same split indices
     (still train-only statistics for the outlier/shift reference).
+    ``clean_train=True`` first removes exact duplicate training rows and, by
+    default, ambiguous duplicate-label clusters via
+    :func:`clean_training_rows`; validation/test rows are never dropped or
+    inspected.  The returned ``indices['train']`` is the cleaned index, so the
+    preprocessor and every downstream step see exactly the same rows.
 
     Returns a dict with ``indices``, per-split ``X`` (and ``y``), the fitted
-    ``preprocessor`` (or ``None`` when ``preprocess=False``), and optionally
-    the ``quality`` report.
+    ``preprocessor`` (or ``None`` when ``preprocess=False``), an optional
+    ``cleaning`` record and optionally the ``quality`` report.
     """
     Xarr = _as_numeric_2d(X)
     n = int(Xarr.shape[0])
@@ -1060,8 +1482,18 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
                         train_frac=train_frac, val_frac=val_frac,
                         test_frac=test_frac, train_size=train_size,
                         val_size=val_size, test_size=test_size, purge=purge)
+    cleaning = None
+    if clean_train:
+        cleaning = clean_training_rows(
+            Xarr, y=yarr, train_idx=idx['train'],
+            label_conflicts=label_conflicts)
+        idx['train'] = cleaning['train_idx']
+        assert_no_split_leakage(idx['train'], idx['val'], idx['test'],
+                                groups=groups, time=time)
     raw_X = {name: _take(Xarr, idx[name]) for name in SPLIT_NAMES}
     out = {'indices': idx, 'X': dict(raw_X)}
+    if cleaning is not None:
+        out['cleaning'] = cleaning
     if yarr is not None:
         out['y'] = {name: _take(yarr, idx[name]) for name in SPLIT_NAMES}
     prep = None
@@ -1103,14 +1535,29 @@ def _matrix_fingerprint(X):
     arr = np.asarray(X)
     h = hashlib.sha256()
     h.update(str(arr.shape).encode('ascii'))
-    # Convert and hash in bounded row blocks: the whole matrix is never
-    # duplicated as float64 just to be hashed, and the block row count is
-    # sized from the actual width so a wide matrix cannot allocate a
-    # gigabyte-sized block from a fixed row count.
+    # Convert and hash in bounded row blocks; the block row count is sized
+    # from the actual width.
     _w = int(arr.shape[1]) if arr.ndim > 1 else 1
     _step = _hash_row_block(_w, 1 << 20)
+    # float64 preserves integers up to 2**53 exactly.  Beyond that two
+    # different token ids can round to the same float and produce a false
+    # corpus fingerprint, so those integral tables are hashed as exact
+    # uint64 instead.  In-range tables keep the same fingerprint.
+    _integral = (arr.dtype != object
+                 and (np.issubdtype(arr.dtype, np.integer)
+                      or np.issubdtype(arr.dtype, np.bool_)))
+    _wide_int = False
+    if _integral and arr.size:
+        _lim = 2 ** 53
+        if np.issubdtype(arr.dtype, np.unsignedinteger):
+            _wide_int = bool((arr > _lim).any())
+        else:
+            _wide_int = bool(((arr > _lim) | (arr < -_lim)).any())
     for start in range(0, arr.shape[0], _step):
-        block = np.asarray(arr[start:start + _step], dtype=np.float64)
+        if _wide_int:
+            block = np.ascontiguousarray(arr[start:start + _step], dtype=np.uint64)
+        else:
+            block = np.asarray(arr[start:start + _step], dtype=np.float64)
         h.update(np.ascontiguousarray(block).tobytes())
     return h.hexdigest()[:16]
 
@@ -1118,10 +1565,67 @@ def _matrix_fingerprint(X):
 def _row_keys(X):
     """Stable per-row keys for exact-duplicate detection (NaN-safe)."""
     src = np.asarray(X)
+    if src.ndim == 0:
+        raise ValueError('duplicate detection needs a 1-D or 2-D table, got a scalar')
+    if src.ndim > 2:
+        raise ValueError(
+            f'duplicate detection needs a 1-D or 2-D table, got shape {src.shape}')
     if src.ndim == 1:
         src = src.reshape(-1, 1)
+    if src.dtype == object:
+        # Object tables are often mixed/non-contiguous; converting them to
+        # float64 both crashes on string columns and loses integer precision
+        # above 2**53.  Build an exact canonical key per cell instead.
+        def _cell_key(v):
+            if isinstance(v, (bool, np.bool_)):
+                return ('bool', bool(v))
+            if isinstance(v, (int, np.integer)):
+                return ('num', int(v))
+            if isinstance(v, (float, np.floating)):
+                f = float(v)
+                if math.isnan(f):
+                    return ('nan',)
+                if math.isinf(f):
+                    return ('inf', 1 if f > 0 else -1)
+                return ('num', 0.0 if f == 0.0 else f)
+            if isinstance(v, (np.datetime64, np.timedelta64)):
+                if np.isnat(v):
+                    return ('nat', type(v).__name__)
+                return ('dt', type(v).__name__, str(v))
+            try:
+                hash(v)
+            except TypeError:
+                return ('unhashable', type(v).__name__, repr(v))
+            return ('obj', type(v).__name__, v)
+
+        return [tuple(_cell_key(v) for v in row) for row in src]
     keys = []
-    # Hash row blocks; each block is converted to float64 before hashing.
+    # Integer/bool/datetime/string columns have an exact fixed-width byte
+    # representation.  Converting them through float64 loses integers above
+    # 2**53 (2**53 and 2**53+1 would hash as the same row and one would be
+    # dropped as a false duplicate), so hash the raw row bytes instead.
+    # Integral tables are first canonicalised to uint64: the same logical
+    # integer then hashes identically whether a cache stored it as int32 or
+    # int64 (raw bytes are width-dependent and would miss cross-dtype
+    # leakage).  uint64 keeps every integer value exact, including negatives
+    # via two's complement.
+    _integral = (src.dtype != object
+                 and (np.issubdtype(src.dtype, np.integer)
+                      or np.issubdtype(src.dtype, np.bool_)))
+    if _integral or (src.dtype != object and not np.issubdtype(src.dtype, np.floating)):
+        _step = _hash_row_block(int(src.shape[1]), 1 << 16)
+        for start in range(0, src.shape[0], _step):
+            if _integral:
+                arr = np.ascontiguousarray(src[start:start + _step], dtype=np.uint64)
+            else:
+                arr = np.ascontiguousarray(src[start:start + _step])
+            for row_view in arr.view(np.uint8).reshape(arr.shape[0], -1):
+                h = hashlib.blake2b(digest_size=8)
+                h.update(memoryview(row_view))
+                keys.append(h.digest())
+        return keys
+    # Hash row blocks; each floating block is converted to float64 before
+    # hashing (values are preserved exactly for float16/32/64).
     _step = _hash_row_block(int(src.shape[1]), 1 << 16)
     for start in range(0, src.shape[0], _step):
         arr = np.ascontiguousarray(np.asarray(src[start:start + _step], dtype=np.float64))
@@ -1135,11 +1639,8 @@ def _row_keys(X):
             arr[arr == 0.0] = 0.0
         finite = np.isfinite(arr)
         if finite.all():
-            # Fast path: every row is finite, so the old key is exactly
-            # ``row_bytes + b'|' + packbits(all-False)``.  Hashing the
-            # contiguous row view with the precomputed all-zero mask tail
-            # reproduces the historical key byte-for-byte while avoiding the
-            # per-row boolean-index copy and packbits call.
+            # Every row is finite, so the key is
+            # ``row_bytes + b'|' + packbits(all-False)``.
             _tail = np.packbits(np.zeros(int(src.shape[1]), dtype=bool)).tobytes()
             for row_view in arr.view(np.uint8):
                 h = hashlib.blake2b(digest_size=8)
@@ -1160,11 +1661,17 @@ def _row_keys(X):
             h.update(np.ascontiguousarray(row[ok]).tobytes())
             h.update(b'|')
             h.update(np.packbits(~ok).tobytes())
-            _code = np.zeros(row.shape, dtype=np.uint8)
-            _code[np.isnan(row)] = 1
-            _code[np.isposinf(row)] = 2
-            _code[np.isneginf(row)] = 3
-            h.update(_code.tobytes())
+            # Only a row that actually contains a non-finite value gets the
+            # extra value-code tail.  Appending an all-zero tail to finite rows
+            # in a mixed block would make the same finite row hash differently
+            # depending on which block it landed in (and therefore hide a
+            # duplicate whenever the two copies straddle a block boundary).
+            if not ok.all():
+                _code = np.zeros(row.shape, dtype=np.uint8)
+                _code[np.isnan(row)] = 1
+                _code[np.isposinf(row)] = 2
+                _code[np.isneginf(row)] = 3
+                h.update(_code.tobytes())
             keys.append(h.digest())
     return keys
 
@@ -1188,8 +1695,20 @@ def _split_array(X, idx):
     return X[np.asarray(idx, dtype=np.int64).reshape(-1)]
 
 
+def _hashable_label(value):
+    try:
+        hash(value)
+    except TypeError:
+        return ('__unhashable__', type(value).__name__, repr(value))
+    return value
+
+
 def _label_key(v):
     if v is None:
+        return None
+    if isinstance(v, (np.datetime64, np.timedelta64)) and np.isnat(v):
+        # NaT is a missing target, just like NaN (object-dtype labels are not
+        # normalised by ndarray.tolist() the way native datetime arrays are).
         return None
     # Only actual numeric scalars are checked for NaN/Inf.  Coercing every
     # value through float() turned legitimate categorical labels spelled
@@ -1212,9 +1731,11 @@ def _label_key(v):
 
 def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=None,
                         groups=None, time=None, clip_z=3.0, shift_threshold=0.5,
+                        known_labels=None,
                         fail_on_nan_inf=True, fail_on_label_conflict=True,
                         fail_on_nonfinite_labels=False,
                         fail_on_label_shift=False,
+                        fail_on_unknown_labels=False,
                         fail_on_duplicate_rows=False, fail_on_outliers=False,
                         fail_on_shift=False):
     """Report the common data-cleaning failure modes before any fit.
@@ -1247,15 +1768,25 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
     labels and label shift are warnings by default; ``fail_on_nonfinite_labels``
     and ``fail_on_label_shift`` turn them into hard failures.  The training
     labels are the only reference distribution.
+
+    ``known_labels`` optionally declares the admissible label set (a typo or a
+    label seen only in a holdout is then reported per split).
+    ``fail_on_unknown_labels`` turns that into a hard failure.
     """
     # A NaN/negative threshold silently disables the corresponding gate
     # (NaN compares False against everything), which is worse than an error.
+    if isinstance(clip_z, (bool, np.bool_)):
+        raise ValueError(f'clip_z must be a positive finite number, got {clip_z!r}')
     try:
         clip_z = float(clip_z)
     except (TypeError, ValueError, OverflowError):
         raise ValueError(f'clip_z must be a positive finite number, got {clip_z!r}') from None
     if not math.isfinite(clip_z) or clip_z <= 0.0:
         raise ValueError(f'clip_z must be a positive finite number, got {clip_z!r}')
+    if isinstance(shift_threshold, (bool, np.bool_)):
+        raise ValueError(
+            f'shift_threshold must be a finite non-negative number, got '
+            f'{shift_threshold!r}')
     try:
         shift_threshold = float(shift_threshold)
     except (TypeError, ValueError, OverflowError):
@@ -1266,8 +1797,24 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         raise ValueError(
             f'shift_threshold must be a finite non-negative number, got '
             f'{shift_threshold!r}')
-    X = _as_float_2d(X)
+    Xraw = _as_numeric_2d(X)
+    X = _as_float_2d(Xraw)
     n = X.shape[0]
+    known = None
+    if known_labels is not None:
+        if isinstance(known_labels, (str, bytes)):
+            raise ValueError(
+                'known_labels must be an iterable of labels, not a single string')
+        try:
+            values = (known_labels.reshape(-1).tolist()
+                      if isinstance(known_labels, np.ndarray)
+                      else list(known_labels))
+        except TypeError:
+            raise ValueError('known_labels must be a flat iterable of labels') from None
+        known = {_hashable_label(_label_key(v)) for v in values}
+        known.discard(None)
+        if y is None:
+            raise ValueError('known_labels requires y so the labels can be audited')
     idx = {'train': train_idx, 'val': val_idx, 'test': test_idx}
     for name, v in idx.items():
         if v is not None:
@@ -1292,11 +1839,13 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         split_rows = {name: (_empty_index() if idx[name] is None else idx[name])
                       for name in SPLIT_NAMES}
     ref = split_rows['train']
-    if ref.size == 0 and (split_rows['val'].size or split_rows['test'].size):
+    if ref.size == 0 and n > 0:
+        # An explicit empty train_idx (with or without holdouts) audits
+        # nothing; every vacuous check would otherwise report "ok".  An empty
+        # input table remains a vacuous no-op rather than an error.
         raise ValueError(
-            'data_quality_report: the training reference is empty while '
-            'validation/test rows were supplied; holdout rows must never be '
-            'used as the reference that defines the statistics')
+            'data_quality_report: the training reference is empty; there are '
+            'no training rows whose statistics can be audited')
     warnings = []
     hard_failures = []
     checks = {}
@@ -1338,7 +1887,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
 
     # Exact duplicates within each split.
     dup = {}
-    keys = _row_keys(X)
+    keys = _row_keys(Xraw)
     for name, rows in split_rows.items():
         sub = [keys[i] for i in rows]
         dup[name] = int(len(sub) - len(set(sub)))
@@ -1425,26 +1974,64 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
     # and the counts are broken down by split so a corrupted holdout cannot
     # hide behind a clean overall total.
     if y is not None:
-        y = np.asarray(y).reshape(-1)
-        if y.shape[0] != n:
-            raise ValueError(f'y has length {y.shape[0]}, expected {n}')
-        raw_labels = y.tolist()
-        labels = [_label_key(v) for v in raw_labels]
-        missing_labels = int(sum(v is None for v in labels))
-        absent_labels = int(sum(v is None for v in raw_labels))
-        nonfinite_labels = missing_labels - absent_labels
-        checks['missing_labels'] = absent_labels
+        yarr = np.asarray(y)
+        if yarr.ndim == 0 or yarr.shape[0] != n:
+            raise ValueError(
+                f'y has {yarr.shape[0] if yarr.ndim else 1} rows, expected {n}')
+        if yarr.ndim == 1:
+            raw_labels = yarr.tolist()
+            labels = [_label_key(v) for v in raw_labels]
+        else:
+            # Multi-output targets: flatten only along the output axis, not
+            # across rows.  reshape(-1) would make the flattened length n*k
+            # and reject every valid multi-output target with a misleading
+            # length error (clean_training_rows already supports this shape).
+            _rows_y = yarr.reshape(n, -1).tolist()
+            raw_labels = [tuple(r) for r in _rows_y]
+            labels = [tuple(_label_key(v) for v in r) for r in _rows_y]
+
+        def _raw_missing_atom(v):
+            if v is None:
+                return True
+            return (isinstance(v, (np.datetime64, np.timedelta64))
+                    and np.isnat(v))
+
+        def _raw_missing(v):
+            # For a multi-output target, any missing output makes the row
+            # unusable; requiring ALL outputs to be missing hid a partially
+            # corrupted row from both the missing and non-finite counters.
+            return _raw_missing_atom(v) or (isinstance(v, tuple)
+                                            and any(_raw_missing_atom(x) for x in v))
+
+        def _label_missing(v):
+            return v is None or (isinstance(v, tuple)
+                                 and any(x is None for x in v))
+
+        def _row_nonfinite(label, raw):
+            # A row can be BOTH partly missing and partly non-finite
+            # (e.g. (None, inf)).  Subtracting the missing count from the
+            # missing-label count hid the Inf entirely, so count the two
+            # conditions independently at the output level.
+            pairs = (zip(label, raw) if isinstance(label, tuple)
+                     else ((label, raw),))
+            return any(key is None and not _raw_missing_atom(atom)
+                       for key, atom in pairs)
+
+        missing_labels = int(sum(_raw_missing(v) for v in raw_labels))
+        nonfinite_labels = int(sum(_row_nonfinite(lab, raw)
+                                   for lab, raw in zip(labels, raw_labels)))
+        checks['missing_labels'] = missing_labels
         checks['nonfinite_labels'] = nonfinite_labels
         checks['missing_labels_by_split'] = {}
         checks['nonfinite_labels_by_split'] = {}
         for name, rows in split_rows.items():
             _rows = np.asarray(rows, dtype=np.int64).reshape(-1).tolist()
             checks['missing_labels_by_split'][name] = int(
-                sum(labels[i] is None and raw_labels[i] is None for i in _rows))
+                sum(_raw_missing(raw_labels[i]) for i in _rows))
             checks['nonfinite_labels_by_split'][name] = int(
-                sum(labels[i] is None and raw_labels[i] is not None for i in _rows))
-        if absent_labels:
-            warnings.append(f'{absent_labels} missing labels')
+                sum(_row_nonfinite(labels[i], raw_labels[i]) for i in _rows))
+        if missing_labels:
+            warnings.append(f'{missing_labels} missing labels')
         if nonfinite_labels:
             _msg = (f'{nonfinite_labels} non-finite labels (NaN/Inf); impute '
                     'or remove them before fitting')
@@ -1454,8 +2041,8 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                 warnings.append(_msg)
         by_row = {}
         for i, (k, lab) in enumerate(zip(keys, labels)):
-            if lab is not None:
-                by_row.setdefault(k, set()).add(lab)
+            if not _label_missing(lab):
+                by_row.setdefault(k, set()).add(_hashable_label(lab))
         conflicts = [k for k, labs in by_row.items() if len(labs) > 1]
         checks['label_conflicts_on_duplicate_rows'] = len(conflicts)
         if conflicts:
@@ -1465,13 +2052,35 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                 hard_failures.append(_msg)
             else:
                 warnings.append(_msg)
+        if known is not None:
+            unknown_by_split = {}
+            for name, rows in split_rows.items():
+                counts = {}
+                for i in np.asarray(rows, dtype=np.int64).reshape(-1).tolist():
+                    lab = labels[i]
+                    if _label_missing(lab):
+                        continue
+                    key = _hashable_label(lab)
+                    if key not in known:
+                        text = str(lab)
+                        counts[text] = counts.get(text, 0) + 1
+                unknown_by_split[name] = counts
+            checks['unknown_labels_by_split'] = unknown_by_split
+            _n_unknown = sum(sum(v.values()) for v in unknown_by_split.values())
+            if _n_unknown:
+                _msg = (f'{_n_unknown} labels are outside the declared '
+                        f'known_labels set: {unknown_by_split}')
+                if fail_on_unknown_labels:
+                    hard_failures.append(_msg)
+                else:
+                    warnings.append(_msg)
         # Stringify before counting so mixed/object label types cannot make
         # np.unique raise (and so a numpy scalar and its Python twin count as
         # one category).  This is an audit histogram, not a model input.
         def _label_hist(values):
             hist = {}
             for v in values:
-                if v is not None:
+                if not _label_missing(v):
                     hist[str(v)] = hist.get(str(v), 0) + 1
             return {k: hist[k] for k in sorted(hist)}
         checks['label_distribution'] = _label_hist(labels)
@@ -1487,12 +2096,13 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         label_shift = {}
         _train_lab = [str(labels[i]) for i in
                       np.asarray(ref, dtype=np.int64).reshape(-1).tolist()
-                      if labels[i] is not None]
+                      if not _label_missing(labels[i])]
         for name in ('val', 'test'):
             _rows = np.asarray(split_rows[name], dtype=np.int64).reshape(-1).tolist()
             if not _rows:
                 continue
-            _hold_lab = [str(labels[i]) for i in _rows if labels[i] is not None]
+            _hold_lab = [str(labels[i]) for i in _rows
+                         if not _label_missing(labels[i])]
             if not _train_lab or not _hold_lab:
                 continue
             _sh = categorical_shift_report(_train_lab, _hold_lab)
@@ -1644,39 +2254,95 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
     used to define the vocabulary or the reference frequencies.  Returns
     ``{'js_divergence', 'total_variation', 'n_reference', 'n_holdout',
     'unseen_rate'}``.
+
+    Categories are compared by their hashable identity rather than by a NumPy
+    sort.  A mixed object column (e.g. a short string code and an integer code)
+    has no single natural ordering in NumPy 2, but it still has well-defined
+    category frequencies; sorting the identity keys on ``(type, repr)`` keeps
+    the report computable and deterministic without conflating distinct values.
     """
-    ref = np.asarray(reference).reshape(-1)
-    hold = np.asarray(holdout).reshape(-1)
-    if hold.size == 0:
-        return {'js_divergence': 0.0, 'total_variation': 0.0,
-                'n_reference': int(ref.size), 'n_holdout': 0,
-                'unseen_rate': 0.0}
+    def _categories(values):
+        # Categories are hashable identities, not a flat scalar column: a
+        # list of tuple labels must stay two categories, not be expanded into
+        # four scalars by reshape(-1).  Rows of a genuine 2-D array are one
+        # composite category each.
+        def _item(v):
+            # A list is the unhashable spelling of the same composite
+            # category; normalise it so a row from a 2-D array and a tuple
+            # supplied by the caller compare equal.
+            return tuple(v) if isinstance(v, list) else v
+
+        if isinstance(values, np.ndarray):
+            if values.ndim == 0:
+                return [values.item()]
+            if values.ndim == 1:
+                return values.tolist()
+            return [_item(v) for v in values.tolist()]
+        if isinstance(values, (str, bytes)):
+            return [values]
+        try:
+            return [_item(v) for v in values]
+        except TypeError:
+            return [values]
+
+    ref = _categories(reference)
+    hold = _categories(holdout)
     if max_categories is not None:
         max_categories = _check_count('max_categories', max_categories, positive=True)
-        cat = np.unique(ref)
-        if cat.size > max_categories:
+        if max_categories < 2:
+            raise ValueError(
+                'max_categories must be at least 2: a single bin would collapse '
+                'the reference distribution and report zero divergence while '
+                'every holdout category is unseen')
+    if not hold:
+        return {'js_divergence': 0.0, 'total_variation': 0.0,
+                'n_reference': len(ref), 'n_holdout': 0,
+                'unseen_rate': 0.0}
+
+    def _key(value):
+        return ('__missing__',) if _category_is_missing(value) else _hashable_label(value)
+
+    def _sort_key(value):
+        return (type(value).__name__, repr(value))
+
+    ref_keys = [_key(v) for v in ref]
+    hold_keys = [_key(v) for v in hold]
+    counts = {}
+    for key in ref_keys:
+        counts[key] = counts.get(key, 0) + 1
+    if max_categories is not None:
+        if len(counts) > max_categories:
             # Keep the most frequent reference categories plus an "other" bin.
-            vals, counts = np.unique(ref, return_counts=True)
-            keep = np.sort(vals[np.argsort(-counts)[:max_categories - 1]])
+            # Count ties are broken by the stable identity key, not by NumPy's
+            # unstable argsort of object values.
+            ranked = sorted(counts, key=lambda k: (-counts[k], _sort_key(k)))
+            keep = sorted(ranked[:max_categories - 1], key=_sort_key)
         else:
-            keep = cat
+            keep = sorted(counts, key=_sort_key)
     else:
-        keep = np.unique(ref)
+        keep = sorted(counts, key=_sort_key)
+    keep_index = {key: i for i, key in enumerate(keep)}
+    # `keep` may be TRUNCATED by max_categories, but a holdout value that was a
+    # genuine reference category (just not frequent enough to get its own bin)
+    # is not "unseen" — it is represented by the reference's other-bin.  Track
+    # the full reference vocabulary separately from the displayed bins.
+    reference_keys = set(counts)
 
-    def _hist(a):
-        h = np.zeros(keep.size + 1, dtype=np.float64)
-        if keep.size:
-            pos = np.searchsorted(keep, a)
-            inb = (pos < keep.size)
-            inb[inb] = keep[pos[inb]] == a[inb]
-            h[:keep.size] = np.bincount(pos[inb], minlength=keep.size)
-            h[-1] = np.sum(~inb)
+    def _hist(keys):
+        h = np.zeros(len(keep) + 1, dtype=np.float64)
+        if keep:
+            for key in keys:
+                pos = keep_index.get(key)
+                if pos is None:
+                    h[-1] += 1.0
+                else:
+                    h[pos] += 1.0
         else:
-            h[-1] = a.size
-        return h / max(a.size, 1)
+            h[-1] = len(keys)
+        return h / max(len(keys), 1)
 
-    p = _hist(ref)
-    q = _hist(hold)
+    p = _hist(ref_keys)
+    q = _hist(hold_keys)
     m = 0.5 * (p + q)
 
     def _kl(a, b):
@@ -1685,16 +2351,16 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
 
     tv = 0.5 * float(np.sum(np.abs(p - q)))
     js = 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
-    if keep.size:
-        unseen = float(np.mean(~np.isin(hold, keep)))
+    if reference_keys:
+        unseen = float(np.mean([key not in reference_keys for key in hold_keys]))
     else:
         # No reference category exists (e.g. an empty training side): every
         # holdout token is unseen, not zero.
-        unseen = 1.0 if hold.size else 0.0
+        unseen = 1.0 if hold_keys else 0.0
     return {
         'js_divergence': js,
         'total_variation': tv,
-        'n_reference': int(ref.size),
-        'n_holdout': int(hold.size),
+        'n_reference': int(len(ref)),
+        'n_holdout': int(len(hold)),
         'unseen_rate': unseen,
     }

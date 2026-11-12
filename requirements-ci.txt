@@ -1,0 +1,14 @@
+# CI-only dependency set (CPU, Python 3.12).
+#
+# 与 requirements.lock 保持一致，但只用于 CI：
+#   - continuous-loop.yml 的测试门；
+#   - test.yml 的 setup-python 依赖文件。
+#
+# 安装方式（CPU wheel）：
+#   python -m pip install -r requirements-ci.txt \
+#     --extra-index-url https://download.pytorch.org/whl/cpu
+numpy==2.5.4
+torch==2.14.1
+tokenizers==0.23.3
+datasets==5.1.0
+matplotlib==3.11.2

@@ -44,7 +44,7 @@ if _NEEDED:
         print(f"[setup] {_msg}")
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
-import gc, copy, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections, threading, numbers
+import gc, copy, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections, threading, numbers, weakref
 import array
 from math import comb
 from dataclasses import dataclass
@@ -59,7 +59,9 @@ from data_guard import (
     grouped_chronological_split, grouped_chronological_split_indices,
     split_indices, split_and_prepare, train_val_test_split,
     assert_no_split_leakage, LeakageSafePreprocessor, SafeScaler,
+    LeakageSafeCategoricalEncoder, clean_training_rows,
     prepare_features, fit_preprocessor, data_quality_report,
+    prepare_categorical_features, fit_categorical_encoder,
     categorical_shift_report, duplicate_mask,
 )
 import torch
@@ -134,7 +136,7 @@ def _uses_batched_eager(cfgs, device=None, batch_size=None):
         return False
     return any(
         getattr(c, 'kind', None) in ('csa', 'hca')
-        # v11.128: RoPE CSA/HCA layers ALWAYS take the per-row
+        # RoPE CSA/HCA layers ALWAYS take the per-row
         # `HybridAttentionRoPE._single_rope` loop (v7_supp.py forward), and the
         # batched twin in csa_kernels has no RoPE/qk-norm implementation.  A
         # layer is batched only when it is NOT a rope layer.
@@ -164,8 +166,8 @@ def code_stamp():
 
 # ---- 训练健康 / 数值防线 ---------------------------------------------------
 # `nan_to_num` 默认静默清洗数值异常。这里保留原有数值语义（逐位不变），
-# 但让调用点可以计数，并允许 CSA_STRICT_NAN=1 直接报错。元素级计数会强制
-# GPU 同步，所以默认只记调用次数；CSA_NAN_AUDIT=1 时才展开元素统计。
+# 但让调用点可以计数，并允许 CSA_STRICT_NAN=1 直接报错。默认只记调用次数；
+# CSA_NAN_AUDIT=1 时才展开元素统计。
 _NAN_GUARD = {'calls': 0, 'elements_cleaned': 0, 'first': None, 'by_where': {}}
 _NAN_AUDIT_ELEMENTS = os.environ.get('CSA_NAN_AUDIT', '').strip().lower() in ('1', 'true', 'yes', 'on')
 _STRICT_NAN = os.environ.get('CSA_STRICT_NAN', '').strip().lower() in ('1', 'true', 'yes', 'on')
@@ -186,7 +188,7 @@ def nan_guard_state(reset=False):
 def _safe_nan_to_num(x, *, where='attention', **kwargs):
     """`torch.nan_to_num` wrapper used by the attention paths.
 
-    Default behaviour is byte-identical to the historical call.  With
+    Default behaviour is byte-identical to the plain call.  With
     CSA_NAN_AUDIT=1 (or CSA_STRICT_NAN=1) the non-finite element count is
     measured; strict mode raises with the call site instead of silently
     changing attention semantics."""
@@ -214,15 +216,14 @@ def _finite_curve(values):
     first_bad = None
     last_bad = None
     for i, v in enumerate(vals):
-        try:
-            fv = float(v)
-        except (TypeError, ValueError, OverflowError):
-            fv = None
-        if fv is not None and math.isfinite(fv):
+        # Booleans/strings are flags/metadata, not curve measurements (and
+        # float(True) would become a genuine loss point of 1.0).
+        fv = _finite_scalar(v)
+        if fv is not None:
             finite.append(fv)
         elif first_bad is None:
             first_bad = i
-        if fv is None or not math.isfinite(fv):
+        if fv is None:
             last_bad = i
     return {'n_points': len(vals), 'n_finite': len(finite),
             'n_nonfinite': len(vals) - len(finite),
@@ -238,8 +239,8 @@ def _curve_slope_stats(points, key, k=4):
 
     Returning the standard error is what makes the health thresholds
     noise-aware: with four equally spaced eval points and CE noise of order
-    0.01-0.03, the slope's standard error is ~5e-5 per step, five times the
-    historical fixed ``slope_tol=1e-5``.  A fixed tolerance therefore lets the
+    0.01-0.03, the slope's standard error is ~5e-5 per step, five times a
+    fixed ``slope_tol=1e-5``.  A fixed tolerance therefore lets the
     *sign of the noise* decide ``healthy`` vs ``overfitting``.  Callers that
     need a scale-free criterion compare the slope with a multiple of this SE.
     """
@@ -247,12 +248,9 @@ def _curve_slope_stats(points, key, k=4):
     for p in (points if points is not None else []):
         if not isinstance(p, dict):
             continue
-        try:
-            x = float(p.get('step'))
-            y = float(p.get(key))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if math.isfinite(x) and math.isfinite(y):
+        x = _finite_scalar(p.get('step'))
+        y = _finite_scalar(p.get(key))
+        if x is not None and y is not None:
             pts.append((x, y))
     pts = pts[-max(2, int(k)):]
     if len(pts) < 2:
@@ -288,11 +286,11 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     rule: it says whether the run looks overfit / underfit / stalled / broken
     on the fixed evaluation grid.
 
-    ``slope_tol=None`` (the default since v11.128) makes the threshold
+    ``slope_tol=None`` (the default) makes the threshold
     noise-aware: each curve's tolerance is ``max(1e-5, 2 * SE(slope))``, where
     SE is the least-squares standard error of the fitted tail slope.  A slope
     must then exceed twice its own noise before it can flip a health status.
-    Pass a number to restore the historical fixed-threshold behaviour (tests
+    Pass a number to use the fixed-threshold behaviour (tests
     and callers that deliberately use a synthetic noise-free curve do this).
     """
     entries = [h for h in (history if history is not None else []) if isinstance(h, dict)]
@@ -308,13 +306,10 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
                 # healthy validation curve `nonfinite` and block or excuse a
                 # run for the wrong reason.
                 continue
-            try:
-                v = float(v)
-            except (TypeError, ValueError, OverflowError):
+            fv = _finite_scalar(v)
+            if fv is None:
                 n_bad += 1
                 continue
-            if not math.isfinite(v):
-                n_bad += 1
             if key == 'train_ce':
                 n_train_measured += 1
     train_s, train_se = _curve_slope_stats(entries, 'train_ce', k=tail_k)
@@ -322,12 +317,9 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     if val_s is None:
         _val_from_ppl = []
         for _p in entries:
-            try:
-                _st = float(_p.get('step'))
-                _vp = float(_p.get('val_ppl'))
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if math.isfinite(_st) and math.isfinite(_vp) and _vp > 0.0:
+            _st = _finite_scalar(_p.get('step'))
+            _vp = _finite_scalar(_p.get('val_ppl'))
+            if _st is not None and _vp is not None and _vp > 0.0:
                 _val_from_ppl.append({'step': _st, 'val_ce': math.log(_vp)})
         val_s, val_se = _curve_slope_stats(_val_from_ppl, 'val_ce', k=tail_k)
     if slope_tol is None:
@@ -339,22 +331,16 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         train_tol = val_tol = float(slope_tol)
     val_ppl_points = []
     for h in entries:
-        try:
-            st = int(h.get('step'))
-            vp = float(h.get('val_ppl'))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if math.isfinite(vp) and vp > 0:
+        st = _as_seed_int(h.get('step'))
+        vp = _finite_scalar(h.get('val_ppl'))
+        if st is not None and vp is not None and vp > 0:
             val_ppl_points.append((st, vp, h))
     best = min(val_ppl_points, key=lambda t: t[1]) if val_ppl_points else None
     last = val_ppl_points[-1] if val_ppl_points else None
     last_gap = None
     for h in reversed(entries):
-        try:
-            g = float(h.get('gap'))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if math.isfinite(g):
+        g = _finite_scalar(h.get('gap'))
+        if g is not None:
             last_gap = g
             break
     if n_bad:
@@ -419,8 +405,10 @@ def _safe_exp_ppl(x):
 
     ``math.exp`` raises once the exponent exceeds ~709.  A training run that
     has diverged but still produced finite CE must be recorded as ``inf`` and
-    diagnosed, not crash the eval callback.  The clamp mirrors the historical
-    ``eval_ppl`` overflow behaviour while making the CI bounds consistent."""
+    diagnosed, not crash the eval callback.  The clamp keeps the CI bounds
+    consistent."""
+    if isinstance(x, (bool, np.bool_)):
+        return None
     try:
         x = float(x)
     except (TypeError, ValueError, OverflowError):
@@ -463,17 +451,46 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     # residual pass below (silently reporting n_docs=0).
     _nll = list(nll_per_row) if nll_per_row is not None else []
     _ntok = list(n_tokens_per_row) if n_tokens_per_row is not None else []
+    if len(_nll) != len(_ntok):
+        # zip() would silently drop the extra documents, changing both the
+        # pooled token denominator and the number of independent clusters.
+        raise ValueError(
+            f'_nll_doc_ci: nll_per_row has {len(_nll)} entries but '
+            f'n_tokens_per_row has {len(_ntok)}; the per-document arrays are misaligned')
+
+    def _parse_pair(nll, ntok):
+        if isinstance(nll, (bool, np.bool_)) or isinstance(ntok, (bool, np.bool_)):
+            return None
+        try:
+            nll = float(nll)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        # Token counts are exact integers.  A fractional count would silently
+        # change the pooled denominator if int() truncated it.
+        try:
+            if isinstance(ntok, numbers.Integral):
+                ntok = int(ntok)
+            elif isinstance(ntok, numbers.Real):
+                nf = float(ntok)
+                if not math.isfinite(nf) or nf != math.floor(nf):
+                    return None
+                ntok = int(nf)
+            else:
+                ntok = int(ntok)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if ntok <= 0 or not math.isfinite(nll) or nll < 0.0:
+            return None
+        return nll, ntok
+
     doc_ce = []
     total_nll = 0.0
     total_tok = 0
     for nll, ntok in zip(_nll, _ntok):
-        try:
-            nll = float(nll)
-            ntok = int(ntok)
-        except (TypeError, ValueError, OverflowError):
+        pair = _parse_pair(nll, ntok)
+        if pair is None:
             continue
-        if ntok <= 0 or not math.isfinite(nll):
-            continue
+        nll, ntok = pair
         total_nll += nll
         total_tok += ntok
         doc_ce.append(nll / ntok)
@@ -495,13 +512,10 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     # claiming a normal-theory interval.
     _resid = []
     for nll, ntok in zip(_nll, _ntok):
-        try:
-            nll = float(nll)
-            ntok = int(ntok)
-        except (TypeError, ValueError, OverflowError):
+        pair = _parse_pair(nll, ntok)
+        if pair is None:
             continue
-        if ntok <= 0 or not math.isfinite(nll):
-            continue
+        nll, ntok = pair
         _resid.append(nll - ce * ntok)
     n_docs = len(_resid)
     _var = (n_docs / (n_docs - 1.0)) * sum(r * r for r in _resid) / (total_tok * total_tok)
@@ -676,13 +690,13 @@ SCALE_LADDER = {'S1': dict(d=768, n_layers=12, n_heads=12, d_head=64), 'S2': dic
 # Declared transfer assumptions for the S1→S4 ladder.  They are deliberately
 # explicit: a scale comparison that changes width/depth also changes the
 # optimal optimizer settings, so a constant LR is a DISCLOSED assumption, not
-# a matched control.  `scale_ladder_audit` checks the token budget and makes
-# the assumption visible before the panel spends GPU time.
+# a matched control.  `scale_ladder_audit` checks the token allocation and makes
+# the assumption visible.
 SCALE_TRANSFER_POLICY = {
     'tokens_per_param_tolerance': 0.25,
     'lr_transfer': 'constant_declared_not_validated',
     'family_m': 4,
-    'note': 'S1-S4 hold lr/wd/warmup fraction fixed across widths. No muP or LR-transfer calibration has been run; scale contrasts therefore carry an optimisation-transfer confound and the ladder is descriptive until a transfer check exists.',
+    'note': 'S1-S4 hold lr/wd/warmup fraction fixed across widths. No muP or LR-transfer calibration has been run; scale contrasts therefore carry a training-transfer confound and the ladder is descriptive until a transfer check exists.',
 }
 B_ARMS = ['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic']
 RUN_S1 = dict(RUN, dataset='fineweb', vocab_size=B_VOCAB, d=768, n_layers=12, n_heads=12, d_head=64, seq_len=8192, batch_size=8, n_train_tokens=5000000000, steps=76294, warmup=2000, eval_every=4000, eval_subset=32, val_seqs=512, seeds=[0, 1, 2, 3], outdir='results_b_s1', variants=B_ARMS)
@@ -695,7 +709,7 @@ _DEV_STR = {}
 
 def _dev_str(device):
     # str(device) is a pure formatting function of the device object: the same
-    # string every time, host-side only — cache it per object.
+    # string every time.
     s = _DEV_STR.get(device)
     if s is None:
         s = str(device)
@@ -811,10 +825,10 @@ def _segment(n, want_cut_list, min_block, max_block):
     if max_block is None:
         max_block = int(n)
     cacheable = n <= 64
-    # uint8 cast of the booleans is exactly 0/1 per slot — the same byte string
-    # `bytes(bytearray(1 if _c else 0 ...))` built; the cached
-    # bids/honoured/counts the key guards are unchanged.
-    key = (n, min_block, max_block, np.asarray(want_cut_list, dtype=np.uint8).tobytes()) if cacheable else None
+    # The segmentation below uses boolean truthiness, not the raw numeric
+    # value; the cache key must normalise the same way (any non-zero value is
+    # a cut, not only exactly 1).
+    key = (n, min_block, max_block, np.asarray(want_cut_list, dtype=bool).tobytes()) if cacheable else None
     if cacheable:
         hit = _SEGMENT_CACHE.get(key)
         if hit is not None:
@@ -1119,7 +1133,9 @@ def _d2h_stage(shape, dtype, device):
         return (None, None)
 
 def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_count=False, return_honoured=False):
-    if n == 0:
+    # _segment() treats any non-positive length as "no tokens, no blocks";
+    # the public wrapper follows the same rule.
+    if n <= 0:
         base, cnt, hon = (torch.empty(0, dtype=torch.long, device=device), 0, {})
     elif n == 1:
         base, cnt, hon = (torch.zeros(1, dtype=torch.long, device=device), 1, {})
@@ -1132,7 +1148,7 @@ def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_coun
         cnt = len(counts)
         if isinstance(counts, np.ndarray):
             # Large cut tables return their counts as a numpy row; use the
-            # vectorised extrema instead of iterating Python ints over it.
+            # vectorised extrema.
             _mx = int(counts.max()) if counts.size else 0
             _mx_prev = int(counts[:-1].max()) if cnt > 1 else 0
         else:
@@ -1191,10 +1207,8 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
     if want_honoured and T > 1:
         # Build the honoured table on the host as float32 and let _h2d_async
         # perform the cast+staging.  A direct H2D-pool borrow cannot expose a
-        # NumPy view for dtypes such as bfloat16 (used under AMP), and an
-        # abandoned borrow leaves its pinned slot reserved.  The mask is only
-        # B x (T-1) exact 0.0/1.0 values, so the extra copy is negligible next
-        # to the hidden states.
+        # NumPy view for dtypes such as bfloat16 (used under AMP).  The mask
+        # is B x (T-1) exact 0.0/1.0 values.
         arr = np.zeros((len(gate_lists), T - 1), dtype=np.float32)
         for _i, _hon in enumerate(hons):
             if _hon:
@@ -1410,6 +1424,11 @@ def _causal_quantile_exact(x, cols, target_block_tokens, _full_range=False):
     q = max(1.0 / max(int(target_block_tokens), 1), 0.001)
     idx = _arange_cache(n, dev)
     cols = cols.to(torch.long)
+    if cols.numel() == 0:
+        # No requested columns: return an empty [rows, 0] table.  The chunked
+        # loop below cannot write any column, and its `nc = max(1, ...)` guard
+        # would otherwise leave a [rows, 1] buffer of uninitialised values.
+        return x.new_empty((x.shape[0], 0))
     pos = q * cols.to(torch.float32)
     lo = pos.floor().long()
     frac = pos - lo
@@ -1739,7 +1758,7 @@ def _range_cache(lo, hi, device):
 def _i32_range_cache(n, device):
     # int32 [n] arange (index transport, §6.1: the same exact integers as the
     # int64 form, narrowed).  Read-only constant of (n, device); shared by the
-    # hot selection paths so no per-chunk arange kernel/alloc is issued.
+    # selection paths.
     key = (_dev_str(device), 'arange_i32', int(n))
     a = _cache_get(_IDX_CACHE, key)
     if a is None:
@@ -2811,7 +2830,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
 # geometry is read from the segmenter's per-token ids, and the only positions
 # used are `u - s_t` for u <= t.
 #
-# `causal_prefix_pool` is the optimized implementation.  It is mathematically
+# `causal_prefix_pool` is the implementation.  It is mathematically
 # the same softmax mixture as the repository's block pooling, but it computes
 # every prefix in one pass with a cumulative sum:
 #
@@ -2928,18 +2947,15 @@ def _open_prefix_geometry(bid, n_blocks=None, scope='full_prefix', window=128,
     else:
         raise ValueError(f'unknown open_block_scope {scope!r}')
     # `prefix_summary` needs only ONE candidate per query; only the singleton
-    # table is [T, P].  Never materialise an O(T^2) table for a summary just
-    # because a no-cap block is long.  The maximum prefix length is read from
-    # the device only when the singleton table actually needs its width, so
-    # the summary path performs no GPU->CPU synchronisation.
+    # table is [T, P].  The maximum prefix length is read from the device only
+    # when the singleton table actually needs its width.
     if not candidate_table:
         P = 1
     else:
         P = int(plen.max().item()) if n else 0
-        # A full-prefix singleton table is [T, P]; for a pathological no-cap
-        # block this can be O(T^2).  Fail explicitly instead of silently
-        # exhausting GPU memory; the panel reports candidate growth and can
-        # cap/evaluate in shorter slices.
+        # A full-prefix singleton table is [T, P]; a pathological no-cap block
+        # can make this very large.  Fail explicitly; the panel reports
+        # candidate growth and can cap/evaluate in shorter slices.
         if n * max(P, 1) > (16 << 20):
             raise RuntimeError(
                 f'open-block prefix candidate table would be {n}x{P} '
@@ -2993,8 +3009,7 @@ def _prefix_overlap_values(geo, Xb, Zb, B_pos_b, overlap):
     ov_len = torch.cat([torch.zeros_like(ov_len_prev[:1]), ov_len_prev], 0)
     prev_start_full = torch.cat([starts[:1], prev_start], 0)
     # The overlap-lane width is a pure function of (geo, overlap): cache it on
-    # the shared geometry dict so the GPU->CPU maximum is read once per
-    # forward instead of once per layer.
+    # the shared geometry dict.
     _wkey = '_ov_w_' + str(int(overlap))
     Wb = geo.get(_wkey)
     if Wb is None:
@@ -3051,7 +3066,7 @@ def _prefix_overlap_terms(geo, Xb, Zb, B_pos_b, overlap, shift, use_overlap,
 def causal_prefix_pool(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
                        *, n_blocks=None, scope='full_prefix', window=128,
                        window_start=None, use_overlap=True):
-    """Optimized all-query causal prefix pooling (see block comment above).
+    """All-query causal prefix pooling (see block comment above).
 
     Xa/Za are the A-lane content/position projections; Xb/Zb are the
     previous-block overlap content/position projections (None for HCA).
@@ -3159,7 +3174,7 @@ def causal_prefix_pool_reference(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
     """Per-query, numerically stable reference for `causal_prefix_pool`.
 
     This is deliberately slow and loops over queries; it is the oracle the
-    optimized cumulative-sum form is tested against (forward and gradients).
+    cumulative-sum form is tested against (forward and gradients).
     """
     geo = _open_block_geometry(bid, n_blocks=n_blocks)
     T = int(geo['n'])
@@ -3242,8 +3257,8 @@ def _rank_blocks(masked, B, ties, k=None):
     # Scatter the selected source columns into [n, kk] (column order); the
     # sentinel column kk absorbs the non-selected lanes and is sliced away.
     # The base arange is a read-only constant of (B, device) — the same exact
-    # integers a fresh torch.arange returns every call — so it rides the
-    # shared index-table cache instead of being rebuilt per chunk.
+    # integers a fresh torch.arange returns every call — so it uses the
+    # shared index-table cache.
     cols = _i32_range_cache(B, src.device)[None, :].expand(n, B)
     buf = torch.empty(n, kk + 1, dtype=torch.int32, device=src.device)
     buf.scatter_(1, rank, cols)
@@ -3599,7 +3614,7 @@ def lightning_indexer_open(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
     topk = max(int(topk), 0)
     q_chunk = max(1, min(int(query_chunk), max(n, 1)))
     # The singleton gather is [C, P, nIH, hd]; cap it so long contexts use
-    # smaller query chunks instead of materialising a huge candidate table.
+    # smaller query chunks.
     if P > 0:
         _per = max(1, int(nIH) * int(P) * int(hd))
         q_chunk = max(1, min(q_chunk, (16 << 20) // _per))
@@ -3980,9 +3995,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             logits = torch.cat([blk_logits, win_logits], -1)
             del blk_logits, win_logits
         else:
-            # Write the two independent logits halves into one preallocated
-            # [q, h, nb + w] table instead of materialising both halves and a
-            # concatenated copy.  The slice assignment feeds the same einsum
+            # Write the two independent logits halves into one
+            # [q, h, nb + w] table.  The slice assignment feeds the same einsum
             # values to the same lanes.
             _w0 = int(_win_local.shape[1])
             logits = qseg.new_empty((qseg.shape[0], qseg.shape[1], _nb + _w0))
@@ -4209,7 +4223,7 @@ class AttnCfg:
     # positions are handled by `pool_position_policy` (currently `truncate`).
     pool_position_capacity: int = 129
     pool_position_policy: str = 'truncate'
-    # Open-block reading rule.  `closed` is the historical behaviour: only
+    # Open-block reading rule.  `closed` is the default: only
     # blocks whose end is strictly before the query are readable.  The two
     # prefix modes add a causal representation of the current (still open)
     # block to the candidate set without changing the dynamic cut table.
@@ -4244,43 +4258,52 @@ class AttnCfg:
             raise ValueError(f'unknown selection_budget {self.selection_budget!r}; expected one of {SELECTION_BUDGETS}')
         if self.pool_position_policy not in POOL_POSITION_POLICIES:
             raise ValueError(f'unknown pool_position_policy {self.pool_position_policy!r}; expected one of {POOL_POSITION_POLICIES}')
-        if int(self.pool_position_capacity) < 1:
-            raise ValueError(f'pool_position_capacity must be >= 1, got {self.pool_position_capacity!r}')
+
+        def _cfg_int(label, value, minimum):
+            # Structural counts are exact integers: booleans and fractional
+            # values must not be silently truncated into a different config.
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError(f'{label} must be an integer, got {value!r}')
+            if isinstance(value, numbers.Integral):
+                out = int(value)
+            elif isinstance(value, numbers.Real):
+                f = float(value)
+                if not math.isfinite(f) or f != math.floor(f):
+                    raise ValueError(f'{label} must be an integer, got {value!r}')
+                out = int(f)
+            else:
+                raise ValueError(f'{label} must be an integer, got {value!r}')
+            if out < int(minimum):
+                raise ValueError(f'{label} must be >= {minimum}, got {value!r}')
+            return out
+
+        _cfg_int('pool_position_capacity', self.pool_position_capacity, 1)
         # Non-negative/positive structural bounds.  A negative window or
         # overlap is not a meaningful configuration; reject it here rather
         # than failing later inside torch.arange/index maths.
-        if int(self.min_block) < 1:
-            raise ValueError(f'min_block must be >= 1, got {self.min_block!r}')
-        if int(self.block_size) < 1:
-            raise ValueError(f'block_size must be >= 1, got {self.block_size!r}')
-        if int(self.target_block_tokens) < 1:
-            raise ValueError(f'target_block_tokens must be >= 1, got {self.target_block_tokens!r}')
-        if int(self.overlap) < 0:
-            raise ValueError(f'overlap must be >= 0, got {self.overlap!r}')
-        if int(self.sliding_window) < 0:
-            raise ValueError(f'sliding_window must be >= 0, got {self.sliding_window!r}')
-        if int(self.window) < 0:
-            raise ValueError(f'window must be >= 0, got {self.window!r}')
-        if int(self.index_topk) < 0:
-            raise ValueError(f'index_topk must be >= 0, got {self.index_topk!r}')
-        if int(self.c_kv) < 0 or int(self.c_index) < 0:
-            raise ValueError(f'c_kv/c_index must be >= 0, got {self.c_kv!r}/{self.c_index!r}')
-        if int(self.n_index_heads) < 1:
-            raise ValueError(f'n_index_heads must be >= 1, got {self.n_index_heads!r}')
+        min_block = _cfg_int('min_block', self.min_block, 1)
+        _cfg_int('block_size', self.block_size, 1)
+        _cfg_int('target_block_tokens', self.target_block_tokens, 1)
+        _cfg_int('overlap', self.overlap, 0)
+        _cfg_int('sliding_window', self.sliding_window, 0)
+        _cfg_int('window', self.window, 0)
+        _cfg_int('index_topk', self.index_topk, 0)
+        _cfg_int('c_kv', self.c_kv, 0)
+        _cfg_int('c_index', self.c_index, 0)
+        _cfg_int('n_index_heads', self.n_index_heads, 1)
         if self.max_block is not None:
-            if int(self.max_block) < 1:
-                raise ValueError(f'max_block must be None or >= 1, got {self.max_block!r}')
-            if int(self.max_block) < int(self.min_block):
+            max_block = _cfg_int('max_block', self.max_block, 1)
+            if max_block < min_block:
                 raise ValueError(f'max_block={self.max_block} is smaller than min_block={self.min_block}')
         if self.open_block_mode != 'closed':
             if self.kind not in ('csa', 'hca'):
                 raise ValueError(f'open_block_mode={self.open_block_mode!r} is only defined for csa/hca layers, not {self.kind!r}')
             if self.kind == 'hca' and self.selection_budget == 'shared_topk':
                 # HCA reads every closed block (no top-k), so a "shared top-k"
-                # budget is not the rule it implements.  Make the extra-read
-                # budget explicit rather than silently pretending the two
+                # quota is not the rule it implements.  Make the extra-read
+                # allowance explicit rather than silently pretending the two
                 # arms have the same number of slots.
-                raise ValueError('open_block_mode on an hca layer requires selection_budget="all_closed_plus_prefix": HCA reads every closed block and has no top-k budget to share; an extra prefix candidate is an ADDITIONAL read slot')
+                raise ValueError('open_block_mode on an hca layer requires selection_budget="all_closed_plus_prefix": HCA reads every closed block and has no top-k quota to share; an extra prefix candidate is an ADDITIONAL read slot')
             if self.kind == 'csa' and self.selection_budget != 'shared_topk':
                 raise ValueError(f'csa open-block layers implement selection_budget="shared_topk"; got {self.selection_budget!r}')
 
@@ -4491,7 +4514,7 @@ class HybridAttention(nn.Module):
             # 张量上的 exp_ 原地——exp 反向保存的输出此后再无人改写）；原地
             # sub_ 会使 logsumexp 保存的张量版本失效，反向直接报错。
             # 推理（无梯度）时没有保存值，logits 也不再被读取，因此可以直接
-            # 原地归一化，省掉一张与 logits 同尺寸的临时表。
+            # 原地归一化。
             if torch.is_grad_enabled():
                 attn = logits.sub(lse).exp_()
             else:
@@ -4887,7 +4910,7 @@ class HybridAttention(nn.Module):
                 # prefix candidate is an ADDITIONAL read slot; the config
                 # validation refuses to label this `shared_topk`.  The main
                 # open-block panel uses CSA layers so the three arms share a
-                # fixed top-k budget.
+                # fixed top-k quota.
                 _P = 1 if _prefix_kind == 'summary' else int(_prefix_geo['token_idx'].shape[1])
                 _tot = int(Bn) + int(_P)
                 topk_idx = _arange_cache(_tot, x.device)[None, :].expand(T, _tot).to(torch.int32)
@@ -5085,10 +5108,9 @@ class HybridAttention(nn.Module):
         if pre_blocks is not None:
             _prefetch_pool_geometry(self, pre_blocks, T, x.device)
         # Write each row's attention output into the batch output: the stacked
-        # buffer holds exactly the tensor torch.stack would have built (a
-        # per-row copy into the same layout), and the CopySlices backward hands
-        # each row the identical grad slice — value-identical to the stack form
-        # (transport only, design notes §6.1).
+        # buffer holds exactly the tensor torch.stack would have built, and the
+        # CopySlices backward hands each row the identical grad slice —
+        # value-identical to the stack form (transport only, design notes §6.1).
         outs = torch.empty(B, T, d, device=x.device, dtype=x.dtype)
         gates = []
         _prev_batch = _CPU_ACTIVE_BATCH[0]
@@ -5467,8 +5489,7 @@ def boundary_token_ids(tok, eos_id):
     ids = set()
     _n = int(tok.get_vocab_size())
     try:
-        # One batched decode instead of a Python-level call per vocabulary
-        # entry (32k entries on the B-tier tokenizer).
+        # Decode the vocabulary in one batch.
         decoded = tok.decode_batch([[i] for i in range(_n)])
     except (AttributeError, TypeError, ValueError):
         decoded = [tok.decode([i]) for i in range(_n)]
@@ -5605,13 +5626,18 @@ def _array_id_range(arr):
     return [int(a.min()), int(a.max())]
 
 
+_IDS_FP_ALGO = 2
+
+
 def _ids_fp(train_ids):
     # Pure function of the token values, memoised on (data pointer, layout)
     # with a weak reference to the array: a dead entry can never alias a
-    # recycled pointer, and large corpora are not retained by the cache.
-    # Same tokens in -> same digest out, always.  Sub-int32 storage (the
-    # uint16 FineWeb cache) is hashed through its canonical int32 form, so a
-    # corpus keeps the same fingerprint regardless of storage width.
+    # recycled pointer.
+    # Same tokens in -> same digest out, always.  Every integer storage width
+    # is hashed through one canonical int64 form (uint64 only when a value
+    # exceeds int64), so a corpus keeps the same fingerprint whether the cache
+    # stored it as int8/int16/int32/uint16 or int64.  Raw width-dependent bytes
+    # would make the same corpus look different across loaders/cache versions.
     import weakref as _weakref
     try:
         _key = (train_ids.__array_interface__['data'][0], train_ids.shape, train_ids.strides, train_ids.dtype.str)
@@ -5639,9 +5665,12 @@ def _ids_fp(train_ids):
             _tdtype = np.dtype(np.asarray(train_ids).dtype).str
             with open(_side, encoding='utf-8') as _sf:
                 _rec = json.load(_sf)
+            if not isinstance(_rec, dict):
+                raise ValueError('idsfp sidecar is not a JSON object')
             if ((int(_rec.get('size', -1)), int(_rec.get('mtime_ns', -1)),
                  int(_rec.get('ctime_ns', -1)), int(_rec.get('inode', -1))) == _stat
                     and isinstance(_rec.get('fp'), str)
+                    and _rec.get('algo') == _IDS_FP_ALGO
                     and _rec.get('dtype') == _tdtype
                     and tuple(_rec.get('shape') or ()) == _tshape):
                 _fp = _rec['fp']
@@ -5658,12 +5687,19 @@ def _ids_fp(train_ids):
             pass
     _h = hashlib.sha256()
     _arr = np.asarray(train_ids)
-    _widen = _arr.dtype in (np.dtype(np.uint8), np.dtype(np.uint16))
+    _canon = None
+    if np.issubdtype(_arr.dtype, np.integer):
+        _canon = np.dtype(np.int64)
+        # uint64 is the only integer width that cannot be represented exactly
+        # in int64.  Keep it as uint64 only when a value actually needs that
+        # range; all ordinary token/doc ids stay on the signed canonical form.
+        if _arr.dtype == np.dtype(np.uint64) and _arr.size                 and int(_arr.max()) > np.iinfo(np.int64).max:
+            _canon = np.dtype(np.uint64)
     _cs = 1 << 24
     for _off in range(0, len(_arr), _cs):
         _part = _arr[_off:_off + _cs]
-        if _widen:
-            _part = _part.astype(np.int32, copy=False)
+        if _canon is not None and _part.dtype != _canon:
+            _part = _part.astype(_canon, copy=False)
         elif not _part.flags.c_contiguous:
             _part = np.ascontiguousarray(_part)
         _h.update(memoryview(_part).cast('B'))
@@ -5680,6 +5716,7 @@ def _ids_fp(train_ids):
         try:
             _rec_out = {'size': _stat[0], 'mtime_ns': _stat[1],
                         'ctime_ns': _stat[2], 'inode': _stat[3], 'fp': _fp,
+                        'algo': _IDS_FP_ALGO,
                         'dtype': np.dtype(np.asarray(train_ids).dtype).str,
                         'shape': [int(_x) for _x in np.shape(train_ids)]}
             atomic_write_json(_side, _rec_out)
@@ -5695,13 +5732,19 @@ def _validate_token_ids(ids, vocab, label='token ids'):
     the split.  It runs on every cold build and every cache hit.
     """
     arr = np.asarray(ids)
+    # A vocabulary size is an exact positive count.  int(True)=1 or
+    # int(8192.9)=8192 would silently accept malformed metadata and check the
+    # ids against a different vocabulary than the tokenizer actually used.
+    _v = _as_seed_int(vocab)
+    if _v is None or _v <= 0:
+        raise ValueError(f'{label}: vocab must be a positive integer, got {vocab!r}')
     if arr.size == 0:
         return arr
     if not np.issubdtype(arr.dtype, np.integer):
         raise TypeError(f'{label}: expected integer token ids, got dtype {arr.dtype}')
     mn, mx = int(arr.min()), int(arr.max())
-    if mn < 0 or mx >= int(vocab):
-        raise ValueError(f'{label}: token id range [{mn}, {mx}] is outside vocab [0, {int(vocab)})')
+    if mn < 0 or mx >= _v:
+        raise ValueError(f'{label}: token id range [{mn}, {mx}] is outside vocab [0, {_v})')
     return arr
 
 
@@ -5713,14 +5756,13 @@ def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=N
     the train fingerprint lets a stale/mixed validation file be served under a
     valid train cache — exactly the situation in which validation (or test)
     rows leak into the tuning split.  New caches always record ``val_fp``;
-    legacy caches without it are accepted with an explicit warning so existing
+    caches without it are accepted with an explicit warning so existing
     results remain reproducible, but their validation bytes are not silently
     blessed as verified.
     """
     problems = []
-    try:
-        vocab = int(vocab)
-    except (TypeError, ValueError, OverflowError):
+    vocab = _as_seed_int(vocab)
+    if vocab is None or vocab <= 0:
         return ['metadata has no usable vocab size']
     if not fingerprints_trusted and meta.get('src_fp') != _ids_fp(train_ids):
         problems.append('train id fingerprint does not match the meta file')
@@ -5729,8 +5771,12 @@ def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=N
         problems.append(f'validation batch is not 2-D (shape {vb.shape})')
     elif vb.shape[0] == 0:
         problems.append('validation batch is empty')
-    elif seq_len is not None and vb.shape[1] != int(seq_len):
-        problems.append(f'validation sequence length {vb.shape[1]} != requested {seq_len}')
+    elif seq_len is not None:
+        _sl = _as_seed_int(seq_len)
+        if _sl is None or _sl <= 0:
+            problems.append(f'requested sequence length {seq_len!r} is not a positive integer')
+        elif vb.shape[1] != _sl:
+            problems.append(f'validation sequence length {vb.shape[1]} != requested {seq_len}')
     if np.asarray(val_bnd).shape != vb.shape:
         problems.append(f'validation boundary mask shape {np.asarray(val_bnd).shape} != {vb.shape}')
     if (not fingerprints_trusted and 'val_fp' in meta
@@ -5797,11 +5843,9 @@ _WT103_MEMO_CAP = 4
 def _wt_cache_dir(cache_dir=None):
     """Resolve the WikiText cache directory, honouring ``WT103_CACHE_DIR``.
 
-    Before v11.128 the loaders hard-coded ``./wt103_cache`` while the audit
-    and the confirmation driver looked at ``WT103_CACHE_DIR``.  That meant the
-    leakage gate could audit a different directory from the one the evaluation
-    actually used.  One resolver is now shared by both loaders so there is a
-    single cache identity.
+    The loaders and the audit/confirmation driver share this resolver, so the
+    leakage gate always inspects the same directory the evaluation reads and
+    there is a single cache identity.
     """
     if cache_dir not in (None, ''):
         return str(cache_dir)
@@ -5820,8 +5864,17 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     trd_path = os.path.join(cache_dir, f'train_doc_ids_{tag}.npy')
     vad_path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
-        _sig = _memo_file_sig({'train': tr_path, 'val': va_path,
-                               'bnd': vp_path, 'meta': me_path})
+        _sig_paths = {'train': tr_path, 'val': va_path,
+                      'bnd': vp_path, 'meta': me_path}
+        # Document-id sidecars are part of the cache identity and are checked
+        # on every cold hit.  Leaving them out of the memo key let a swapped
+        # or removed sidecar be hidden by an in-process hit after the first
+        # verification.
+        if os.path.exists(trd_path):
+            _sig_paths['train_doc_ids'] = trd_path
+        if os.path.exists(vad_path):
+            _sig_paths['val_doc_ids'] = vad_path
+        _sig = _memo_file_sig(_sig_paths)
         _mkey = (os.path.abspath(cache_dir), tag, _sig)
         _hit = _WT103_MEMO.get(_mkey)
         if _hit is not None:
@@ -5890,18 +5943,24 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                         'cache has document-id sidecars but no document-disjointness '
                         'attestation in its metadata')
                 if _mdoc and (_mdoc.get('disjoint') is not True
-                              or int(_mdoc.get('overlap', 0) or 0) != 0):
+                              or _as_seed_int(_mdoc.get('overlap', 0)) != 0):
                     _problems.append(
                         'cache metadata does not attest document-disjoint train/validation splits')
                 # Fingerprints make the sidecars part of the cache identity:
                 # a sidecar swapped in from another build can be disjoint by
                 # accident without describing these token arrays.
-                if _mdoc.get('train_fp') and _mdoc['train_fp'] != _ids_fp(_trd):
+                if not _mdoc.get('train_fp') or not _mdoc.get('validation_fp'):
+                    # Without both fingerprints a sidecar swapped in from
+                    # another build can look disjoint by accident.
                     _problems.append(
-                        'train document-id sidecar does not match the fingerprint in the cache metadata')
-                if _mdoc.get('validation_fp') and _mdoc['validation_fp'] != _ids_fp(_vad):
-                    _problems.append(
-                        'validation document-id sidecar does not match the fingerprint in the cache metadata')
+                        'cache metadata omits the train/validation document-id fingerprints')
+                else:
+                    if _mdoc['train_fp'] != _ids_fp(_trd):
+                        _problems.append(
+                            'train document-id sidecar does not match the fingerprint in the cache metadata')
+                    if _mdoc['validation_fp'] != _ids_fp(_vad):
+                        _problems.append(
+                            'validation document-id sidecar does not match the fingerprint in the cache metadata')
             except Exception as _de:
                 _problems.append(f'document-id sidecars unreadable ({type(_de).__name__}: {_de})')
         elif _has_doc_meta:
@@ -5917,7 +5976,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             _cache_warning('WikiText train/validation split', _problems)
         else:
             if 'val_fp' not in meta:
-                print('[data] NOTE: this is a legacy cache without a validation fingerprint; its file bytes are range/shape-checked but its split membership cannot be independently re-derived. New caches record val_fp.')
+                print('[data] NOTE: this cache has no validation fingerprint; its file bytes are range/shape-checked but its split membership cannot be independently re-derived.')
             audit_corpus_split(train_ids, val_batch, int(meta['vocab']),
                                dataset='wikitext', meta=meta)
             _out = (train_ids, val_batch, int(meta['vocab']), None, val_bnd)
@@ -6238,6 +6297,24 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         _sig_paths = {'test': te_path, 'bnd': tb_path, 'meta': me_path}
         if os.path.exists(td_path):
             _sig_paths['test_doc_ids'] = td_path
+        # The tokenizer bytes are part of the verified identity on every hit.
+        # Leaving them out of the memo key served a stale pair after the test
+        # or train tokenizer was replaced, bypassing the checks below.
+        if os.path.exists(tk_path):
+            _sig_paths['test_tok'] = tk_path
+        import glob as _glob_memo
+        for _tp in sorted(_glob_memo.glob(os.path.join(cache_dir, 'tok_v5_*.json'))):
+            _sig_paths[f'train_tok:{os.path.basename(_tp)}'] = _tp
+        # The cached-test verification also intersects the persisted train and
+        # validation document-id sidecars and cross-checks every train meta.
+        # Those files are therefore part of the memo identity too: a swapped
+        # sidecar/meta must force verification, not be masked by a memo hit.
+        for _dp in sorted(_glob_memo.glob(os.path.join(cache_dir, 'train_doc_ids_v5_*.npy'))):
+            _sig_paths[f'train_doc_ids:{os.path.basename(_dp)}'] = _dp
+        for _dp in sorted(_glob_memo.glob(os.path.join(cache_dir, 'val_doc_ids_*.npy'))):
+            _sig_paths[f'val_doc_ids:{os.path.basename(_dp)}'] = _dp
+        for _mp in sorted(_glob_memo.glob(os.path.join(cache_dir, 'meta_v5_*.json'))):
+            _sig_paths[f'train_meta:{os.path.basename(_mp)}'] = _mp
         _sig = _memo_file_sig(_sig_paths)
         _mkey = (os.path.abspath(cache_dir), tag, _sig)
         _hit = _WT103_TEST_MEMO.get(_mkey)
@@ -6296,15 +6373,19 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             if test_doc_ids is None:
                 _problems.append('test cache metadata records document ids but the sidecar is missing')
             else:
-                if int(np.asarray(test_doc_ids).size) != int(_mdoc.get('test_count', -1)):
+                if (int(np.asarray(test_doc_ids).size)
+                        != _as_seed_int(_mdoc.get('test_count', -1))):
                     _problems.append(
                         'test document-id sidecar count does not match the cache metadata')
-                if _mdoc.get('test_fp') and _mdoc['test_fp'] != _ids_fp(test_doc_ids):
+                if not _mdoc.get('test_fp'):
+                    _problems.append(
+                        'test cache metadata omits the document-id fingerprint')
+                elif _mdoc['test_fp'] != _ids_fp(test_doc_ids):
                     _problems.append(
                         'test document-id sidecar does not match the fingerprint in the cache metadata')
                 if (_mdoc.get('disjoint') is not True
-                        or int(_mdoc.get('train_overlap', 0) or 0) != 0
-                        or int(_mdoc.get('validation_overlap', 0) or 0) != 0):
+                        or _as_seed_int(_mdoc.get('train_overlap', 0)) != 0
+                        or _as_seed_int(_mdoc.get('validation_overlap', 0)) != 0):
                     _problems.append(
                         'test cache metadata does not attest document-disjoint '
                         'train/validation/test groups')
@@ -6327,6 +6408,13 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                     _problems.append(
                         f'{_shared["train"]} train / {_shared["validation"]} validation '
                         'document ids also occur in the test split (group leakage)')
+        else:
+            # No sidecars/attestation: the test split cannot be shown to be
+            # group-disjoint from train/validation, so rebuild instead of
+            # silently serving it.
+            _problems.append(
+                'test cache has no document-id attestation; whole-document '
+                'group isolation cannot be verified — rebuild the test cache')
         # A cached test set is only pairable if its tokenizer was fitted on the
         # SAME train prefix as the train/validation cache.  Verifying this on
         # the cold path is not enough: a swapped test cache could otherwise
@@ -6348,10 +6436,10 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                 'rebuild it from the same train tokenizer')
         if meta.get('fit_fp') and not _train_fit_fps:
             print('[data] NOTE: no train-cache meta found; the cached TEST fit provenance cannot be cross-checked locally')
-        # v11.128: bind the actual test tokenizer bytes on EVERY cache hit.
+        # Bind the actual test tokenizer bytes on EVERY cache hit.
         # `fit_fp` hashes the fit TEXT, which two different BPE merge sets can
         # share; it is not a tokenizer identity.  A missing identity in a
-        # legacy cache is a hard refusal for the frozen confirmation (delete
+        # cache is a hard refusal for the frozen confirmation (delete
         # the test cache and rebuild it from the same train tokenizer).
         _tok_sha_now = None
         if os.path.exists(tk_path):
@@ -6360,23 +6448,35 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             except Exception as _te:
                 _problems.append(f'test tokenizer file unreadable ({type(_te).__name__}: {_te})')
         _tok_sha_meta = meta.get('tokenizer_file_sha256')
+        _train_toks = sorted(_glob2.glob(os.path.join(cache_dir, 'tok_v5_*.json')))
         if _tok_sha_meta:
             if _tok_sha_now is None:
                 _problems.append('test meta binds a tokenizer file that is missing')
             elif _tok_sha_now != _tok_sha_meta:
                 raise RuntimeError(f'load_wikitest: the cached test tokenizer bytes (sha256 {_tok_sha_now[:16]}…) do not match the identity recorded in test meta ({str(_tok_sha_meta)[:16]}…) — the test cache and its tokenizer are not a matched pair; delete the test cache and rebuild it')
+            if _tok_sha_now is not None and _train_toks:
+                # A test tokenizer can match its own metadata and still differ
+                # from the tokenizer that defines the train id space.  Compare
+                # the full id->token maps, not just fit text or file bytes.
+                try:
+                    from tokenizers import Tokenizer as _Tok
+                    _tv = dict(_Tok.from_file(tk_path).get_vocab())
+                    _trv = dict(_Tok.from_file(_train_toks[0]).get_vocab())
+                except Exception as _te:
+                    raise RuntimeError(f'load_wikitest: could not compare the test tokenizer with the train tokenizer ({type(_te).__name__}: {_te}); rebuild the test cache') from _te
+                if _tv != _trv:
+                    raise RuntimeError('load_wikitest: the test tokenizer vocabulary is not identical to the train tokenizer vocabulary — the id spaces cannot be paired; delete the test cache and rebuild it')
         else:
-            _train_toks = sorted(_glob2.glob(os.path.join(cache_dir, 'tok_v5_*.json')))
             if _tok_sha_now is None or not _train_toks:
-                raise RuntimeError('load_wikitest: this is a legacy test cache without a tokenizer identity and without a matched train tokenizer file; refusing to serve an unpaired id space — rebuild the test cache with the current loader')
+                raise RuntimeError('load_wikitest: this test cache has no tokenizer identity and no matched train tokenizer file; refusing to serve an unpaired id space — rebuild the test cache with the current loader')
             try:
                 from tokenizers import Tokenizer as _Tok
                 _tv = dict(_Tok.from_file(tk_path).get_vocab())
                 _trv = dict(_Tok.from_file(_train_toks[0]).get_vocab())
             except Exception as _te:
-                raise RuntimeError(f'load_wikitest: could not compare the legacy test tokenizer with the train tokenizer ({type(_te).__name__}: {_te}); rebuild the test cache') from _te
+                raise RuntimeError(f'load_wikitest: could not compare the test tokenizer with the train tokenizer ({type(_te).__name__}: {_te}); rebuild the test cache') from _te
             if _tv != _trv:
-                raise RuntimeError('load_wikitest: the legacy test tokenizer vocabulary is not identical to the train tokenizer vocabulary — the id spaces cannot be paired; delete the test cache and rebuild it')
+                raise RuntimeError('load_wikitest: the test tokenizer vocabulary is not identical to the train tokenizer vocabulary — the id spaces cannot be paired; delete the test cache and rebuild it')
         if np.asarray(test_ids).shape != (int(n_seqs), int(seq_len)):
             raise RuntimeError(f'load_wikitest: cached test slice shape {np.asarray(test_ids).shape} != the frozen ({int(n_seqs)}, {int(seq_len)}); the frozen slice is part of the pre-registration, so a different row count must be re-frozen explicitly')
         if _problems:
@@ -6477,8 +6577,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     # the two corpora builds cannot be paired — refuse rather than serve it.
     # A persisted train tokenizer is compared by FULL vocab identity (id->token
     # mapping), not merely by size: two BPE fits can share a vocab size with
-    # different merges, in which case the id spaces are un-pairable.  Legacy
-    # caches without a persisted tokenizer fall back to the size check.
+    # different merges, in which case the id spaces are un-pairable.  Caches
+    # without a persisted tokenizer fall back to the size check.
     import glob as _glob
     _test_vocab = dict(tok.get_vocab())
     _train_tok_paths = _glob.glob(os.path.join(cache_dir, 'tok_v5_*.json'))
@@ -6645,7 +6745,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         _cap_test, 'test', tok, eos_id, lengths_out=_test_lengths)
     n_have = min(len(ids) // seq_len, n_seqs)
     if n_have < n_seqs:
-        # v11.128: hard failure.  The frozen plan declares n_seqs (16) as part
+        # Hard failure.  The frozen plan declares n_seqs (16) as part
         # of the slice; silently evaluating 14 rows would change the estimand
         # and could still pass every downstream admission check.
         raise RuntimeError(f'load_wikitest: the test split yields only {n_have} full rows but {n_seqs} are required by the frozen slice; refusing to shrink the held-out panel silently (investigate the near-duplicate cleanup / raw dump or re-freeze explicitly)')
@@ -6663,8 +6763,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     test_doc_ids = _doc_ids_for_capped_rows(
         [r for r in _trows if r.strip()], _test_lengths, _served_cap)
     # Prove group isolation against every train/val cache sidecar present.  The
-    # build-time dedup should already guarantee zero; this turns a silent
-    # dedup/index bug into a hard refusal before the cache is written.
+    # build-time dedup should already guarantee zero; this turns any silent
+    # dedup/index mismatch into a hard refusal before the cache is written.
     _shared_train_docs = 0
     _shared_val_docs = 0
     _doc_scan_errors = []
@@ -6787,10 +6887,9 @@ def _disk_ids_chunk(buf, disk_dt, vocab):
     # numpy builds that silently overflow).  `_fineweb_disk_dtype` returns
     # uint16 only for vocab <= 65536, so this is a defensive guard.
     if buf:
-        # Convert once to int64 and take the extrema with NumPy's C loops:
-        # scanning a multi-million-element Python list twice is the slow part
-        # of the staging write at scale.  The range check still runs on the
-        # pre-cast values, so a uint16 wrap can never hide a bad id.
+        # Convert once to int64 and take the extrema with NumPy's C loops.
+        # The range check runs on the pre-cast values, so a uint16 wrap can
+        # never hide a bad id.
         _a = np.asarray(buf, dtype=np.int64)
         _mn, _mx = int(_a.min()), int(_a.max())
         if _mn < 0 or _mx >= int(vocab):
@@ -6801,9 +6900,13 @@ def _disk_ids_chunk(buf, disk_dt, vocab):
     return np.empty(0, dtype=disk_dt)
 
 def _i32_sidecar_path(path):
-    """Identity-bound int32 sidecar path for a wide on-disk token cache."""
+    """Identity-bound int32 sidecar path for a wide on-disk token cache.
+
+    The ``v2`` marker invalidates sidecars written before the narrowing path
+    stopped trusting a stale ``max_id`` metadata field: such a sidecar could
+    contain silently wrapped ids and must never be served again."""
     st = os.stat(path)
-    return (f'{path}.i32-{int(st.st_size)}-'
+    return (f'{path}.i32v2-{int(st.st_size)}-'
             f'{int(getattr(st, "st_mtime_ns", 0))}-'
             f'{int(getattr(st, "st_ctime_ns", int(st.st_ctime * 1e9)))}-'
             f'{int(getattr(st, "st_ino", 0))}.npy')
@@ -6819,13 +6922,17 @@ def _npy_serve_int32(path):
     # Wider integer cache: narrow to int32 only after proving every id fits.
     # A silent wrap (e.g. 2**32 + 5 -> 5) would pass the downstream
     # vocab-range check for small vocabularies and corrupt the corpus.
+    # Validate BEFORE the sidecar/fallback block: a validation ValueError
+    # (non-integer values, negative ids, out-of-int32 ids) must propagate.
+    # Catching it there and falling through to an int32 cast would truncate a
+    # float cache or wrap a large id, exactly the corruption this guard exists
+    # to prevent.
     if src.size:
         _mn, _mx = int(src.min()), int(src.max())
         if _mn < 0 or _mx > 2 ** 31 - 1:
             raise ValueError(f'_npy_serve_int32: token ids in {path} span [{_mn}, {_mx}], outside the int32 transport range')
-    # Serve an identity-bound int32 sidecar so workers share one mapped copy:
-    # the returned values are the same exact integers and the fingerprint
-    # stays on the int32 canonical form.
+    # Serve an identity-bound int32 sidecar: the returned values are the same
+    # exact integers and the fingerprint stays on the int32 canonical form.
     try:
         _side = _i32_sidecar_path(path)
         if os.path.exists(_side):
@@ -6859,6 +6966,8 @@ def _npy_serve_int32(path):
             raise
         return np.load(_side, mmap_mode='r')
     except (OSError, ValueError, TypeError):
+        # The source range was already validated above, so this fallback can
+        # only fail to write/serve the sidecar cache; narrowing is exact.
         out = np.empty(src.shape, dtype=np.int32)
         for s in range(0, src.size, 1 << 24):
             e = min(s + (1 << 24), src.size)
@@ -7207,10 +7316,20 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 if meta.get('doc_ids', {}).get('disjoint') is not True:
                     _problems.append('cache metadata does not attest document-level disjointness')
                 _mdoc = meta.get('doc_ids') or {}
-                if _mdoc.get('train_fp') and _mdoc['train_fp'] != _ids_fp(_trd):
+                # A missing fingerprint is not a pass: it cannot bind the
+                # sidecar to this cache.  WikiText already fails closed here;
+                # FineWeb must too, or swapped sidecars can be served as long
+                # as the pair happens to be disjoint.
+                if not _mdoc.get('train_fp'):
+                    _problems.append(
+                        'cache metadata does not record a train document-id fingerprint')
+                elif _mdoc['train_fp'] != _ids_fp(_trd):
                     _problems.append(
                         'train document-id sidecar does not match the fingerprint in the cache metadata')
-                if _mdoc.get('validation_fp') and _mdoc['validation_fp'] != _ids_fp(_vad):
+                if not _mdoc.get('validation_fp'):
+                    _problems.append(
+                        'cache metadata does not record a validation document-id fingerprint')
+                elif _mdoc['validation_fp'] != _ids_fp(_vad):
                     _problems.append(
                         'validation document-id sidecar does not match the fingerprint in the cache metadata')
             except Exception as _de:
@@ -7235,7 +7354,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 _cache_warning('FineWeb train/validation split', _problems)
             else:
                 if 'val_fp' not in meta:
-                    print('[data] NOTE: this is a legacy FineWeb cache without a validation fingerprint; shape/range checks passed but split membership cannot be independently re-derived. New caches record val_fp.')
+                    print('[data] NOTE: this FineWeb cache has no validation fingerprint; shape/range checks passed but split membership cannot be independently re-derived.')
                 audit_corpus_split(train_ids, val_batch, int(meta['vocab']),
                                    dataset='fineweb', meta=meta)
                 _out = (train_ids, val_batch, int(meta['vocab']), None, val_bnd)
@@ -7511,6 +7630,33 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 pass
 
 _CORPUS_AUDIT_MEMO = {}
+_CORPUS_AUDIT_MEMO_CAP = 8
+
+
+def _corpus_audit_cache_key(dataset, vocab, train_ids, val_batch, meta,
+                            max_scan_tokens, sample_rows, shift_warn, shift_fail):
+    """Identity of a corpus-audit result, including the scan/dedup options.
+
+    The fingerprints identify the DATA, not the audit policy: two calls with
+    the same rows but a smaller ``max_scan_tokens`` (or a different sample /
+    threshold / document attestation) produce different reports and must not
+    share a cache slot.
+    """
+    _mdoc = (meta or {}).get('doc_ids') or {}
+    _va = np.asarray(val_batch)
+    return (str(dataset), int(vocab),
+            _ids_fp(np.asarray(train_ids).reshape(-1)),
+            # The report is shape-sensitive (row counts, duplicate rows, the
+            # sampled rows): two holdouts with the same flattened tokens but
+            # different row boundaries are different evaluations and must not
+            # share a memo slot.
+            (tuple(int(x) for x in _va.shape),
+             _ids_fp(np.ascontiguousarray(_va).reshape(-1))
+             if _va.size else None),
+            int(max_scan_tokens), int(sample_rows),
+            float(shift_warn), float(shift_fail),
+            str((meta or {}).get('split_strategy')),
+            json.dumps(_mdoc, sort_keys=True, default=str))
 
 
 def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
@@ -7537,10 +7683,18 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
         'warnings': [],
         'meta_split_strategy': (meta or {}).get('split_strategy'),
     }
-    key = (dataset, int(vocab), _ids_fp(tr),
-           _ids_fp(np.ascontiguousarray(va).reshape(-1)) if va.size else None)
+    key = _corpus_audit_cache_key(dataset, vocab, tr, va, meta,
+                                  max_scan_tokens, sample_rows,
+                                  shift_warn, shift_fail)
     _hit = _CORPUS_AUDIT_MEMO.get(key)
     if _hit is not None:
+        # A non-strict exploratory call may have cached a FAILING report.
+        # Returning it to a strict caller would silently bypass the hard gate.
+        if _hit.get('hard_failures') and strict:
+            raise RuntimeError(
+                f'[{dataset}] DATA GATE REFUSED this split: ' +
+                '; '.join(_hit['hard_failures']) +
+                ' — correct the split/cache before training (no model has been fitted).')
         return _hit
     try:
         _validate_token_ids(tr, vocab, f'{dataset} train_ids')
@@ -7626,10 +7780,11 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
         report['documents'] = {k: _docs.get(k) for k in
                                ('train_count', 'validation_count', 'overlap',
                                 'disjoint', 'policy')}
-        if _docs.get('disjoint') is not True or int(_docs.get('overlap', 0) or 0) != 0:
+        if (_docs.get('disjoint') is not True
+                or _as_seed_int(_docs.get('overlap', 0)) != 0):
             report['hard_failures'].append('cache does not attest document-disjoint train/validation splits')
     elif dataset == 'fineweb':
-        report['warnings'].append('legacy FineWeb cache has no document-id disjointness proof')
+        report['warnings'].append('FineWeb cache has no document-id disjointness proof')
 
     # Training-only reference distribution; the holdout never defines it.
     if tr.size and va.size:
@@ -7655,7 +7810,9 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
         raise RuntimeError(
             f'[{dataset}] DATA GATE REFUSED this split: ' +
             '; '.join(report['hard_failures']) +
-            ' — fix the split/cache before training (no model has been fitted).')
+            ' — correct the split/cache before training (no model has been fitted).')
+    if key not in _CORPUS_AUDIT_MEMO and len(_CORPUS_AUDIT_MEMO) >= _CORPUS_AUDIT_MEMO_CAP:
+        _CORPUS_AUDIT_MEMO.pop(next(iter(_CORPUS_AUDIT_MEMO)))
     _CORPUS_AUDIT_MEMO[key] = report
     return report
 
@@ -7703,7 +7860,18 @@ def _json_clean(obj):
     if isinstance(obj, np.ndarray):
         return _json_clean(obj.tolist())
     if isinstance(obj, np.generic):
-        return _json_clean(obj.item())
+        # ``longdouble.item()`` returns another NumPy scalar, so recursing on
+        # item() alone loops forever.  Convert through the scalar kind first.
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return _json_clean(float(obj))
+        _item = obj.item()
+        return _json_clean(_item) if not isinstance(_item, np.generic) else str(_item)
+    if isinstance(obj, (set, frozenset)):
+        return sorted((_json_clean(v) for v in obj), key=str)
     if isinstance(obj, float):
         return obj if math.isfinite(obj) else None
     return obj
@@ -7747,6 +7915,7 @@ def atomic_write_text(path, text):
 def locked_json_read(path):
     """Consistent read of a shared JSON file under the same flock the writers
     use ({} when absent).  Pure read: never creates or rewrites the file."""
+    path = os.fspath(path)
     try:
         import fcntl
     except ImportError:
@@ -7758,7 +7927,14 @@ def locked_json_read(path):
             fcntl.flock(lock_f, fcntl.LOCK_SH)
         except OSError:
             # A missing/unwritable parent directory means the file is absent
-            # (or unreadable); a read must return {} rather than crash.
+            # (or unreadable); a read must return {} rather than crash.  If
+            # open() succeeded but flock() failed, close the descriptor here:
+            # the cleanup below only runs for a successfully held lock.
+            if lock_f is not None:
+                try:
+                    lock_f.close()
+                except OSError:
+                    pass
             lock_f = None
     try:
         if not os.path.exists(path):
@@ -7787,6 +7963,7 @@ def locked_json_update(path, mutfn, indent=2):
     write itself stays atomic (atomic_write_json), so a crash mid-update
     leaves the previous content intact.
     """
+    path = os.fspath(path)
     try:
         import fcntl
     except ImportError:
@@ -7796,8 +7973,18 @@ def locked_json_update(path, mutfn, indent=2):
     # that does not exist yet.
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     if fcntl is not None:
-        lock_f = open(path + '.lock', 'a')
-        fcntl.flock(lock_f, fcntl.LOCK_EX)
+        try:
+            lock_f = open(path + '.lock', 'a')
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+        except BaseException:
+            # Do not leak the descriptor when open() succeeds but the lock
+            # cannot be acquired; the finally below is not reached yet.
+            if lock_f is not None:
+                try:
+                    lock_f.close()
+                except OSError:
+                    pass
+            raise
     try:
         obj = {}
         if os.path.exists(path):
@@ -7940,11 +8127,25 @@ def _gpu_corpus_cache_fits(nbytes, device):
         return True
 
 _NARROW_MEMO = {}
+# Keep a small LRU of narrowed corpora and drop entries whose source array
+# has died.
+_NARROW_MEMO_CAP = 8
+
+
+def _narrow_memo_put(key, train_ids, value):
+    memo = _NARROW_MEMO
+    for _k in [k for k, v in memo.items()
+               if v[0] is not None and v[0]() is None]:
+        memo.pop(_k, None)
+    if key not in memo:
+        while len(memo) >= _NARROW_MEMO_CAP:
+            memo.pop(next(iter(memo)))
+    memo[key] = (weakref.ref(train_ids), value)
 
 
 def _cache_id_upper_bound(path):
     """Recorded token-id upper bound for a cache file, when the sibling meta
-    file provides one.  Avoids a full-corpus max() scan on legacy int64 caches."""
+    file provides one."""
     if not path:
         return None
     base = os.path.basename(str(path))
@@ -7962,18 +8163,34 @@ def _cache_id_upper_bound(path):
     except (OSError, ValueError, TypeError):
         return None
     for key in ('max_id', 'max_token_id', 'token_max'):
-        try:
-            v = int(meta[key])
-            if 0 <= v < 2 ** 31:
-                return v
-        except (KeyError, TypeError, ValueError):
-            pass
-    try:
-        vocab = int(meta.get('vocab'))
-        if 0 < vocab <= 2 ** 31:
-            return vocab - 1
-    except (TypeError, ValueError, OverflowError):
-        pass
+        raw = meta.get(key)
+        if isinstance(raw, (bool, np.bool_)):
+            continue
+        if isinstance(raw, numbers.Integral):
+            v = int(raw)
+        elif isinstance(raw, numbers.Real):
+            f = float(raw)
+            if not math.isfinite(f) or f != math.floor(f):
+                continue
+            v = int(f)
+        else:
+            continue
+        if 0 <= v < 2 ** 31:
+            return v
+    raw_vocab = meta.get('vocab')
+    if isinstance(raw_vocab, (bool, np.bool_)):
+        return None
+    if isinstance(raw_vocab, numbers.Integral):
+        vocab = int(raw_vocab)
+    elif isinstance(raw_vocab, numbers.Real):
+        f = float(raw_vocab)
+        if not math.isfinite(f) or f != math.floor(f):
+            return None
+        vocab = int(f)
+    else:
+        return None
+    if 0 < vocab <= 2 ** 31:
+        return vocab - 1
     return None
 
 
@@ -7992,20 +8209,23 @@ def _ids_narrow(train_ids):
         try:
             _st = os.stat(_path)
             # Bind the sidecar to the same identity fields the cache loaders
-            # use.  A same-size rewrite can preserve mtime (``cp -p``), so
-            # size+mtime alone could silently serve a stale int32 copy.
+            # use; size+mtime alone does not identify it.
             _side = _i32_sidecar_path(_path)
             if os.path.exists(_side):
                 _n = np.load(_side, mmap_mode='r')
                 if (int(_n.size) == int(train_ids.size)
                         and tuple(_n.shape) == tuple(train_ids.shape)
                         and np.dtype(_n.dtype) == np.dtype(np.int32)):
-                    _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
+                    _narrow_memo_put(_key, train_ids, _n)
                     return _n
-            _mx = _cache_id_upper_bound(_path)
-            if _mx is None:
-                _mx = int(train_ids.max()) if train_ids.size else -1
-            if _mx < 2 ** 31:
+            # Never trust a metadata `max_id` to decide the cast: a stale or
+            # hand-edited value below 2**31 would make the int32 cast wrap an
+            # out-of-range token into a negative id (which PyTorch then indexes
+            # from the end of the embedding table).  The sidecar + binding mean
+            # this full scan happens at cache build time.
+            _mn = int(train_ids.min()) if train_ids.size else 0
+            _mx = int(train_ids.max()) if train_ids.size else -1
+            if -2 ** 31 <= _mn and _mx < 2 ** 31:
                 _dir = os.path.dirname(os.path.abspath(_side)) or '.'
                 _fd, _tmp = tempfile.mkstemp(dir=_dir, prefix=os.path.basename(_side) + '.', suffix='.tmp')
                 os.close(_fd)
@@ -8027,16 +8247,15 @@ def _ids_narrow(train_ids):
                         pass
                     raise
                 _n = np.load(_side, mmap_mode='r')
-                _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
+                _narrow_memo_put(_key, train_ids, _n)
                 return _n
         except (OSError, ValueError, TypeError):
             pass
-    _mx = _cache_id_upper_bound(getattr(train_ids, 'filename', None))
-    if _mx is None:
-        _mx = int(train_ids.max()) if train_ids.size else -1
-    if train_ids.size and _mx < 2 ** 31:
+    _mn = int(train_ids.min()) if train_ids.size else 0
+    _mx = int(train_ids.max()) if train_ids.size else -1
+    if train_ids.size and -2 ** 31 <= _mn and _mx < 2 ** 31:
         _n = train_ids.astype(np.int32)
-        _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
+        _narrow_memo_put(_key, train_ids, _n)
         return _n
     return train_ids
 
@@ -8196,8 +8415,10 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
         'labels_are_next_token_shift': True,
         'ids_within_vocab': True,
         'same_seed_repeats_stream': True,
+        'final_target_matches_source': True,
         'nonempty': True,
     }
+    _src = np.asarray(train_ids).reshape(-1)
     try:
         it_a = batch_iter(train_ids, seq_len, batch_size, device, seed=int(seed))
         it_b = batch_iter(train_ids, seq_len, batch_size, device, seed=int(seed))
@@ -8219,6 +8440,30 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
                 checks['labels_are_next_token_shift']
                 and ya.shape[1] == xa.shape[1]
                 and torch.equal(ya[:, :-1], xa[:, 1:]))
+            # The shift identity only covers ya[:, :-1]; it says nothing about
+            # the final target.  Verify that every last target is the token
+            # following the matching input window in the source stream.
+            if _src.size > seq_len and xa.numel() and ya.numel():
+                _xn = xa.detach().cpu().numpy()
+                _yn = ya.detach().cpu().numpy()
+                for _bi in range(_xn.shape[0]):
+                    _row = _xn[_bi]
+                    _last = int(_yn[_bi, -1])
+                    _starts = np.flatnonzero(_src[:max(0, _src.size - seq_len)] == _row[0])
+                    _nexts = set()
+                    for _p in _starts:
+                        _p = int(_p)
+                        if _p + seq_len < _src.size and np.array_equal(
+                                _src[_p:_p + seq_len], _row):
+                            _nexts.add(int(_src[_p + seq_len]))
+                    # A repeated input window with different continuations
+                    # makes the final target unverifiable from x/y alone:
+                    # accepting ANY occurrence lets a corrupted iterator pass
+                    # by borrowing another occurrence's target.  Pass only when
+                    # every matching occurrence agrees on the continuation.
+                    if len(_nexts) != 1 or _last not in _nexts:
+                        checks['final_target_matches_source'] = False
+                        break
             checks['same_seed_repeats_stream'] = bool(
                 checks['same_seed_repeats_stream']
                 and torch.equal(xa, xb) and torch.equal(ya, yb))
@@ -8402,6 +8647,11 @@ def result_is_current(rec, code, *required_keys):
         return False
     if 'ppl' in required_keys and (not ppl_is_usable(rec.get('ppl'))):
         return False
+    if 'acc' in required_keys and _finite_scalar(rec.get('acc')) is None:
+        # NIAH cells are skipped on resume through this predicate; a bool,
+        # string or NaN 'acc' is not a completed measurement and must be
+        # re-evaluated rather than frozen as done.
+        return False
     return rec.get('_code') == code
 PAIR_STEP_KEYS = ('steps', 'tokens_seen')
 
@@ -8415,14 +8665,14 @@ def pair_reason(ra, rb):
     # Controlled-variable gate for the settings the run fingerprint does not
     # carry (optimizer identity / betas / eps, LR-schedule shape, grad-clip,
     # augmentation).  BOTH records must carry the descriptor or BOTH must omit
-    # it (legacy-vs-legacy); a one-sided descriptor is unverifiable and is
+    # it (absent-vs-absent); a one-sided descriptor is unverifiable and is
     # refused.
     _ka, _kb = (ra.get('train_knobs'), rb.get('train_knobs'))
     # Mixed presence is itself unverifiable: a record that carries the
     # descriptor and one that does not cannot be shown to share the optimizer /
     # schedule / clipping / augmentation settings, and pairing them is exactly
     # the uncontrolled comparison this gate exists to prevent.  Only
-    # legacy-vs-legacy (both absent) keeps the permissive path.
+    # both-absent keeps the permissive path.
     if (_ka is None) != (_kb is None):
         return 'unverifiable train_knobs (only one record carries the optimizer / lr-schedule / augmentation descriptor)'
     if _ka is not None and _ka != _kb:
@@ -8431,8 +8681,8 @@ def pair_reason(ra, rb):
     # newer records.  Compare them explicitly (the descriptor above already
     # covers records that carry it) so an fp32-vs-bf16 or row-loop-vs-batched
     # pair cannot be treated as controlled even if some future caller omits
-    # the full descriptor.  Legacy records (neither key present) keep the
-    # historical permissive path; a one-sided key is unverifiable.
+    # the full descriptor.  Records with neither key present keep the
+    # permissive path; a one-sided key is unverifiable.
     for _k in ('amp_dtype', 'amp_grad_scaler', 'eager_batch'):
         _pa, _pb = (_k in ra), (_k in rb)
         if _pa != _pb:
@@ -8455,9 +8705,9 @@ def pair_reason(ra, rb):
             return f'different {_k} ({str(_pa)[:12]}… vs {str(_pb)[:12]}…)'
     # Matched initialization: same seed is not enough (architectures consume
     # different amounts of RNG), so compare the shared-trunk init digest.
-    # Both-present equality is required; one-sided is unverifiable (legacy
-    # records predate the field).  RNG-state equality is deliberately NOT
-    # required: architecture-induced RNG consumption is part of the arm.
+    # Both-present equality is required; one-sided is unverifiable.  RNG-state
+    # equality is deliberately NOT required: architecture-induced RNG
+    # consumption is part of the arm.
     _ia, _ib = ra.get('init_core_fp'), rb.get('init_core_fp')
     _ha = _ia is not None and str(_ia) != ''
     _hb = _ib is not None and str(_ib) != ''
@@ -8483,7 +8733,7 @@ def _hyperparam_reason(ra, rb):
     `hyperparams` copy additionally carries `mlp_ratio` (and any future key
     that never made it into the string).  Two records with equal run_cfg can
     still differ in MLP width, which is a capacity change rather than the
-    module under test.  Both records must carry the descriptor (legacy/legacy
+    module under test.  Both records must carry the descriptor (both absent
     is the only permissive path) and every checked key must agree.
 
     Baseline-vs-method contrasts do NOT use this gate: their MLP width is
@@ -8513,11 +8763,11 @@ def objective_reason(ra, rb):
     this helper makes the difference explicit instead of silently pairing
     `ce` with `ce + comp_lambda*comp_reg`.  It returns None when the records
     carry matching objective descriptors, a reason string otherwise, and
-    'unverifiable ...' when the descriptors are absent/one-sided (legacy
-    records keep the permissive path, but the state is reported)."""
+    'unverifiable ...' when the descriptors are absent/one-sided (records
+    without a descriptor keep the permissive path, but the state is reported)."""
     oa, ob = ra.get('train_objective'), rb.get('train_objective')
     if oa is None and ob is None:
-        return 'unverifiable train_objective (legacy records carry no objective descriptor)'
+        return 'unverifiable train_objective (records carry no objective descriptor)'
     if (oa is None) != (ob is None):
         return 'unverifiable train_objective (only one record carries the objective descriptor)'
     if not isinstance(oa, dict) or not isinstance(ob, dict):
@@ -8533,10 +8783,18 @@ def ppl_is_usable(v):
     return f is not None and f > 0.0
 
 def by_len_cells(rows, Ln, variant=None):
-    keys = (Ln, int(Ln), str(int(Ln)))
+    # A requested length must be an exact integer >= 2.  int(True)==1 and
+    # int(4.9)==4 would otherwise select cells for a different sequence length;
+    # a length-1 row predicts no next token, so it has no usable cell.
+    Ln_i = _as_seed_int(Ln)
+    if Ln_i is None:
+        raise ValueError(f'by_len_cells: length {Ln!r} is not an exact integer')
+    if Ln_i < 2:
+        return []
+    keys = (Ln_i, str(Ln_i))
     # Length-panel rows must all come from one validation slice: PPL@L is only
     # comparable when the underlying corpus is the same.  Records without a
-    # fingerprint keep the historical permissive path; a mixed fingerprint set
+    # fingerprint keep the permissive path; a mixed fingerprint set
     # raises instead of silently averaging two slices.
     assert_shared_validation_fp([r for r in rows if isinstance(r, dict)],
                                 context=f'by_len_cells(L={Ln})')
@@ -8567,7 +8825,12 @@ def holm_adjust(named_pvals, alpha=0.05):
     输出 {name: {'p_raw', 'p_holm', 'rank', 'reject', 'm_effective'}}。
     family 的定义必须由调用方预先声明（预注册的族用冻结清单，探索性的族
     明示「未预注册」），本函数只做数学，不做族的选择——族的选择正是
-    多重比较问题的来源（design_notes §4/§17）。"""
+    多重比较问题的来源（design_notes §4/§17）。
+
+    An invalid/missing p-value still occupies its declared family slot: it is
+    counted in ``m`` as ``p=1`` (its own ``p_holm`` stays None).  Dropping it
+    from ``m`` would shrink the correction family and make the remaining
+    comparisons look more significant than the caller's stated family allows."""
     fam = []
     invalid = {}
     _seen_names = set()
@@ -8579,16 +8842,24 @@ def holm_adjust(named_pvals, alpha=0.05):
             # corrupt the correction family.
             raise ValueError(f'holm_adjust: duplicate comparison name {sname!r}')
         _seen_names.add(sname)
-        try:
-            pv = float(p)
-        except (TypeError, ValueError, OverflowError):
+        if isinstance(p, (bool, np.bool_)):
+            # A boolean is a flag, not a probability.  float(False) == 0.0
+            # would otherwise become the strongest possible p-value and
+            # shrink the correction family to a bogus "certain" result.
             pv = float('nan')
+        else:
+            try:
+                pv = float(p)
+            except (TypeError, ValueError, OverflowError):
+                pv = float('nan')
         if (not math.isfinite(pv)) or pv < 0.0 or pv > 1.0:
             invalid[sname] = {'p_raw': p, 'p_holm': None, 'rank': None, 'reject': False, 'reason': 'p not in [0,1] or not finite'}
             continue
         fam.append((sname, pv))
     out = dict(invalid)
-    m = len(fam)
+    # Invalid slots sort after every valid p as p=1, so they increase m
+    # without changing the ranks of the valid comparisons.
+    m = len(fam) + len(invalid)
     order = sorted(fam, key=lambda kv: kv[1])
     prev = 0.0
     for i, (name, p) in enumerate(order):
@@ -8624,10 +8895,15 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         p = v.get('p_exact_signflip')
         if p is None:
             p = v.get('p')
-        try:
-            p = float(p)
-        except (TypeError, ValueError, OverflowError):
+        if isinstance(p, (bool, np.bool_)):
+            # Boolean flags are not p-values; treat them as invalid so the
+            # declared family keeps a p=1 slot instead of a fake p=0.
             p = float('nan')
+        else:
+            try:
+                p = float(p)
+            except (TypeError, ValueError, OverflowError):
+                p = float('nan')
         if math.isfinite(p) and 0.0 <= p <= 1.0:
             pairs.append((str(k), p))
             tested += 1
@@ -8646,17 +8922,21 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     for v in (comparisons or {}).values():
         if not isinstance(v, dict):
             continue
-        try:
-            _n = int(v.get('n'))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if _n > 0:
+        # A boolean/fractional n is not a seed count; int(True)=1 or
+        # int(12.9)=12 would understate n_max and could mislabel the whole
+        # family as resolution-limited.
+        _n = _as_seed_int(v.get('n'))
+        if _n is not None and _n > 0:
             _ns.append(_n)
     _m = int(len(comparisons or {}))
-    _fam_floor = holm_min_attainable_p(min(_ns), _m, alpha) if _ns else None
+    # The family's smallest attainable raw p is min_i 2/2**n_i, which is set
+    # by the LARGEST seed count in the family (more seeds -> finer p grid).
+    # Using the smallest n here overstated the floor and could call a family
+    # resolution-limited even when its best-resolved comparison can reject.
+    _fam_floor = holm_min_attainable_p(max(_ns), _m, alpha) if _ns else None
     _fam_limited = bool(_fam_floor is not None and math.isfinite(_fam_floor) and _fam_floor > alpha)
     if _fam_limited:
-        print(f'[stats] WARNING: family {family!r} has m={_m} declared comparisons and n_min={min(_ns)} seeds — '
+        print(f'[stats] WARNING: family {family!r} has m={_m} declared comparisons and n_max={max(_ns)} seeds — '
               f'the smallest attainable Holm p is {_fam_floor:.4g} > alpha={alpha}; NO comparison in this family can be significant. '
               'That is a resolution ceiling, not a null result; report it as such and add seeds before interpreting p_holm=1.0')
     return {
@@ -8708,44 +8988,78 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     if not isinstance(stats, dict):
         out['reasons'].append('not a statistics dict')
         return out
-    try:
-        n = int(stats.get('n') or 0)
-    except (TypeError, ValueError, OverflowError):
+    _n_raw = stats.get('n')
+    if isinstance(_n_raw, (bool, np.bool_)):
         n = 0
+        out['reasons'].append('n is a boolean flag, not a seed count')
+    elif isinstance(_n_raw, numbers.Integral):
+        n = int(_n_raw)
+    elif isinstance(_n_raw, numbers.Real):
+        _nf = float(_n_raw)
+        if math.isfinite(_nf) and _nf == math.floor(_nf):
+            n = int(_nf)
+        else:
+            n = 0
+            out['reasons'].append(f'n {_n_raw!r} is not an integer seed count')
+    else:
+        # Do not accept a string or other object by truncating/coercing it:
+        # a declared seed count must be an exact integer.
+        n = 0
+        out['reasons'].append(f'n {_n_raw!r} is not an integer seed count')
     p = stats.get('p_exact_signflip')
     if p is None:
         p = stats.get('p')
     ph = stats.get('p_holm')
     mean, std = stats.get('mean'), stats.get('std')
     out['n'] = n
-    try:
-        out['p_raw'] = float(p) if p is not None else None
-    except (TypeError, ValueError, OverflowError):
+    if isinstance(p, (bool, np.bool_)):
+        # float(False) == 0.0 must never be read as a significant p-value.
         out['p_raw'] = None
-    try:
-        out['p_holm'] = float(ph) if ph is not None else None
-    except (TypeError, ValueError, OverflowError):
+    else:
+        try:
+            out['p_raw'] = float(p) if p is not None else None
+        except (TypeError, ValueError, OverflowError):
+            out['p_raw'] = None
+    if isinstance(ph, (bool, np.bool_)):
         out['p_holm'] = None
+    else:
+        try:
+            out['p_holm'] = float(ph) if ph is not None else None
+        except (TypeError, ValueError, OverflowError):
+            out['p_holm'] = None
     out['p_floor'] = signflip_p_floor(n) if n > 0 else None
     if n < int(min_n):
         out['reasons'].append(f'n={n} < min_n={int(min_n)}: the exact-test p floor is {out["p_floor"]:.3g} > alpha' if out['p_floor'] is not None else f'n={n} < min_n={int(min_n)}')
     elif out['p_floor'] is not None and math.isfinite(out['p_floor']) and out['p_floor'] > alpha:
         out['reasons'].append(f'p floor {out["p_floor"]:.3g} > alpha={alpha}: resolution ceiling, not a null result')
-    try:
-        if out['p_raw'] is None or not (out['p_raw'] < alpha):
-            out['reasons'].append(f'raw p {out["p_raw"]!r} is not < alpha={alpha}')
-    except TypeError:
-        out['reasons'].append('raw p is not comparable')
+    _praw = out['p_raw']
+    if _praw is None:
+        out['reasons'].append(f'raw p {_praw!r} is not a probability')
+    elif not (math.isfinite(_praw) and 0.0 <= _praw <= 1.0):
+        out['reasons'].append(f'raw p {_praw!r} is not a probability in [0,1]')
+    elif not (_praw < alpha):
+        out['reasons'].append(f'raw p {_praw:.3g} is not < alpha={alpha}')
     if require_holm:
-        if out['p_holm'] is None:
+        _ph = out['p_holm']
+        if _ph is None:
             out['reasons'].append('no Holm-corrected p (family correction not attached)')
-        elif not (out['p_holm'] < alpha):
-            out['reasons'].append(f'Holm p {out["p_holm"]:.3g} is not < alpha={alpha}')
-    try:
-        if mean is None or std is None or not (abs(float(mean)) > float(std)):
-            out['reasons'].append('|mean| <= std: effect is within seed noise')
-    except (TypeError, ValueError, OverflowError):
-        out['reasons'].append('mean/std are not numeric')
+        elif not (math.isfinite(_ph) and 0.0 <= _ph <= 1.0):
+            out['reasons'].append(f'Holm p {_ph!r} is not a probability in [0,1]')
+        elif not (_ph < alpha):
+            out['reasons'].append(f'Holm p {_ph:.3g} is not < alpha={alpha}')
+    if isinstance(mean, (bool, np.bool_)) or isinstance(std, (bool, np.bool_)):
+        out['reasons'].append('mean/std are boolean flags, not measurements')
+    else:
+        try:
+            _mean_f = float(mean)
+            _std_f = float(std)
+        except (TypeError, ValueError, OverflowError):
+            out['reasons'].append('mean/std are not numeric')
+        else:
+            if not (math.isfinite(_mean_f) and math.isfinite(_std_f) and _std_f >= 0.0):
+                out['reasons'].append('mean/std are not finite non-negative measurements')
+            elif not (abs(_mean_f) > _std_f):
+                out['reasons'].append('|mean| <= std: effect is within seed noise')
     # Leave-one-seed-out instability is a direct contradiction of a stable
     # directional effect: dropping one seed must not flip the sign.  Only
     # enforced when the caller supplied the diagnostic (old stats dicts do not
@@ -8754,13 +9068,35 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     if isinstance(_seed_driven, (bool, np.bool_)) and bool(_seed_driven):
         out['reasons'].append('leave-one-seed-out stability fails: dropping one seed flips the mean sign')
     if family_size is not None:
+        # A boolean flag or a non-integral number is not a declared family
+        # size.  int() would turn True into m=1 (the smallest possible family)
+        # or 4.9 into m=4, silently relaxing the correction instead of failing
+        # closed on malformed input.
+        _fs = None
+        if isinstance(family_size, (bool, np.bool_)):
+            out['reasons'].append(f'family_size {family_size!r} is a boolean flag, not a comparison count')
+        elif isinstance(family_size, numbers.Integral):
+            _fs = int(family_size)
+        elif isinstance(family_size, numbers.Real):
+            _f = float(family_size)
+            if math.isfinite(_f) and _f == math.floor(_f):
+                _fs = int(_f)
+            else:
+                out['reasons'].append(f'family_size {family_size!r} is not an integer comparison count')
+        else:
+            # Strings/other objects are not exact declared family sizes; do not
+            # coerce int('4') into a smaller family than the caller stated.
+            out['reasons'].append(f'family_size {family_size!r} is not an integer comparison count')
+        if _fs is not None and _fs <= 0:
+            out['reasons'].append(f'family_size {family_size!r} must be positive')
+            _fs = None
         try:
-            _fl = holm_min_attainable_p(n, int(family_size), alpha)
+            _fl = holm_min_attainable_p(n, _fs, alpha) if _fs is not None else None
         except Exception:
             _fl = None
         out['min_attainable_p_holm_family'] = _fl
         if _fl is not None and math.isfinite(_fl) and _fl > alpha:
-            out['reasons'].append(f'family of m={int(family_size)} at n={n} has minimum attainable Holm p {_fl:.4g} > alpha')
+            out['reasons'].append(f'family of m={_fs} at n={n} has minimum attainable Holm p {_fl:.4g} > alpha')
     out['allowed'] = not out['reasons']
     if out['allowed']:
         out['level'] = 'confirmatory' if str(evidence_level).lower() == 'confirmatory' else 'exploratory_significant'
@@ -8777,6 +9113,8 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
 def signflip_p_floor(n):
     """双侧精确符号翻转检验在 n 个种子下的最小可达 p 值（2/2^n）；
     n<=0 返回 NaN。用于报告「未显著是分辨率上限还是数据结论」。"""
+    if isinstance(n, (bool, np.bool_)):
+        return float('nan')
     try:
         n = int(n)
     except (TypeError, ValueError, OverflowError):
@@ -8937,10 +9275,11 @@ def exact_signflip_p(deltas):
     与残余风险（训练随机性进入种间方差、文档抽样进入 doc 层方差）。"""
     d_in = []
     for _x in (deltas if deltas is not None else []):
-        try:
-            d_in.append(float(_x))
-        except (TypeError, ValueError, OverflowError):
-            d_in.append(float('nan'))
+        # Use the shared scalar contract: booleans are flags, not paired
+        # effects.  float(True) == 1.0 would otherwise turn six flags into six
+        # identical "significant" deltas.
+        _f = _finite_scalar(_x)
+        d_in.append(_f if _f is not None else float('nan'))
     d = np.asarray([x for x in d_in if math.isfinite(x)], dtype=float)
     n = int(d.size)
     n_dropped = len(d_in) - n
@@ -8992,13 +9331,16 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     if n < 2:
         return None
     try:
-        nb = int(n_boot)
         c = float(conf)
     except (TypeError, ValueError, OverflowError):
         return None
+    nb = _as_seed_int(n_boot)
+    sd = _as_seed_int(seed)
+    if nb is None or sd is None or isinstance(conf, (bool, np.bool_)):
+        return None
     if nb < 20 or not (0.0 < c < 1.0):
         return None
-    rng = np.random.default_rng(int(seed))
+    rng = np.random.default_rng(sd)
     means = np.empty(nb, dtype=float)
     _chunk = 256
     for _off in range(0, nb, _chunk):
@@ -9022,9 +9364,12 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
     # correspondingly large index table: the seed-completion path can grow a
     # panel to hundreds/thousands of seeds and paired_effect_stats calls this
     # for every displayed contrast.
-    rng = np.random.default_rng(int(seed))
-    nb = int(n_boot)
-    means = np.empty(max(0, nb), dtype=float)
+    nb = _as_seed_int(n_boot)
+    sd = _as_seed_int(seed)
+    if nb is None or sd is None or nb < 2:
+        return None
+    rng = np.random.default_rng(sd)
+    means = np.empty(nb, dtype=float)
     chunk = 256
     for off in range(0, nb, chunk):
         m = min(chunk, nb - off)
@@ -9039,9 +9384,12 @@ def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=2026
                     if f is not None], dtype=float)
     if a.size < 2 or b.size < 2:
         return None
-    rng = np.random.default_rng(int(seed))
-    nb = int(n_boot)
-    diff = np.empty(max(0, nb), dtype=float)
+    nb = _as_seed_int(n_boot)
+    sd = _as_seed_int(seed)
+    if nb is None or sd is None or nb < 2:
+        return None
+    rng = np.random.default_rng(sd)
+    diff = np.empty(nb, dtype=float)
     chunk = 256
     for off in range(0, nb, chunk):
         m = min(chunk, nb - off)
@@ -9057,8 +9405,7 @@ def wilcoxon_signed_rank_p(deltas):
     """Two-sided Wilcoxon signed-rank p, exact over the integer rank-sum
     distribution for n<=200 and normal above that.  Reported as a SENSITIVITY
     check, not as a replacement for the sign-flip test: it assumes symmetric
-    paired differences, which the review correctly says is not guaranteed by
-    sharing a seed number.
+    paired differences, which is not guaranteed by sharing a seed number.
 
     Ranks are doubled so average ranks from ties stay integral; a 0/1 subset-
     sum DP then counts every sign assignment exactly in O(n * sum_ranks),
@@ -9204,7 +9551,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     if with_values is not None and without_values is not None:
         _unpaired_ci = unpaired_bootstrap_ci(with_values, without_values)
     _assumption = ('exact sign-flip is valid as a sign test under symmetric paired differences; '
-                   'same seed does NOT randomise the arm, and architecture-induced RNG/optimisation '
+                   'same seed does NOT randomise the arm, and architecture-induced RNG/training '
                    'differences are part of the arm. p is SEED-level, never token-level.')
     return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict,
             'unit': 'seed', 'assumption': _assumption, 'sign_counts': _sign,
@@ -9223,12 +9570,12 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
     最小可达 p_holm = min(1, m * 2/2^n)。若该值 > alpha，则该方案在构造上
     无法确认任何比较——这是分辨率上限，不是「保守的选择」，应当在读到
     任何测试数据之前修订（加种子 / 缩族 / 改检验），而不是事后再解释。"""
-    try:
-        n = int(n_seeds)
-        m = int(m_comparisons)
-    except (TypeError, ValueError, OverflowError):
-        return float('nan')
-    if n <= 0 or m <= 0:
+    # A seed/comparison count is an exact integer: int(12.9)=12 would make a
+    # plan look one seed larger than it is and could wrongly clear the
+    # resolution gate.  _as_seed_int also rejects booleans and lossy floats.
+    n = _as_seed_int(n_seeds)
+    m = _as_seed_int(m_comparisons)
+    if n is None or m is None or n <= 0 or m <= 0:
         return float('nan')
     return min(1.0, m * signflip_p_floor(n))
 
@@ -9245,17 +9592,173 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     returned n is descriptive only (the exact-test floor, not the data, bounds
     the p value), so the audit labels it resolution-limited instead of reading
     it as a null result."""
+    m = _as_seed_int(m_comparisons)
+    n_max = _as_seed_int(n_max)
+    if isinstance(alpha, (bool, np.bool_)):
+        return None
     try:
-        m = int(m_comparisons)
         a = float(alpha)
     except (TypeError, ValueError, OverflowError):
         return None
+    if m is None or n_max is None or m <= 0 or n_max <= 0:
+        return None
+    if not (math.isfinite(a) and 0.0 < a < 1.0):
+        return None
     if m <= 0 or not (0.0 < a < 1.0):
         return None
-    for n in range(1, int(n_max) + 1):
+    for n in range(1, n_max + 1):
         if holm_min_attainable_p(n, m, a) <= a + 1e-15:
             return n
     return None
+
+
+def global_multiplicity_audit(named_pvals, *, alpha=0.05,
+                              families=None, family_holm=None):
+    """Cross-PANEL multiplicity view over every comparison a report displays.
+
+    `attach_holm` / `holm_adjust` control the error rate INSIDE one panel's
+    family, but a report or a paper quotes many families, and "it was
+    significant in v7, v10 and v11" is itself a selection over every contrast
+    the project has displayed.  This audit is the machine-computed global
+    view over that larger family:
+
+      * Benjamini-Hochberg step-up q-values (FDR-controlled across panels);
+      * Bonferroni p*m (family-wise, the conservative bound);
+      * a per-comparison `global_status` that report prose must respect:
+          - 'globally_controlled'  : raw p < alpha AND BH-rejected AND
+                                     Bonferroni < alpha
+          - 'fdr_only'             : BH-rejected but Bonferroni >= alpha
+                                     (quote as FDR-controlled, never as
+                                     family-wise certain)
+          - 'family_only'          : raw p < alpha but not BH-rejected —
+                                     prose may not say "significant"
+                                     without the "not globally corrected"
+                                     qualifier
+          - 'not_significant'      : raw p >= alpha
+          - 'untestable'           : no valid p (counted in m with a p=1
+                                     slot, so a report cannot shrink the
+                                     global family by dropping a failed
+                                     comparison — the same fail-closed
+                                     convention as `holm_adjust`)
+
+    `named_pvals` is [(name, p), ...] or [(name, p, family), ...]; `families`
+    may carry one family label per entry (same order) and `family_holm` the
+    within-family Holm p per entry (used only for the display column, never
+    for the global decision).  Duplicate names are a hard error: two rows for
+    one comparison would double-count it in m.
+
+    The audit never forbids REPORTING a number; it only separates the wordings
+    a cross-panel quote is allowed to use, exactly like `reportable_claim`."""
+    if isinstance(alpha, (bool, np.bool_)):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
+    try:
+        a = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
+    if not (0.0 < a < 1.0):
+        raise ValueError(f'alpha must be in (0,1), got {alpha!r}')
+    entries = []
+    seen = set()
+    for i, item in enumerate(named_pvals if named_pvals is not None else []):
+        if not isinstance(item, (tuple, list)) or not 2 <= len(item) <= 3:
+            raise ValueError(f'global_multiplicity_audit: entry #{i} must be (name, p) or (name, p, family), got {item!r}')
+        name = str(item[0])
+        if name in seen:
+            raise ValueError(f'global_multiplicity_audit: duplicate comparison name {name!r} — two rows for one contrast would double-count it in m')
+        seen.add(name)
+        fam = item[2] if len(item) == 3 else None
+        entries.append({'name': name, 'p': item[1], 'family': (str(fam) if fam is not None else None)})
+    if families is not None:
+        fams = list(families)
+        if len(fams) != len(entries):
+            raise ValueError(f'global_multiplicity_audit: families length {len(fams)} does not match {len(entries)} comparisons')
+        for e, f in zip(entries, fams):
+            if f is not None:
+                e['family'] = str(f)
+    if family_holm is not None:
+        fh = list(family_holm)
+        if len(fh) != len(entries):
+            raise ValueError(f'global_multiplicity_audit: family_holm length {len(fh)} does not match {len(entries)} comparisons')
+        for e, h in zip(entries, fh):
+            e['p_holm_in_family'] = h
+    m = len(entries)
+    out = {'m': m, 'alpha': a, 'entries': [], 'untestable': [],
+           'wording_rule': ('a comparison with global_status="family_only" may be '
+                            'quoted as within-family significant but must carry the '
+                            '"not globally corrected" qualifier; only '
+                            '"globally_controlled" supports cross-panel significance '
+                            'wording; "fdr_only" supports FDR-controlled wording, '
+                            'not family-wise certainty')}
+    if m == 0:
+        out['summary'] = {'n_raw_significant': 0, 'n_bh_rejected': 0,
+                          'n_bonferroni_significant': 0, 'n_family_only': 0,
+                          'n_globally_controlled': 0, 'n_untestable': 0}
+        return out
+    pvals = []
+    for e in entries:
+        p = e['p']
+        valid = False
+        if p is not None and not isinstance(p, (bool, np.bool_)):
+            try:
+                pf = float(p)
+                valid = math.isfinite(pf) and 0.0 <= pf <= 1.0
+            except (TypeError, ValueError, OverflowError):
+                valid = False
+        if valid:
+            e['p_raw'] = pf
+        else:
+            e['p_raw'] = None
+            out['untestable'].append(e['name'])
+        pvals.append(e['p_raw'] if e['p_raw'] is not None else 1.0)
+    parr = np.asarray(pvals, dtype=float)
+    # Benjamini-Hochberg step-up q-values with the monotone min from the
+    # largest rank down, so q is non-decreasing in p and q_i <= q_j for
+    # p_i <= p_j (the standard BH q definition).
+    order = np.argsort(parr, kind='stable')
+    ranked = parr[order]
+    q_ranked = ranked * m / np.arange(1, m + 1, dtype=float)
+    for i in range(m - 2, -1, -1):
+        if q_ranked[i] > q_ranked[i + 1]:
+            q_ranked[i] = q_ranked[i + 1]
+    np.minimum(q_ranked, 1.0, out=q_ranked)
+    q = np.empty(m, dtype=float)
+    q[order] = q_ranked
+    # BH rejection set == {i : q_i <= alpha} (the defining property of BH
+    # q-values; q_i >= p_i always, so tied p values can never receive
+    # different verdicts and a p=1 slot is never rejected).
+    bh_rejected = q <= a + 1e-15
+    bonf = np.minimum(parr * m, 1.0)
+    n_raw = n_bh = n_bonf = n_famonly = n_global = 0
+    for i, e in enumerate(entries):
+        p_raw = e['p_raw']
+        rej_bh = bool(bh_rejected[i])
+        qv = float(q[i])
+        bv = float(bonf[i])
+        if p_raw is None:
+            status = 'untestable'
+        elif p_raw >= a:
+            status = 'not_significant'
+        elif rej_bh and bv < a:
+            status = 'globally_controlled'
+        elif rej_bh:
+            status = 'fdr_only'
+        else:
+            status = 'family_only'
+        e.update({'q_bh': qv, 'p_bonferroni': bv, 'bh_rejected': rej_bh,
+                  'global_status': status})
+        if p_raw is not None:
+            n_raw += int(p_raw < a)
+        n_bh += int(rej_bh and p_raw is not None)
+        n_bonf += int(p_raw is not None and bv < a)
+        n_famonly += int(status == 'family_only')
+        n_global += int(status == 'globally_controlled')
+        out['entries'].append(e)
+    out['summary'] = {'n_raw_significant': n_raw, 'n_bh_rejected': n_bh,
+                      'n_bonferroni_significant': n_bonf,
+                      'n_family_only': n_famonly,
+                      'n_globally_controlled': n_global,
+                      'n_untestable': len(out['untestable'])}
+    return out
 
 
 def _binom_cdf_half(n, m):
@@ -9298,17 +9801,19 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     下界，真实数据可能仍需更多同向种子。返回使 m·p(k) < alpha 的最小
     k；若全部 n 个同向仍不够，返回 None（方案不可能确认）。二项尾概率
     在 log 空间计算，因此大 n（规模扩展后的补种子计划）也不会整数溢出。"""
-    try:
-        n = int(n_seeds)
-        m = int(m_comparisons)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if n <= 0 or m <= 0:
+    # Exact integer counts only: truncating 12.9 to 12 would report a plan as
+    # feasible one seed before it actually is.
+    n = _as_seed_int(n_seeds)
+    m = _as_seed_int(m_comparisons)
+    if n is None or m is None or n <= 0 or m <= 0:
         return None
     best = None
     for k in range(n, -1, -1):
         p = 2.0 * _binom_cdf_half(n, n - k)
-        if m * p < alpha:
+        # Holm rejects at p_holm <= alpha, so the planning helper must use the
+        # same inclusive boundary.  A strict '<' would report a plan as
+        # impossible at the exact boundary that holm_adjust accepts.
+        if m * p <= alpha + 1e-15:
             best = k  # keep descending: p(k) grows monotonically as k shrinks,
             # so the last k that still clears the gate is the MINIMUM k
         else:
@@ -9329,6 +9834,8 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
     kmin = signflip_min_consistency(n_seeds, m_comparisons, alpha)
     if kmin is None or kmin <= 0:
         return 0.0 if kmin is None else 1.0
+    if isinstance(q, (bool, np.bool_)):
+        return 0.0
     try:
         n = int(n_seeds)
         q = float(q)
@@ -9365,10 +9872,20 @@ def tost_paired(deltas, margin, conf=0.90):
     d = np.asarray([f for f in (_finite_scalar(x) for x in (deltas if deltas is not None else []))
                     if f is not None], dtype=float)
     n = int(d.size)
-    out = {'n': n, 'margin': float(margin), 'conf': float(conf), 'equivalent': None,
+    _bad_option = (isinstance(margin, (bool, np.bool_))
+                   or isinstance(conf, (bool, np.bool_)))
+    try:
+        margin = float(margin)
+        conf = float(conf)
+    except (TypeError, ValueError, OverflowError):
+        margin, conf = float('nan'), float('nan')
+        _bad_option = True
+    out = {'n': n, 'margin': margin, 'conf': conf, 'equivalent': None,
            'method': 'paired-t (Student t, df=n-1; pre-registered margin required)'}
-    if n < 2 or not (margin > 0):
-        out['note'] = 'not decidable (n<2 or non-positive margin)'
+    if (_bad_option or n < 2 or not math.isfinite(margin) or margin <= 0
+            or not math.isfinite(conf) or not (0.0 < conf < 1.0)):
+        out['note'] = ('not decidable (n<2, non-positive/non-finite margin, '
+                       'or conf outside (0,1))')
         return out
     mean = float(d.mean())
     sd = float(d.std(ddof=1))
@@ -9405,7 +9922,12 @@ def tost_paired(deltas, margin, conf=0.90):
     out['p_hi'] = float(p_hi)
     out['p_lo'] = float(p_lo)
     out['p_tost'] = float(max(p_hi, p_lo))
-    out['equivalent'] = bool(p_hi < 0.05 and p_lo < 0.05)
+    # TOST decision level and the reported interval must agree.  A two-sided
+    # ``conf`` CI is the (1-conf)/2 one-sided test in each direction (conf=0.90
+    # -> alpha=0.05, the pre-registered G0 rule).
+    equiv_alpha = (1.0 - float(conf)) / 2.0
+    out['equiv_alpha'] = float(equiv_alpha)
+    out['equivalent'] = bool(p_hi < equiv_alpha and p_lo < equiv_alpha)
     out['ci_within_margin'] = bool(out['ci'][0] > -margin and out['ci'][1] < margin)
     return out
 
@@ -9578,12 +10100,18 @@ def paired_log_ratio(with_values, without_values, seeds=None):
     ss = list(range(len(wa))) if seeds is None else list(seeds)
     if len(ss) != len(wa):
         raise ValueError('paired_log_ratio seeds length %d does not match vectors length %d' % (len(ss), len(wa)))
-    if len(set(ss)) != len(ss):
+    if len({_seed_identity(x) for x in ss}) != len(ss):
         # Two rows for one seed are not independent observations; downstream
-        # means/SEs would silently double-count that seed.
+        # means/SEs would silently double-count that seed.  Compare the
+        # normalised identity so 0 and "0" (the same JSON seed) collide.
         raise ValueError('paired_log_ratio got duplicate seeds %r' % (ss,))
     effects, kept, dropped = [], [], []
     for s, a, b in zip(ss, wa, wb):
+        # Boolean flags are not PPL measurements.  float(True) would become
+        # PPL 1.0 and enter the log-ratio as a real observation.
+        if isinstance(a, (bool, np.bool_)) or isinstance(b, (bool, np.bool_)):
+            dropped.append(s)
+            continue
         try:
             fa, fb = float(a), float(b)
         except (TypeError, ValueError, OverflowError):
@@ -9599,7 +10127,16 @@ def paired_log_ratio(with_values, without_values, seeds=None):
 
 
 def _scale_points(points):
-    """Normalise [{label, scale, effects, seeds}] / [(scale, effects)] inputs."""
+    """Normalise [{label, scale, effects, seeds, corpus_fp?, vocab?}] /
+    [(scale, effects)] inputs.
+
+    `corpus_fp` (the composite data identity, e.g. the record's
+    `data_version`: dataset + tokenizer fit + train/val fingerprints) and
+    `vocab` are optional per-point provenance for the scale family: a
+    cross-scale effect (paired log PPL ratio) is only defined when every
+    scale point measured the SAME corpus and tokenizer — a mixed family must
+    be refused by the consumers (meta_analyze_effects / scaling_trend), not
+    pooled into a trend."""
     out = []
     for i, p in enumerate(points if points is not None else []):
         if isinstance(p, dict):
@@ -9607,10 +10144,14 @@ def _scale_points(points):
             scale = p.get('scale')
             label = p.get('label', i)
             seeds = p.get('seeds')
+            corpus_fp = p.get('corpus_fp')
+            vocab = p.get('vocab')
         elif isinstance(p, (tuple, list)) and len(p) >= 2:
             scale, eff = p[0], p[1]
             label = i
             seeds = p[2] if len(p) > 2 else None
+            corpus_fp = p[3] if len(p) > 3 else None
+            vocab = None
         else:
             continue
         if eff is None:
@@ -9632,16 +10173,76 @@ def _scale_points(points):
                     if f is not None]
             seeds_kept = [s for s, _v in keep]
             effects = [f for _s, f in keep]
-        if len(set(seeds_kept)) != len(seeds_kept):
+        if len({_seed_identity(x) for x in seeds_kept}) != len(seeds_kept):
             # A repeated seed would be counted as two independent observations
             # and shrink every within-scale SE in meta_analyze_effects; this
-            # must be a hard error, not silently "n looks larger".
+            # must be a hard error, not silently "n looks larger".  Normalise
+            # first so 0 and "0" from a JSON round-trip cannot slip through.
             raise ValueError('scale point %r: duplicate seeds %r' % (label, seeds_kept))
+        if isinstance(scale, (bool, np.bool_)):
+            raise ValueError('scale point %r: scale %r is a boolean flag, not a measurement'
+                             % (label, scale))
         try:
             sc = float(scale)
         except (TypeError, ValueError, OverflowError):
             sc = float('nan')
-        out.append({'label': str(label), 'scale': sc, 'effects': effects, 'seeds': seeds_kept})
+        if isinstance(corpus_fp, (bool, np.bool_)):
+            # A boolean flag is not a corpus/tokenizer identity; str(True)
+            # would compare equal across unrelated panels.
+            raise ValueError('scale point %r: corpus_fp=%r is a boolean flag, not a fingerprint'
+                             % (label, corpus_fp))
+        if vocab is not None:
+            # A tokenizer vocabulary is an exact positive count; int(True)=1
+            # or int(1.9)=1 would masquerade as a real vocabulary and could
+            # falsely satisfy the shared-tokenisation check.
+            vb = _as_seed_int(vocab)
+            if vb is None or vb <= 0:
+                raise ValueError('scale point %r: vocab %r is not a positive integer'
+                                 % (label, vocab))
+        else:
+            vb = None
+        out.append({'label': str(label), 'scale': sc, 'effects': effects, 'seeds': seeds_kept,
+                    'corpus_fp': (str(corpus_fp) if corpus_fp not in (None, '') else None),
+                    'vocab': vb})
+    return out
+
+
+def _scale_corpus_binding(pts):
+    """Shared-corpus/tokenizer attestation across scale points.
+
+    Returns a dict with `corpus_binding` in
+      * 'shared'    — every point carries the same corpus fingerprint
+      * 'mixed'     — >=2 fingerprints differ: cross-scale effects are not
+                      defined (different corpora/tokenizers), pooling must be
+                      refused
+      * 'unverifiable' — fewer than two points carry a fingerprint: the family
+                      MIGHT be mixed; absence of evidence is not attestation
+    plus `corpus_fps`, `vocabs` and a refusal reason when mixed."""
+    fps = [p.get('corpus_fp') for p in pts if p.get('corpus_fp')]
+    vbs = sorted({p.get('vocab') for p in pts if p.get('vocab') is not None})
+    out = {'corpus_fps': sorted(set(fps)), 'vocabs': vbs}
+    if len(fps) >= 2 and len(set(fps)) > 1:
+        out['corpus_binding'] = 'mixed'
+        out['refusal_reason'] = (
+            'the scale points do not share one corpus/tokenizer fingerprint '
+            f'({len(set(fps))} distinct); a paired log PPL ratio is only '
+            'defined within one tokenisation, so cross-scale pooling is '
+            'refused (report the scales separately)')
+    elif len(fps) == len(pts) and len(pts) > 0 and len(set(fps)) == 1:
+        out['corpus_binding'] = 'shared'
+    else:
+        out['corpus_binding'] = 'unverifiable'
+        out['refusal_reason'] = (
+            'the scale points carry no corpus/tokenizer fingerprint; '
+            'cross-scale pooling cannot be bound to one tokenisation and '
+            'stays unattested (add corpus_fp per point, e.g. the record '
+            'data_version)')
+    if len(vbs) > 1:
+        out['corpus_binding'] = 'mixed'
+        out['refusal_reason'] = (
+            f'the scale points declare {len(vbs)} different vocab sizes {vbs}; '
+            'PPL/log-ratios across different tokenisations are not comparable '
+            '(see design_notes §22)')
     return out
 
 
@@ -9668,6 +10269,10 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         d = np.asarray(p['effects'], dtype=float)
         n = int(d.size)
         row = {'label': p['label'], 'scale': p['scale'], 'n': n}
+        if p.get('corpus_fp'):
+            row['corpus_fp'] = p['corpus_fp']
+        if p.get('vocab') is not None:
+            row['vocab'] = p['vocab']
         if n:
             m = float(d.mean())
             sd = float(d.std(ddof=1)) if n > 1 else float('nan')
@@ -9682,7 +10287,16 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     usable = [r for r in per if r['n'] > 1 and math.isfinite(r.get('se', float('nan'))) and r['se'] > 0.0]
     out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'per_point': per,
            'n_points': len(per), 'n_usable': len(usable),
+           'corpus_binding': _scale_corpus_binding(pts),
            'convention': 'input effects are scale-free; positive = with arm worse (higher PPL)'}
+    if len(pts) >= 2 and out['corpus_binding']['corpus_binding'] == 'mixed':
+        # Log PPL ratios are only defined within ONE tokenisation; pooling
+        # across corpora/tokenizers is a units error, not a heterogeneity
+        # finding.  Per-scale rows stay in the output; the pooled claims go.
+        out.update({'status': 'refused_corpus_mismatch', 'poolable': False,
+                    'note': out['corpus_binding']['refusal_reason']
+                            + ' — per-scale effects are reported; pooled estimates are withheld'})
+        return out
     if not usable:
         out.update({'status': 'insufficient_within_scale_replication', 'poolable': False,
                     'note': 'every scale point has n<2 or zero within-scale variance; no random-effects weights can be formed'})
@@ -9728,12 +10342,17 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
     ss = list(range(len(a))) if seeds is None else list(seeds)
     if len(ss) != len(a):
         raise ValueError('scale_interaction seeds length does not match effects')
-    if len(set(ss)) != len(ss):
+    if len({_seed_identity(x) for x in ss}) != len(ss):
         # A repeated seed would enter paired_effect_stats as two independent
-        # observations and shrink the interaction SE.
+        # observations and shrink the interaction SE.  Normalise so 0 and
+        # "0" (the same JSON seed) collide.
         raise ValueError('scale_interaction got duplicate seeds %r' % (ss,))
     diff, kept = [], []
     for s, x, y in zip(ss, a, b):
+        # Boolean flags are not scale effects; reject them before float()
+        # turns them into 0/1 observations.
+        if isinstance(x, (bool, np.bool_)) or isinstance(y, (bool, np.bool_)):
+            continue
         try:
             fx, fy = float(x), float(y)
         except (TypeError, ValueError, OverflowError):
@@ -9776,10 +10395,18 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'min_points': int(min_points),
            'n_points': len(pts), 'labels': labels,
            'scales': [p['scale'] for p in pts],
+           'corpus_binding': _scale_corpus_binding(pts),
            'min_seeds_for_significance': signflip_min_n_for_holm(1, alpha),
            'convention': 'effects must be scale-free (e.g. paired log PPL ratio); positive = with arm worse'}
     if len(pts) < 2:
         out.update({'status': 'insufficient_points', 'verdict': 'insufficient_points'})
+        return out
+    if out['corpus_binding']['corpus_binding'] == 'mixed':
+        # A trend across scales that did not share one corpus/tokenizer is a
+        # units artefact, not a scaling law: the per-scale numbers may be
+        # reported, the slope may not.
+        out.update({'status': 'refused_corpus_mismatch', 'verdict': 'refused_corpus_mismatch',
+                    'note': out['corpus_binding']['refusal_reason']})
         return out
     x = np.asarray([math.log10(p['scale']) if log_scale else p['scale'] for p in pts], dtype=float)
     y = np.asarray([float(np.mean(p['effects'])) for p in pts], dtype=float)
@@ -9891,7 +10518,13 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     # is 2/2**n), and a two-point "trend" is a line even when the per-seed
     # exact test rejects.  Gate the README-level claim on the same thresholds
     # the rest of this function reports.
-    underpowered = bool(paired.get('underpowered')) if paired_primary else False
+    # The unpaired WLS fallback has no paired sign-flip test, but the
+    # pre-registered seed floor still applies: a ladder whose scale points each
+    # carry fewer than min_seeds observations is descriptive, however small the
+    # t-test p happens to be.
+    _unpaired_underpowered = any(len(p['effects']) < int(min_seeds) for p in pts)
+    underpowered = (bool(paired.get('underpowered')) if paired_primary
+                    else _unpaired_underpowered)
     too_few_scales = k < int(min_points)
     sig = bool(p_primary is not None and math.isfinite(float(p_primary)) and float(p_primary) < alpha
                and not resolution_limited and not underpowered and not too_few_scales)
@@ -9929,18 +10562,18 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
 
 
 def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
-    """Pre-flight audit of the scale ladder's budget and transfer assumptions.
+    """Pre-flight audit of the scale ladder's allocation and transfer assumptions.
 
     A width/depth comparison is not controlled if the larger model also saw a
-    different tokens-per-parameter budget or silently inherited an untested
+    different tokens-per-parameter allocation or silently inherited an untested
     learning-rate transfer.  This audit does not choose those values; it makes
-    them machine-checkable and persistent before a panel consumes GPU time.
+    them machine-checkable and persistent.
 
     `tiers` is a list of {name, cfg, params}: `cfg` carries steps / batch_size
     / seq_len / n_train_tokens / lr / warmup / seeds, `params` is the measured
-    parameter count (optional; without it the budget per parameter is
-    unverifiable).  A budget mismatch is a disclosure warning (a scale study
-    may deliberately change budget), never a silent "matched" claim.
+    parameter count (optional; without it the allocation per parameter is
+    unverifiable).  An allocation mismatch is a disclosure warning (a scale
+    study may deliberately change allocation), never a silent "matched" claim.
     """
     policy = dict(SCALE_TRANSFER_POLICY if policy is None else policy)
     tol = float(policy.get('tokens_per_param_tolerance', 0.25) if tolerance is None else tolerance)
@@ -9967,12 +10600,48 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         name = str(tier.get('name') or f'T{i}')
         cfg = tier.get('cfg') or {}
         row = {'name': name}
+        # Optional corpus/tokenizer provenance: the ladder's cross-tier
+        # contrasts (paired log PPL ratios, tokens-per-param) are only defined
+        # when every tier measured the SAME corpus and tokenisation.  A tier
+        # that carries no fingerprint is disclosed as unverifiable, never
+        # assumed to match.
+        for _fpk in ('corpus_fp', 'fit_fp', 'vocab'):
+            _v = cfg.get(_fpk)
+            if _v is None:
+                _v = tier.get(_fpk)
+            if _v is None:
+                continue
+            if _fpk == 'vocab':
+                # A tokenizer vocabulary is an exact positive count, not a
+                # boolean flag or a fractional value: int(True)=1 and
+                # int(2.9)=2 would masquerade as a real (and "shared")
+                # tokenisation.  Strings are refused too; a declared count
+                # must be a number, not a coercion target.
+                try:
+                    _v = _as_int(_v, 'vocab')
+                except (TypeError, ValueError, OverflowError):
+                    problems.append(f'{name}: vocab={_v!r} is not an integer')
+                    continue
+                if _v <= 0:
+                    problems.append(f'{name}: vocab={_v!r} must be positive')
+                    continue
+            elif isinstance(_v, (bool, np.bool_)):
+                # A boolean is a flag, not a corpus/tokenizer fingerprint;
+                # otherwise two unrelated tiers would look "shared".
+                problems.append(f'{name}: {_fpk}={_v!r} is a boolean, not a fingerprint')
+                continue
+            row[_fpk] = _v
         try:
             steps = _as_int(cfg['steps'], 'steps')
             batch = _as_int(cfg['batch_size'], 'batch_size')
             seq = _as_int(cfg['seq_len'], 'seq_len')
             declared_tokens = _as_int(cfg.get('n_train_tokens') or 0, 'n_train_tokens')
-            lr = float(cfg.get('lr'))
+            _lr_raw = cfg.get('lr')
+            if isinstance(_lr_raw, (bool, np.bool_)):
+                # A boolean is a flag, not a learning rate: float(True)=1.0
+                # would silently become a plausible (and finite) LR.
+                raise ValueError(f'lr={_lr_raw!r} is a boolean, not a number')
+            lr = float(_lr_raw)
             warmup = _as_int(cfg.get('warmup') or 0, 'warmup')
             seeds = [_as_int(s, 'seed') for s in (cfg.get('seeds') or [])]
         except (KeyError, TypeError, ValueError, OverflowError) as e:
@@ -10013,7 +10682,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             'min_seeds_for_family_significance': signflip_min_n_for_holm(int(policy.get('family_m', 4)), 0.05),
         })
         if params is None:
-            warnings.append(f'{name}: params missing — tokens-per-parameter and budget matching are unverifiable')
+            warnings.append(f'{name}: params missing — tokens-per-parameter and allocation matching are unverifiable')
         rows.append(row)
     if len(rows) >= 2:
         tpp = [r['tokens_per_param'] for r in rows if r.get('tokens_per_param')]
@@ -10026,14 +10695,14 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                 warnings.append(
                     'tokens-per-parameter is not matched across the ladder '
                     f'(max/min={tpp_ratio:.2f} > {1.0 + tol:.2f}); a cross-scale '
-                    'effect is confounded with a different exposure budget')
+                    'effect is confounded with a different exposure allocation')
         lrs = {r['lr'] for r in rows if r.get('lr') is not None}
         lr_constant = (len(lrs) == 1) if lrs else None
         _transfer = str(policy.get('lr_transfer') or '')
         if lr_constant and _transfer in ('', 'constant_declared_not_validated', 'constant_lr_not_validated'):
             warnings.append(
                 'learning rate is held constant across widths without a validated '
-                'transfer rule (policy=%r); scale contrasts carry an optimisation-'
+                'transfer rule (policy=%r); scale contrasts carry a training-'
                 'transfer confound, not a matched optimizer control' % _transfer)
         warm = [r['warmup_fraction'] for r in rows if r.get('warmup_fraction') is not None]
         warm_ratio = (max(warm) / min(warm)) if len(warm) == len(rows) and min(warm) > 0 else None
@@ -10045,17 +10714,44 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                 r['descriptive_only'] = bool(r['p_floor'] > 0.05)
                 r['seeds_sufficient_for_family'] = (
                     None if not feas else bool(r['n_seeds'] >= min(feas)))
+        # Corpus/tokenizer binding across the ladder: a MISMATCH is a hard
+        # problem (the cross-tier log-ratios the ladder exists to compute are
+        # not defined), while missing fingerprints stay a warning (the audit
+        # cannot attest, but old panels predate the field).
+        binding = {}
+        for _fpk, _what in (('corpus_fp', 'corpus fingerprint'),
+                            ('fit_fp', 'tokenizer-fit fingerprint'),
+                            ('vocab', 'vocab size')):
+            _vals = [r.get(_fpk) for r in rows if r.get(_fpk) is not None]
+            if len(_vals) >= 2 and len(set(map(str, _vals))) > 1:
+                problems.append(
+                    f'tiers do not share one {_what}: '
+                    + ', '.join(f'{r["name"]}={r[_fpk]!r}' for r in rows if r.get(_fpk) is not None)
+                    + ' — cross-tier PPL/log-ratio contrasts are not defined across '
+                      'different tokenisations/corpora; run each tier on the same '
+                      'corpus/tokenizer or report the tiers separately')
+                binding[_fpk] = 'mixed'
+            elif len(_vals) == len(rows) and len(rows) >= 2:
+                binding[_fpk] = 'shared'
+            elif len(_vals) >= 1:
+                binding[_fpk] = 'partial'
+                warnings.append(f'only {len(_vals)}/{len(rows)} tiers carry a {_what}; '
+                                'the cross-tier corpus binding is unverifiable for the rest')
+            else:
+                binding[_fpk] = 'unverifiable'
         out = {'status': ('fail' if problems else ('warn' if warnings else 'ok')),
                'budget_matched': (budget_matched if len(rows) >= 2 else None),
                'tokens_per_param_ratio': tpp_ratio,
                'tokens_per_param_tolerance': tol,
                'lr_constant': (lr_constant if len(rows) >= 2 else None),
                'lr_transfer_policy': policy.get('lr_transfer'),
+               'corpus_binding': binding,
                'tiers': rows, 'policy': policy,
                'problems': problems, 'warnings': warnings}
     else:
         warnings.append('fewer than two complete tiers — no cross-scale comparison can be checked')
         out = {'status': ('fail' if problems else 'warn'), 'budget_matched': None,
+               'corpus_binding': {},
                'tiers': rows, 'policy': policy, 'problems': problems,
                'warnings': warnings}
     return out
@@ -10076,6 +10772,8 @@ def loglog_regression(points, *, alpha=0.05):
         elif isinstance(p, (tuple, list)) and len(p) >= 2:
             x, y, label = p[0], p[1], i
         else:
+            continue
+        if isinstance(x, (bool, np.bool_)) or isinstance(y, (bool, np.bool_)):
             continue
         try:
             fx, fy = float(x), float(y)
@@ -10146,6 +10844,11 @@ def loglog_regression(points, *, alpha=0.05):
     return out
 
 
+def _mean_not_crossed(v):
+    """True only for a real boolean false (including numpy.bool_)."""
+    return isinstance(v, (bool, np.bool_)) and not bool(v)
+
+
 def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
                           d_spread_min=1.2):
     """Fit log10(crossover tokens) ~ log10(d_model) only when the points can
@@ -10163,7 +10866,7 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
     Refusal rules (each returns `status` + `reasons`, never a slope):
       * reconstructed trajectories are excluded outright;
       * any censored point refuses the fit (dropping it estimates the slope on
-        a selected, faster-crossing subset -- informative censoring);
+        a selected crossing subset -- informative censoring);
       * fewer than `min_points` distinct widths after de-duplication;
       * widths span less than `d_spread_min` (a degenerate x axis);
       * training volume is not comparable: max/min > 1 + volume_tol.  Scale
@@ -10194,6 +10897,11 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
         dur = e.get('d')
         tok = e.get('crossover_tokens')
         tr = e.get('train_tokens')
+        # Booleans are flags, not measured widths/token counts.  float(True)
+        # would otherwise become d=1 or a one-token training volume and enter
+        # the fit as a real point.
+        if any(isinstance(_x, (bool, np.bool_)) for _x in (dur, tok, tr) if _x is not None):
+            continue
         try:
             fd = float(dur)
             ftok = float(tok) if tok is not None else None
@@ -10205,7 +10913,7 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
         rows.append({'label': str(label), 'd': fd,
                      'crossover_tokens': (ftok if ftok is not None and math.isfinite(ftok) and ftok > 0.0 else None),
                      'train_tokens': (ftr if ftr is not None and math.isfinite(ftr) and ftr > 0.0 else None),
-                     'censored': bool(e.get('censored') or e.get('mean_crossed') is False)})
+                     'censored': bool(e.get('censored')) or _mean_not_crossed(e.get('mean_crossed'))})
     out = {'status': 'insufficient_points', 'n_input': len(rows),
            'claim_level': 'descriptive', 'min_points': int(min_points),
            'volume_tolerance': float(volume_tol), 'points': [], 'excluded': [],
@@ -10220,7 +10928,7 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
     out['incomplete_panels'] = missing
     if censored:
         out.update({'status': 'censored',
-                    'reasons': [f'{len(censored)} panel(s) never crossed inside their training window ({censored}); dropping them would fit the slope on the faster-crossing subset only. Report the censored positions as lower bounds or run longer, then refit.']})
+                    'reasons': [f'{len(censored)} panel(s) never crossed inside their training window ({censored}); dropping them would fit the slope on the crossing subset only. Report the censored positions as lower bounds or run longer, then refit.']})
         return out
     if missing:
         out.update({'status': 'incomplete',
@@ -10297,6 +11005,9 @@ def variant_presence(outdir):
     except Exception as e:
         print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — variant presence cannot be established')
         return out
+    if not isinstance(raw, dict):
+        print(f'[stats] WARNING: {sp} is valid JSON but not an object ({type(raw).__name__}) — variant presence cannot be established')
+        return out
     kept = {}
     refused = {}
     for _k, r in raw.items():
@@ -10364,13 +11075,34 @@ def _as_seed_int(v):
     if isinstance(v, numbers.Real):
         # np.float32/np.float64 are Real but not all are Python ``float``;
         # int() would silently truncate 1.5 to 1, turning an invalid seed
-        # into a different valid one.
+        # into a different valid one.  Above 2**53 a float cannot
+        # represent every integer, so accepting it would let a requested
+        # seed collapse to a different one (the same rule as
+        # normalize_seed_list).
         f = float(v)
-        return int(f) if math.isfinite(f) and f.is_integer() else None
+        if not (math.isfinite(f) and f.is_integer()):
+            return None
+        if abs(f) >= 2 ** 53:
+            return None
+        return int(f)
     try:
         return int(v)
     except (TypeError, ValueError, OverflowError):
         return None
+
+def _seed_identity(v):
+    """Normalise a seed id for duplicate/pairing checks.
+
+    JSON round-trips can leave the same seed as ``0`` or ``"0"``; raw set
+    membership treats those as distinct and would count one seed twice.  The
+    numeric normal form is used when available; non-numeric ids keep a typed
+    wrapper so ``True``/``1`` and other Python equality collisions stay
+    distinct.
+    """
+    n = _as_seed_int(v)
+    if n is not None:
+        return n
+    return ('__seed_id__', type(v).__name__, repr(v))
 
 def read_panel(outdir):
     sp = os.path.join(outdir, 'summary.json')
@@ -10380,6 +11112,9 @@ def read_panel(outdir):
         raw = json.load(open(sp, encoding='utf-8'))
     except Exception as e:
         print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — this panel is EXCLUDED')
+        return {}
+    if not isinstance(raw, dict):
+        print(f'[stats] WARNING: {sp} is valid JSON but not an object ({type(raw).__name__}) — this panel is EXCLUDED')
         return {}
     _legacy_ok = legacy_warm_tags(raw)
     _by_id = {}
@@ -10559,8 +11294,8 @@ BASELINE_TUNING_PROTOCOL = {
          'matched': ['full_rope'], 'mlp_match_ref': 'csa_fixed_rope',
          'method_arm': 'csa_fixed_rope'},
     ],
-    # Budget-matched intervention controls share the csa_fixed_rope recipe and
-    # training budget, so their equal-search evidence is inherited from the arm
+    # Allocation-matched intervention controls share the csa_fixed_rope recipe
+    # and training allocation, so their equal-search evidence is inherited from the arm
     # they intervene on.  The audit resolves coverage through this map.
     'inherits_tuning': {'csa_fixed_rope_randidx': 'csa_fixed_rope',
                         'csa_fixed_rope_allblocks': 'csa_fixed_rope'},
@@ -10801,6 +11536,50 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             problems.append(f'{arm}: no trial records')
             continue
         cfgs = [json.dumps(t.get('config') or {}, sort_keys=True, default=str) for t in trials if isinstance(t, dict)]
+        # The declared search range is part of the evidence: a "selected"
+        # smoothing value outside the protocol grid was never part of the
+        # equal-search comparison.
+        _arm_decl = (_declared.get(arm) if isinstance(_declared, dict) else None)
+        _arm_order = None
+        if isinstance(_arm_decl, dict) and _arm_decl.get('order') is not None:
+            try:
+                _arm_order = int(_arm_decl['order'])
+            except (TypeError, ValueError, OverflowError):
+                problems.append(f'{arm}: declared order is not an integer ({_arm_decl.get("order")!r})')
+        _grids = protocol.get('grids')
+        _grid = _grids.get(arm) if isinstance(_grids, dict) else None
+        if isinstance(_grid, dict):
+            for _ti, _t in enumerate(trials):
+                if not isinstance(_t, dict):
+                    continue
+                _cfg = _t.get('config')
+                if not isinstance(_cfg, dict):
+                    problems.append(f'{arm}: trial {_ti} has no config mapping')
+                    continue
+                if _arm_order is not None:
+                    try:
+                        _co = int(_cfg.get('order'))
+                    except (TypeError, ValueError, OverflowError):
+                        _co = None
+                    if _co is None:
+                        problems.append(f'{arm}: trial {_ti} has no integer order')
+                    elif _co != _arm_order:
+                        problems.append(f'{arm}: trial {_ti} order={_co} differs from the declared order={_arm_order}')
+                for _gk, _gvals in _grid.items():
+                    if not isinstance(_gvals, (list, tuple)) or not _gvals:
+                        continue
+                    if _gk not in _cfg:
+                        if _gk == 'interpolation' and _arm_order == 1:
+                            continue
+                        problems.append(f'{arm}: trial {_ti} is missing declared {_gk}')
+                        continue
+                    _gv = _finite_scalar(_cfg.get(_gk))
+                    _allowed = [_finite_scalar(x) for x in _gvals]
+                    if _gv is None or not any(_a is not None and abs(_gv - _a) <= 1e-12
+                                              for _a in _allowed):
+                        problems.append(
+                            f'{arm}: trial {_ti} {_gk}={_cfg.get(_gk)!r} is outside '
+                            f'the declared search grid {list(_gvals)!r}')
         chosen = entry.get('selected') or entry.get('selected_config')
         if not isinstance(chosen, dict):
             problems.append(f'{arm}: no selected config')
@@ -10835,13 +11614,13 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         for t in trials:
             if not isinstance(t, dict) or t.get('n_tokens') is None:
                 continue
-            try:
-                if isinstance(t.get('n_tokens'), (bool, np.bool_)):
-                    raise ValueError
-                nt.add(int(t.get('n_tokens')))
-            except (TypeError, ValueError, OverflowError):
-                problems.append(f'{arm}: trial n_tokens is not an integer ({t.get("n_tokens")!r})')
+            # Exact positive integer only: int(100.4) and int(100.9) both
+            # collapse to 100 and would hide unequal evaluation sizes.
+            _ntv = _as_seed_int(t.get('n_tokens'))
+            if _ntv is None or _ntv <= 0:
+                problems.append(f'{arm}: trial n_tokens is not an integer ({t.get("n_tokens")!r}); expected a positive integer')
                 break
+            nt.add(_ntv)
         if len(nt) > 1:
             problems.append(f'{arm}: trials evaluated different token counts {sorted(nt)} — PPLs are not comparable')
         n_tokens_by_arm[arm] = sorted(nt)
@@ -10971,7 +11750,7 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
         for key in _HYPOTHESIS_REQUIRED:
             val = spec.get(key)
             if key == 'predicted_sign':
-                if isinstance(val, bool) or val not in (-1, 0, 1):
+                if isinstance(val, (bool, np.bool_)) or val not in (-1, 0, 1):
                     issues.append(f'predicted_sign={val!r} (must be -1, 0 or 1)')
             elif not isinstance(val, str) or not val.strip():
                 issues.append(f'{key} is empty or not a string')
@@ -11061,8 +11840,35 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
             if y_pred is not None:
                 labels = np.unique(np.concatenate([labels, np.asarray(y_pred).ravel()]))
     labels = np.asarray(labels)
+    if labels.ndim != 1:
+        raise ValueError(f'labels must be a flat 1-D sequence, got shape {labels.shape}')
     if labels.size == 0:
         raise ValueError('classification_metrics needs at least one label')
+    def _label_identity(value):
+        try:
+            hash(value)
+        except TypeError:
+            return ('__unhashable__', type(value).__name__, repr(value))
+        return value
+    if len({_label_identity(v) for v in labels.tolist()}) != int(labels.size):
+        raise ValueError(f'labels contains duplicate class identifiers: {labels.tolist()}')
+    if y_score is not None:
+        try:
+            y_score = np.asarray(y_score, dtype=float)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError('y_score must be numeric (scores/probabilities)') from None
+        if not np.all(np.isfinite(y_score)):
+            # Ranking with a NaN/Inf score is not defined; treating it as an
+            # ordinary rank silently manufactures an AUC/AP from a failed
+            # prediction.  Refuse instead of reporting a corrupted metric.
+            raise ValueError('y_score contains NaN/Inf; ranking metrics require finite scores')
+        if y_score.ndim == 2:
+            _ncols = int(y_score.shape[1])
+            if _ncols != int(labels.size):
+                raise ValueError(
+                    f'y_score has {_ncols} score column(s) but labels has '
+                    f'{int(labels.size)} identit(ies); a column-per-label score '
+                    'matrix must name exactly one label per column')
     pos = None
     if labels.size == 2:
         if positive_label is None:
@@ -11106,13 +11912,18 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
         per_class[str(lab)] = {'precision': precision, 'recall': recall, 'f1': f1, 'support': support}
         all_f1s.append(f1)
+        # Balanced accuracy / macro recall are also averages over the full
+        # REQUESTED label set.  A label absent from y_true (but requested, or
+        # present only in y_pred) has recall 0, not "not applicable": dropping
+        # it made a constant predictor on a two-label endpoint score balanced
+        # accuracy 1.0 instead of 0.5.
+        rs.append(recall)
         total_tp += tp
         total_fp += fp
         total_fn += fn
         if support:
             supports.append(support)
             f1s.append(f1)
-            rs.append(recall)
     micro_f1 = 2 * total_tp / max(2 * total_tp + total_fp + total_fn, 1)
     # Macro averages over the requested label set (zero-support labels count
     # as 0, as in sklearn), so a rare class cannot be dropped from the macro
@@ -11234,10 +12045,15 @@ def metric_policy_audit(summary=None, policy=None):
             for key in ('prevalence', 'positive_prevalence'):
                 val = r.get(key)
                 if isinstance(val, dict) and len(val) == 2:
-                    prevalence = min(float(x) for x in val.values())
-                    break
+                    # A malformed prevalence entry is unverifiable, not a
+                    # reason to abort the whole audit.  Only finite values in
+                    # [0, 1] define a class prevalence.
+                    _pv = [_finite_scalar(x) for x in val.values()]
+                    if all(v is not None and 0.0 <= v <= 1.0 for v in _pv):
+                        prevalence = min(_pv)
+                        break
                 _prev_f = _finite_scalar(val)
-                if _prev_f is not None:
+                if _prev_f is not None and 0.0 <= _prev_f <= 1.0:
                     prevalence = min(_prev_f, 1.0 - _prev_f)
                     break
             if task in classify_tasks and prevalence is not None and prevalence < 1e-3:
@@ -11412,6 +12228,11 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             if isinstance(_ppls, dict) and _trial_ppl is not None:
                 _vals = [f for f in (_finite_scalar(v) for v in _ppls.values())
                          if f is not None]
+                if len(_vals) != len(_ppls):
+                    # Dropping a NaN/Inf draw changes which seeds the trial
+                    # was actually selected on; it is a broken measurement,
+                    # not a valid mean over the surviving subset.
+                    problems.append(f'{arm}: trial seed_ppls contains non-finite values')
                 if _vals:
                     _m = float(np.mean(_vals))
                     if abs(_m - _trial_ppl) > 1e-9 * max(1.0, abs(_m)):
@@ -11422,9 +12243,19 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                         except (TypeError, ValueError, OverflowError):
                             problems.append(f'{arm}: trial ppl_std is not numeric ({t.get("ppl_std")!r})')
                         else:
-                            _s = float(np.std(_vals, ddof=1))
-                            if abs(_s - _reported_sd) > 1e-9 * max(1.0, abs(_s)):
-                                problems.append(f'{arm}: trial ppl_std is not the sample std of its per-seed values')
+                            if not math.isfinite(_reported_sd):
+                                problems.append(f'{arm}: trial ppl_std is not finite ({t.get("ppl_std")!r})')
+                            else:
+                                _s = float(np.std(_vals, ddof=1))
+                                if abs(_s - _reported_sd) > 1e-9 * max(1.0, abs(_s)):
+                                    problems.append(f'{arm}: trial ppl_std is not the sample std of its per-seed values')
+        if len(_set) > 1:
+            # Trials inside ONE arm must compare the same seed draws.  Equal
+            # arm-level sets cannot fix a within-arm mismatch: its selected
+            # config was still chosen on a different noise realisation.
+            problems.append(
+                f'{arm}: its trials used different search-seed sets '
+                f'{sorted(_set)} — the trial comparison is not equal-search')
         if _set:
             search_seed_sets[arm] = _set
         if declared and any(c not in declared for c in cfgs):
@@ -11444,7 +12275,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         _steps = {v[0] for v in by_cfg.values() if v[0] is not None}
         _toks = {v[1] for v in by_cfg.values() if v[1] is not None}
         if len(_steps) > 1:
-            problems.append(f'{arm}: trials used different step budgets {sorted(_steps)}')
+            problems.append(f'{arm}: trials used different step allocations {sorted(_steps)}')
         if len(_toks) > 1:
             problems.append(f'{arm}: trials saw different token counts {sorted(_toks)}')
         chosen = entry.get('selected') or entry.get('selected_config')
@@ -11495,13 +12326,13 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                     problems.append(f'{arm}: selected trial is not the maximum-{metric} trial')
     if signatures:
         if len(set(signatures.values())) != 1:
-            problems.append('arms did not search the same trial grid — tuning budgets are unequal')
+            problems.append('arms did not search the same trial grid — tuning allocations are unequal')
         if len(set(n_trials.values())) != 1:
-            problems.append('arms did not receive the same number of tuning trials — tuning budgets are unequal')
+            problems.append('arms did not receive the same number of tuning trials — tuning allocations are unequal')
     # Equal tuning includes equal SEARCH SEEDS.  If one arm selected on seeds
     # {0} and another on {0,1,2}, their selection noise differs even though the
     # lr grid is identical.  Only trials that expose their seed set are
-    # checkable; legacy artifacts without it stay on the untested path.
+    #     checkable; artifacts without it stay on the untested path.
     search_seed_balanced = None
     search_seeds_seen = None
     _declared_ss = protocol.get('search_seeds')
@@ -11572,6 +12403,11 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     # checked; this makes the overlap visible either way).
     final_seed_coverage = {}
     if final_records:
+        _bad_final_seeds = [s for s in (final_seeds or [])
+                            if _as_seed_int(s) is None]
+        if _bad_final_seeds:
+            problems.append(
+                f'declared final_seeds contain non-integer values {_bad_final_seeds!r}')
         for arm, entry in arms.items():
             chosen = entry.get('selected') or entry.get('selected_config') or {}
             hits = [(k, r) for k, r in final_records.items()
@@ -11592,6 +12428,17 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 _miss = sorted(_need - set(_seeds))
                 if _miss:
                     problems.append(f'{arm}: final records miss declared seeds {_miss}')
+                # Extra records are just as damaging as missing ones: a
+                # resumed/merged panel could carry an older seed that is not
+                # in the declared final partition, inflating n while the
+                # artifact still claims the pre-registered seed set.  Without
+                # this check the coverage sets can agree on the extra seed and
+                # the audit reports tuning_verified=True.
+                _extra = sorted(set(_seeds) - _need)
+                if _extra:
+                    problems.append(
+                        f'{arm}: final records include undeclared seed(s) '
+                        f'{_extra} outside final_seeds {sorted(_need)}')
             for _k, r in hits:
                 hp = r.get('hyperparams') or {}
                 for _kn in ('lr', 'weight_decay', 'warmup'):
@@ -11629,7 +12476,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         elif _final_family_floor is not None and final_min_seed_count < _final_family_floor:
             warnings.append(f'{final_min_seed_count} final seeds per arm cannot reach a Holm-corrected p<0.05 for {max(1, len(arms) - 1)} tuned contrast(s) (needs n>={_final_family_floor}); the tuned contrast is resolution-limited, not a null')
     # Coverage: an arm is covered either by its own tuned record or by the arm
-    # whose recipe it inherits (budget-matched intervention controls).
+    # whose recipe it inherits (allocation-matched intervention controls).
     _inherits = protocol.get('inherits_tuning') or {}
     coverage = {a: a for a in arms}
     for _arm, _ref in _inherits.items():
@@ -11755,7 +12602,7 @@ def _knobs_equal_across_arms(recs, arms, key):
             if key in r and r.get(key) is not None:
                 vals.append(json.dumps(r.get(key), sort_keys=True, default=str))
                 break
-            # keep scanning this arm: a legacy/first record without the key
+            # keep scanning this arm: an early record without the key
             # must not mask a later record that does record it.
     if len(vals) < 2:
         return None
@@ -11794,7 +12641,7 @@ def _setting_control(vals_by_arm, *, check_within_arm=True):
 
     Returns `equal` (True/False/None), every arm's distinct values, the arms
     whose own seeds disagree (mixed protocol inside one arm), and arms with
-    no value.  `equal=None` means unverifiable (legacy record), never a pass.
+    no value.  `equal=None` means unverifiable (record without the key), never a pass.
     """
     arms = list(vals_by_arm)
     nonempty = {a: v for a, v in vals_by_arm.items() if v}
@@ -11812,6 +12659,31 @@ def _setting_control(vals_by_arm, *, check_within_arm=True):
     return {'equal': equal, 'within_arm_mixed': mixed, 'missing_arms': missing,
             'values': {a: sorted(v) for a, v in nonempty.items()}}
 
+def _setting_missing_records(recs, arms, getter):
+    """Per-arm count of records whose descriptor is absent/unreadable."""
+    out = {a: 0 for a in arms}
+    for (v, _t, _s), r in recs.items():
+        if v in out and getter(r) is None:
+            out[v] += 1
+    return out
+
+
+def _apply_within_arm_missing(ctl, missing, totals):
+    """A partially recorded descriptor is unverifiable, not controlled.
+
+    Dropping a record with no `run_cfg` from the value set would let the
+    remaining (identical) records call the arm controlled even though one
+    seed's protocol cannot be checked at all.
+    """
+    bad = sorted(a for a in totals
+                 if 0 < missing.get(a, 0) < totals.get(a, 0))
+    if bad:
+        ctl['within_arm_missing'] = bad
+        if ctl['equal'] is True:
+            ctl['equal'] = None
+    return ctl
+
+
 def controlled_variables_report(recs, arms):
     """Per-component controlled-variable audit across ALL seed records.
 
@@ -11823,14 +12695,30 @@ def controlled_variables_report(recs, arms):
     `run_cfg_equal` / `train_knobs_equal` keys and adds the detail.
     """
     arms = sorted(set(arms))
-    run_cfg = _setting_control(_setting_values(
-        recs, arms, lambda r: _canon_setting(r.get('run_cfg'))))
-    train_knobs = _setting_control(_setting_values(
-        recs, arms, lambda r: _canon_setting(r.get('train_knobs'))))
+    _totals = {a: sum(1 for (v, _t, _s) in recs if v == a) for a in arms}
+
+    def _cfg_get(r):
+        return _canon_setting(r.get('run_cfg'))
+
+    def _knobs_get(r):
+        return _canon_setting(r.get('train_knobs'))
+
+    def _hp_get(r, k):
+        hp = r.get('hyperparams')
+        return _canon_setting(hp.get(k)) if isinstance(hp, dict) else None
+
+    run_cfg = _apply_within_arm_missing(
+        _setting_control(_setting_values(recs, arms, _cfg_get)),
+        _setting_missing_records(recs, arms, _cfg_get), _totals)
+    train_knobs = _apply_within_arm_missing(
+        _setting_control(_setting_values(recs, arms, _knobs_get)),
+        _setting_missing_records(recs, arms, _knobs_get), _totals)
     hyper = {}
     for key in _CONTROL_HYPER_KEYS:
-        hyper[key] = _setting_control(_setting_values(
-            recs, arms, lambda r, k=key: _canon_setting((r.get('hyperparams') or {}).get(k))))
+        _get = lambda r, k=key: _hp_get(r, k)
+        hyper[key] = _apply_within_arm_missing(
+            _setting_control(_setting_values(recs, arms, _get)),
+            _setting_missing_records(recs, arms, _get), _totals)
     hp_checked = [k for k, v in hyper.items()
                   if any(v['values'].get(a) for a in arms)]
     hp_diffs = [k for k in hp_checked if hyper[k]['equal'] is False]
@@ -11845,6 +12733,10 @@ def controlled_variables_report(recs, arms):
         hp_equal = True
     mixed = sorted(set(run_cfg['within_arm_mixed']) | set(train_knobs['within_arm_mixed'])
                    | {a for k in hp_checked for a in hyper[k]['within_arm_mixed']})
+    missing_records = sorted(
+        set(run_cfg.get('within_arm_missing', []))
+        | set(train_knobs.get('within_arm_missing', []))
+        | {a for k in hp_checked for a in hyper[k].get('within_arm_missing', [])})
     diff_values = {}
     for key, ctl in (('run_cfg', run_cfg), ('train_knobs', train_knobs)):
         if ctl['equal'] is False:
@@ -11886,6 +12778,7 @@ def controlled_variables_report(recs, arms):
         'hyperparams_equal': hp_equal,
         'controlled': controlled,
         'within_arm_mixed': mixed,
+        'within_arm_missing': missing_records,
         'differences': diff_values,
         'checked_hyperparam_keys': sorted(hp_checked),
         'hyperparam_differences': hp_diffs,
@@ -11898,11 +12791,12 @@ def _params_of_arm(recs, arm):
     for (v, _t, _s), r in recs.items():
         if v != arm:
             continue
-        p = r.get('params')
-        try:
-            return int(p)
-        except (TypeError, ValueError, OverflowError):
-            continue
+        # Parameter counts are exact integers.  int(1.5) would silently turn a
+        # corrupted count into a different, apparently valid one, and bool is
+        # not a count.
+        p = _as_seed_int(r.get('params'))
+        if p is not None and p > 0:
+            return p
     return None
 
 def _param_control(recs, a, b):
@@ -11935,7 +12829,7 @@ def _param_breakdown_of_arm(recs, arm):
 def _param_control_detail(recs, a, b):
     """Capacity breakdown for a pair: total as well as non-embedding and
     active parameters.  Returns `{}` when neither record exposes the detail,
-    so legacy records are not silently labelled controlled."""
+    so records without it are not silently labelled controlled."""
     out = {'total_rel_diff': None, 'total_controlled': None,
            'non_embedding_rel_diff': None, 'non_embedding_controlled': None,
            'active_rel_diff': None, 'active_controlled': None,
@@ -11949,7 +12843,9 @@ def _param_control_detail(recs, a, b):
         return out
 
     def _num(d, key):
-        return _finite_scalar(d.get(key))
+        # Breakdown entries are exact parameter counts; a fractional value is
+        # corrupted provenance, not a measurement to compare with 1%.
+        return _as_seed_int(d.get(key))
     for key, label in (('non_embedding', 'non_embedding'), ('active', 'active')):
         va, vb = _num(ba, key), _num(bb, key)
         if va is None or vb is None:
@@ -11961,13 +12857,13 @@ def _param_control_detail(recs, a, b):
     return out
 
 def _compute_control_detail(recs, a, b, *, tolerance=0.25):
-    """Measured compute budget of a pair, not just its step count.
+    """Measured compute allocation of a pair, not just its step count.
 
     Equal `steps`/`tokens_seen` is enforced by `pair_reason`, but that is not
     equal compute: the parameter-matched dense arm widens its MLP (+69%) and
     reads every token, while a sparse arm reads a fraction of the blocks.  The
-    review's fairness requirement needs the mismatch *shown*, and its
-    DIRECTION matters: if the arm with more measured compute also wins, the
+    mismatch must be *shown*, and its DIRECTION matters: if the arm with more
+    measured compute also wins, the
     comparison is confounded in favour of the claim; if it loses, the claim is
     conservative.
 
@@ -11983,13 +12879,15 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
         for (v, _t, _s), r in recs.items():
             if v != arm or not isinstance(r, dict):
                 continue
-            tt, tok = r.get('train_time_s'), r.get('tokens_seen')
-            if isinstance(tt, (int, float)) and isinstance(tok, (int, float)) and tt > 0 and tok > 0:
+            tt, tok = _finite_scalar(r.get('train_time_s')), _as_seed_int(r.get('tokens_seen'))
+            if tt is not None and tok is not None and tt > 0 and tok > 0:
                 tpt.append(float(tt) / float(tok))
-            p = r.get('params')
-            if isinstance(p, (int, float)) and p > 0:
+            # Parameter and token counts are exact integers; bool/fractional
+            # values must not silently become a compute ratio.
+            p = _as_seed_int(r.get('params'))
+            if p is not None and p > 0:
                 par.append(float(p))
-                if isinstance(tok, (int, float)) and tok > 0:
+                if tok is not None and tok > 0:
                     prox.append(float(p) * float(tok))
         med = (lambda xs: float(np.median(xs)) if xs else None)
         return med(tpt), med(par), med(prox)
@@ -12031,8 +12929,11 @@ def _holm_assign(entries, m_family, alpha, out_key):
     named = []
     for i, e in enumerate(entries):
         p = e.get('p_exact_signflip')
-        if isinstance(p, (int, float)) and math.isfinite(float(p)):
-            named.append((str(i), float(p)))
+        if (isinstance(p, (bool, np.bool_))
+                or not isinstance(p, (int, float))
+                or not math.isfinite(float(p))):
+            continue
+        named.append((str(i), float(p)))
     m_eff = max(int(m_family), len(entries), len(named))
     for j in range(m_eff - len(named)):
         named.append((f'__missing_{j}', 1.0))
@@ -12071,9 +12972,9 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
                           advantage claim;
     system_level_only   — significant after correction, but every significant
                           contrast is confounded by a different training
-                          objective or by a compute budget that favours the
+                          objective or by a compute allocation that favours the
                           claimed winner (`mechanism_claim_allowed=False`).
-                          This is a real performance difference, not evidence
+                          This is a genuine measured difference, not evidence
                           for the isolated mechanism;
     measured            — a controlled contrast exists with n >= min_n, but no
                           corrected significance;
@@ -12377,7 +13278,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                         report.setdefault('objective_confounded', []).append(
                             '%s vs %s: %s — same run_cfg but different actual loss/optimizer objective; '
                             'the contrast is a system-level comparison, not an isolated mechanism' % (a, b, '; '.join(_obj_bad)))
-                    # Compute-budget control.  Equal tokens is
+                    # Compute-allocation control.  Equal tokens is
                     # not equal compute.  Report the measured mismatch and its
                     # direction; only a mismatch that FAVOURS the claimed winner
                     # downgrades the contrast, because the reverse is conservative.
@@ -12394,7 +13295,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                             st['mechanism_claim_allowed'] = False
                             report.setdefault('compute_confounded', []).append(
                                 '%s vs %s: the arm that wins by %.2f PPL also consumed about %.2fx the compute (%s); '
-                                'the performance difference is not separable from the compute difference'
+                                'the measured difference is not separable from the compute difference'
                                 % (a, b, abs(float(st['mean'])), float(st['compute_ratio']), _cc.get('compute_matched_source')))
                     if _a_vals and _b_vals:
                         _a_mean = float(np.mean(_a_vals))
@@ -12854,7 +13755,7 @@ def _print_methodology_audit(report):
             continue
         _cv = report.get('controlled_variables', {}).get(comp, {})
         _kn = _cv.get('train_knobs_equal')
-        _kn_s = {True: 'optimizer/schedule knobs shared', False: 'OPTIMIZER/SCHEDULE KNOBS DIFFER', None: 'optimizer/schedule knobs not recorded (legacy or absent)'}[_kn]
+        _kn_s = {True: 'optimizer/schedule knobs shared', False: 'OPTIMIZER/SCHEDULE KNOBS DIFFER', None: 'optimizer/schedule knobs not recorded (absent)'}[_kn]
         print('  [%s]  %s; arms=%s' % (comp, _kn_s, ','.join(_cv.get('arms_present') or []) or 'none'))
         for e in live:
             _c = 'controlled (same run_cfg)' if e['controlled'] else ('UNCONTROLLED: ' + '; '.join(e['skipped_reasons']))
@@ -12890,7 +13791,7 @@ def _print_methodology_audit(report):
     if report.get('resolution_limited_components'):
         print('  resolution-limited (non-noise effect, but the family-corrected p floor > alpha at this n; need n>=%s — add seeds, do NOT read as a null): ' % str((_fam.get('min_seeds_for_family_significance') or '?')) + ', '.join(report['resolution_limited_components']))
     if report.get('system_level_only_components'):
-        print('  SYSTEM-LEVEL ONLY (significant but the objective/compute budget favours the claimed winner): ' + ', '.join(report['system_level_only_components']))
+        print('  SYSTEM-LEVEL ONLY (significant but the objective/compute allocation favours the claimed winner): ' + ', '.join(report['system_level_only_components']))
     if report.get('noise_level_components'):
         print('  noise-level (effect within seed noise across all contrasts): ' + ', '.join(report['noise_level_components']))
     if report.get('underpowered_components'):
@@ -12959,8 +13860,12 @@ def normalize_seed_list(seeds, *, default=(0,)):
     """
     if seeds is None:
         seeds = list(default)
-    elif isinstance(seeds, (int, np.integer)) and not isinstance(seeds, bool):
+    elif isinstance(seeds, (bool, np.bool_)):
+        raise ValueError(f'seed must be an integer, got boolean {seeds!r}')
+    elif isinstance(seeds, numbers.Real):
         seeds = [seeds]
+    elif isinstance(seeds, np.ndarray) and seeds.ndim == 0:
+        seeds = [seeds.item()]
     elif isinstance(seeds, (str, bytes)):
         seeds = seeds.decode().split() if isinstance(seeds, bytes) else seeds.replace(',', ' ').split()
     out = []
@@ -12968,8 +13873,14 @@ def normalize_seed_list(seeds, *, default=(0,)):
     for raw in seeds:
         if isinstance(raw, (bool, np.bool_)):
             raise ValueError(f'seed must be an integer, got boolean {raw!r}')
-        if isinstance(raw, (float, np.floating)) and not float(raw).is_integer():
-            raise ValueError(f'seed must be an integer, got non-integral {raw!r}')
+        if isinstance(raw, (float, np.floating)):
+            _rf = float(raw)
+            if not _rf.is_integer():
+                raise ValueError(f'seed must be an integer, got non-integral {raw!r}')
+            if abs(_rf) >= 2 ** 53:
+                # Above 2**53 a float cannot represent every integer; the
+                # requested seed may silently collapse to a different seed.
+                raise ValueError(f'seed {raw!r} exceeds the exact float-integer range (2**53); pass an int')
         try:
             s = int(raw)
         except (TypeError, ValueError, OverflowError):
@@ -13004,7 +13915,7 @@ def normalize_variant_list(variants):
 
 def set_seed(seed):
     """Seed every RNG that can affect a run: Python ``random``, NumPy's
-    legacy global RNG, PyTorch's CPU RNG and every CUDA device, plus the
+    global RNG, PyTorch's CPU RNG and every CUDA device, plus the
     Python hash seed (best effort for child processes).  Returns the integer
     seed so callers can record exactly what was used.  torch's deterministic
     algorithm / cuDNN switches are pinned at the same time, so two runs with
@@ -13012,9 +13923,16 @@ def set_seed(seed):
     seed = int(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     random.seed(seed)
-    np.random.seed(seed)
+    # NumPy's global RNG only accepts [0, 2**32-1], while the panel planner
+    # deliberately preserves exact Python integers beyond that (and negative
+    # ids).  Fold only out-of-range ids into the RNG's domain so a planned
+    # panel can actually start; in-range seeds keep their exact stream.
+    np_seed = seed if 0 <= seed < 2 ** 32 else seed % (2 ** 32)
+    np.random.seed(np_seed)
     _attb_bump_epoch()
-    torch.manual_seed(seed)
+    # torch accepts the signed/unsigned 64-bit range; fold anything larger.
+    torch_seed = seed if -(2 ** 63) <= seed < 2 ** 64 else seed % (2 ** 64)
+    torch.manual_seed(torch_seed)
     _pin_cpu_threads()
     # Pin the backend determinism switches on CPU too: the cuDNN flags are
     # inert without CUDA, while CSA_DETERMINISTIC must still enable torch's
@@ -13024,8 +13942,8 @@ def set_seed(seed):
     if torch.cuda.is_available():
         # manual_seed already covers all devices; the explicit current-device
         # call documents the contract and is harmless.
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed(torch_seed)
+        torch.cuda.manual_seed_all(torch_seed)
     # TensorFlow is not a dependency of this repo, but a future/embedded
     # TensorFlow path must not become an unseeded RNG source.  Only touch it
     # when the user has already imported it (never import TensorFlow here:
@@ -13203,7 +14121,7 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
     """Explicit audit of every RNG source a reproducible run depends on.
 
     `reproducibility_check` proves that a short TRAINING stream repeats; this
-    check is cheaper and more direct: it enumerates the seed contract itself
+    check is direct: it enumerates the seed contract itself
     (Python, NumPy, PyTorch CPU, every CUDA device, an already-imported
     TensorFlow, the DataLoader generator and the DataLoader worker hook), runs
     it twice with the same seed and once with a different seed, and verifies
@@ -13412,7 +14330,17 @@ def _jsonable(v):
     if isinstance(v, np.ndarray):
         return _jsonable(v.tolist())
     if isinstance(v, np.generic):
-        return v.item()
+        # longdouble.item() returns another NumPy scalar; convert through the
+        # scalar kind so JSON serialisation cannot recurse or leak a
+        # non-serialisable object.
+        if isinstance(v, np.bool_):
+            return bool(v)
+        if isinstance(v, np.integer):
+            return int(v)
+        if isinstance(v, np.floating):
+            return float(v)
+        item = v.item()
+        return _jsonable(item) if not isinstance(item, np.generic) else str(item)
     if isinstance(v, (str, int, float, bool)) or v is None:
         return v
     return str(v)
@@ -13581,7 +14509,13 @@ def experiment_provenance(cfg, *, train_ids=None, val_batch=None, vocab=None):
         data['val_sequences'] = int(np.asarray(val_batch).shape[0])
         data['val_fp'] = _ids_fp(_vb)
     if vocab is not None:
-        data['vocab_size'] = int(vocab)
+        # The vocabulary is part of the data identity: int(True)=1 and
+        # int(8192.9)=8192 would label a different token space under a valid
+        # looking data_version.
+        _vb = _as_seed_int(vocab)
+        if _vb is None or _vb <= 0:
+            raise ValueError(f'experiment_provenance: vocab must be a positive integer, got {vocab!r}')
+        data['vocab_size'] = _vb
     _extra = cfg.get('data_extra')
     if isinstance(_extra, dict):
         # Synthetic/task-specific generators (NIAH recipe, corruption modes)
@@ -13653,7 +14587,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
 
     def _evidence_for_this_panel(doc, path, what):
         """Only evidence stamped with THIS panel's run_cfg may enter the
-        manifest.  A run_cfg-less (legacy/hand-written) doc must say
+        manifest.  A run_cfg-less (hand-written) doc must say
         ``legacy: true`` explicitly; otherwise a stale pre-flight from a reused
         outdir could silently certify a new configuration."""
         if doc is None:
@@ -13664,9 +14598,9 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         _rc = doc.get('run_cfg')
         if _rc is None:
             if doc.get('legacy') is True:
-                print(f'[track] WARNING: {what} evidence ({path}) has no run_cfg and is explicitly marked legacy — embedding it as unverified legacy evidence')
+                print(f'[track] WARNING: {what} evidence ({path}) has no run_cfg and is explicitly marked as imported — embedding it as unverified evidence')
                 return doc
-            print(f'[track] WARNING: {what} evidence ({path}) has NO run_cfg — refusing to embed it (it cannot be tied to this panel; mark legacy=True only for a deliberately imported old record)')
+            print(f'[track] WARNING: {what} evidence ({path}) has NO run_cfg — refusing to embed it (it cannot be tied to this panel; mark legacy=True only for a deliberately imported record)')
             return None
         if _rc != run_cfg:
             print(f'[track] WARNING: {what} evidence ({path}) belongs to a DIFFERENT run_cfg ({_rc!r} != {run_cfg!r}) — not embedding it in this panel (a stale pre-flight must not certify a new config)')
@@ -13770,22 +14704,29 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
     _seed_ok = 0
     for _key, _c in cells.items():
         try:
-            _expected = int(str(_key).rsplit('::seed', 1)[1])
-        except (ValueError, IndexError):
+            _expected = _as_seed_int(str(_key).rsplit('::seed', 1)[1])
+        except IndexError:
+            _expected = None
+        if _expected is None:
             _seed_mismatch.append(_key)
             continue
         _hp = _c.get('hyperparams') if isinstance(_c.get('hyperparams'), dict) else {}
         _rng = _hp.get('rng') if isinstance(_hp.get('rng'), dict) else {}
-        try:
-            _vals = [int(_hp.get('seed'))] if _hp.get('seed') is not None else []
-            if _hp.get('data_seed') is not None:
-                _vals.append(int(_hp.get('data_seed')))
-            _vals.extend(int(_rng[k]) for k in ('python', 'numpy', 'torch', 'cuda', 'tensorflow',
-                                                'data', 'dataloader_generator') if _rng.get(k) is not None)
-            _ok = (bool(_c.get('seed') is not None) and int(_c.get('seed')) == _expected
-                   and all(v == _expected for v in _vals))
-        except (TypeError, ValueError, OverflowError):
-            _ok = False
+        _vals = [x for x in (_as_seed_int(_hp.get('seed')),
+                             _as_seed_int(_hp.get('data_seed'))) if x is not None]
+        _rng_keys = ('python', 'numpy', 'torch', 'cuda', 'tensorflow',
+                     'data', 'dataloader_generator')
+        _vals.extend(x for x in (_as_seed_int(_rng.get(k)) for k in _rng_keys
+                                 if _rng.get(k) is not None) if x is not None)
+        # Exact integer identity only: int(0.9) == 0 would make a mis-keyed
+        # fractional seed look like the declared seed 0.
+        _rec_seed = _as_seed_int(_c.get('seed'))
+        _hp_seeds_ok = all(_as_seed_int(_hp.get(k)) is not None
+                           for k in ('seed', 'data_seed') if _hp.get(k) is not None)
+        _rng_seeds_ok = all(_as_seed_int(_rng.get(k)) is not None
+                            for k in _rng_keys if _rng.get(k) is not None)
+        _ok = (_rec_seed == _expected and _hp_seeds_ok and _rng_seeds_ok
+               and all(v == _expected for v in _vals))
         if _ok:
             _seed_ok += 1
         else:
@@ -14181,8 +15122,7 @@ class _PrefixStats:
     """Diagnostics for the open-block (current-prefix) reading path.
 
     Accumulates per-query quantities only when the caller enables block stats
-    (the validation/eval report), so training keeps its fast path.  Nothing
-    here is a loss term or a model input.
+    (the validation/eval report).  Nothing here is a loss term or a model input.
     """
 
     def __init__(self):
@@ -14238,9 +15178,8 @@ class _PrefixStats:
             self.n_seq += 1
             self.age_sum += float(age.sum().item())
             self.age_max = max(self.age_max, int(age.max().item()))
-            # Ages are exact integers; int32 halves the retained diagnostic
-            # memory versus the int64 device dtype (the summary casts to
-            # float32 only when computing the quantiles).
+            # Ages are exact integers; store the diagnostic values as int32
+            # (the summary casts to float32 only when computing the quantiles).
             self.age_p95.append(age.detach().to(torch.int32).cpu())
             self.outside_len_sum += float(outside_len.sum().item())
             self.outside_nonzero += int((outside_len > 0).sum().item())
@@ -15148,7 +16087,7 @@ def training_knobs_fingerprint(*, amp_dtype='auto', eager_batch='auto'):
     per-record `train_knobs` copy, which `pair_reason` checks at analysis
     time.  Putting this digest in the resume fingerprint makes a changed
     descriptor invalidate earlier cells just like a changed lr.
-    Unset/legacy fingerprints simply decode without a `tk` field.
+    Unset fingerprints simply decode without a `tk` field.
     """
     if amp_dtype == 'auto' and eager_batch == 'auto':
         _knobs = training_knobs()
@@ -15229,8 +16168,13 @@ _CURVE_SIDECAR_INLINE_PPL = 4096
 
 
 def _curve_sidecar_rel(key):
+    # The readable prefix is for humans; the digest makes the mapping
+    # injective.  Replacing every unsafe character with '_' alone collided
+    # (a#1 and a@1 both became a_1), letting one cell overwrite another's
+    # curves.
     safe = ''.join(ch if (ch.isalnum() or ch in '._:-') else '_' for ch in str(key))
-    return f'curves/{safe}.json'
+    digest = hashlib.sha1(str(key).encode('utf-8')).hexdigest()[:16]
+    return f'curves/{safe}-{digest}.json'
 
 
 def _write_cell_curve(outdir, key, rec):
@@ -15300,7 +16244,7 @@ def distributed_info():
 
     Initialises the default process group on first use when ``WORLD_SIZE > 1``
     and no group exists yet.  Single-process runs return ``(0, 1, False)`` and
-    never touch torch.distributed, so the historical path is unchanged."""
+    never touch torch.distributed."""
     if not torch.distributed.is_available():
         return (0, 1, False)
     if torch.distributed.is_initialized():
@@ -15341,16 +16285,16 @@ def _amp_requested():
 def _active_amp(device=None):
     """The autocast dtype the training path uses on ``device``.
 
-    The fp32 path is the historical, bitwise-stable one; AMP only applies on
-    CUDA.  Keeping this helper separate lets `training_knobs()` record the
-    concrete choice on a CPU analysis box (None) without pretending that a
-    GPU job ran in fp32."""
+    The fp32 path is the bitwise-stable one; AMP only applies on CUDA.
+    Keeping this helper separate lets `training_knobs()` record the concrete
+    choice on a CPU analysis box (None) without pretending that a GPU job ran
+    in fp32."""
     if device is None:
         device = DEVICE
     if getattr(device, 'type', str(device)) != 'cuda':
         return None
     _amp = _amp_requested()
-    # v11.128: bf16 is requested unconditionally on CUDA, but pre-Ampere
+    # bf16 is requested unconditionally on CUDA, but pre-Ampere
     # GPUs (V100/T4) cannot run it.  Failing here with a clear message beats
     # training under a silently different numerical path and then having the
     # frozen confirmation binding reject or mis-certify every record.
@@ -15416,7 +16360,7 @@ def _resolve_impl_modes(cfg=None, *, device=None):
     else:
         eb = bool(_normalise_eager_batch(eb_raw))
         if eb and device is not None and not _eager_batch_active(device, cfg.get('batch_size')):
-            raise RuntimeError(f'run config requires eager_batch={eb!r} but device={device}/backend cannot provide the batched CUDA twin; pass eager_batch=false or fix the runtime instead of silently changing the implementation')
+            raise RuntimeError(f'run config requires eager_batch={eb!r} but device={device}/backend cannot provide the batched CUDA twin; pass eager_batch=false or correct the runtime instead of silently changing the implementation')
     return amp, bool(eb)
 
 
@@ -15491,6 +16435,40 @@ class _HashingWriter:
 
     def __getattr__(self, name):
         return getattr(self._f, name)
+
+
+def _safe_path_component(value):
+    """A single safe filename component (no separators / traversal)."""
+    s = ''.join(ch if (ch.isalnum() or ch in '._-') else '_' for ch in str(value))
+    return s or '_'
+
+
+def ckpt_file_name(variant, seed, tag):
+    """Checkpoint filename built from a variant/seed/tag.
+
+    The variant comes from user config; without sanitisation a value like
+    ``../escape`` or ``/tmp/escape`` escapes ``ckpt_dir``.  Keep the normal
+    names unchanged while making the component a single safe path element.
+    The seed uses the same exact-integer contract as the panel plan: a
+    boolean, a fractional float, or a float above 2**53 is refused rather
+    than silently truncated to a different checkpoint identity."""
+    seed_i = _as_seed_int(seed)
+    if seed_i is None:
+        raise ValueError(f'ckpt_file_name: seed must be an exact integer, got {seed!r}')
+    return (f'{_safe_path_component(variant)}_seed{seed_i}_'
+            f'{_safe_path_component(tag)}.pt')
+
+
+def direct_ckpt_name(variant, seed):
+    """Tagless per-cell checkpoint name used by the length/probe drivers.
+
+    Sanitise the variant and require an exact seed so a user-supplied arm name
+    cannot escape ``ckpt_dir`` or truncate a fractional seed into another
+    cell's checkpoint.  Normal names are unchanged."""
+    seed_i = _as_seed_int(seed)
+    if seed_i is None:
+        raise ValueError(f'direct_ckpt_name: seed must be an exact integer, got {seed!r}')
+    return f'{_safe_path_component(variant)}_seed{seed_i}.pt'
 
 
 def _atomic_torch_save(obj, path, hash_out=None):
@@ -15617,9 +16595,8 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
                              warmup=1, iters=3):
     """Batch x sequence-length latency/throughput sweep on ONE checkpoint.
 
-    `measure_efficiency` answers "how fast is this one input"; a claim that an
-    architecture is cheaper needs the shape dependence too (batch 1 vs 8,
-    short vs long).  CUDA timings use events (so kernel launch is included but
+    `measure_efficiency` answers "how long this one input takes"; the sweep
+    adds the shape dependence (batch 1 vs 8, short vs long).  CUDA timings use events (so kernel launch is included but
     host-side jitter is not); CPU timings use perf_counter.  The output records
     the device, torch/triton versions and TF32 state so two rows are only
     compared when they were measured under the same conditions.
@@ -15746,7 +16723,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     # the same per-element IEEE op chain as the single-tensor form (lerp /
     # addcmul / sqrt are elementwise, so every element sees the identical
     # rounding sequence), so the update is bit-identical to the single-tensor
-    # form, and on CUDA it pins the already-default foreach path.
+    # form.
     opt = torch.optim.AdamW([{'params': decay_params, 'weight_decay': weight_decay, 'lr_scale': 1.0}, {'params': ndecay_params, 'weight_decay': 0.0, 'lr_scale': 1.0}, {'params': delta_params, 'weight_decay': 0.0, 'lr_scale': delta_lr_mult}], lr=lr, betas=OPT_ADAMW_BETAS, eps=OPT_ADAMW_EPS, foreach=True)
     if delta_params:
         print(f'    delta_logit params: {len(delta_params)} (lr x{delta_lr_mult:g})')
@@ -15775,8 +16752,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             _fixed_eval = None
     _diag_stride = max(1, int(diag_every) if diag_every else max(1, int(steps) // 1000))
     # Lightweight token-range/shape checks stay at roughly every 1% of the run
-    # (plus step 0 and any post-anomaly window), not once per 1024 steps: a
-    # single corrupted window can poison all later checkpoints.
+    # (plus step 0 and any post-anomaly window): a single corrupted window can
+    # poison all later checkpoints.
     _token_check_every = max(1, int(steps) // 100)
     _diag = {'step': [], 'ce': [], 'total_loss': [], 'comp_reg': [], 'boundary_pg': [],
              'grad_norm_pre_clip': [], 'update_norm': [], 'lr': [], 'clipped': [],
@@ -15853,14 +16830,15 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         if tag == 'final' and _save_mode not in ('final', 'both'):
             return
         try:
-            path = os.path.join(ckpt_dir, f'{variant}_seed{seed}_{tag}.pt')
+            path = os.path.join(ckpt_dir, ckpt_file_name(variant, seed, tag))
             _h = classify_training_health(_health_history)
             _checkpoints[tag] = _save_analysis_checkpoint(path, _inner_model, {
                 'variant': variant, 'seed': seed, 'step': step_no,
                 'val_ppl': val_ppl, 'train_ce': train_ce, 'health': _h,
                 'extra': {'train_fp': _ids_fp(train_ids),
                           'eval_fp': _ids_fp(np.ascontiguousarray(np.asarray(val_batch)).reshape(-1)) if val_batch is not None else None,
-                          'rng_fp': _rng_fp, 'params': int(n_param),
+                          'rng_fp': _rng_fp, 'init_core_fp': _init_core_fp,
+                          'params': int(n_param),
                           'open_block_config': open_block_config(_inner_model)}})
             print(f'  [ckpt] saved {tag} checkpoint {path} (step={step_no}, val_ppl={val_ppl})')
         except Exception as _se:
@@ -16278,7 +17256,7 @@ def _lm_batch_metrics(model, x, y, vocab, chunk=64, ignore_index=None):
 
     With ``ignore_index`` set, both the loss and the accuracy are reduced over
     the valid targets only (the same denominator the caller's training loss
-    uses).  The historical non-masked path keeps its exact reduction order.
+    uses).  The non-masked path keeps its exact reduction order.
     """
     was_training = model.training
     model.eval()
@@ -16372,7 +17350,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             b = 'position:last10%'
         return b
 
-    # Vectorised bucket accumulation: one bincount per chunk.
+    # Vectorised bucket accumulation.
     _bucket_names = ['position:first10%', 'position:10-50%', 'position:50-90%',
                      'position:last10%', 'target:rare(<=5 train occurrences)',
                      'target:common', 'target:boundary-token']
@@ -16403,8 +17381,8 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                 n_nonfinite += int((~finite).sum())
             ce_safe = torch.where(finite, ce_f, torch.zeros_like(ce_f))
             row_nll += ce_safe.double().sum(dim=1).cpu().numpy()
-            # Entropy from one log_softmax table (no separate softmax/log
-            # copies); top-k works directly on the fp32 logits.
+            # Entropy from one log_softmax table; top-k works directly on the
+            # fp32 logits.
             lg_work = lg.float()
             logp = torch.log_softmax(lg_work, dim=-1)
             ent = -(logp * logp.exp()).sum(-1)
@@ -16913,7 +17891,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     elif not loss_decreased:
         report['diagnosis'] = 'loss did not decrease on the fixed batch (optimizer/step or graph is not wired through)'
     elif _label_shift_required and not _label_shift_ok:
-        report['diagnosis'] = 'labels are not the next-token shift of the inputs (label construction/order bug)'
+        report['diagnosis'] = 'labels are not the next-token shift of the inputs (label construction/order fault)'
     elif _initial_chance_required and not _initial_near_chance:
         report['diagnosis'] = 'initial loss is far from log(vocab) (wrong label map, vocabulary mismatch or broken initialisation)'
     elif _batch_contract is False:
@@ -17448,8 +18426,8 @@ class TimeGuard:
         Geometry alone is too coarse on the B-tier ladder: a dense full-attention
         arm and a sparse CSA arm with the same shapes can differ by a large
         factor, so one shared rate would systematically under- or over-book
-        cells.  `variant=None` keeps the historical geometry-only key used by
-        the v7-v12 drivers, so existing state files stay valid."""
+        cells.  `variant=None` keeps the geometry-only key used by the v7-v12
+        drivers, so existing state files stay valid."""
         base = str((int(d), int(n_layers), int(seq_len), int(batch_size)))
         return base if variant is None else f'{base}|{variant}'
 
@@ -17519,10 +18497,10 @@ class TimeGuard:
             return True  # 无法判定（非 posix 等）时按存活处理，绝不误退
 
     def reconcile(self):
-        """Refund per-token bookings whose recording process is no longer
-        alive (crash/kill recovery).  Old state files without a `bookings`
-        map are untouched: their `booked_seconds` is preserved as
-        `booked_untracked` once any tokenised booking coexists."""
+        """Refund per-token bookings whose recording process is not alive
+        (crash/kill recovery).  State files without a `bookings` map are
+        untouched: their `booked_seconds` is preserved as `booked_untracked`
+        once any tokenised booking coexists."""
         try:
             import fcntl
         except ImportError:
@@ -17760,6 +18738,8 @@ def _tag_of(rec):
     return ''
 
 def legacy_warm_tags(summary):
+    if not isinstance(summary, dict):
+        return {}
     _legacy = {}
     for key, rec in summary.items():
         if not isinstance(rec, dict) or 'seed' not in rec or 'ppl' not in rec:
@@ -17795,12 +18775,11 @@ def record_tag(rec, key, legacy_ok):
 
 def _group_params(recs):
     for r in recs:
-        v = r.get('params')
-        if v is not None:
-            try:
-                return int(v)
-            except (TypeError, ValueError, OverflowError):
-                continue
+        # Exact positive integer counts only: int(True)=1 and int(1.5)=1 are
+        # not a measured parameter count.
+        v = _as_seed_int(r.get('params'))
+        if v is not None and v > 0:
+            return v
     return None
 
 def _pooled_ppl_from_records(recs):
@@ -17812,8 +18791,11 @@ def _pooled_ppl_from_records(recs):
     `nll_sum`/`n_tokens` cannot be pooled and fall back explicitly."""
     nlls, nts = [], []
     for r in recs:
-        nll, nt = _finite_scalar(r.get('nll_sum')), _finite_scalar(r.get('n_tokens'))
-        if nll is None or nt is None or nt <= 0:
+        nll = _finite_scalar(r.get('nll_sum'))
+        # Token counts are exact positive integers: int(4.9) would change
+        # the pooled denominator without changing the reported n_tokens.
+        nt = _as_seed_int(r.get('n_tokens'))
+        if nll is None or nt is None or nt <= 0 or nll < 0.0:
             return None, None, None
         nlls.append(nll)
         nts.append(nt)
@@ -17850,11 +18832,23 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
         ntok = r.get('n_tokens_per_row')
         if not isinstance(nll, list) or not isinstance(ntok, list) or len(nll) != len(ntok) or not nll:
             return None
-        rows.append((np.asarray(nll, dtype=float), np.asarray(ntok, dtype=float)))
+        _nll, _ntok = [], []
+        for _a, _b in zip(nll, ntok):
+            _fa, _fb = _finite_scalar(_a), _finite_scalar(_b)
+            if (_fa is None or _fb is None or _fa < 0.0 or _fb < 0.0 or _fb != math.floor(_fb)):
+                return None
+            _nll.append(_fa)
+            _ntok.append(_fb)
+        rows.append((np.asarray(_nll, dtype=float), np.asarray(_ntok, dtype=float)))
     if len({len(a) for a, _ in rows}) != 1:
         return None
     R = len(rows[0][0])
-    if R == 0:
+    if R < 2:
+        # Resampling ONE document always reproduces the same pooled PPL, so a
+        # percentile interval would be [ppl, ppl] — false certainty rather
+        # than a document-sampling uncertainty estimate.  The combined
+        # seed x document helper already reports R<2 as unverifiable; keep the
+        # standalone helper consistent instead of inventing a zero-width CI.
         return None
     nll_mat = np.stack([a for a, _ in rows], axis=0)          # [S, R]
     ntok_mat = np.stack([b for _, b in rows], axis=0)         # [S, R]
@@ -17862,8 +18856,7 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     nll_col = nll_mat.sum(axis=0)
     ntok_col = ntok_mat.sum(axis=0)
     vals = np.empty(int(n_boot), dtype=float)
-    # Multinomial bootstrap counts: a single [chunk, R] count matrix is reused
-    # across draws.
+    # Multinomial bootstrap counts drawn in [chunk, R] blocks.
     _chunk = 256
     _b = 0
     while _b < int(n_boot):
@@ -17882,7 +18875,151 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     lo, hi = np.percentile(vals, [2.5, 97.5])
     return [float(lo), float(hi)]
 
+def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
+    """Two-level (seed x document) uncertainty disclosure for the pooled PPL.
+
+    The seed-level interval (`ppl_ci95_seed_t`) answers "how much does
+    TRAINING noise move the number"; the document bootstrap
+    (`ppl_ci95_doc_bootstrap`) answers "how much does the EVALUATION SUBSET
+    move it".  Neither alone bounds the reported pooled PPL, because both
+    sources act at once — a small seed CI next to a wide doc CI is not a
+    precise measurement.  This helper estimates both components on the
+    log-PPL scale (PPL is multiplicative; the interval is exponentiated back
+    at the end) and combines them as independent variance sources:
+
+      se_seed  = std_s(log pooled_ppl_s, ddof=1) / sqrt(S)
+      se_doc   = bootstrap SD of the log pooled PPL over document resamples
+      se_combined = sqrt(se_seed^2 + se_doc^2)
+      ci95     = exp(mean_s log pooled_ppl_s  +-  t_{S-1, conf} * se_combined)
+
+    The component ratio is reported too: it says whether precision is bought
+    by more seeds or by more evaluation documents, which is the actionable
+    question a small-n panel faces.  This is a disclosed two-source
+    approximation, not a fitted hierarchical random-effects model; when a
+    component is unmeasurable (S<2, records without per-row NLL, or fewer
+    than two scored documents) the status says so explicitly and the missing
+    component is never silently treated as zero."""
+    rows = []
+    for r in recs:
+        nll = r.get('nll_per_row')
+        ntok = r.get('n_tokens_per_row')
+        if not isinstance(nll, list) or not isinstance(ntok, list) or len(nll) != len(ntok) or not nll:
+            rows = None
+            break
+        _nll, _ntok = [], []
+        for _a, _b in zip(nll, ntok):
+            _fa, _fb = _finite_scalar(_a), _finite_scalar(_b)
+            if (_fa is None or _fb is None or _fa < 0.0 or _fb < 0.0 or _fb != math.floor(_fb)):
+                rows = None
+                break
+            _nll.append(_fa)
+            _ntok.append(_fb)
+        if rows is None:
+            break
+        rows.append((np.asarray(_nll, dtype=float), np.asarray(_ntok, dtype=float)))
+    if isinstance(rows, list):
+        if len({len(a) for a, _ in rows}) != 1:
+            rows = None
+    if isinstance(rows, list):
+        nll_mat = np.stack([a for a, _ in rows], axis=0)          # [S, R]
+        ntok_mat = np.stack([b for _, b in rows], axis=0)          # [S, R]
+        keep = ntok_mat.sum(axis=0) > 0
+        n_dropped = int((~keep).sum())
+        nll_mat = nll_mat[:, keep]
+        ntok_mat = ntok_mat[:, keep]
+        if not np.isfinite(nll_mat).all() or not np.isfinite(ntok_mat).all() or (ntok_mat < 0).any():
+            rows = None
+    out = {'status': 'unverifiable', 'n_seeds': len(recs), 'n_docs': None,
+           'n_docs_dropped_zero_token': None,
+           'se_seed_logppl': None, 'se_doc_logppl': None,
+           'se_combined_logppl': None, 'ci95_ppl': None,
+           'component_ratio_seed_over_doc': None, 'conf': float(conf),
+           'method': 'two-source variance combination on log-PPL (seed training noise x evaluation-document bootstrap); approximation, not a fitted hierarchical model'}
+    S = len(recs)
+    if S < 1:
+        return out
+    # Seed-level component: per-seed pooled PPL over the SAME doc set.
+    # log(PPL) is the pooled cross-entropy (NLL per token), so the seed-level
+    # values are ``per_tok`` itself.
+    seed_logppl = None
+    if rows is not None:
+        per_tok = nll_mat.sum(axis=1) / np.maximum(ntok_mat.sum(axis=1), 1e-30)
+        ok = np.isfinite(per_tok) & (per_tok > 0)
+        if ok.sum() == S and S >= 2:
+            lp = per_tok
+            seed_logppl = lp
+            out['se_seed_logppl'] = float(lp.std(ddof=1) / math.sqrt(S))
+            out['n_docs'] = int(nll_mat.shape[1])
+            out['n_docs_dropped_zero_token'] = n_dropped
+        elif ok.sum() == S:
+            out['n_docs'] = int(nll_mat.shape[1])
+            out['n_docs_dropped_zero_token'] = n_dropped
+    # Doc-level component: bootstrap SD of log pooled PPL over doc resamples
+    # (seed-pooled NLL/ntok columns, the same pooled estimator the doc CI
+    # uses, taken on the log scale).
+    if rows is not None and nll_mat.shape[1] >= 2:
+        rng = np.random.default_rng(int(seed))
+        nll_col = nll_mat.sum(axis=0)
+        ntok_col = ntok_mat.sum(axis=0)
+        R = int(nll_mat.shape[1])
+        draws = np.empty(int(n_boot), dtype=float)
+        _chunk = 256
+        _b = 0
+        while _b < int(n_boot):
+            _nb = min(_chunk, int(n_boot) - _b)
+            counts = rng.multinomial(R, np.full(R, 1.0 / R, dtype=float), size=_nb)
+            nt = counts @ ntok_col
+            nn = counts @ nll_col
+            with np.errstate(divide='ignore', invalid='ignore'):
+                # log(PPL) = pooled CE = NLL/tokens.
+                lp_draw = np.where(nt > 0, nn / np.maximum(nt, 1e-30), np.nan)
+                lp_draw = np.where(np.isfinite(lp_draw) & (lp_draw > 0), lp_draw, np.nan)
+            draws[_b:_b + _nb] = lp_draw
+            _b += _nb
+        draws = draws[np.isfinite(draws)]
+        if draws.size >= max(20, int(0.5 * n_boot)):
+            sd = float(draws.std(ddof=1))
+            if sd < 1e-12:
+                # Identical documents: the bootstrap SD is pure float noise.
+                # Report the component as exactly zero so the ratio field is
+                # not a 1e16 number that reads like a measurement.
+                sd = 0.0
+            out['se_doc_logppl'] = sd
+            if out['n_docs'] is None:
+                out['n_docs'] = R
+                out['n_docs_dropped_zero_token'] = n_dropped
+    if out['se_seed_logppl'] is None and out['se_doc_logppl'] is None:
+        out['status'] = 'unverifiable'
+        return out
+    if out['se_seed_logppl'] is None:
+        out['status'] = 'seed_component_unverifiable'
+        return out
+    if out['se_doc_logppl'] is None:
+        out['status'] = 'doc_component_unverifiable'
+        return out
+    se_s = out['se_seed_logppl']
+    se_d = out['se_doc_logppl']
+    out['se_combined_logppl'] = float(math.sqrt(se_s * se_s + se_d * se_d))
+    if se_d > 0:
+        out['component_ratio_seed_over_doc'] = float(se_s / se_d)
+    try:
+        tc = _t_critical(float(conf), S - 1)
+    except Exception:
+        tc = None
+    if tc is not None and math.isfinite(tc):
+        m = float(seed_logppl.mean())
+        out['ci95_ppl'] = [float(math.exp(m - tc * out['se_combined_logppl'])),
+                           float(math.exp(m + tc * out['se_combined_logppl']))]
+        out['status'] = 'ok'
+    else:
+        out['status'] = 'ci_unavailable'
+    return out
+
 def aggregate(summary):
+    if not isinstance(summary, dict):
+        raise ValueError(
+            f'aggregate() needs a summary object (variant/cell -> record), got '
+            f'{type(summary).__name__}; a list/scalar cannot be aggregated as a panel')
 
     def _protocol_tag(rec, key=None):
         if key is None:
@@ -17894,6 +19031,13 @@ def aggregate(summary):
         if not isinstance(rec, dict) or 'ppl' not in rec or 'seed' not in rec:
             continue
         if not ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
+            continue
+        # A seed id is the unit of independent replication.  `int()` would
+        # turn True into 1 and 1.5 into 1, fabricating extra or duplicate
+        # seeds in the reported n; use the same exact-integer contract as
+        # read_panel / _variant_seed_map and ignore unverifiable records.
+        if _as_seed_int(rec.get('seed')) is None:
+            print(f'[aggregate] WARNING: ignoring record {key!r}: seed {rec.get("seed")!r} is not an exact integer')
             continue
         v = rec.get('variant')
         if v is None:
@@ -18025,6 +19169,7 @@ def aggregate(summary):
                  'nll_sum': _nll_total, 'n_tokens': _ntok_total,
                  'ppl_pooled': (_pooled if _pooled is not None else None),
                  'ppl_ci95_doc_bootstrap': _doc_bootstrap_ppl_ci(recs),
+                 'ppl_ci_seed_doc_combined': _combined_seed_doc_ci(recs),
                  'ppl_aggregation': ('pooled_token_nll' if _pooled is not None else 'arithmetic_seed_mean_fallback (records lack nll_sum/n_tokens)'),
                  'ppl_primary': (float(_pooled) if _pooled is not None else float(ppls.mean()))}
         _pb = next((r.get('param_breakdown') for r in recs if isinstance(r.get('param_breakdown'), dict)), None)
@@ -18738,10 +19883,15 @@ def preflight_fingerprint(cfg, *, stage, vocab=None, data_fp=None, probe_cfg=Non
     fails before the corpus is loaded).  It is deliberately not a resume key:
     it exists so the evidence can state which config/code/data/probe produced
     it."""
+    _vb = None
+    if vocab is not None:
+        _vb = _as_seed_int(vocab)
+        if _vb is None or _vb <= 0:
+            raise ValueError(f'preflight_fingerprint: vocab must be a positive integer, got {vocab!r}')
     blob = json.dumps({
         'config': _jsonable(cfg),
         'stage': str(stage),
-        'vocab': None if vocab is None else int(vocab),
+        'vocab': _vb,
         'data_fp': data_fp,
         'probe_cfg': _jsonable(probe_cfg) if probe_cfg is not None else None,
         'train_knobs': training_knobs_fingerprint(),
@@ -18821,7 +19971,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
 
     # Synthetic pre-flight before the corpus load.  The actual-data probe below
     # is the authoritative one; this one still exercises the real model
-    # geometry so a shape/gradient fault is caught even if the corpus is slow.
+    # geometry so a shape/gradient fault is caught.
     _pre_vocab = int(cfg.get('vocab_size') or 1024)
     _pre_ratios = _panel_ratios(_pre_vocab)
     try:
@@ -18894,8 +20044,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     # Explicit seed contract: same seed reproduces every RNG source the
     # pipeline can consume (Python/NumPy/Torch/CUDA/TF/DataLoader generator
     # and worker hook) and a different seed actually changes each one.  This
-    # is cheaper than the 3-step training check and pinpoints WHICH stream is
-    # unseeded when a reproduction fails.
+    # check pinpoints WHICH stream is unseeded when a reproduction fails.
     _seed_contract = seed_contract_check(seed=_first_seed)
     _seed_contract.update({'run_cfg': fp, 'label': label or outdir, 'provenance': prov})
     atomic_write_json(os.path.join(outdir, 'seed_contract.json'), _seed_contract)

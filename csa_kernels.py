@@ -275,7 +275,7 @@ class PoolGeometry:
             starts_prev_np = np.zeros((R, Bm), dtype=np.int64)
             max_ov = 0
         W_b = max_ov if overlap is not None else 0
-        # 8 张 int32 几何表打包进一条宿主缓冲、一次 H2D（同样的 int32 值、
+        # 8 张 int32 几何表打包进一条宿主缓冲（同样的 int32 值、
         # 同样的 int64→int32 窄化，transport only），设备侧按只读视图切分。
         flat = np.empty(7 * R * Bm + R, dtype=np.int32)
         for _i, _a in enumerate((counts_np, ends_np, starts_np, last_np,
@@ -382,8 +382,7 @@ def _geom_nbytes(geom):
     # Charge the real (physical) storage of every integer table a geometry
     # entry holds, including its lazily-built gather constants.  The eight
     # scalar tables are slices of ONE packed `_buf`, and the int64 views can
-    # share storage too, so charge each underlying storage exactly once
-    # rather than once per view.
+    # share storage too, so charge each underlying storage exactly once.
     seen = {}
     def _charge(t):
         if t is None:
@@ -1088,7 +1087,7 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     if valid is None:
         valid = torch.ones_like(topk_idx, dtype=torch.bool)
     win_raw = (t_idx - (w - 1) + torch.arange(w, device=dev)[None, None, :]).expand(R, T, w)
-    sink_v = torch.nan_to_num(sink).to(dtype) if sink is not None else None
+    sink_v = torch.nan_to_num(sink).to(torch.float32) if sink is not None else None
     tc = _attn_t_chunk(R, M, nh, hd)
     # t-chunk 在外、头在内：各 (t,h) 的前向计算相互独立，循环顺序交换
     # 不改变任何元素值。chunk 内的 lt_sel/sel_ok/src_win/win_ok/anyrow
@@ -1161,7 +1160,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     if valid is None:
         valid = torch.ones_like(topk_idx, dtype=torch.bool)
     win_raw = (t_idx - (w - 1) + torch.arange(w, device=dev)[None, None, :]).expand(R, T, w)
-    sink_v = torch.nan_to_num(sink).to(dtype) if sink is not None else None
+    sink_v = torch.nan_to_num(sink).to(torch.float32) if sink is not None else None
     dq = torch.zeros_like(q) if need_dq else None
     dsoft = torch.zeros_like(soft) if (need_dsoft and soft is not None) else None
     dsink = torch.zeros_like(sink) if (need_dsink and sink is not None) else None
@@ -1312,14 +1311,18 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                      P_sinkS, P_sinkA, P_A, P_A_f, GA, dzA, dz)
             del (src32, src64, lt_sel, sel_ok, src_win, win_ok, lane_ok, anyrow,
                  soft_c, seg_b_c, seg_w_c)
+        # The final head group can be smaller than `group` when nh is not a
+        # divisor of the slab-derived group size; only the first h1-h0 slices
+        # of each slab were written.
+        _hg = h1 - h0
         if dk_blk is not None:
-            dk_blk[:, :, h0:h1, :] = dk_slab.view(group, R, Bm, hd).permute(1, 2, 0, 3).to(dtype)
+            dk_blk[:, :, h0:h1, :] = dk_slab[:_hg].view(_hg, R, Bm, hd).permute(1, 2, 0, 3).to(dtype)
         if dv_blk is not None:
-            dv_blk[:, :, h0:h1, :] = dv_slab.view(group, R, Bm, hd).permute(1, 2, 0, 3).to(dtype)
+            dv_blk[:, :, h0:h1, :] = dv_slab[:_hg].view(_hg, R, Bm, hd).permute(1, 2, 0, 3).to(dtype)
         if dk_sw is not None:
-            dk_sw[:, :, h0:h1, :] = dksw_slab.view(group, R, T, hd).permute(1, 2, 0, 3).to(dtype)
+            dk_sw[:, :, h0:h1, :] = dksw_slab[:_hg].view(_hg, R, T, hd).permute(1, 2, 0, 3).to(dtype)
         if dv_sw is not None:
-            dv_sw[:, :, h0:h1, :] = dvsw_slab.view(group, R, T, hd).permute(1, 2, 0, 3).to(dtype)
+            dv_sw[:, :, h0:h1, :] = dvsw_slab[:_hg].view(_hg, R, T, hd).permute(1, 2, 0, 3).to(dtype)
     return (dq, dk_blk, dv_blk, dk_sw, dv_sw, dsoft, dsink)
 
 
@@ -2285,7 +2288,7 @@ def _indexer_topk_chunked(scores, last_tok, t0, T, Bm, k_out, need_soft, out_dty
     R, tc = int(scores.shape[0]), int(scores.shape[1])
     dev = scores.device
     k_out = max(0, min(int(k_out), int(Bm)))
-    # Chunk width: keep one candidate tile around a few megabytes.
+    # Chunk width for the candidate tile.
     bc = max(64, min(int(Bm), (4 << 20) // max(1, R * tc * 4)))
     b = torch.arange(int(Bm), device=dev, dtype=torch.long)
     lt = last_tok[:, :Bm].to(torch.int64)
@@ -2372,7 +2375,7 @@ def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=True):
                                   num_warps=8 if BB2 >= 1024 else 4)
         else:
             _i, _v, _s = _indexer_topk_chunked(
-                scores, last_tok, t0, T, Bm, k_out, bool(need_soft), qI.dtype)
+                scores[:, :tc], last_tok, t0, T, Bm, k_out, bool(need_soft), qI.dtype)
             idx[:, t0:t0 + tc] = _i
             valid_i8[:, t0:t0 + tc] = _v.to(torch.int8)
             if soft is not None:

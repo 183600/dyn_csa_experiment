@@ -4,6 +4,8 @@ import json
 import math
 import numbers
 import os
+
+import numpy as np
 import random
 import re
 import sys
@@ -47,16 +49,28 @@ def load(path, default=None):
         # 发布（进入 main 的 failed 列表），而不是伪装成「（无结果）」。
         raise RuntimeError(f'{path} exists but cannot be parsed ({type(_e).__name__}: {_e}); refusing to build a report over corrupt data — repair or remove the file') from _e
 
+def _object_or_refuse(value, path, kind):
+    """A valid-JSON non-object is corrupt for this role, not empty data."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise RuntimeError(
+            f'{path} is valid JSON but not an object ({type(value).__name__}); '
+            f'refusing to build a {kind} over it — repair or remove the file')
+    return value
+
 def agg(outdir):
     key = ('agg', outdir)
     if key not in _LOADED:
-        _LOADED[key] = load(os.path.join(REPO, outdir, 'aggregate.json'), {}) or {}
+        _path = os.path.join(REPO, outdir, 'aggregate.json')
+        _LOADED[key] = _object_or_refuse(load(_path, {}), _path, 'report aggregate')
     return _LOADED[key]
 
 def summary(outdir):
     key = ('summary', outdir)
     if key not in _LOADED:
-        _LOADED[key] = load(os.path.join(REPO, outdir, 'summary.json'), {}) or {}
+        _path = os.path.join(REPO, outdir, 'summary.json')
+        _LOADED[key] = _object_or_refuse(load(_path, {}), _path, 'report')
     return _LOADED[key]
 
 def fm(x, nd=2):
@@ -69,7 +83,7 @@ def sp(x, nd=2):
 
 def _ppl_value(entry):
     """Primary PPL aggregate: pooled token-level NLL when the records carry it,
-    otherwise the historical arithmetic seed mean (explicitly labelled)."""
+    otherwise the arithmetic seed mean (explicitly labelled)."""
     if not isinstance(entry, dict):
         return None
     for k in ('ppl_primary', 'ppl_pooled', 'ppl_mean'):
@@ -88,10 +102,14 @@ def _hist_points(r):
     for _pt in (r.get('ppl_history') or []) if isinstance(r, dict) else []:
         try:
             _st, _pv = _pt
-            _st = int(_st)
         except (TypeError, ValueError, OverflowError):
             continue
-        yield (_st, _pv)
+        # int(1.5) == int(True) == 1 would merge distinct/failed evaluation
+        # points into step 1 and distort the warmup/long-run curve.
+        _step = _int_or(_st, None)
+        if _step is None or _step < 0:
+            continue
+        yield (_step, _pv)
 
 def sample_std(vals):
     n = len(vals)
@@ -197,6 +215,12 @@ def _signflip_saddlepoint_p(values):
     return float(min(1.0, max(floor, p))), 'saddlepoint'
 
 
+def signflip_p_floor(n):
+    """Smallest achievable two-sided exact sign-flip p for n nonzero deltas."""
+    n = int(n)
+    return min(1.0, math.ldexp(2.0, -n)) if n > 0 else 1.0
+
+
 def exact_signflip(deltas):
     # Same scalar contract as exp_lib.exact_signflip_p: NumPy integers and
     # floats are measurements too, non-finite/boolean values are not.
@@ -263,12 +287,15 @@ def _finite_or_none(v):
     return _as_finite(v)
 
 def _int_or(v, default):
-    if v is None or isinstance(v, bool):
+    if v is None or isinstance(v, (bool, np.bool_)):
         return default
-    if isinstance(v, int):
+    if isinstance(v, numbers.Integral):
         return int(v)
-    if isinstance(v, float):
-        return int(v) if math.isfinite(v) and float(v).is_integer() else default
+    if isinstance(v, numbers.Real):
+        f = float(v)
+        if not (math.isfinite(f) and f.is_integer()) or abs(f) >= 2 ** 53:
+            return default
+        return int(f)
     try:
         return int(v)
     except (TypeError, ValueError, OverflowError):
@@ -425,11 +452,13 @@ def per_seed_records(outdir):
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
             _sv = r['seed']
-            if isinstance(_sv, bool):
+            if isinstance(_sv, (bool, np.bool_)):
                 print(f"[report] record {_k!r} in {outdir} carries a boolean seed — skipped for pairing")
                 continue
-            if isinstance(_sv, float):
-                _sd = int(_sv) if math.isfinite(_sv) and _sv.is_integer() else None
+            if isinstance(_sv, numbers.Real):
+                _sf = float(_sv)
+                _sd = (int(_sf) if math.isfinite(_sf) and _sf.is_integer()
+                       and abs(_sf) < 2 ** 53 else None)
             else:
                 try:
                     _sd = int(_sv)
@@ -482,6 +511,16 @@ def _pair_reason(ra, rb):
             return f'unverifiable {_k} (only one record carries the corpus / evaluation-slice fingerprint)'
         if _ha and str(_pa) != str(_pb):
             return f'different {_k} ({str(_pa)[:12]}… vs {str(_pb)[:12]}…)'
+    # Matched initialization: equal seeds/geometry do not prove the two arms
+    # started from the same shared trunk.  Mirror exp_lib.pair_reason.
+    _ia, _ib = ra.get('init_core_fp'), rb.get('init_core_fp')
+    _ha = _ia is not None and str(_ia) != ''
+    _hb = _ib is not None and str(_ib) != ''
+    if _ha != _hb:
+        return 'unverifiable init_core_fp (only one record carries the matched-initialization digest)'
+    if _ha and str(_ia) != str(_ib):
+        return (f'different init_core_fp ({str(_ia)[:12]}… vs {str(_ib)[:12]}…): '
+                'the two arms did not start from the same shared-trunk initialization despite the paired seed')
     bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
     if not bad:
         return None
@@ -505,6 +544,19 @@ def paired_row(a_records, b_records):
         _keep_tag, _kept_keys = _ranked[0]
         print(f"[report] paired_row: the two arms share {len(_by_tag)} protocol conditions ({sorted(_by_tag)}) — one sign-flip test cannot pool deltas across protocols (that would fake extra seeds), so only the largest shared condition `{_keep_tag or '(untagged)'}` ({len(_kept_keys)} seed(s)) is tested; the rest ({sorted((t for t in _by_tag if t != _keep_tag))}) is left to its own per-condition section")
         common = _kept_keys
+    # Every paired seed must come from ONE run configuration on each side.
+    # _pair_reason checks only the two records inside a seed; without this
+    # grouping seed 0 from cfgA and seed 1 from cfgB would be pooled into one
+    # sign-flip test and fabricate n.
+    _cfg_groups = collections.defaultdict(list)
+    for _tk in common:
+        _cfg_groups[(a_records[_tk].get('run_cfg'), b_records[_tk].get('run_cfg'))].append(_tk)
+    if len(_cfg_groups) > 1:
+        _ranked = sorted(_cfg_groups.items(),
+                         key=lambda kv: (not (isinstance(kv[0][0], str) and _CUR_CS and kv[0][0].endswith(f'_cs{_CUR_CS}')), -len(kv[1]), str(kv[0])))
+        _keep_cfg, _kept_keys = _ranked[0]
+        print(f'[report] paired_row: the paired seeds span {len(_cfg_groups)} run_cfg groups; pooling them would fabricate n, so only the largest/current group ({len(_kept_keys)} seed(s)) is tested and the rest are skipped')
+        common = _kept_keys
     dl, kept, skipped = ([], [], [])
     for s in common:
         reason = _pair_reason(a_records[s], b_records[s])
@@ -524,7 +576,7 @@ def paired_row(a_records, b_records):
 def sec_header():
     return ('# CSA / HCA 受控机制研究 — 补充实验报告 (v7)\n\n'
             f'> 生成时间：{time.strftime("%Y-%m-%d %H:%M:%S")}\n'
-            '> 参考论文：arXiv:2606.19348。**范围声明**：本仓库是小规模、从头训练、WikiText-103、固定训练预算下的受控研究，不是 DeepSeek-V4 的全量复现；结论不外推到该模型的规模、语料、长上下文训练或生产系统。\n'
+            '> 参考论文：arXiv:2606.19348。**范围声明**：本仓库是小规模、从头训练、WikiText-103、固定训练量下的受控研究，不是 DeepSeek-V4 的全量复现；结论不外推到该模型的规模、语料、长上下文训练或生产系统。\n'
             '> 定位：**受控机制研究**（controlled mechanism study），非论文全量复现。\n'
             '> **证据等级：探索性（exploratory）**。本报告的面板/种子/比较是在同一 validation split 上选择后观察的；'
             'Holm 校正只限制过度宣称，不能把这些结果变成预注册确认。确认性证据见 `confirmation_frozen.json` / v12。\n'
@@ -545,7 +597,7 @@ def sec_p0r():
     if not rope or not ab:
         return '## P0-3 位置编码对照 — （无结果）\n\n'
     pairs = [('full', 'full_rope'), ('csa_fixed', 'csa_fixed_rope'), ('csa_dynamic', 'csa_dynamic_rope'), ('hybrid_fixed', 'hybrid_fixed_rope')]
-    lines = ['## P0-3 位置编码错配是否为混淆项？（RoPE + QK-RMSNorm 对照）', '', '**评审论断**：论文用 partial RoPE（末 64 维）+ 输出侧反向 RoPE(pos=−i) + core attention 前 Q/KV RMSNorm；仓库用 `nn.Embedding(max_seq,d)` 学习式绝对位置编码、无 QK-norm。怀疑 PE 错配造成了 sparse 落后。', '', '**做法**：新增 `*_rope` 变体族，seed 0/1/2 × 1500 步 × seq 512，其余训练配置与 absPE 面板完全一致。', '', '| 变体 | absPE (v3_1500) | RoPE+QKnorm (v7) | Δ(RoPE−abs) | params(abs/rope) |', '|---|---|---|---|---|']
+    lines = ['## P0-3 位置编码错配是否为混淆项？（RoPE + QK-RMSNorm 对照）', '', '**待检验论断**：论文用 partial RoPE（末 64 维）+ 输出侧反向 RoPE(pos=−i) + core attention 前 Q/KV RMSNorm；仓库用 `nn.Embedding(max_seq,d)` 学习式绝对位置编码、无 QK-norm。怀疑 PE 错配造成了 sparse 落后。', '', '**做法**：新增 `*_rope` 变体族，seed 0/1/2 × 1500 步 × seq 512，其余训练配置与 absPE 面板完全一致。', '', '| 变体 | absPE (v3_1500) | RoPE+QKnorm (v7) | Δ(RoPE−abs) | params(abs/rope) |', '|---|---|---|---|---|']
     for a, b in pairs:
         ea, eb = (_agg_entry(ab, a), _agg_entry(rope, b))
         if ea is not None and eb is not None:
@@ -556,7 +608,7 @@ def sec_p0r():
             lines.append(f'| `{a}` | {fm(pa)} {sp(ea.get('ppl_std'))} | {fm(pb)} {sp(eb.get('ppl_std'))} | **{pb - pa:+.2f}** | {_params_m(ea)} / {_params_m(eb)} |')
         else:
             print(f'[report] sec_p0r: `{a}`/`{b}` not both present (config-split or absent) — row omitted')
-    lines += ['', '> 注：表中 Δ(RoPE−abs) 为两臂**各自 seed 集合的均值之差（非配对）**——且跨面板（absPE vs RoPE）本身没有同 seed 配对的意义；显著性主张一律以下文配对检验的口径为准。', '', '**组间差距（决定评审论点是否成立）**：', '']
+    lines += ['', '> 注：表中 Δ(RoPE−abs) 为两臂**各自 seed 集合的均值之差（非配对）**——且跨面板（absPE vs RoPE）本身没有同 seed 配对的意义；显著性主张一律以下文配对检验的口径为准。', '', '**组间差距（决定该论断是否成立）**：', '']
     _cf, _fu = (_agg_entry(ab, 'csa_fixed'), _agg_entry(ab, 'full'))
     _cf_r, _fu_r = (_agg_entry(rope, 'csa_fixed_rope'), _agg_entry(rope, 'full_rope'))
     _mt = _agg_entry(ab, 'full_matched')
@@ -602,7 +654,7 @@ def sec_p0r():
                 # `_sig_gate` still applies.
                 _st_mt['p_holm'] = _st_mt.get('p_exact_signflip')
                 _mt_stat = f'配对符号翻转 n={_st_mt['n']}、p={_st_mt['p_exact_signflip']:.3f}（Δ mean={_st_mt['mean']:+.2f}）'
-                _mt_sig = _sig_gate(_st_mt)
+                _mt_sig = _sig_gate(_st_mt, label='P0R csa_fixed vs full_matched (param-matched absPE)', family='P0R')
                 _mt_gap = _st_mt['mean']
             else:
                 _mt_stat = '本面板没有可通过配对门禁的同配置种子对，显著性无法检验'
@@ -624,6 +676,19 @@ def sec_p0w():
     s = summary('results_lm_v7_warmup')
     if not s:
         return '## P0-1 dense→sparse warmup — （无结果）\n\n'
+    if _CUR_CS:
+        _meas = [(k, r) for k, r in s.items()
+                 if isinstance(r, dict) and _measurable(r)]
+        _cur = [(k, r) for k, r in _meas if r.get('_code') == _CUR_CS]
+        if _meas and not _cur:
+            print(f'[report] sec_p0w: NONE of the {len(_meas)} measurable record(s) carries the current code-semantics stamp {_CUR_CS!r} — stale panel excluded')
+            return ('## P0-1 dense→sparse warmup — （无可验证结果）\n\n'
+                    f'> **陈旧记录已排除**：全部可测量记录都早于当前代码语义戳 `{_CUR_CS}`。'
+                    '本节不引用这些 PPL、不计算差值，也不给出显著性结论；重跑预热面板后再纳入。\n\n')
+        if len(_cur) < len(_meas):
+            print(f'[report] sec_p0w: {len(_meas) - len(_cur)} measurable record(s) predate the current code semantics — excluded from the table and conclusions')
+            _stale_keys = {k for k, _r in _meas} - {k for k, _r in _cur}
+            s = {k: v for k, v in s.items() if k not in _stale_keys}
     _legacy_ok = _legacy_warm_tags_cached('results_lm_v7_warmup')
     rows = []
     for k, r in s.items():
@@ -667,7 +732,7 @@ def sec_p0w():
     for (v, w), _m in rec_by_s.items():
         for _sd, _r in sorted(_m.items()):
             grp[v, w].append((_r.get('ppl'), _r.get('ppl_at_switch'), _sd))
-    lines = ['## P0-1 dense→sparse warmup 是否能让 sparse 追平 dense？（评审「必做」项）', '', '**评审论断**：论文 §4.2.2 先训 1T token 的 dense 再在 seq 64K 切 sparse；仓库所有 sparse run 都是 from-scratch，故「渐近线更差」可能是没 warmup 的产物。不给这个实验，「渐近线反转」立不住。', '', '**做法**：`train_warmup` 用**相同全长度 cosine LR**，前 `warm_steps` 步走 dense 前向（复用各 csa/hca 层自己的 `W_kvhead` per-token KV 路径 + 同一 sink，不引入新参数），到点切换为 sparse 并记录切换瞬间 PPL。网格 `warm ∈ {0,5000,10000}`（每格 seed 数以下表 n 列为准），20k 步、seq 512。**两臂参数/步数/token 数/初始 PPL/LR 曲线完全相同**，唯一差异是切点。', '', '| variant | warm_steps | PPL (mean±std) | n | 切换时 PPL |', '|---|---|---|---|---|']
+    lines = ['## P0-1 dense→sparse warmup 是否能让 sparse 追平 dense？（待检验项）', '', '**待检验论断**：论文 §4.2.2 先训 1T token 的 dense 再在 seq 64K 切 sparse；仓库所有 sparse run 都是 from-scratch，故「渐近线更差」可能是没 warmup 的产物。不给这个实验，「渐近线反转」立不住。', '', '**做法**：`train_warmup` 用**相同全长度 cosine LR**，前 `warm_steps` 步走 dense 前向（复用各 csa/hca 层自己的 `W_kvhead` per-token KV 路径 + 同一 sink，不引入新参数），到点切换为 sparse 并记录切换瞬间 PPL。网格 `warm ∈ {0,5000,10000}`（每格 seed 数以下表 n 列为准），20k 步、seq 512。**两臂参数/步数/token 数/初始 PPL/LR 曲线完全相同**，唯一差异是切点。', '', '| variant | warm_steps | PPL (mean±std) | n | 切换时 PPL |', '|---|---|---|---|---|']
     for (v, w), vals in sorted(grp.items()):
         ppls = [p for p, _s, _sd in vals]
         mean = sum(ppls) / len(ppls)
@@ -710,6 +775,7 @@ def sec_p0w():
         _parts = []
         _ds = []
         _ds_sig = []
+        _contrasts = []
         for v, w in sorted(grp):
             if v != 'csa_fixed' or w == 0:
                 continue
@@ -729,10 +795,18 @@ def sec_p0w():
             _st = exact_signflip(_dd) if _dd else None
             if _st is None:
                 continue
+            _contrasts.append((v, w, _dd, _st))
+        # Holm over the warm-up contrasts this section actually displays, then
+        # attach the corrected p before the significance gate runs.
+        _p0w_names = [(f'P0W csa_fixed warm={w} vs warm=0', st.get('p_exact_signflip'))
+                      for _v, w, _dd, st in _contrasts]
+        _p0w_holm = holm_adjust(_p0w_names) if _p0w_names else {}
+        for v, w, _dd, _st in _contrasts:
+            _st['p_holm'] = _p0w_holm.get(f'P0W csa_fixed warm={w} vs warm=0')
             _d = _st['mean']
-            _floor = 2.0 / (1 << _st['n']) if _st['n'] and _st['n'] <= 20 else 1.0 / 200001.0
+            _floor = signflip_p_floor(_st['n'])
             _same_dir = all((x != 0 and (x > 0) == (_d > 0) for x in _dd))
-            _gate_ok = _sig_gate(_st)
+            _gate_ok = _sig_gate(_st, label=f'P0W csa_fixed warm={w} vs warm=0', family='P0W')
             if not _gate_ok:
                 _verdict = f'n={_st['n']} 时 p={_st['p_exact_signflip']:.4f}（检验下限 {_floor:.3f}），**不构成显著/未过族校正**，' + ('各 seed 方向一致，仅作方向性读数' if _same_dir else '方向不一致')
             else:
@@ -772,11 +846,23 @@ def sec_p0e():
         if isinstance(_r, dict) and _measurable(_r) and isinstance(_r.get('tokens_seen'), (int, float)) and _r['tokens_seen'] > 0:
             _tok_hdr = f'~{_r['tokens_seen'] / 1e6:.0f}M tokens'
             break
-    lines = [f'## P0-2 「渐近线更差」是否成立？（延长到 40k 步 / {_tok_hdr}）', '', '**评审论断**：20k 步时两臂都未平台化、差距在收窄。要么延长，要么改述为「等训练量下收敛更慢」。', '', '**做法**：`csa_fixed` + `full`（seed 数见下表），同 LONG 配置延到 40k 步（seq 512、bs 12、同一 110M token 池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。', '', '| variant | PPL@40k (pooled/mean; ±seed sd) | n | params |', '|---|---|---|---|']
+    lines = [f'## P0-2 「渐近线更差」是否成立？（延长到 40k 步 / {_tok_hdr}）', '', '**待检验论断**：20k 步时两臂都未平台化、差距在收窄。要么延长，要么改述为「等训练量下收敛更慢」。', '', '**做法**：`csa_fixed` + `full`（seed 数见下表），同 LONG 配置延到 40k 步（seq 512、bs 12、同一 110M token 池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。', '', '| variant | PPL@40k (pooled/mean; ±seed sd) | n | params |', '|---|---|---|---|']
     for v in sorted(d):
-        r = d[v]
+        r = _agg_entry(d, v)
+        if r is None:
+            continue
         lines.append(f'| `{v}` | {fm(_ppl_value(r))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
-    _s_items = _prefer_one_cfg([_kv for _kv in s.items() if isinstance(_kv[1], dict) and 'variant' in _kv[1] and _measurable(_kv[1])], lambda kv: (kv[1].get('variant'), kv[1].get('run_cfg')), who='sec_p0e')
+    _raw_items = [_kv for _kv in s.items() if isinstance(_kv[1], dict) and 'variant' in _kv[1] and _measurable(_kv[1])]
+    if _CUR_CS:
+        _cur_items = [_kv for _kv in _raw_items if _kv[1].get('_code') == _CUR_CS]
+        if _raw_items and not _cur_items:
+            print(f'[report] sec_p0e: NONE of the {len(_raw_items)} measurable trajectory record(s) carries the current code-semantics stamp {_CUR_CS!r} — stale panel excluded')
+            lines += ['', f'> **⚠ 陈旧记录已排除**：全部可测量轨迹记录都早于当前代码语义戳 `{_CUR_CS}`，未进入轨迹表、尾段斜率或任何结论；重跑长跑面板后再纳入。', '']
+            return '\n'.join(lines) + '\n'
+        if len(_cur_items) < len(_raw_items):
+            print(f'[report] sec_p0e: {len(_raw_items) - len(_cur_items)} measurable trajectory record(s) predate the current code semantics — excluded from the trajectory and conclusions')
+        _raw_items = _cur_items
+    _s_items = _prefer_one_cfg(_raw_items, lambda kv: (kv[1].get('variant'), kv[1].get('run_cfg')), who='sec_p0e')
     trajs = collections.defaultdict(lambda: collections.defaultdict(dict))
     _dropped_pts = 0
     for _k, r in _s_items:
@@ -784,7 +870,10 @@ def sec_p0e():
             continue
         if not _measurable(r):
             continue
-        _sdv = str(r.get('seed'))
+        _sdv = _int_or(r.get('seed'), None)
+        if _sdv is None:
+            print(f"[report] sec_p0e: record {_k!r} carries a non-integer seed ({r.get('seed')!r}) — it is skipped, not counted")
+            continue
         for step, pv in _hist_points(r):
             if not _ppl_ok(pv):
                 _dropped_pts += 1
@@ -816,7 +905,9 @@ def sec_p0e():
             _rec_of = {}
             for _k, r in _s_items:
                 if isinstance(r, dict):
-                    _rec_of.setdefault((r.get('variant'), str(r.get('seed'))), r)
+                    _sd_rec = _int_or(r.get('seed'), None)
+                    if _sd_rec is not None:
+                        _rec_of.setdefault((r.get('variant'), _sd_rec), r)
             _paired = []
             _pair_gated = []
             for _sd in _paired_raw:
@@ -881,7 +972,7 @@ def sec_p0e():
             elif not (math.isfinite(g_last) and math.isfinite(slope)):
                 verdict = f'**结论：尾段差距统计量不可用**（`g_last` 或 `slope` 非有限值：g_last={g_last!r}、slope={slope!r}），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。上表已剔除非有限的曲线点；若此处仍出现，说明该面板的尾段整体缺失，需补跑。'
             elif g_last <= 0:
-                verdict = f'**结论：渐近线在 {_lastk:g}k 内反演**——`csa_fixed` 追平并超过 dense，评审的 P0-2 质疑成立，此前「worse asymptote」的表述需撤回。'
+                verdict = f'**结论：渐近线在 {_lastk:g}k 内反演**——`csa_fixed` 追平并超过 dense，P0-2 的质疑成立，此前「worse asymptote」的表述需撤回。'
             elif slope < -1e-06:
                 x0 = steps[-1] - g_last * 1000.0 / slope
                 if steps[-1] < x0 <= steps[-1] * 10:
@@ -900,7 +991,7 @@ def sec_p1t():
     if not d:
         return '## P1 选择率错配 / m=1 对照（seq 2048 topk 扫描）— （无结果）\n\n'
     order = ['csa_fix_m1', 'csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fixed']
-    lines = ['## P1 选择率错配 与 m=1(纯 DSA) 对照（seq 2048, topk 扫描）', '', '**评审论断**：仓库 seq 512 时选择率 25%，论文在长序列约 0.2%。`topk` 是主控旋钮，需要扫描；且缺 m=1（纯 DSA，不压缩）对照。', '', '**做法**：seq 2048、1500 步（seed 数见下表），扫描 `topk ∈ {8,32,128,512}` 并加入 `csa_fix_m1`（block_size=1, overlap=0 → 逐 token 选择 = 纯 DSA）。', '', '| variant | PPL (mean±std) | n | 等效选择率 (topk / 实测块数) |', '|---|---|---|---|']
+    lines = ['## P1 选择率错配 与 m=1(纯 DSA) 对照（seq 2048, topk 扫描）', '', '**待检验论断**：仓库 seq 512 时选择率 25%，论文在长序列约 0.2%。`topk` 是主控旋钮，需要扫描；且缺 m=1（纯 DSA，不压缩）对照。', '', '**做法**：seq 2048、1500 步（seed 数见下表），扫描 `topk ∈ {8,32,128,512}` 并加入 `csa_fix_m1`（block_size=1, overlap=0 → 逐 token 选择 = 纯 DSA）。', '', '| variant | PPL (mean±std) | n | 等效选择率 (topk / 实测块数) |', '|---|---|---|---|']
     # Selection rates are computed from the *measured* per-sequence block
     # counts persisted in each run's `stats` (never assumed): for a fixed
     # block size m the panel has n_blocks = seq_len / m blocks, and the
@@ -922,6 +1013,10 @@ def sec_p1t():
             if not isinstance(_r, dict) or _r.get('variant') != base_variant:
                 continue
             if not _measurable(_r):
+                continue
+            if _CUR_CS and _r.get('_code') != _CUR_CS:
+                # A stale record's block count must not set the displayed
+                # selection rate for a current aggregate row.
                 continue
             for _e in (_r.get('stats') or {}).values():
                 if isinstance(_e, dict) and isinstance(_e.get('blocks'), (int, float)) and _e['blocks'] > 0:
@@ -945,7 +1040,9 @@ def sec_p1t():
         if v in seen or v not in d:
             continue
         seen.add(v)
-        r = d[v]
+        r = _agg_entry(d, v)
+        if r is None:
+            continue
         ppls = _finite_ppls(r)
         if ppls:
             mean = sum(ppls) / len(ppls)
@@ -1060,7 +1157,7 @@ def sec_p1t():
         elif m1m < t8m and m1m < t32m:
             lines.append(f'1. **m=1（纯 DSA、不压缩）是三点中最好的**（{fm(m1m)} vs topk8 {fm(t8m)} / topk32 {fm(t32m)}{_dir3}）：去掉压缩反而占优——在 seq 2048 / 1500 步的受控训练量下，这是支持「压缩是瓶颈之一」的方向性证据，但三点均值未做配对/族校正，不能单独支撑机制结论。')
         else:
-            lines.append(f'1. m=1（{fm(m1m)}）介于 topk8（{fm(t8m)}）与 topk32（{fm(t32m)}）之间，三点排序非单调{_dir3}；评审「缺 m=1 对照」的质疑得到直接回答，但压缩是否瓶颈需结合显著性判断，此处只作方向性表述。')
+            lines.append(f'1. m=1（{fm(m1m)}）介于 topk8（{fm(t8m)}）与 topk32（{fm(t32m)}）之间，三点排序非单调{_dir3}；「缺 m=1 对照」的质疑得到直接回答，但压缩是否瓶颈需结合显著性判断，此处只作方向性表述。')
     elif _m1_ok:
         lines.append(f'1. m=1 测得 {fm(m1m)}，但 topk8/topk32 至少其一缺失，三点排序不可比——本条只陈述事实，不作「压缩是否瓶颈」的读法。')
     else:
@@ -1075,7 +1172,10 @@ def sec_p1t():
         _pair = paired_row(_recs.get('csa_fixed_topk8', {}), _recs.get('csa_fixed_topk32', {}))
         if _pair is not None:
             _kept, _dl, _st = _pair
-            _sig_txt = '显示该差距**达到 p≤0.05 且通过族校正/噪声门槛**，按显著性读法处理。' if _sig_gate(_st) else '显示该差距未通过「n≥6 + 原始 p<0.05 + Holm + 效应大于 seed 噪声」门槛，**不构成显著性主张**，只作方向性参考。'
+            # This is the single pre-specified contrast in P1T: Holm over a
+            # one-element family is the raw p, so attach it before the gate.
+            _st['p_holm'] = _st.get('p_exact_signflip')
+            _sig_txt = '显示该差距**达到 p≤0.05 且通过族校正/噪声门槛**，按显著性读法处理。' if _sig_gate(_st, label='P1T csa_fixed_topk8 vs topk32 (seq2048)', family='P1T') else '显示该差距未通过「n≥6 + 原始 p<0.05 + Holm + 效应大于 seed 噪声」门槛，**不构成显著性主张**，只作方向性参考。'
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；配对的精确符号翻转检验（n={_st['n']}，p={_st['p_exact_signflip']:.3f}，Δ(topk8−topk32) mean={_st['mean']:+.2f} PPL）{_sig_txt}')
         else:
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；面板上没有可通过 pairing 门禁的同配置种子对，topk8 与 topk32 之差（{_gap:.2f} PPL）无法配对检验，只作方向性参考。')
@@ -1092,7 +1192,7 @@ def sec_p1l():
     s = summary('results_len')
     if not s:
         return '## P1 长上下文长度外推（train@512 → eval 512..4096）— （无结果）\n\n> 注：合成 NIAH 检索探针已实现并调试（碰撞无关布局、可达标签）；本报告以 wikitext 长度外推覆盖长上下文评测（见报告头部说明）。\n\n'
-    recs = [r for r in s.values() if isinstance(r, dict) and 'by_len' in r and (not r.get('synthesized')) and any((isinstance(c, dict) and _ppl_ok(c.get('ppl')) for c in r['by_len'].values()))]
+    recs = [r for r in s.values() if isinstance(r, dict) and isinstance(r.get('by_len'), dict) and (not r.get('synthesized')) and any((isinstance(c, dict) and _ppl_ok(c.get('ppl')) for c in r['by_len'].values()))]
     _by_var = {}
     for r in recs:
         _by_var.setdefault(r.get('variant'), []).append(r)
@@ -1111,6 +1211,11 @@ def sec_p1l():
             # of being quoted with a warning marker.
             print(f'[report] sec_p1l: {_v}: NONE of the {len(_rv)} by-length record(s) carries the current code-semantics stamp {_CUR_CS!r} — EXCLUDED from the table and conclusions; re-run the length panel to refresh')
             _stale_vars.add(_v)
+    # One run_cfg per variant: a length table must not pool @512 from one
+    # configuration with @4096 from another, which would fabricate a
+    # same-weights extrapolation ratio.
+    recs = _prefer_one_cfg(
+        recs, lambda r: (r.get('variant'), r.get('run_cfg')), who='sec_p1l')
     if not recs:
         _msg = '## P1 长上下文长度外推 — （无可验证结果）\n\n'
         if _stale_vars:
@@ -1119,15 +1224,71 @@ def sec_p1l():
                      '本节不引用这些数值、不计算 ratio，也不给出外推结论。重跑长度面板后再纳入。\n\n')
         return _msg
     def _len_key(Ln):
+        # A displayed length must be an exact positive integer.  int(True)==1
+        # and int(4.9)==4 would otherwise admit a boolean/fractional key (or a
+        # length-0 column) into the table, and a cell measured at 4.9 tokens
+        # would be quoted as PPL@4.  Mirror the length audit's contract.
+        # Integers/strings are parsed without a float round-trip so an id above
+        # 2**53 cannot silently map to a neighbouring length.
+        if isinstance(Ln, (bool, np.bool_)):
+            return None
+        if isinstance(Ln, numbers.Integral):
+            v = int(Ln)
+        elif isinstance(Ln, numbers.Real):
+            f = float(Ln)
+            # Exact integer lengths only.
+            if (not math.isfinite(f) or f != math.floor(f)
+                    or abs(f) >= 2 ** 53):
+                return None
+            v = int(f)
+        else:
+            try:
+                v = int(Ln)
+            except (TypeError, ValueError, OverflowError):
+                return None
+        return v if v >= 2 else None
+
+    def _cell_at(by_len, Ln):
+        # by_len keys are normally the integer length or its string spelling,
+        # but integral floats/other encodings are also validated by value.
+        # Resolve them so a cell is never silently shown as "—", while a
+        # malformed key (including the dict-equality alias True == 1) never
+        # supplies a cell for a different real length.
+        if Ln in by_len:
+            for _k in by_len:
+                if _k == Ln and _len_key(_k) == Ln:
+                    return by_len[_k]
+        _sk = str(Ln)
+        if _sk in by_len and _len_key(_sk) == Ln:
+            return by_len[_sk]
+        for _k, _c in by_len.items():
+            if _len_key(_k) == Ln:
+                return _c
+        return None
+
+    def _norm_seed(x):
+        if isinstance(x, (bool, np.bool_)):
+            return None
+        if isinstance(x, numbers.Real):
+            f = float(x)
+            if not (math.isfinite(f) and f.is_integer()) or abs(f) >= 2 ** 53:
+                return None
+            return int(f)
         try:
-            return int(Ln)
+            return int(x)
         except (TypeError, ValueError, OverflowError):
             return None
+
     lens = sorted({_k for _k in (_len_key(Ln) for r in recs for Ln in r['by_len']) if _k is not None})
+    if not lens:
+        return ('## P1 长上下文长度外推 — （无可验证结果）\n\n'
+                '> 按长度记录中没有任何整数长度键，无法构建长度表。重跑长度面板并写入数值长度键后再纳入。\n\n')
     variants = sorted({r.get('variant') for r in recs if r.get('variant') is not None})
-    _seed_key = lambda x: (0, float(x), '') if isinstance(x, (int, float)) and (not isinstance(x, bool)) else (1, 0.0, str(x))
-    _seeds_by_v = {v: sorted({r.get('seed') for r in recs if r.get('variant') == v and r.get('seed') is not None}, key=_seed_key) for v in variants}
-    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**评审论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、超出部分只取末尾 `max_pos` 个 token 截断评测——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；`?` = 该格缺少 `truncated` 标记，按不可验证处理（不参与 ratio）；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
+    _seeds_by_v = {
+        v: sorted({_sd for r in recs if r.get('variant') == v
+                   for _sd in [_norm_seed(r.get('seed'))] if _sd is not None})
+        for v in variants}
+    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**待检验论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训 3000 步（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、超出部分只取末尾 `max_pos` 个 token 截断评测——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；`?` = 该格缺少 `truncated` 标记，按不可验证处理（不参与 ratio）；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
     per_v = {}
     trunc_v = {}
     # Group by variant (preserving order).
@@ -1143,9 +1304,12 @@ def sec_p1l():
             _seen_sd = set()
             for _r in _recs_by_v.get(v, []):
                 _bl = _r.get('by_len') or {}
-                _c = _bl.get(Ln, _bl.get(str(Ln)))
+                _c = _cell_at(_bl, Ln)
                 if isinstance(_c, dict) and _ppl_ok(_c.get('ppl')):
-                    _sd = _r.get('seed')
+                    _sd = _norm_seed(_r.get('seed'))
+                    if _sd is None:
+                        print(f"[report] sec_p1l: {v} L{Ln}: record with a non-integer seed ({_r.get('seed')!r}) is skipped, not counted")
+                        continue
                     if _sd in _seen_sd:
                         print(f'[report] sec_p1l: ambiguous (variant, seed) = ({v!r}, {_sd}) at L{Ln}: two measurable records found; keeping the FIRST')
                         continue
@@ -1153,10 +1317,14 @@ def sec_p1l():
                     recs_l.append((_sd, _c))
             # Fail closed on a missing truncation flag: a cell that does not
             # say whether it was truncated is unverifiable, not full-length.
-            _unknown = [_sd for _sd, x in recs_l if 'truncated' not in x]
+            _unknown = [_sd for _sd, x in recs_l
+                        if 'truncated' not in x
+                        or not isinstance(x.get('truncated'), (bool, np.bool_))]
             if _unknown:
-                print(f'[report] sec_p1l: {v} L{Ln}: {len(_unknown)} cell(s) lack the `truncated` flag {sorted(_unknown)} — the column is marked unverifiable and never enters a ratio')
-            ok = [x for _sd, x in recs_l if ('truncated' in x and not x.get('truncated'))]
+                print(f'[report] sec_p1l: {v} L{Ln}: {len(_unknown)} cell(s) lack a boolean `truncated` flag {sorted(_unknown)} — the column is marked unverifiable and never enters a ratio')
+            ok = [x for _sd, x in recs_l
+                  if isinstance(x.get('truncated'), (bool, np.bool_))
+                  and not bool(x.get('truncated'))]
             is_tr = bool(recs_l) and (len(ok) < len(recs_l))
             vals = [float(x['ppl']) for x in ok]
             trunc_flags.append(is_tr)
@@ -1277,14 +1445,24 @@ def sec_p2s():
     d = agg('results_lm_v5_scale')
     if not d:
         return ''
-    lines = ['## P2 v5 scale 面板补种子（至 4 seeds）+ 配对显著性', '', '**评审论断**：v5 scale 的种子数不足，需 4 seeds + `full_matched`。', '', '| variant | PPL (pooled/mean; ±seed sd) | 文档 bootstrap 95% CI | n | params |', '|---|---|---|---|---|']
+    lines = ['## P2 v5 scale 面板补种子（至 4 seeds）+ 配对显著性', '', '**待检验论断**：v5 scale 的种子数不足，需 4 seeds + `full_matched`。', '', '| variant | PPL (pooled/mean; ±seed sd) | 文档 bootstrap 95% CI | n | params |', '|---|---|---|---|---|']
     _variants = sorted({r.get('variant') for r in d.values() if isinstance(r, dict) and r.get('variant') is not None})
     for v in _variants:
         r = _agg_entry(d, v)
         if r is None:
             continue
         _dci = r.get('ppl_ci95_doc_bootstrap')
-        _dcitxt = f'[{_dci[0]:.2f}, {_dci[1]:.2f}]' if isinstance(_dci, (list, tuple)) and len(_dci) == 2 else '—（缺逐文档 NLL）'
+        _dci_ok = False
+        if isinstance(_dci, (list, tuple)) and len(_dci) == 2:
+            try:
+                _dlo, _dhi = float(_dci[0]), float(_dci[1])
+                _dci_ok = (not isinstance(_dci[0], (bool, np.bool_))
+                           and not isinstance(_dci[1], (bool, np.bool_))
+                           and math.isfinite(_dlo) and math.isfinite(_dhi)
+                           and _dlo <= _dhi)
+            except (TypeError, ValueError, OverflowError):
+                _dci_ok = False
+        _dcitxt = f'[{_dlo:.2f}, {_dhi:.2f}]' if _dci_ok else '—（缺失/无效的逐文档 NLL CI）'
         lines.append(f'| `{v}` | {fm(_ppl_value(r))} {sp(r.get('ppl_std'))} | {_dcitxt} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
     lines += ['', '> 注：`±seed sd` 是**种子层**训练随机性；`文档 bootstrap 95% CI` 重采样固定的评测文档，只量化**文档抽样**不确定性，二者不是同一个估计量。评测文档少于 64 条时该 CI 不覆盖语言数据总体（design_notes §20）。', '']
     ps = per_seed_records('results_lm_v5_scale')
@@ -1302,8 +1480,24 @@ def sec_p2s():
                 common, dl, st = pr
                 rows.append((a, b, common, st))
     if rows:
+        # Holm-correct the P2S family that is actually displayed, then attach
+        # the adjusted p to each row so both the prose gate and the global
+        # multiplicity registry see a corrected value.
+        _p2s_pairs = [(f'P2S {a} - {b}', st.get('p_exact_signflip'))
+                      for a, b, _c, st in rows]
+        _p2s_holm = holm_adjust(_p2s_pairs)
+        for a, b, _c, st in rows:
+            # The local holm_adjust returns {name: adjusted_float}; this is
+            # deliberately not exp_lib's {name: {'p_holm': ...}} shape.
+            st['p_holm'] = _p2s_holm.get(f'P2S {a} - {b}')
         lines += ['', '**配对检验（同 seed 配对，符号翻转）**：', '', '| 比较 | n (配对 seeds) | Δ (a−b) mean±std | p | params |', '|---|---|---|---|---|']
         for a, b, common, st in rows:
+            # Every p-value printed in this table belongs to the report's
+            # global multiplicity family, not only the one row later used by
+            # the prose gate.
+            _note_comparison(f'P2S {a} - {b}', st.get('p_exact_signflip'),
+                             family='P2S', p_holm=st.get('p_holm'),
+                             n=st.get('n'), mean=st.get('mean'))
             _pl = f'{st["p_exact_signflip"]:.3f}' + (' (saddlepoint)' if str(st.get('method', '')).startswith('saddlepoint') else ' (exact)')
             lines.append(f'| `{a}` − `{b}` | {len(common)} | {st['mean']:+.2f} ± {st['std']:.2f} | {_pl} | {unmatched_tag(_agg_entry(_agg, a), _agg_entry(_agg, b)) or '✓'} |')
         main = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full'), None)
@@ -1311,10 +1505,22 @@ def sec_p2s():
         _base = _mt if _mt else main
         if _base:
             _ba, _bb, common, st = _base
-            _which = '`csa_fixed − full_matched`（参数对齐）' if _mt else '`csa_fixed − full`（未做容量匹配）'
+            if _mt:
+                _pm_ok = is_param_matched(_agg_entry(_agg, 'csa_fixed'),
+                                          _agg_entry(_agg, 'full_matched'))
+                if _pm_ok is True:
+                    _which = '`csa_fixed − full_matched`（参数对齐）'
+                elif _pm_ok is False:
+                    _which = '`csa_fixed − full_matched`（参数不匹配，见下表）'
+                else:
+                    _which = '`csa_fixed − full_matched`（参数未验证，见下表）'
+            else:
+                _which = '`csa_fixed − full`（未做容量匹配）'
             _tag = unmatched_tag(_agg_entry(_agg, _ba), _agg_entry(_agg, _bb)) if _mt else unmatched_tag(_agg_entry(_agg, 'csa_fixed'), _agg_entry(_agg, 'full'))
             if st['mean'] > 0:
-                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：' + ('该差距通过 n≥6 + Holm + 效应>噪声门槛，方向为 sparse 更差。' if _sig_gate(st) else '该差距**未通过** n≥6 + Holm + 效应>噪声门槛，只能作方向性读数，不能写成「已经反转」。') + '该面板同时改变宽度、层数、序列长度与训练量，**不能把差异单独归因于「dense 的容量红利」**；需要参数/计算/训练量匹配的规模臂才能做机制归因。' + (f'{_tag}' if _tag else '✓')
+                _gate_ok = _sig_gate(st, label=f'P2S {_ba} - {_bb}',
+                                     family='P2S', register=False)
+                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：' + ('该差距通过 n≥6 + Holm + 效应>噪声门槛，方向为 sparse 更差。' if _gate_ok else '该差距**未通过** n≥6 + Holm + 效应>噪声门槛，只能作方向性读数，不能写成「已经反转」。') + '该面板同时改变宽度、层数、序列长度与训练量，**不能把差异单独归因于「dense 的容量红利」**；需要参数/计算/训练量匹配的规模臂才能做机制归因。' + (f'{_tag}' if _tag else '✓')
             else:
                 concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：该规模下 sparse 仍领先，早期优势未随规模消失。{_tag or '✓'}'
             lines += ['', f'**结论**：{concl}', '']
@@ -1337,24 +1543,43 @@ def sec_flops():
             lines.append(f'| {r['seq_len']} | {r['sel_ratio']:.2%} | {r['csa_over_dense']:.3f} | {r['hybrid_over_dense']:.3f} | {r['csa_kv_over_dense']:.3f} |')
         except (KeyError, TypeError, ValueError) as _e:
             print(f'[report] sec_flops: a malformed row was skipped ({type(_e).__name__}: {_e})')
-    _clean = sorted((r for r in rows if isinstance(r, dict) and isinstance(r.get('seq_len'), (int, float)) and (not isinstance(r.get('seq_len'), bool)) and math.isfinite(r['seq_len'])), key=lambda r: r['seq_len'])
+    _need = ('seq_len', 'sel_ratio', 'csa_over_dense', 'hybrid_over_dense',
+             'csa_kv_over_dense')
+    _clean = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            _sv = float(r.get('seq_len'))
+            if not math.isfinite(_sv):
+                continue
+            if any(not isinstance(r.get(k), (int, float))
+                   or isinstance(r.get(k), bool)
+                   or not math.isfinite(float(r[k])) for k in _need[1:]):
+                continue
+        except (TypeError, ValueError, OverflowError):
+            continue
+        _clean.append(r)
+    _clean.sort(key=lambda r: float(r['seq_len']))
     _rows = {}
     for r in _clean:
         _rows.setdefault(r['seq_len'], r)
     _x = d.get('crossover_seq_len_csa_beats_dense')
     _r512 = _rows.get(512)
     if _r512 is not None and _x is not None:
-        _ratio = _r512['csa_over_dense']
-        _sel = _r512['sel_ratio']
+        _ratio = float(_r512['csa_over_dense'])
+        _sel = float(_r512['sel_ratio'])
         _verdict = '省' if _ratio < 1.0 else '不省'
         _cross = f'交叉点本身就在 seq={_x}' if _x <= 512 else f'交叉点在 seq={_x}，训练序列（512）尚未到达'
-        _ratios = [r['csa_over_dense'] for r in _clean]
+        # Use one row per sequence length so a duplicated malformed/partial
+        # entry cannot distort the monotonicity read.
+        _ratios = [float(r['csa_over_dense']) for _k, r in sorted(_rows.items())]
         _mono = all((_ratios[i] >= _ratios[i + 1] - 1e-12 for i in range(len(_ratios) - 1)))
         _trend = f'比值单调降到 {min(_ratios):.3f}' if _mono else f'比值总体下行到 {min(_ratios):.3f}（非严格单调，逐点见 flops_analytic.csv）'
-        lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。**按该解析口径**（仅注意力项，不是实测延迟/吞吐/显存），CSA/dense 比随长度下降（{_trend}）；这不等于真实 GPU 加速，实际收益须由 checkpoint 上的测量确认。', '']
+        lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。**按该解析口径**（仅注意力项，不是对延迟、吞吐或设备内存的实测），CSA/dense 比随长度下降（{_trend}）；这不等于真实设备上的收益，实际收益须由 checkpoint 上的测量确认。', '']
     return '\n'.join(lines) + '\n'
 
-def _sig_gate(st, alpha=0.05, min_n=6):
+def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):
     """Conservative significance gate for report prose.
 
     Requires n>=6 (the exact sign-flip floor at n<6 is >alpha, so no n<6 panel
@@ -1362,25 +1587,196 @@ def _sig_gate(st, alpha=0.05, min_n=6):
     and |mean|>std (effect bigger than seed noise).  A missing Holm value is
     treated as NOT corrected — the report may say "nominal" but never
     "significant" until a family correction has actually been attached.
-    """
+
+    `label` (with optional `family`) registers the decision in the report's
+    cross-panel multiplicity audit (`sec_global_multiplicity`): every
+    significance decision the report makes must be counted there, because a
+    claim that survives its own family can still be one of many contrasts the
+    report displays.  An unlabeled call is counted and flagged, never lost."""
     if not isinstance(st, dict):
         return False
-    n = st.get('n') or 0
+    global _GATE_CALLS, _UNREGISTERED_GATES
+    _GATE_CALLS += 1
+    if register:
+        if label is None:
+            _UNREGISTERED_GATES += 1
+        else:
+            _note_comparison(label, st.get('p_exact_signflip'), family,
+                             st.get('p_holm'), st.get('n'), st.get('mean'))
+    # A seed count is an exact integer; `_int_or` rejects booleans and lossy floats.
+    n = _int_or(st.get('n'), None)
     p = st.get('p_exact_signflip')
     ph = st.get('p_holm')
     mean, std = st.get('mean'), st.get('std')
+    if any(isinstance(v, (bool, np.bool_)) for v in (n, p, ph, mean, std)):
+        # float(False) == 0.0 would otherwise turn a boolean flag into a
+        # significant p-value (or a zero seed count into a real measurement).
+        return False
+    _min_n = _int_or(min_n, None)
+    if n is None or _min_n is None:
+        return False
     try:
-        if int(n) < int(min_n):
+        if n < _min_n:
             return False
-        if p is None or not (float(p) < alpha):
+        pf, phf = (float(p) if p is not None else None), (float(ph) if ph is not None else None)
+        if pf is None or not (math.isfinite(pf) and 0.0 <= pf <= 1.0 and pf < alpha):
             return False
-        if ph is None or not (float(ph) < alpha):
+        if phf is None or not (math.isfinite(phf) and 0.0 <= phf <= 1.0 and phf < alpha):
             return False
-        if mean is None or std is None or abs(float(mean)) <= float(std):
+        if mean is None or std is None:
+            return False
+        mf, sf = float(mean), float(std)
+        if not (math.isfinite(mf) and math.isfinite(sf) and sf >= 0.0):
+            return False
+        if abs(mf) <= sf:
             return False
     except (TypeError, ValueError, OverflowError):
         return False
     return True
+
+# Every comparison whose p-value this report DISPLAYS, or whose significance
+# the prose asserts via `_sig_gate`, is registered here so the cross-panel
+# multiplicity audit (sec_global_multiplicity) counts it.  A report that shows
+# twenty contrasts and corrects inside each panel still selected on twenty —
+# the global view is what a cross-panel quote has to survive.
+_REPORTED_COMPARISONS = []
+_GATE_CALLS = 0
+_UNREGISTERED_GATES = 0
+
+
+def _reset_claim_registry():
+    global _REPORTED_COMPARISONS, _GATE_CALLS, _UNREGISTERED_GATES
+    _REPORTED_COMPARISONS = []
+    _GATE_CALLS = 0
+    _UNREGISTERED_GATES = 0
+
+
+def _note_comparison(label, p, family=None, p_holm=None, n=None, mean=None):
+    _REPORTED_COMPARISONS.append(
+        {'label': str(label), 'p': p, 'family': (str(family) if family else None),
+         'p_holm': p_holm, 'n': n, 'mean': mean})
+
+
+def global_multiplicity_adjust(named_pvals, alpha=0.05):
+    """Local twin of exp_lib.global_multiplicity_audit (this builder
+    intentionally does not import torch/exp_lib; test_review_fixes cross-checks
+    the two implementations against each other so they cannot drift).
+
+    Benjamini-Hochberg step-up q-values + Bonferroni over ALL displayed
+    comparisons.  Invalid/missing p keeps a p=1 slot (fail-closed family size,
+    same convention as holm_adjust).  Duplicate names are a hard error."""
+    if isinstance(alpha, bool):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
+    try:
+        a = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
+    if not (0.0 < a < 1.0):
+        raise ValueError(f'alpha must be in (0,1), got {alpha!r}')
+    seen = set()
+    rows = []
+    for i, item in enumerate(named_pvals if named_pvals is not None else []):
+        if not isinstance(item, (tuple, list)) or not 2 <= len(item) <= 3:
+            raise ValueError(f'global_multiplicity_adjust: entry #{i} must be (name, p) or (name, p, family), got {item!r}')
+        name = str(item[0])
+        if name in seen:
+            raise ValueError(f'global_multiplicity_adjust: duplicate comparison name {name!r}')
+        seen.add(name)
+        p = item[1]
+        valid = False
+        if p is not None and not isinstance(p, (bool, np.bool_)):
+            try:
+                pf = float(p)
+                valid = math.isfinite(pf) and 0.0 <= pf <= 1.0
+            except (TypeError, ValueError, OverflowError):
+                valid = False
+        fam = item[2] if len(item) == 3 else None
+        rows.append({'name': name, 'p_raw': (pf if valid else None),
+                     'p_slot': (pf if valid else 1.0),
+                     'family': (str(fam) if fam is not None else None)})
+    m = len(rows)
+    if m == 0:
+        return {'m': 0, 'alpha': a, 'rows': [],
+                'n_raw_significant': 0, 'n_bh_rejected': 0,
+                'n_bonferroni_significant': 0, 'n_untestable': 0}
+    ps = sorted(range(m), key=lambda i: rows[i]['p_slot'])
+    q_by_rank = []
+    prev = float('inf')
+    for rank in range(m, 0, -1):
+        qi = rows[ps[rank - 1]]['p_slot'] * m / rank
+        prev = min(prev, qi, 1.0)
+        q_by_rank.append(prev)
+    q_by_rank.reverse()
+    for idx_in_sorted, row_i in enumerate(ps):
+        rows[row_i]['q_bh'] = q_by_rank[idx_in_sorted]
+        rows[row_i]['p_bonferroni'] = min(1.0, rows[row_i]['p_slot'] * m)
+        p_slot = rows[row_i]['p_slot']
+        rows[row_i]['bh_rejected'] = bool(rows[row_i]['q_bh'] <= a + 1e-15 and rows[row_i]['p_raw'] is not None)
+    n_raw = n_bh = n_bonf = n_untest = 0
+    for r in rows:
+        if r['p_raw'] is None:
+            n_untest += 1
+            r['global_status'] = 'untestable'
+        elif r['p_raw'] >= a:
+            r['global_status'] = 'not_significant'
+        elif r['bh_rejected'] and r['p_bonferroni'] < a:
+            r['global_status'] = 'globally_controlled'
+        elif r['bh_rejected']:
+            r['global_status'] = 'fdr_only'
+        else:
+            r['global_status'] = 'family_only'
+        if r['p_raw'] is not None and r['p_raw'] < a:
+            n_raw += 1
+        if r['bh_rejected']:
+            n_bh += 1
+        if r['p_raw'] is not None and r['p_bonferroni'] < a:
+            n_bonf += 1
+    return {'m': m, 'alpha': a, 'rows': rows, 'n_raw_significant': n_raw,
+            'n_bh_rejected': n_bh, 'n_bonferroni_significant': n_bonf,
+            'n_untestable': n_untest}
+
+
+def sec_global_multiplicity():
+    """Cross-panel multiplicity section: what the report's displayed contrasts
+    look like AFTER all of them are counted (BH-FDR + Bonferroni).
+
+    Within-family Holm (sec_stats) corrects inside one panel.  A report that
+    displays contrasts from several panels and then quotes the significant ones
+    has selected over the union, so the union is what a cross-panel quote must
+    survive.  This section does not delete any number; it sets the allowed
+    wording for each one."""
+    if not _REPORTED_COMPARISONS and _GATE_CALLS == 0:
+        return '## 跨面板多重性（全局 FDR / Bonferroni）\n\n> 本报告没有显示任何带 p 值的比较或做任何显著性判定，本节为空。\n\n'
+    lines = ['## 跨面板多重性（全局 FDR / Bonferroni）', '',
+             '族内 Holm 只控制**单个面板内**的错误率；本报告把多个面板的比较并排放示，跨面板引用（“在 v7 与 v10 都显著”）实际是对**展示并集**的选择。下表把本报告实际显示/判定的每一个对比放进全局视图：Benjamini-Hochberg FDR q 值与 Bonferroni p×m。它不删任何数字，只约束措辞：', '',
+             '| 比较 | 面板 | p | 族内 p_Holm | q_BH | p_Bonferroni | 全局判定 |', '|---|---|---|---|---|---|---|']
+    named = [(r['label'], r['p'], r['family']) for r in _REPORTED_COMPARISONS]
+    holm_by_label = {}
+    for r in _REPORTED_COMPARISONS:
+        if r.get('p_holm') is not None:
+            holm_by_label[r['label']] = r['p_holm']
+    aud = global_multiplicity_adjust(named, alpha=0.05)
+    by_name = {r['name']: r for r in aud['rows']}
+    for r in _REPORTED_COMPARISONS:
+        a = by_name.get(r['label']) or {}
+        _status_txt = {'globally_controlled': '全局可控（可跨面板引用）',
+                       'fdr_only': '仅 FDR 可控（不得写族-wise 确定）',
+                       'family_only': '仅族内（不得写“显著”而不加“未全局校正”）',
+                       'not_significant': '不显著',
+                       'untestable': '不可检验（无有效 p）'}.get(a.get('global_status'), a.get('global_status'))
+        lines.append('| %s | %s | %s | %s | %s | %s | %s |' % (
+            r['label'], (r['family'] or '—'), fm(r['p'], 4),
+            fm(holm_by_label.get(r['label']), 4), fm(a.get('q_bh'), 4),
+            fm(a.get('p_bonferroni'), 4), _status_txt))
+    lines += ['', f'共 {aud["m"]} 个展示比较：原始 p<0.05 的 {aud["n_raw_significant"]} 个；BH-FDR q<0.05 的 {aud["n_bh_rejected"]} 个；Bonferroni p<0.05 的 {aud["n_bonferroni_significant"]} 个；无有效 p 的 {aud["n_untestable"]} 个（计入族大小，p 槽位=1）。', '']
+    if aud['n_bh_rejected'] < aud['n_raw_significant']:
+        lines.append('> **读法限制**：存在原始 p<0.05 但全局 BH 不拒绝的比较——跨面板引用它们时必须写成「族内显著、未通过全局校正」，不得写成多个独立发现。')
+    if _UNREGISTERED_GATES:
+        lines.append(f'> ⚠ 有 {_UNREGISTERED_GATES} 个 `_sig_gate` 判定未带 label 注册（本节族大小可能偏小）——这是报告构建的缺陷，应校正，而不是忽略。')
+    lines.append('> 本节是**探索性展示的纪律层**，不是确认性证据：全局校正不把任何探索面板变成预注册结果（见 docs/design_notes.md §17/§20）。')
+    lines.append('')
+    return '\n'.join(lines) + '\n'
+
 
 def holm_adjust(named_pvals, alpha=0.05):
     """Holm step-down over the report's displayed family (local copy: this
@@ -1393,10 +1789,15 @@ def holm_adjust(named_pvals, alpha=0.05):
         if name in _seen:
             raise ValueError(f'holm_adjust: duplicate comparison name {name!r}')
         _seen.add(name)
-        try:
-            pv = float(v)
-        except (TypeError, ValueError, OverflowError):
+        if isinstance(v, (bool, np.bool_)):
+            # A flag is not a probability: float(False) == 0.0 would make it
+            # the strongest possible p-value and shrink the family.
             pv = float('nan')
+        else:
+            try:
+                pv = float(v)
+            except (TypeError, ValueError, OverflowError):
+                pv = float('nan')
         if (not math.isfinite(pv)) or pv < 0.0 or pv > 1.0:
             pv = 1.0
         items.append((name, pv))
@@ -1512,14 +1913,25 @@ def sec_stats():
         _pv = None
         if isinstance(v, dict) and 'omitted' not in v:
             _pv = v.get('p_exact_signflip') if v.get('p_exact_signflip') is not None else v.get('p')
-            try:
-                _pv = float(_pv)
-            except (TypeError, ValueError, OverflowError):
+            if isinstance(_pv, (bool, np.bool_)):
+                # Booleans are flags; float(False)==0.0 would enter Holm as
+                # the strongest possible p while the display shows n/a.
                 _pv = None
+            else:
+                try:
+                    _pv = float(_pv)
+                except (TypeError, ValueError, OverflowError):
+                    _pv = None
         # Omitted/invalid comparisons keep a dummy p=1 slot so a report cannot
         # shrink its own correction family by dropping a failed comparison.
         _pairs.append((k, _pv if (_pv is not None and math.isfinite(_pv) and 0.0 <= _pv <= 1.0) else 1.0))
     _holm = holm_adjust(_pairs, alpha=0.05) if _pairs else {}
+    # The displayed family is itself part of the report's global selection:
+    # register every displayed comparison (invalid/omitted ones included) so
+    # the cross-panel audit counts them with a p=1 slot, never drops them.
+    for _k, _pv in _pairs:
+        _note_comparison(f'STATS {_k}', _pv, family='v7 displayed comparisons',
+                         p_holm=_holm.get(_k))
     for k, v in items.items():
         if not isinstance(v, dict):
             continue
@@ -1546,7 +1958,8 @@ def main(argv=None):
         raise SystemExit(f'build_report: unknown argument {a!r} (this builder takes none; try -h)')
     parts = [sec_header(), '---\n']
     failed = []
-    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_training_health, sec_efficiency, sec_stats):
+    _reset_claim_registry()
+    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_training_health, sec_efficiency, sec_stats, sec_global_multiplicity):
         try:
             parts.append(sec())
         except Exception as e:

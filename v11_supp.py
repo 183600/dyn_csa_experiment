@@ -47,8 +47,8 @@ def make_guard():
     return g
 
 def P4MT_CFG(seeds=(0, 1, 2, 3, 4, 5)):
-    # P3MT_PAYLOAD 变体列表已扩展（v10 评审响应：从头训练控制），但 P4MT 的语义
-    # 是「既有 RoPE 双臂的种子补齐」——显式钉死原始两臂，不受 v10 扩展影响。
+    # P4MT 的语义是「既有 RoPE 双臂的种子补齐」——显式钉死这两臂，
+    # 不受 P3MT_PAYLOAD 扩展的影响。
     return dict(V10.P3MT_PAYLOAD, seeds=list(seeds), variants=['csa_fixed_rope', 'full_rope'])
 
 def run_p4mt(payload=None, guard=None, label='v11 P4MT', par=None):
@@ -92,13 +92,20 @@ def v11_analysis(out='analysis_v11/stats.json'):
         except Exception as _e:
             print(f'[stats] FATAL: {sp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — refusing to compute probe statistics from a truncated file; move it aside to re-probe.')
             raise
+        if not isinstance(raw, dict):
+            print(f'[v11 stats] WARNING: {sp} is valid JSON but not an object ({type(raw).__name__}) — the probe panel is EXCLUDED')
+            raw = {}
         cells, _dup_cells, _bad_cells = ({}, [], [])
         for _k, r in raw.items():
             if not isinstance(r, dict):
                 _bad_cells.append((_k, 'not a dict'))
                 continue
-            if r.get('variant') is None or r.get('seed') is None:
-                _bad_cells.append((_k, 'no variant/seed'))
+            if r.get('synthesized'):
+                _bad_cells.append((_k, 'synthesized reconstruction'))
+                continue
+            _seed = L._as_seed_int(r.get('seed'))
+            if r.get('variant') is None or _seed is None:
+                _bad_cells.append((_k, 'no variant/integer seed'))
                 continue
             if not L.ppl_is_usable(r.get('ppl_mean')):
                 _bad_cells.append((_k, 'ppl_mean is not a usable measurement'))
@@ -111,10 +118,10 @@ def v11_analysis(out='analysis_v11/stats.json'):
                 continue
             pk = (r['variant'], r.get('arm'), r.get('eval_len'), r.get('rho'), str(r.get('mode', 'uniform')), json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')))
             grp = cells.setdefault(pk, {})
-            if r['seed'] in grp:
-                _dup_cells.append((_k, pk[:4], r['seed']))
+            if _seed in grp:
+                _dup_cells.append((_k, pk[:4], _seed))
                 continue
-            grp[r['seed']] = r
+            grp[_seed] = dict(r, seed=_seed)
         if _bad_cells:
             print(f'[v11 stats] {len(_bad_cells)} record(s) in {sp} carry no variant/seed/ppl_mean and are skipped (they are error or truncation stubs, not measurements): ' + ', '.join((f'{k}({why})' for k, why in _bad_cells[:4])))
         if _dup_cells:
@@ -230,6 +237,32 @@ def _fmt_pm(cell, std=None):
     else:
         mean = cell
     return f'{mean:.2f} ±{std or 0.0:.2f}'
+
+def _one_record_per_seed(rows, label=''):
+    """Drop invalid seeds and exclude every ambiguous duplicate seed.
+
+    The by-length table means each seed once; averaging two records for one
+    seed would bias the column while the reported n (a set) still counts one.
+    """
+    by_seed = {}
+    dup = set()
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        s = L._as_seed_int(r.get('seed'))
+        if s is None:
+            continue
+        if s in by_seed:
+            dup.add(s)
+        else:
+            by_seed[s] = r
+    if dup:
+        print(f'[v11 report] {label}: seed(s) {sorted(dup)} hold more than one by-length record — '
+              'the duplicate seed(s) are EXCLUDED rather than averaged into the column')
+        for s in dup:
+            by_seed.pop(s, None)
+    return list(by_seed.values())
+
 
 def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     v11_analysis(out=stats_p)
@@ -357,7 +390,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
                 _rv = _cur
             elif _rv:
                 print(f'[v11 report] {v}: no by-length record carries the current code semantics ({L.code_stamp()}) — quoting all {len(_rv)} (they predate it; re-run P4MT to refresh)')
-            _rows_by_v[v] = _rv
+            _rows_by_v[v] = _one_record_per_seed(_rv, label=v)
         n_by_v = {v: {r['seed'] for r in _rv} for v, _rv in _rows_by_v.items() if _rv}
         if len(n_by_v) > 1:
             _common_seeds = set.intersection(*n_by_v.values())
@@ -380,7 +413,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
 
             def _at(Ln, rows=rows):
                 cells = L.by_len_cells(rows, Ln)
-                ok = [c for c in cells if not c.get('truncated')]
+                ok = [c for c in cells if isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated'))]
                 if (ok if ok else cells) and len(ok if ok else cells) < len(rows):
                     print(f'[v11 report] {v} L{Ln}: the column mean covers {len(ok if ok else cells)}/{len(rows)} seeds — the rest hold no usable cell at this length (error/truncated cell), so the column is a sub-seed mean')
                 if ok:
@@ -395,7 +428,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
                         continue
                     for Ln, mp in ((512, m512), (4096, m4096)):
                         c = bl.get(Ln, bl.get(str(Ln)))
-                        if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and (not c.get('truncated')):
+                        if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated')):
                             mp[r.get('seed')] = float(c['ppl'])
                 both = sorted(set(m512) & set(m4096))
                 if both and len(both) < len(rows):

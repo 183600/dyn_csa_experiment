@@ -16,14 +16,9 @@ LONG_GAP_VARIANTS = ['hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn']
 _LONG_STEPS = L.RUN_LONG['steps']
 
 def _num_or_none(v):
-    if v is None or isinstance(v, bool):
-        return None
-    if isinstance(v, float):
-        return int(v) if math.isfinite(v) and v.is_integer() else None
-    try:
-        return int(v)
-    except (TypeError, ValueError, OverflowError):
-        return None
+    # One exact-integer contract for seeds/counts: reject booleans, fractional
+    # NumPy floats, and lossy floats at/above 2**53 instead of truncating them.
+    return L._as_seed_int(v)
 
 def git_push(msg):
     if os.environ.get('V6_NO_PUSH'):
@@ -85,6 +80,9 @@ def _fold_backup_into_aggregate(adir):
     except Exception as _e:
         print(f'[synth] NOTE: the pre-retrain snapshot {bak_path} cannot be parsed ({type(_e).__name__}: {_e}) — ignoring it')
         return
+    if not isinstance(bak, dict):
+        print(f'[synth] NOTE: the pre-retrain snapshot {bak_path} is valid JSON but not an object ({type(bak).__name__}) — ignoring it')
+        return
     live = {}
     if os.path.exists(agg_path):
         try:
@@ -133,6 +131,9 @@ def synthesize_long_summary():
     except Exception as _e:
         print(f'[synth] SKIP: {agg_path} exists but cannot be parsed ({type(_e).__name__}: {_e}) — refusing to rebuild summary.json from a corrupt aggregate; re-derive the aggregate first.')
         return ({'skipped_unreadable_aggregate': agg_path}, None)
+    if not isinstance(agg, dict):
+        print(f'[synth] SKIP: {agg_path} is valid JSON but not an object ({type(agg).__name__}) — refusing to rebuild summary.json from it.')
+        return ({'skipped_unreadable_aggregate': agg_path}, None)
     spath = os.path.join(adir, 'summary.json')
     summary = {}
     if os.path.exists(spath):
@@ -141,6 +142,9 @@ def synthesize_long_summary():
         except Exception as _e:
             print(f'[synth] FATAL: {spath} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
             raise
+    if not isinstance(summary, dict):
+        print(f'[synth] FATAL: {spath} is valid JSON but not an object ({type(summary).__name__}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
+        return ({'skipped_unreadable_summary': spath}, None)
     n_synth = n_kept = n_replaced = n_backfill = 0
     _unaligned = []
     _split = []

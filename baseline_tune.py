@@ -68,7 +68,7 @@ def _mean_std(values):
 
 
 def _protocol_arm_groups(protocol, base, arms):
-    """Resolve the protocol's arm groups, falling back to one legacy group.
+    """Resolve the protocol's arm groups, falling back to one group.
 
     Groups exist because the v6 arms and the frozen v12 rope arms parameter-
     match against DIFFERENT reference arms (csa_dynamic vs csa_fixed_rope),
@@ -168,8 +168,8 @@ def _contrast_plan(protocol, groups, selected):
 
     The v6 and frozen-v12 arms are matched against different references, so a
     cross-group contrast would change the parameter-matching reference as well
-    as the mechanism.  Legacy protocols without `arm_groups` keep the old
-    single-method rule.
+    as the mechanism.  Protocols without `arm_groups` use the single-method
+    rule.
     """
     selected = set(selected)
     plan = []
@@ -218,7 +218,7 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
     # Tuning selection must not be decided by a single seed's validation
     # noise.  The same declared search-seed set is used for every arm and
     # every trial, and selection uses the mean validation PPL (with the
-    # across-seed std recorded).  Legacy protocols that only declare
+    # across-seed std recorded).  Protocols that only declare
     # `search_seed` keep the single-seed path.
     search_seeds, final_seeds_declared, overlap = _search_final_seeds(protocol)
     if final and final_seeds_declared and overlap:
@@ -388,12 +388,11 @@ def _relaxed_pair_reason(a, b, tuned_arms):
         return 'unverifiable init_core_fp (only one record carries the matched-initialization digest)'
     if ia is not None and ib is not None and ia != ib:
         return f'different init_core_fp ({str(ia)[:12]}… vs {str(ib)[:12]}…)'
-    try:
-        pa, pb = int(a.get('params')), int(b.get('params'))
-        if abs(pa - pb) / float(max(pa, pb, 1)) > 0.01:
-            return f'parameter mismatch ({pa} vs {pb})'
-    except (TypeError, ValueError, OverflowError):
-        pass
+    pa, pb = L._as_seed_int(a.get('params')), L._as_seed_int(b.get('params'))
+    if pa is None or pb is None or pa <= 0 or pb <= 0:
+        return 'unverifiable params (missing, boolean, fractional or non-positive count)'
+    if abs(pa - pb) / float(max(pa, pb, 1)) > 0.01:
+        return f'parameter mismatch ({pa} vs {pb})'
     if tuned_arms.get(a.get('variant')) != tuned_arms.get(b.get('variant')):
         return 'arms did not receive the same declared tuning range'
     return None
@@ -401,6 +400,12 @@ def _relaxed_pair_reason(a, b, tuned_arms):
 
 def _run_final(base, outdir, protocol, selected):
     final_seeds = [int(s) for s in protocol.get('final_seeds', [])]
+    if not final_seeds:
+        # An empty partition would be silently normalised to seed 0 by the
+        # runner, reusing a search draw as an "independent" final evaluation.
+        raise ValueError(
+            'protocol declares no final_seeds — refusing to fall back to seed 0; '
+            'declare a disjoint final seed partition before running final records')
     search_seeds, _, overlap = _search_final_seeds(protocol)
     if final_seeds and overlap:
         raise ValueError(
@@ -424,9 +429,25 @@ def _run_final(base, outdir, protocol, selected):
                    warmup=int(entry['selected']['warmup']))
         L.run(cfg, seeds=final_seeds, guard=None, label=f'final tuned {arm}')
         s = json.load(open(os.path.join(adir, 'summary.json'), encoding='utf-8'))
+        # A resumed panel can leave older summary keys in the file.  Only the
+        # declared final partition may enter the tuned comparison; merging a
+        # stale seed would inflate n while the artifact still claims the
+        # pre-registered final seed set.
+        _allowed = set(final_seeds)
+        _extra = []
         for rec in s.values():
-            if isinstance(rec, dict) and L.ppl_is_usable(rec.get('ppl')) and 'seed' in rec:
-                merged[f'{arm}::seed{int(rec["seed"])}'] = rec
+            if not (isinstance(rec, dict) and L.ppl_is_usable(rec.get('ppl'))
+                    and not rec.get('synthesized')):
+                continue
+            _sid = L._as_seed_int(rec.get('seed'))
+            if rec.get('variant') not in (None, arm):
+                continue
+            if _sid is None or _sid not in _allowed:
+                _extra.append(rec.get('seed'))
+                continue
+            merged[f'{arm}::seed{_sid}'] = rec
+        if _extra:
+            print(f'[tune] {arm}: ignored stale summary record(s) with seed(s) {_extra} outside the declared final seeds {final_seeds}')
     L.atomic_write_json(os.path.join(final_dir, 'summary.json'), merged)
     _live = [r for r in merged.values() if isinstance(r, dict)]
     _prov = next((r.get('provenance') for r in _live if r.get('provenance')), None) or L.code_provenance()

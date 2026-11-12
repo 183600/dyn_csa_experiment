@@ -5,7 +5,7 @@ These are the substantive gates the panel must pass before any GPU run:
 
   K1  config / segmenter: `max_block=None` is an explicit no-cap bound,
       the position capacity is independent of it, and the default is closed.
-  K2  optimized causal prefix pooling == per-query reference (forward and
+  K2  causal prefix pooling == per-query reference (forward and
       gradients), for full-prefix and outside-window scopes.  At a block end
       the full-prefix summary equals the closed block pooling exactly.
   K3  prefix invariance: a truncated input gives the same outputs on the
@@ -19,7 +19,7 @@ These are the substantive gates the panel must pass before any GPU run:
   K7  closed regression: the default closed path is unchanged (and the
       open modes leave the dynamic cut table untouched).
   K8  singleton semantics: a length-1 pooled block, not a raw-token K/V.
-  K9  HCA budget declaration: open HCA must declare the extra-read budget.
+  K9  HCA read declaration: open HCA must declare the extra-read allowance.
 
 Run directly (`python test_open_block.py`) or through
 `python test_review_fixes.py` (the CI entry point imports CHECKS).
@@ -76,7 +76,7 @@ def _tiny(mode='closed', scope='full_prefix', max_block=8, seq=32, window=6,
 def t_config_and_segmenter():
     c = L.AttnCfg()
     assert c.max_block == 128 and c.position_capacity() == 129
-    assert c.open_block_mode == 'closed', 'the default must preserve the historical closed rule'
+    assert c.open_block_mode == 'closed', 'the default must keep the closed rule'
     assert c.position_policy() == 'truncate'
     n = 23
     cuts = np.zeros(n - 1, dtype=bool)
@@ -107,13 +107,32 @@ def t_config_and_segmenter():
     for kwargs in ({'open_block_mode': 'prefix_summary', 'kind': 'full'},
                    {'open_block_mode': 'nope'},
                    {'pool_position_capacity': 0},
-                   {'max_block': 1, 'min_block': 2}):
+                   {'max_block': 1, 'min_block': 2},
+                   {'min_block': True},
+                   {'block_size': 1.5},
+                   {'sliding_window': True},
+                   {'index_topk': 2.5},
+                   {'pool_position_capacity': True},
+                   {'max_block': True}):
         try:
             L.AttnCfg(**kwargs)
         except ValueError:
             pass
         else:
             raise AssertionError(f'AttnCfg accepted invalid settings {kwargs}')
+    # The max-block alias emitted by open_block_config is a declared factor,
+    # not an uncontrolled field when comparing different caps.
+    import open_block_supp as O
+    def _cfg(cap):
+        return {'open_block_config': {'fingerprint': f'fp{cap}', 'layers': [{
+            'max_block': cap, 'max_block_tokens': cap,
+            'open_block_mode': 'summary', 'open_block_scope': 'full_prefix'}]}}
+    assert O._controlled_reason(_cfg(8), _cfg(None)) is None
+    bad = _cfg(8)
+    bad['open_block_config']['fingerprint'] = 'bad'
+    bad['open_block_config']['layers'][0]['extra_factor'] = 1
+    assert 'undeclared field' in O._controlled_reason(
+        dict(_cfg(8), run_fingerprint='x'), dict(bad, run_fingerprint='x'))
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +277,7 @@ def t_candidate_masks():
     valid = torch.zeros(T, C, dtype=torch.bool)
     for t in range(T):
         valid[t, :min(C, t + 2)] = True
-    # make every invalid column hugely attractive: a mask bug would select it
+    # make every invalid column hugely attractive: any mask error would select it
     scores = scores.masked_fill(~valid, 1e6)
     idx = L._indexer_selection(scores, valid, k)
     box = []
@@ -335,7 +354,7 @@ def t_edge_cases():
 
 
 # ---------------------------------------------------------------------------
-# K7 closed regression / untouched cut table
+# K7 closed behaviour / untouched cut table
 # ---------------------------------------------------------------------------
 
 def t_closed_regression():
@@ -437,7 +456,7 @@ def t_singleton_is_length_one_pooled():
 
 
 # ---------------------------------------------------------------------------
-# K9 HCA budget declaration
+# K9 HCA declaration
 # ---------------------------------------------------------------------------
 
 def t_hca_budget_declaration():
@@ -446,7 +465,7 @@ def t_hca_budget_declaration():
     except ValueError:
         pass
     else:
-        raise AssertionError('open HCA accepted the shared_topk budget label')
+        raise AssertionError('open HCA accepted the shared_topk quota label')
     c = L.AttnCfg(kind='hca', open_block_mode='prefix_summary',
                   selection_budget='all_closed_plus_prefix')
     assert c.selection_budget == 'all_closed_plus_prefix'
@@ -492,6 +511,55 @@ def t_open_candidate_edge_cases():
     assert mass.shape == (n,) and torch.isfinite(mass).all(), mass
 
 
+def t_paired_seeds_are_unique():
+    import open_block_supp as OB
+    cells = {(v, s): {'nll': (1.0 if v == 'a' else 2.0),
+                      'ppl': (20.0 if v == 'a' else 21.0)}
+             for v in ('a', 'b') for s in (0, 1, 2)}
+    ds, ppl_ds, used = OB._paired(cells, 'a', 'b', [0, 0, 1, 1, 2, 2])
+    assert used == [0, 1, 2] and len(ds) == len(ppl_ds) == 3, (used, ds, ppl_ds)
+    import exp_lib as L
+    assert L.exact_signflip_p(ds)['n'] == 3, ds
+
+
+def t_record_identity_and_completeness():
+    import open_block_supp as OB
+    fp = 'fp'
+    base = {'variant': 'A', 'seed': 0, 'ppl': 10.0, 'nll_sum': 10.0,
+            'n_tokens': 1, 'run_fingerprint': fp}
+    # A positive PPL without usable per-token NLL is not a completed cell.
+    assert OB._is_current({'run_fingerprint': fp, 'code': L.code_stamp(),
+                           'ppl': 2.0}, fp) is False
+    cells = OB._rec_by_cell({'A::seed0': dict(base, variant='B', seed=1)}, fp)
+    assert cells == {}, cells
+    cells = OB._rec_by_cell({'A::seed0': dict(base, nll_sum=True,
+                                             n_tokens=True)}, fp)
+    assert cells == {}, cells
+    cells = OB._rec_by_cell({'A::seed0': dict(base, nll_sum=10.0,
+                                             n_tokens=1.5)}, fp)
+    assert cells == {}, cells
+    assert OB._rec_by_cell({'A::seed0': base}, fp)
+
+
+def t_summary_refuses_nonobject():
+    import json
+    import tempfile
+    import shutil
+    import open_block_supp as OB
+    d = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump([{'variant': 'A', 'seed': 0, 'ppl': 1.0}], f)
+        try:
+            OB._load_summary(d)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('a valid-JSON non-object summary must be refused, not treated as empty')
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 CHECKS = [
     ('K1 open-block config/segmenter', t_config_and_segmenter),
     ('K2 prefix pooling reference/grad', t_prefix_pool_reference),
@@ -501,9 +569,12 @@ CHECKS = [
     ('K6 edge cases', t_edge_cases),
     ('K7 closed regression/cut table', t_closed_regression),
     ('K8 singleton semantics', t_singleton_is_length_one_pooled),
-    ('K9 HCA budget declaration', t_hca_budget_declaration),
+    ('K9 HCA read declaration', t_hca_budget_declaration),
     ('K10 forced-vs-natural cuts', t_forced_vs_natural_cuts),
     ('K11 open candidate edge cases', t_open_candidate_edge_cases),
+    ('K12 paired seeds are unique', t_paired_seeds_are_unique),
+    ('K13 record identity/completeness', t_record_identity_and_completeness),
+    ('K14 summary refuses non-object payloads', t_summary_refuses_nonobject),
 ]
 
 

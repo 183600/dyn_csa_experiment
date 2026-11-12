@@ -406,7 +406,7 @@ def _probe_params_current(rec, fp, mode='uniform'):
 
 def _probe_defs(cfg):
     """The (eval_len, rho, mode) grid of a probe config.  Absent 'modes' means
-    the legacy uniform-only protocol (cfg['rhos'])."""
+    the uniform-only protocol (cfg['rhos'])."""
     _modes = cfg.get('modes') or {'uniform': list(cfg['rhos'])}
     out = []
     for _mode, _rhos in _modes.items():
@@ -430,7 +430,7 @@ def _niah_fingerprint(cfg, condition=None):
     return fp
 
 def _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed, condition, rho=0.5):
-    """Far-necessary-information task on NATURAL text (review point 3).
+    """Far-necessary-information task on NATURAL text.
 
     每条序列 = [远端自然文本（内嵌 n_pairs 个 key→value 耦合）] + [目标区：
     自然文本收尾 + n_pairs 个查询 key]。查询 key 之后紧跟的正确 token 是
@@ -563,7 +563,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     # only the shape/config: n_seq, target, vocab, val_seq_len).  Stored on the
     # record and checked forward-compatibly below: a stored record that carries
     # a val_fp differing from the current slice is stale and re-measured, while
-    # legacy records without the field keep their existing resume behaviour.
+    # records without the field keep their existing resume behaviour.
     # v12 reuses this cell with val_ids=test_ids, so the frozen test slice gets
     # the same per-record fingerprint.
     _val_fp = L._ids_fp(np.ascontiguousarray(val_ids).reshape(-1))
@@ -576,7 +576,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             except Exception as _e:
                 print(f'[p3mp] FATAL: {_msp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — without it no checkpoint can be attributed to a training recipe, so the probe would score unknown weights.  Move it aside to re-train.')
                 raise
-    ck = os.path.join(cfg['ckpt_dir'], f'{v}_seed{seed}.pt')
+    ck = os.path.join(cfg['ckpt_dir'], L.direct_ckpt_name(v, seed))
     if not os.path.exists(ck):
         print(f'[p3mp] SKIP {v} s{seed}: no checkpoint {ck} (run phase P3MT first)')
         out['status'] = 'skipped_no_ckpt'
@@ -901,21 +901,26 @@ def _hist_by_seed(outdir, variant, raw=None):
     for _k, r in raw.items():
         if not (isinstance(r, dict) and r.get('variant') == variant and r.get('ppl_history')):
             continue
+        # Use the shared exact-integer contract: this also rejects np.float32
+        # fractions (int() would truncate 1.5 -> 1) and lossy floats >= 2**53.
         _s_raw = r.get('seed')
-        if isinstance(_s_raw, bool):
-            _s_raw = None
-        if isinstance(_s_raw, float):
-            s = int(_s_raw) if math.isfinite(_s_raw) and _s_raw.is_integer() else None
-        else:
-            try:
-                s = int(_s_raw)
-            except (TypeError, ValueError, OverflowError):
-                s = None
+        s = L._as_seed_int(_s_raw)
         if s is None:
-            print(f'[v10 stats] {_k} has no usable `seed`; its curve cannot be attributed and is skipped')
+            print(f'[v10 stats] {_k} has no usable `seed` ({_s_raw!r}); its curve cannot be attributed and is skipped')
             continue
         try:
-            fp = tuple(((int(t), type(v).__name__, round(float(v), 9)) for t, v in r['ppl_history'] if isinstance(v, (int, float)) and (not isinstance(v, bool)) and (v == v)))
+            _fp_parts = []
+            for _t_raw, _v_raw in r['ppl_history']:
+                _vf = L._finite_scalar(_v_raw)
+                if _vf is None:
+                    # A boolean/NaN point is not a measurement and is dropped
+                    # by the clean-history pass below; keep the exact step in
+                    # the identity so a fractional step cannot alias an int.
+                    continue
+                _ti = L._as_seed_int(_t_raw)
+                _fp_parts.append((_ti if _ti is not None else ('bad-step', repr(_t_raw)),
+                                  type(_v_raw).__name__, round(_vf, 9)))
+            fp = tuple(_fp_parts)
         except (TypeError, ValueError, OverflowError):
             fp = None
         if fp is None:
@@ -972,12 +977,15 @@ def _hist_by_seed(outdir, variant, raw=None):
         _n_badpt = 0
         for _pt in r['ppl_history']:
             try:
-                _t = int(_pt[0])
-                _v2 = float(_pt[1])
+                _t = L._as_seed_int(_pt[0])
+                _v2 = L._finite_scalar(_pt[1])
             except (TypeError, ValueError, IndexError):
                 _n_badpt += 1
                 continue
-            if not (math.isfinite(_v2) and _v2 > 0):
+            # Exact integer steps only: int(1.5)==1 would merge two distinct
+            # evaluation points, and float(True)==1.0 would turn a flag into a
+            # PPL measurement.
+            if _t is None or _v2 is None or _t < 0 or not (_v2 > 0):
                 _n_badpt += 1
                 continue
             _clean_hist.append([_t, _v2])
@@ -1209,10 +1217,10 @@ def _panel_convergence(hists):
     return out
 
 def _equal_token_slices():
-    """Review point 1 — the scale panels' endpoints confound model size with
+    """The scale panels' endpoints confound model size with
     cumulative training tokens.  This analysis re-reads the SAME curves at
     matched token counts (and, when the matched arms exist, at matched total
-    compute), so a cross-scale endpoint difference can no longer be silently
+    compute), so a cross-scale endpoint difference cannot be silently
     attributed to scale alone."""
     conf = {}
     _panel_hists = {}
@@ -1231,6 +1239,26 @@ def _equal_token_slices():
         for _h in (ha, hb):
             for s in _stale:
                 _h.pop(s, None)
+        _synth = sorted(s for s in (set(ha) | set(hb))
+                        if getattr(ha, 'per_seed_synth', {}).get(s)
+                        or getattr(hb, 'per_seed_synth', {}).get(s))
+        if _synth:
+            # Reconstructed curves are copies of an old aggregate, not
+            # independent runs; they may not enter an endpoint, convergence
+            # read or matched-token slice.
+            print(f'[stats] {name}: seed(s) {_synth} carry a SYNTHESIZED reconstruction — excluded from the matched-token analysis')
+            for _h in (ha, hb):
+                for s in _synth:
+                    _h.pop(s, None)
+        _cfg_a = getattr(ha, 'per_seed_cfg', {})
+        _cfg_b = getattr(hb, 'per_seed_cfg', {})
+        _cfg_bad = sorted(s for s in (set(ha) & set(hb))
+                          if _cfg_a.get(s) != _cfg_b.get(s))
+        if _cfg_bad:
+            print(f'[stats] {name}: seed(s) {_cfg_bad} pair a `csa_fixed` curve against a `full` curve measured under a DIFFERENT run_cfg — excluded from the matched-token analysis')
+            for _h in (ha, hb):
+                for s in _cfg_bad:
+                    _h.pop(s, None)
         _panel_hists[name] = {'csa_fixed': ha, 'full': hb}
         hists = _panel_hists[name]
         tps = _tokens_per_step(spec['outdir'], fallback=spec['batch'] * spec['seq'], raw=_raw)
@@ -1289,13 +1317,20 @@ def v10_analysis(out='analysis_v10/stats.json'):
         except Exception as _e:
             print(f'[stats] FATAL: {sp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — refusing to compute probe statistics from a truncated file; move it aside to re-probe.')
             raise
+        if not isinstance(raw, dict):
+            print(f'[v10 stats] WARNING: {sp} is valid JSON but not an object ({type(raw).__name__}) — the probe panel is EXCLUDED')
+            raw = {}
         _usable, _bad_cells = ({}, [])
         for _k, r in raw.items():
             if not isinstance(r, dict):
                 _bad_cells.append((_k, 'not a dict'))
                 continue
-            if r.get('variant') is None or r.get('seed') is None:
-                _bad_cells.append((_k, 'no variant/seed'))
+            if r.get('synthesized'):
+                _bad_cells.append((_k, 'synthesized reconstruction'))
+                continue
+            _seed = L._as_seed_int(r.get('seed'))
+            if r.get('variant') is None or _seed is None:
+                _bad_cells.append((_k, 'no variant/integer seed'))
                 continue
             if not L.ppl_is_usable(r.get('ppl_mean')):
                 _bad_cells.append((_k, 'ppl_mean is not a usable measurement'))
@@ -1303,7 +1338,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if r.get('arm') is None or r.get('eval_len') is None or r.get('rho') is None:
                 _bad_cells.append((_k, 'no arm/eval_len/rho'))
                 continue
-            _usable[_k] = r
+            _usable[_k] = dict(r, seed=_seed)
         if _bad_cells:
             print(f'[v10 stats] {len(_bad_cells)} record(s) in {sp} carry no variant/seed/ppl_mean and are skipped (they are error or truncation stubs, not measurements): ' + ', '.join((f'{k}({why})' for k, why in _bad_cells[:4])))
         _n_bad_pre = len(_bad_cells)
@@ -1363,7 +1398,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 dl = [b['ppl_by_seed'][s] - a['ppl_by_seed'][s] for s in common]
                 contrasts[name] = V.exact_sign_permutation(dl)
                 contrasts[name]['seeds'] = common
-        # ---- legacy uniform-mode contrasts (names unchanged for report compat) ----
+        # ---- uniform-mode contrasts (names unchanged for report compat) ----
         for Ln in PROBE['eval_lens']:
             for rho in PROBE['rhos']:
                 learned = cell_mean('csa_fixed_rope', 'learned', Ln, rho, 'uniform')
@@ -1374,7 +1409,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     if not _pairable(learned, other, Ln, rho, tag):
                         continue
                     _add_contrast(f'L{Ln} r{rho}: {tag} - csa+learned', learned, other)
-        # ---- from-scratch selector controls (review point 2) ----
+        # ---- from-scratch selector controls ----
         for Ln in PROBE['eval_lens']:
             for rho in PROBE['rhos']:
                 learned = cell_mean('csa_fixed_rope', 'learned', Ln, rho, 'uniform')
@@ -1400,23 +1435,40 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     if not tt or not sc or not _pairable(tt, sc, Ln, rho, tag):
                         continue
                     _add_contrast(f'L{Ln} r{rho}: {tag}', sc, tt)
-                # architecture-aligned dense (review point 5): full_rope minus
+                # architecture-aligned dense: full_rope minus
                 # the all-blocks CSA twin (same projections/norm/RoPE/sink)
                 dense = cell_mean('full_rope', 'dense', Ln, rho, 'uniform')
                 allt = cell_mean('csa_fixed_rope_allblocks', 'learned', Ln, rho, 'uniform')
                 if dense and allt and _pairable(dense, allt, Ln, rho, 'arch-aligned'):
                     _add_contrast(f'L{Ln} r{rho}: arch-aligned: full_rope - csa_alltrain', allt, dense)
-        # ---- delta-NLL on the corruption modes (review point 3) ----
+        # ---- delta-NLL on the corruption modes ----
         delta_nll = {}
 
         def _nll_tok(rec):
+            # nll_sum and n_tok are PER-ROW arrays: they must align, and token
+            # counts must be exact non-negative integers.  int(1.9) -> 1 and
+            # int(True) -> 1 would silently change the denominator.
+            ns_raw, nt_raw = rec.get('nll_sum'), rec.get('n_tok')
+            if (not isinstance(ns_raw, (list, tuple))
+                    or not isinstance(nt_raw, (list, tuple))
+                    or len(ns_raw) != len(nt_raw) or not ns_raw):
+                return float('nan')
             try:
-                ns = [float(x) for x in (rec.get('nll_sum') or [])]
-                nt = [int(x) for x in (rec.get('n_tok') or [])]
+                ns = []
+                for x in ns_raw:
+                    if isinstance(x, (bool, np.bool_)):
+                        return float('nan')
+                    ns.append(float(x))
+                nt = []
+                for x in nt_raw:
+                    c = L._as_seed_int(x)
+                    if c is None or c < 0:
+                        return float('nan')
+                    nt.append(c)
             except (TypeError, ValueError, OverflowError):
                 return float('nan')
             tot = sum(nt)
-            if not nt or tot <= 0:
+            if tot <= 0:
                 return float('nan')
             v = math.fsum(ns) / tot
             return v if math.isfinite(v) else float('nan')
@@ -1454,7 +1506,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if len(per_seed) >= 1:
                 means = {s: per_seed[s] for s in sorted(per_seed)}
                 _dl = list(means.values())
-                entry = {'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'n': len(_dl), 'mean': float(np.mean(_dl)), 'std': float(np.std(_dl, ddof=1)) if len(_dl) > 1 else 0.0, 'per_seed': means, 'clean_nll_by_seed': {s: _nll_tok(r) for s, r in clean_grp.items() if math.isfinite(_nll_tok(r))}, 'note': 'delta = NLL_corrupted - NLL_clean, nats per target token (review point 3)'}
+                entry = {'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'n': len(_dl), 'mean': float(np.mean(_dl)), 'std': float(np.std(_dl, ddof=1)) if len(_dl) > 1 else 0.0, 'per_seed': means, 'clean_nll_by_seed': {s: _nll_tok(r) for s, r in clean_grp.items() if math.isfinite(_nll_tok(r))}, 'note': 'delta = NLL_corrupted - NLL_clean, nats per target token'}
                 delta_nll[f'{v}::{arm}::L{Ln}::{mode}::r{rho}'] = entry
         # paired delta-NLL contrasts between arms at the same (L, mode, rho)
         for Ln in PROBE['eval_lens']:
@@ -1473,9 +1525,11 @@ def v10_analysis(out='analysis_v10/stats.json'):
                             res = V.exact_sign_permutation(dl)
                             res['seeds'] = common
                             contrasts[f'ΔNLL L{Ln} {mode} r{rho}: {arm} - csa+learned'] = res
-        # ---- Holm correction over the whole contrast family (review point 4) ----
+        # ---- Holm correction over the whole contrast family ----
         holm = {}
-        _fam = [(k, v.get('p_exact_signflip')) for k, v in contrasts.items() if isinstance(v.get('p_exact_signflip'), (int, float)) and math.isfinite(v.get('p_exact_signflip'))]
+        # Declared-but-unmeasurable contrasts keep a p=1 family slot; filtering
+        # them out shrinks m and makes the surviving p_holm too small.
+        _fam = [(k, v.get('p_exact_signflip')) for k, v in contrasts.items()]
         if _fam:
             holm = L.holm_adjust(_fam)
             for _k, _v in contrasts.items():
@@ -1484,7 +1538,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             _rej = [k for k, v in holm.items() if v.get('reject')]
             print(f'[v10 stats] Holm step-down over the {len(_fam)}-contrast family (EXPLORATORY — not pre-registered): {len(_rej)} survive at alpha=0.05' + (f': {sorted(_rej)[:4]}' if _rej else ''))
         probe = {'cells': probe_cells, 'contrasts': contrasts, 'delta_nll': delta_nll, 'holm_exploratory': holm}
-        # ---- NIAH-natural (review point 3, far-necessity task) ----
+        # ---- NIAH-natural (far-necessity task) ----
         _nsp = (PROBE.get('niah') or {}).get('summary')
         if _nsp and os.path.exists(_nsp):
             try:
@@ -1492,17 +1546,34 @@ def v10_analysis(out='analysis_v10/stats.json'):
             except Exception as _e:
                 print(f'[stats] WARNING: {_nsp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — the NIAH-natural panel is skipped')
                 nraw = {}
+            if not isinstance(nraw, dict):
+                print(f'[v10 stats] WARNING: {_nsp} is valid JSON but not an object ({type(nraw).__name__}) — the NIAH-natural panel is EXCLUDED')
+                nraw = {}
             ncells = {}
             for _k, r in nraw.items():
                 if not isinstance(r, dict) or r.get('task') != 'niah_natural':
                     continue
+                if r.get('synthesized'):
+                    continue
                 if r.get('variant') is None or r.get('seed') is None or r.get('arm') is None or r.get('condition') is None:
                     continue
-                nkey = (r['variant'], r['arm'], r['eval_len'], r['condition'], json.dumps(_fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')))
-                grp = ncells.setdefault(nkey, {})
-                if r['seed'] in grp:
+                _seed = L._as_seed_int(r.get('seed'))
+                if _seed is None:
                     continue
-                grp[r['seed']] = r
+                # acc/nll are measurements: a bool/string/NaN is not a result.
+                # Preserve the declared cell with a NaN value so the Holm
+                # family keeps its slot, but never let np.mean crash or read a
+                # boolean as an accuracy.
+                _acc = L._finite_scalar(r.get('acc'))
+                _nll = L._finite_scalar(r.get('nll'))
+                _r = dict(r, seed=_seed,
+                          acc=(_acc if _acc is not None else float('nan')),
+                          nll=(_nll if _nll is not None else float('nan')))
+                nkey = (_r['variant'], _r['arm'], _r['eval_len'], _r['condition'], json.dumps(_fp_norm(_r.get('probe_params')), sort_keys=True), str(_r.get('_code')), str(_r.get('recipe')))
+                grp = ncells.setdefault(nkey, {})
+                if _seed in grp:
+                    continue
+                grp[_seed] = _r
             niah_cells = []
             for (v, arm, Ln, cond, _pp, _cd, _recipe), by_seed in sorted(ncells.items(), key=lambda kv: kv[0]):
                 accs = {s: r['acc'] for s, r in by_seed.items()}
@@ -1545,8 +1616,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             _comb = dict(contrasts)
             _comb.update(niah_contrasts)
             if _comb:
-                _h2 = L.holm_adjust([(k, v.get('p_exact_signflip')) for k, v in _comb.items()
-                                     if isinstance(v.get('p_exact_signflip'), (int, float)) and math.isfinite(v.get('p_exact_signflip'))])
+                _h2 = L.holm_adjust([(k, v.get('p_exact_signflip')) for k, v in _comb.items()])
                 for _k, _v in _comb.items():
                     if isinstance(_v, dict):
                         _e2 = _h2.get(_k)
@@ -1569,7 +1639,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                              'train_tokens': _v.get('train_tokens'),
                              'censored': bool(_v.get('censored') or _v.get('mean_crossed') is False),
                              'reconstructed': bool(_is_recon(_v))}
-    # Reviewer issue 12: one point per width, no censored subset, comparable
+    # One point per width, no censored subset, comparable
     # training volume, at least 4 widths, and a slope WITH CI.  The helper
     # refuses instead of fitting whenever those conditions fail.
     fit = L.crossover_scaling_fit(fit_entries, min_points=4)
@@ -1640,10 +1710,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('> 参考论文：arXiv:2606.19348。**范围声明**：本报告是小规模 WikiText-103 上的受控研究，不是 DeepSeek-V4 的全量复现，也不支持对其规模、语料或生产系统做外推。')
     A('> 说明：本报告全部数字由 `v10_supp.py report` 从 `results_*/`、`analysis_v10/` 的落盘产物计算得到，无手填数值。')
     A('')
-    A('v10 落实 v9 收官后评审的三项升级：(1) 把 v7 P1L 的长度外推观察升级为机制性检验——远距干扰注入实验直接检验「稀疏掩码滤除远距噪声」假设；(2) 新增 d=128/4L 与 d=512/10L 两个规模，与既有 d=256/d=384 面板组成 4 点反转交叉点标度读数（预注册交叉判据）；(3) 把 v9 仍处 p 值分辨率下限的面板（seq-2048 topk 扫描）从 n=2 补到 n=4。')
-    A('')
-    A('**本版修订（评审 5 点）**：(a) P3MTC 补同配方、同 token 预算从头训练的选择器对照（randidx / allblocks；allblocks 在每个位置读取全部块，**不是**等计算量或等读取预算的对照）并补逐项对齐的压缩块全读参照；(b) 干扰注入扩展为 uniform / natural / mask / delete 四种腐坏模式并按 ΔNLL 口径报告，另增 NIAH-natural 远端必要信息任务；(c) P3SL2/P3SL3 补等训练 token 与等计算量的大模型臂，统计新增等 token 切片与收敛（平台期）诊断；(d) 全部配对比较报告逐种子 Δ、效应量 d_z、p 值分辨率下限与 Holm 校正，明确探索性/确认性证据边界（确认性评估见 `v12_supp.py` 与冻结清单 `confirmation_frozen.json`）。')
-    A('')
+
     A('---')
     A('')
     A('## P3M 长度外推优势的机制验证（远距干扰注入）')
@@ -1690,7 +1757,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
 
             def _at(Ln, rows=rows):
                 cells = L.by_len_cells(rows, Ln)
-                ok = [c for c in cells if not c.get('truncated')]
+                ok = [c for c in cells if isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated'))]
                 if (ok if ok else cells) and len(ok if ok else cells) < len(rows):
                     print(f'[v10 report] {v} L{Ln}: the column mean covers {len(ok if ok else cells)}/{len(rows)} seeds — the rest hold no usable cell at this length (error/truncated cell), so the column is a sub-seed mean')
                 if ok:
@@ -1705,7 +1772,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                         continue
                     for Ln, mp in ((512, m512), (4096, m4096)):
                         c = bl.get(Ln, bl.get(str(Ln)))
-                        if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and (not c.get('truncated')):
+                        if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated')):
                             mp[r.get('seed')] = float(c['ppl'])
                 both = sorted(set(m512) & set(m4096))
                 if both and len(both) < len(rows):

@@ -152,7 +152,7 @@ def run_params(outdir='results_m0_params'):
     _budget_tiers = []
     for _name, _run in (('S1', L.RUN_S1), ('S2', L.RUN_S2)):
         _p = next((t['params'] for t in tiers if t['tier'] == _name), None)
-        _budget_tiers.append({'name': _name, 'cfg': _run, 'params': _p})
+        _budget_tiers.append({'name': _name, 'cfg': dict(_run, vocab=_run.get('vocab_size')), 'params': _p})
     _budget = L.scale_ladder_audit(_budget_tiers)
     print(f"\n[params] scale-transfer audit: {_budget['status']}  "
           f"budget_matched={_budget.get('budget_matched')}  "
@@ -466,14 +466,13 @@ def _calibrate_panel(run_cfg, guard, panel):
     """Measure the per-step rate at the panel geometry before planning.
 
     TimeGuard's uncalibrated default is a base-geometry rate extrapolated with
-    an analytic factor; on the S1/S2 ladder that extrapolation is many orders
-    of magnitude too pessimistic (seq 512 -> 8192 and d 256 -> 768/1024 are far
-    outside the fitted range), so a fresh state file would mark every cell
-    `skipped_cap` without ever training.  A short real run at the EXACT panel
-    geometry gives the guard an exact `sps_by_class` entry per variant, and the
-    per-variant key keeps a dense arm from being priced as a sparse one.
+    an analytic factor; on the S1/S2 ladder that extrapolation is not reliable,
+    so a fresh state file could mark every cell `skipped_cap` without ever
+    training.  A short real run at the EXACT panel geometry gives the guard an
+    exact `sps_by_class` entry per variant, and the per-variant key keeps a
+    dense arm from being priced as a sparse one.
 
-    Calibration seconds are booked to the same cap (they are real GPU time).
+    Calibration time is booked to the same cap.
     `M0_CALIB_STEPS` (default 20) controls the probe length; set it to 0 to
     skip when a prior state file already holds every variant's calibration.
     """
@@ -542,7 +541,7 @@ def _calibrate_panel(run_cfg, guard, panel):
     state = guard._load_state()
     by_class = state.get('sps_by_class') or {}
     total = 0.0
-    print(f'[m0-calib] projected {panel} cost at the measured rates (includes the 1.15 safety factor):')
+    print(f'[m0-calib] projected {panel} duration at the calibrated rates (includes the 1.15 safety factor):')
     for v in variants:
         sps = by_class.get(guard._class_key(run_cfg['d'], run_cfg['n_layers'],
                                             run_cfg['seq_len'], run_cfg['batch_size'], v))
@@ -556,8 +555,8 @@ def _calibrate_panel(run_cfg, guard, panel):
           f'(booked so far {state.get("booked_seconds", 0.0) / 3600:.2f} h)')
     if total + state.get('booked_seconds', 0.0) / 3600.0 > cap_h:
         print('[m0-calib] WARNING: the measured projection exceeds the usable cap. The TimeGuard will skip or hard-truncate '
-              'cells that no longer fit (a truncated cell leaves no partial measurement). Raise the cap, reduce the seed/arm '
-              'list, or use a faster kernel — do not read the resulting incomplete panel as a full-panel result.')
+              'cells that do not fit (a truncated cell leaves no partial measurement). Raise the cap or reduce the seed/arm '
+              'list — do not read the resulting incomplete panel as a full-panel result.')
 
 
 B_SCALE_DESIGN = {
@@ -577,15 +576,36 @@ def _ppl_by_seed(summary, variant):
             continue
         if not L.ppl_is_usable(rec.get('ppl')):
             continue
-        try:
-            seed = int(rec.get('seed'))
-        except (TypeError, ValueError, OverflowError):
+        seed = L._as_seed_int(rec.get('seed'))
+        if seed is None:
             continue
         if seed in out:
             # aggregate would reject this; keep the analysis explicit too.
             raise ValueError(f'{variant}: duplicate measurable seed {seed}')
         out[seed] = float(rec['ppl'])
     return out
+
+
+def _panel_corpus_fp(summary, variant=None):
+    """Corpus/tokenizer identity of one (panel, arm): the records' composite
+    `data_version` (dataset + tokenizer fit + train/val fingerprints + vocab).
+    Mixed values inside one panel are an error (aggregate refuses the same
+    panel for pooling); the cross-scale audit needs the fingerprint to refuse
+    log-ratio pooling across different tokenisations."""
+    fps = set()
+    for rec in summary.values():
+        if not isinstance(rec, dict):
+            continue
+        if variant is not None and rec.get('variant') != variant:
+            continue
+        fp = rec.get('data_version')
+        if fp is None and isinstance(rec.get('provenance'), dict):
+            fp = ((rec['provenance'].get('data') or {}).get('data_version'))
+        if fp not in (None, ''):
+            fps.add(str(fp))
+    if len(fps) > 1:
+        raise ValueError(f'{variant or "panel"}: records carry {len(fps)} different data_version fingerprints {sorted(fps)}')
+    return (sorted(fps)[0] if fps else None)
 
 
 def _flatten_contrasts(audit):
@@ -690,9 +710,15 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
                 continue
             lr = L.paired_log_ratio([pa[s] for s in common], [pb[s] for s in common], seeds=common)
             raw[label] = lr
+            try:
+                _cfp = _panel_corpus_fp(summary, a)
+            except ValueError as e:
+                print(f'[m0-analysis] {name}/{label}: {e}')
+                continue
             _e = (report['panels'].get(label) or {}).get('arms', {}).get(a) or {}
             points.append({'label': label, 'scale': _e.get('params'),
-                           'effects': lr['effects'], 'seeds': lr['seeds']})
+                           'effects': lr['effects'], 'seeds': lr['seeds'],
+                           'corpus_fp': _cfp})
         if len(points) < 2:
             if points:
                 report['cross_scale'][name] = {'status': 'single_scale_only', 'per_scale': raw}
@@ -721,10 +747,21 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
         _arms = _pan.get('arms') or {}
         _pick = _arms.get('csa_dynamic') or (next(iter(_arms.values())) if _arms else {})
         _params = _pick.get('params')
-        _budget_tiers.append({'name': _label, 'cfg': _cfg, 'params': _params})
+        # Bind the tier to the corpus/tokenizer identity its records attest
+        # (data_version), so the ladder audit can refuse a cross-tier
+        # comparison that silently mixed tokenisations.
+        try:
+            _cfp = _panel_corpus_fp(summaries.get(_label) or {})
+        except ValueError as e:
+            print(f'[m0-analysis] {_label}: {e}')
+            _cfp = None
+        _budget_tiers.append({'name': _label, 'cfg': dict(_cfg, corpus_fp=_cfp),
+                              'params': _params})
     report['scale_ladder_audit'] = L.scale_ladder_audit(_budget_tiers)
     for _w in report['scale_ladder_audit'].get('warnings') or []:
         print(f'[m0-analysis] WARNING: {_w}')
+    for _p in report['scale_ladder_audit'].get('problems') or []:
+        print(f'[m0-analysis] PROBLEM: {_p}')
     os.makedirs(outdir, exist_ok=True)
     L.stamped_analysis('m0_scale_analysis', report, outdir=outdir, name='scale_analysis.json')
     print(f'[m0-analysis] wrote {outdir}/scale_analysis.json')

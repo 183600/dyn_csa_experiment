@@ -138,6 +138,16 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None):
     common = sorted(set(panel[a]) & set(panel[b]))
     if not common:
         return _omit(f'`{a}` and `{b}` share no seed ({len(panel[a])} vs {len(panel[b])} seeds)')
+    # Pairing is per seed, but a family must not span run configurations:
+    # seed 0 from cfgA and seed 1 from cfgB are not two independent observations
+    # of one controlled contrast.  Keep the largest/current config group.
+    _cfg_groups = {}
+    for _s in common:
+        _cfg_groups.setdefault((panel[a][_s].get('run_cfg'), panel[b][_s].get('run_cfg')), []).append(_s)
+    if len(_cfg_groups) > 1:
+        _ranked = sorted(_cfg_groups.items(), key=lambda kv: (not (isinstance(kv[0][0], str) and V.CKPT_CODE and kv[0][0].endswith(f'_cs{V.CKPT_CODE}')), -len(kv[1]), str(kv[0])))
+        common = _ranked[0][1]
+        print(f'[stats] {who}{name}: paired seeds span {len(_cfg_groups)} run_cfg groups — keeping only the largest/current group ({len(common)} seed(s)) instead of pooling configurations')
     dl, skipped, unstamped, why = ([], [], 0, set())
     for s in common:
         ra, rb = (panel[a][s], panel[b][s])

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """audit_gates.py — 可执行审计入口（零实验）。
 
-评审指出九个「目前不能排除、必须进一步验证」的领域。本模块把其中能以
-**代码 + 现有落盘产物**核验的部分变成可运行的审计子命令；不能本地核验的
+本模块把「目前不能仅凭代码排除、必须进一步验证」的领域变成可运行的审计
+子命令，能用**代码 + 现有落盘产物**核验；不能本地核验的
 （需要 GPU 训练 / 需要 ckpt）提供入口与判据，等实验机器上运行。它**不启动
 任何训练**——每个子命令要么零 GPU 读产物，要么纯 CPU 单元测试。
 
@@ -38,6 +38,7 @@
 """
 import json
 import math
+import numbers
 import os
 import sys
 import time
@@ -50,6 +51,35 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 REPO = os.path.dirname(os.path.abspath(__file__))
+
+
+def _exact_int_scalar(value):
+    """Exact non-lossy integer view of a metadata scalar, or None.
+
+    ``int(1.9) == 1`` and ``int(True) == 1`` silently turn malformed
+    provenance (vocab sizes, sequence lengths) into a different valid cache
+    identity, which would let the leakage/split audits pair the wrong files.
+    """
+    # np.bool_ is neither numbers.Integral nor numbers.Real on NumPy 2, so it
+    # would otherwise fall through float(np.True_) == 1.0 and be accepted.
+    # Its dtype kind is the stable spelling across NumPy versions.
+    if (value is None or isinstance(value, bool)
+            or getattr(getattr(value, 'dtype', None), 'kind', None) == 'b'):
+        return None
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        f = float(value)
+        if not math.isfinite(f) or f != math.floor(f) or abs(f) >= 2 ** 53:
+            return None
+        return int(f)
+    try:
+        f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(f) or f != math.floor(f) or abs(f) >= 2 ** 53:
+        return None
+    return int(f)
 
 
 def _load(path):
@@ -119,10 +149,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     # required to match: the training cache is 512-token and the held-out cache
     # is 4097-token by construction.
     def _as_int(value):
-        try:
-            return int(value)
-        except (TypeError, ValueError, OverflowError):
-            return None
+        return _exact_int_scalar(value)
     _pairs = []
     for _tp in _tm:
         _tmeta = _load(_tp)
@@ -141,9 +168,12 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                 continue
             _pairs.append((_mp, _mmeta, _tp, _tmeta))
     if preferred_train_seq_len is not None:
-        _pref = [p for p in _pairs
-                 if p[1].get('seq_len') is not None
-                 and int(p[1]['seq_len']) == int(preferred_train_seq_len)]
+        _want_sl = _exact_int_scalar(preferred_train_seq_len)
+        _pref = []
+        for p in _pairs:
+            _got_sl = _exact_int_scalar(p[1].get('seq_len'))
+            if _want_sl is not None and _got_sl is not None and _got_sl == _want_sl:
+                _pref.append(p)
         if _pref:
             _pairs = _pref
     if not _pairs:
@@ -220,7 +250,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     # now persist test_doc_ids; when the sidecar is present, recompute the
     # train/test and val/test document intersections instead of trusting the
     # metadata flags.  A missing sidecar is reported as not independently
-    # verified (legacy cache), not silently treated as clean.
+    # verified (unverified cache), not silently treated as clean.
     _trd_p = os.path.join(cache_dir, f'train_doc_ids_{train_tag}.npy')
     _vad_p = os.path.join(cache_dir, f'val_doc_ids_{train_tag}.npy')
     _ted_p = os.path.join(cache_dir, f'test_doc_ids_{test_tag}.npy')
@@ -231,13 +261,26 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             _doc_checks = {'test_documents': int(_ted.size)}
             _doc_leak = []
             _tm_doc = (test_meta or {}).get('doc_ids') or {}
+            _train_doc = (train_meta or {}).get('doc_ids') or {}
             if _tm_doc:
-                if int(_tm_doc.get('test_count', -1)) != int(_ted.size):
+                if _exact_int_scalar(_tm_doc.get('test_count')) != int(_ted.size):
                     _doc_leak.append('test document-id sidecar count disagrees with the test metadata')
+                if (_tm_doc.get('test_fp')
+                        and _tm_doc['test_fp'] != _sidecar_fp(_ted)):
+                    _doc_leak.append('test document-id sidecar does not match the '
+                                     'fingerprint in the test metadata')
             else:
                 _doc_checks['metadata'] = 'test meta has no doc_ids attestation'
             if os.path.exists(_trd_p):
-                _n = int(np.intersect1d(np.load(_trd_p), _ted).size)
+                _trd = np.load(_trd_p)
+                if (_train_doc.get('train_count') is not None
+                        and _exact_int_scalar(_train_doc['train_count']) != int(np.asarray(_trd).size)):
+                    _doc_leak.append('train document-id sidecar count disagrees with the cache metadata')
+                if (_train_doc.get('train_fp')
+                        and _train_doc['train_fp'] != _sidecar_fp(_trd)):
+                    _doc_leak.append('train document-id sidecar does not match the '
+                                     'fingerprint in the cache metadata')
+                _n = int(np.intersect1d(_trd, _ted).size)
                 _doc_checks['test_train_overlap'] = _n
                 if _n:
                     _doc_leak.append(f'{_n} test document ids also occur in train')
@@ -245,7 +288,15 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                 _doc_checks['test_train_overlap'] = 'train sidecar missing'
                 _doc_leak.append('train document-id sidecar is missing; test/train group isolation cannot be verified')
             if os.path.exists(_vad_p):
-                _n = int(np.intersect1d(np.load(_vad_p), _ted).size)
+                _vad = np.load(_vad_p)
+                if (_train_doc.get('validation_count') is not None
+                        and _exact_int_scalar(_train_doc['validation_count']) != int(np.asarray(_vad).size)):
+                    _doc_leak.append('validation document-id sidecar count disagrees with the cache metadata')
+                if (_train_doc.get('validation_fp')
+                        and _train_doc['validation_fp'] != _sidecar_fp(_vad)):
+                    _doc_leak.append('validation document-id sidecar does not match '
+                                     'the fingerprint in the cache metadata')
+                _n = int(np.intersect1d(_vad, _ted).size)
                 _doc_checks['test_validation_overlap'] = _n
                 if _n:
                     _doc_leak.append(f'{_n} test document ids also occur in validation')
@@ -262,11 +313,25 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             out['status'] = 'fail'
             out['note'] = (f'held-out document-id sidecar unreadable ({_de}); '
                            'document-group isolation cannot be verified')
+    elif (test_meta or {}).get('doc_ids'):
+        out['checks']['document_isolation'] = {
+            'status': 'fail',
+            'note': 'test metadata records document ids but the test document-id sidecar is missing',
+        }
+        out['status'] = 'fail'
+        out['note'] = ('held-out test document-id sidecar is missing while the test '
+                       'metadata records document ids — rebuild the test cache')
     else:
         out['checks']['document_isolation'] = {
             'status': 'not_verified',
-            'note': 'legacy test cache without test_doc_ids; rebuild it to prove train/val/test document-group isolation',
+            'note': 'test cache without test_doc_ids; rebuild it to prove train/val/test document-group isolation',
         }
+        # An unverifiable isolation claim must not be reported as a clean
+        # "ok" audit: a consumer that only reads the top-level status would
+        # otherwise treat it as proof of document isolation.
+        if out['status'] == 'ok':
+            out['status'] = 'warnings'
+        out.setdefault('note', 'document-group isolation is not verified (test cache without test_doc_ids)')
     # d) document overlap via deterministic SLIDING shingles on the cached id
     # matrices.  A fixed polynomial rolling hash over every window, uniform
     # segments across the full train stream, and an explicit scanned fraction
@@ -280,7 +345,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             if os.path.exists(expected):
                 return [expected]
             _c = sorted(glob.glob(os.path.join(cache_dir, pattern)))
-            # Legacy caches may use a different tag spelling.  A single
+            # Caches may use a different tag spelling.  A single
             # remaining candidate is unambiguous; more than one is refused
             # instead of silently pairing the wrong configuration.
             return _c if len(_c) == 1 else []
@@ -336,7 +401,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             inter = int(np.intersect1d(tr_s, te_s, assume_unique=True).size)
             union = int(tr_s.size + te_s.size - inter)
             jac = (inter / union) if union else 0.0
-            # v11.128: Jaccard on a 4M-vs-65k shingle pair is bounded near
+            # Jaccard on a 4M-vs-65k shingle pair is bounded near
             # 1.6% even when EVERY test shingle occurs in train, so a
             # `jaccard > 0.05` threshold cannot fire.  Two reachable statistics
             # are used instead: the fraction of TEST shingles shared with train,
@@ -386,7 +451,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                          'evaluation subset or report an overlap-excluded sensitivity '
                          'analysis. Sampling fractions are reported above; '
                          'uniformly-spaced sliding windows over the requested '
-                         'scan budget are deterministic across processes.'),
+                         'scan limit are deterministic across processes.'),
             }
             if _viol:
                 out['status'] = 'fail'
@@ -399,8 +464,17 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                                'analysis is reported).')
         else:
             out['checks']['doc_overlap'] = 'npy caches absent'
+            if out['status'] == 'ok':
+                out['status'] = 'warnings'
     except Exception as e:
+        # A failed overlap computation leaves the train/test document
+        # separation unverified.  Reporting the top-level audit as "ok" would
+        # let a malformed cache/meta silently clear the leakage gate.
         out['checks']['doc_overlap'] = f'failed ({type(e).__name__}: {e})'
+        out['status'] = 'fail'
+        out['note'] = (f'train/test document-overlap computation failed ({type(e).__name__}: {e}); '
+                       'document separation cannot be verified — rebuild the caches '
+                       'or correct the malformed inputs before quoting a clean leakage audit')
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
@@ -409,10 +483,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
 # 1b) split discipline：划分顺序 / 群组完整性 / 重复行 / 分布偏移
 # ---------------------------------------------------------------------------
 
-# Above this many elements the length-n permutation behind
-# rng.choice(..., replace=False) is not worth its memory in an audit
-# box (>= 2**28 * 8 B); _sample_tokens then draws the same uniform
-# without-replacement sample by rejection in O(cap) memory instead.
+# Threshold for switching to the rejection sampler below.
 _CHOICE_PERM_MAX_ELEMS = 1 << 28
 
 
@@ -424,13 +495,9 @@ def _sample_tokens(arr, cap=1000000, seed=0):
         return a
     n = int(a.size)
     rng = np.random.default_rng(seed)
-    # rng.choice(..., replace=False) materialises a length-n permutation
-    # (O(n) work and memory).  That is fine for today's corpus sizes, but a
-    # scale-up corpus makes it an allocation hazard, so above the threshold
-    # where the permutation does not fit a sane audit box the same kind of
-    # uniform without-replacement sample is drawn by rejection instead:
-    # every K-subset remains equally likely and the draw stays
-    # seed-deterministic, with O(cap) memory.
+    # Above the threshold the same uniform without-replacement sample is
+    # drawn by rejection: every K-subset remains equally likely and the draw
+    # stays seed-deterministic.
     if n <= _CHOICE_PERM_MAX_ELEMS:
         idx = rng.choice(n, size=int(cap), replace=False)
     else:
@@ -481,6 +548,39 @@ def _window_hashes(values, width):
     out[0] = np.uint64(h0)
     out[1:] = b_pow[1:] * (np.uint64(h0) + pref)
     return out
+
+
+def _sidecar_fp(arr):
+    """Content fingerprint for a document-id sidecar.
+
+    Mirrors ``exp_lib._ids_fp`` exactly: every integer storage width is hashed
+    through one canonical int64 form (uint64 only when a value exceeds int64),
+    so the same document ids keep one digest whether a sidecar was stored as
+    uint8/uint16/int32/int64.  Keeping the same digest here lets the zero-GPU
+    audit compare a sidecar against the fingerprint recorded at build time
+    without importing the torch-backed experiment library.  A width-dependent
+    hash would make a valid cache look corrupted (or, worse, let two different
+    id arrays collide) after a storage-only rebuild.
+    """
+    import hashlib
+    import numpy as np
+    h = hashlib.sha256()
+    a = np.asarray(arr)
+    _canon = None
+    if np.issubdtype(a.dtype, np.integer):
+        _canon = np.dtype(np.int64)
+        if (a.dtype == np.dtype(np.uint64) and a.size
+                and int(a.max()) > np.iinfo(np.int64).max):
+            _canon = np.dtype(np.uint64)
+    step = 1 << 24
+    for off in range(0, len(a), step):
+        part = a[off:off + step]
+        if _canon is not None and part.dtype != _canon:
+            part = part.astype(_canon, copy=False)
+        elif not part.flags.c_contiguous:
+            part = np.ascontiguousarray(part)
+        h.update(memoryview(part).cast('B'))
+    return h.hexdigest()[:16]
 
 
 def _row_overlap_count(train, rows, chunk_tokens=1 << 20):
@@ -552,7 +652,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
         assumed away).
 
     Exact duplicate rows across splits are a hard failure.  Distribution or
-    legacy-metadata issues are warnings because they need a scientific
+    metadata issues are warnings because they need a scientific
     judgement, not an automatic rebuild.
     """
     import glob
@@ -583,10 +683,17 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             if os.path.basename(mp).startswith('test_meta_'):
                 continue
             _nwarn_before = len(out['warnings'])
+            tag = os.path.basename(mp)[len('meta_'):-len('.json')]
             meta = _load(mp)
             if not isinstance(meta, dict):
+                # An existing but unreadable/non-object meta is a corrupt
+                # cache, not "no cache": skipping it silently would leave the
+                # split contract unverified while the audit reports ok.
+                cache['corpora'][tag] = {'status': 'fail', 'meta': os.path.basename(mp),
+                                         'error': 'metadata exists but is not a JSON object'}
+                cache['status'] = 'fail'
+                _fail(f'{cd}/{tag}: cache metadata is unreadable or not a JSON object — split contract cannot be verified')
                 continue
-            tag = os.path.basename(mp)[len('meta_'):-len('.json')]
             trp = os.path.join(cd, f'train_ids_{tag}.npy')
             vap = os.path.join(cd, f'val_batch_{tag}.npy')
             if not (os.path.exists(trp) and os.path.exists(vap)):
@@ -603,7 +710,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 continue
             rec['train_shape'] = list(tr.shape)
             rec['val_shape'] = list(va.shape)
-            rec['declared_split_strategy'] = meta.get('split_strategy') or 'legacy_unrecorded'
+            rec['declared_split_strategy'] = meta.get('split_strategy') or 'unrecorded'
             rec['shuffle_at_split'] = meta.get('shuffle_at_split')
             rec['tokenizer_fit_split'] = meta.get('tokenizer_fit_split')
             rec['val_fingerprint_recorded'] = bool(meta.get('val_fp'))
@@ -614,7 +721,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 rec['status'] = 'fail'
                 _fail(f'{cd}/{tag}: tokenizer fit split is {meta.get("tokenizer_fit_split")!r}, not train')
             if meta.get('split_strategy') is None:
-                _warn(f'{cd}/{tag}: legacy cache has no split_strategy/tokenizer provenance metadata; rebuild it to make the split auditable')
+                _warn(f'{cd}/{tag}: cache has no split_strategy/tokenizer provenance metadata; rebuild it to make the split auditable')
 
             # Data-cleaning coverage: non-finite values are a hard failure (an
             # embedding index or loss built from them is undefined), and exact
@@ -647,6 +754,27 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 try:
                     _trd = np.load(_trd_path)
                     _vad = np.load(_vad_path)
+                    # The sidecars must match the fingerprints in the metadata
+                    # before their contents are read.
+                    if _mdoc.get('train_fp') and _mdoc['train_fp'] != _sidecar_fp(_trd):
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: train document-id sidecar does not '
+                              'match the fingerprint in the cache metadata')
+                    if _mdoc.get('validation_fp') and _mdoc['validation_fp'] != _sidecar_fp(_vad):
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: validation document-id sidecar does not '
+                              'match the fingerprint in the cache metadata')
+                    # A count recorded in the metadata is a second, independent
+                    # binding: a truncated/extra sidecar must fail even when the
+                    # fingerprint field was omitted by the writer.
+                    if _mdoc.get('train_count') is not None and _exact_int_scalar(_mdoc['train_count']) != int(np.asarray(_trd).size):
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: train document-id sidecar count '
+                              'disagrees with the cache metadata')
+                    if _mdoc.get('validation_count') is not None and _exact_int_scalar(_mdoc['validation_count']) != int(np.asarray(_vad).size):
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: validation document-id sidecar count '
+                              'disagrees with the cache metadata')
                     _shared_docs = int(np.intersect1d(_trd, _vad).size)
                     rec['documents'] = {
                         'train_count': int(np.asarray(_trd).size),
@@ -661,7 +789,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: cache metadata does not attest '
                               'document-disjoint splits')
-                    if _mdoc and int(_mdoc.get('overlap', 0) or 0) != 0:
+                    if _mdoc and _exact_int_scalar(_mdoc.get('overlap', 0)) != 0:
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: cache metadata records a nonzero '
                               'train/validation document overlap')
@@ -672,6 +800,10 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 rec['status'] = 'fail'
                 _fail(f'{cd}/{tag}: cache metadata records document ids but the '
                       'sidecar files are missing')
+            else:
+                rec['document_isolation'] = 'not_verified (cache has no document-id sidecars)'
+                _warn(f'{cd}/{tag}: cache has no document-id sidecars; '
+                      'whole-document group isolation cannot be verified')
 
             # Exact duplicate rows across train/val/test.  This is row-level
             # leakage regardless of how the split was generated.
@@ -687,32 +819,74 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             # negatives in the overlap audit.
             _cands = []
             for _tmp in sorted(glob.glob(os.path.join(cd, 'test_meta_*.json'))):
+                _ttag = os.path.basename(_tmp)[len('test_meta_'):-len('.json')]
                 _tm = _load(_tmp)
                 if not isinstance(_tm, dict):
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{_ttag}: test cache metadata is unreadable or not a JSON object — test split contract cannot be verified')
                     continue
-                _ttag = os.path.basename(_tmp)[len('test_meta_'):-len('.json')]
                 _tfp = os.path.join(cd, f'test_ids_{_ttag}.npy')
                 if not os.path.exists(_tfp):
                     continue
-                if meta.get('seq_len') is not None and _tm.get('seq_len') is not None and int(_tm['seq_len']) != int(meta['seq_len']):
-                    continue
-                if meta.get('vocab') is not None and _tm.get('vocab') is not None and int(_tm['vocab']) != int(meta['vocab']):
-                    continue
+                # Train and held-out sequence lengths may differ (the training
+                # cache uses the training seq_len while the frozen test slice
+                # can use a longer evaluation window).  Pair on tokenizer/vocab
+                # provenance; the row-overlap checks accept different shapes,
+                # and >1 matching candidate is reported as ambiguous.
+                if meta.get('vocab') is not None and _tm.get('vocab') is not None:
+                    _tv = _exact_int_scalar(_tm['vocab'])
+                    _mv = _exact_int_scalar(meta['vocab'])
+                    if _tv is None or _mv is None:
+                        # A malformed vocab cannot be paired; fail the cache
+                        # instead of truncating it to a different identity or
+                        # aborting the whole report.
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: cache metadata has a non-integer vocab '
+                              f'(train={meta.get("vocab")!r}, test={_tm.get("vocab")!r})')
+                        continue
+                    if _tv != _mv:
+                        continue
                 if meta.get('fit_fp') and _tm.get('fit_fp') and meta['fit_fp'] != _tm['fit_fp']:
                     continue
-                _cands.append((_tfp, _ttag))
+                _cands.append((_tfp, _ttag, _tm))
             te = None
             if len(_cands) == 1:
-                _tfp, _ttag = _cands[0]
+                _tfp, _ttag, _tmeta = _cands[0]
+                rec['test_split_strategy'] = _tmeta.get('split_strategy') or 'unrecorded'
+                rec['test_shuffle_at_split'] = _tmeta.get('shuffle_at_split')
+                rec['test_tokenizer_fit_split'] = _tmeta.get('tokenizer_fit_split')
+                if _tmeta.get('shuffle_at_split') is True:
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test metadata declares a shuffled split')
+                if _tmeta.get('tokenizer_fit_split') not in (None, 'train'):
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test tokenizer was fitted on {_tmeta.get("tokenizer_fit_split")!r}, not train')
+                if _tmeta.get('split_strategy') is None:
+                    _warn(f'{cd}/{tag}: test cache has no split_strategy/tokenizer provenance metadata')
+                _tndc = _tmeta.get('near_duplicate_cleanup')
+                if isinstance(_tndc, dict):
+                    if _tndc.get('policy') != 'test_documents_deduplicated_against_train_and_validation':
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: test metadata does not attest duplicate cleanup against both train and validation')
+                else:
+                    # The attestation is required: exact-row checks alone do
+                    # not rule out near-duplicates between test and
+                    # train/validation.
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test metadata has no near-duplicate cleanup '
+                          'attestation against train and validation')
                 try:
                     te = np.load(_tfp, mmap_mode='r')
                     rec['test_file'] = os.path.basename(_tfp)
                     rec['test_tag'] = _ttag
-                except Exception:
+                except Exception as _te:
                     te = None
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test cache exists but is unreadable '
+                          f'({type(_te).__name__}: {_te})')
             elif len(_cands) > 1:
                 rec['test_pairing'] = 'ambiguous'
-                rec['test_candidates'] = sorted(os.path.basename(p) for p, _ in _cands)
+                rec['test_candidates'] = sorted(os.path.basename(p) for p, _, _ in _cands)
                 _warn(f'{cd}/{tag}: {len(_cands)} test caches match the same protocol; refusing to guess which test split to audit')
             else:
                 rec['test_pairing'] = 'not_found'
@@ -743,24 +917,57 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     _fail(f'{cd}/{tag}: {shared_val_test} test rows exactly duplicate a validation row')
                 _ted_path = os.path.join(cd, f'test_doc_ids_{_ttag}.npy')
                 if os.path.exists(_ted_path):
+                    # The test sidecar can be checked against its own metadata
+                    # even when the paired train/validation sidecars are absent.
+                    # Group isolation needs both pairs, but self-consistency is
+                    # independent of them.
                     try:
                         _ted = np.load(_ted_path)
-                        _trd = np.load(_trd_path) if os.path.exists(_trd_path) else np.empty(0, dtype=np.uint64)
-                        _vad = np.load(_vad_path) if os.path.exists(_vad_path) else np.empty(0, dtype=np.uint64)
-                        _dtrain = int(np.intersect1d(_trd, _ted).size)
-                        _dval = int(np.intersect1d(_vad, _ted).size)
+                        _mtdoc = (_tmeta or {}).get('doc_ids') or {}
+                        if _mtdoc:
+                            if _exact_int_scalar(_mtdoc.get('test_count')) != int(np.asarray(_ted).size):
+                                rec['status'] = 'fail'
+                                _fail(f'{cd}/{tag}: test document-id sidecar count '
+                                      'disagrees with the test metadata')
+                            if (_mtdoc.get('test_fp')
+                                    and _mtdoc['test_fp'] != _sidecar_fp(_ted)):
+                                rec['status'] = 'fail'
+                                _fail(f'{cd}/{tag}: test document-id sidecar does '
+                                      'not match the fingerprint in the test metadata')
                         rec['test_documents'] = int(_ted.size)
-                        rec['test_train_document_overlap'] = _dtrain
-                        rec['test_validation_document_overlap'] = _dval
-                        if _dtrain:
-                            rec['status'] = 'fail'
-                            _fail(f'{cd}/{tag}: {_dtrain} test document ids also occur in train (group leakage)')
-                        if _dval:
-                            rec['status'] = 'fail'
-                            _fail(f'{cd}/{tag}: {_dval} test document ids also occur in validation (selection/test group leakage)')
+                        _have_trd = os.path.exists(_trd_path)
+                        _have_vad = os.path.exists(_vad_path)
+                        if not (_have_trd and _have_vad):
+                            _missing = [n for n, ok in (('train', _have_trd),
+                                                       ('validation', _have_vad)) if not ok]
+                            rec['test_document_isolation'] = (
+                                'not_verified (missing '
+                                + '/'.join(_missing)
+                                + ' document-id sidecar)')
+                            _warn(f'{cd}/{tag}: test document-id sidecar is self-consistent, '
+                                  f'but the {"/".join(_missing)} sidecar is missing; '
+                                  'test/train and test/validation group isolation '
+                                  'cannot be verified')
+                        else:
+                            _trd = np.load(_trd_path)
+                            _vad = np.load(_vad_path)
+                            _dtrain = int(np.intersect1d(_trd, _ted).size)
+                            _dval = int(np.intersect1d(_vad, _ted).size)
+                            rec['test_train_document_overlap'] = _dtrain
+                            rec['test_validation_document_overlap'] = _dval
+                            if _dtrain:
+                                rec['status'] = 'fail'
+                                _fail(f'{cd}/{tag}: {_dtrain} test document ids also occur in train (group leakage)')
+                            if _dval:
+                                rec['status'] = 'fail'
+                                _fail(f'{cd}/{tag}: {_dval} test document ids also occur in validation (selection/test group leakage)')
                     except Exception as _de:
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: test document-id sidecar unreadable ({type(_de).__name__}: {_de})')
+                elif ((_tmeta or {}).get('doc_ids')):
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test metadata records document ids but the '
+                          'test document-id sidecar is missing')
                 else:
                     rec['test_document_isolation'] = 'not_verified (no test_doc_ids sidecar)'
             else:
@@ -821,7 +1028,9 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
     # at all" -- the split contract was not verified.  Do not leave the
     # top-level verdict as 'ok' in that case.
     if (not out['caches']
-            or not any(c.get('corpora') for c in out['caches'].values())):
+            or not any(c.get('corpora') for c in out['caches'].values())
+            or any(c.get('status') == 'not_verifiable_locally'
+                   for c in out['caches'].values())):
         if out['status'] == 'ok':
             out['status'] = 'not_verifiable_locally'
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -909,7 +1118,7 @@ def audit_causality():
 def audit_attribution(outdirs=None):
     """动态分块归因审计（零 GPU，读 results_*/summary.json + ckpt 元数据）。
 
-    评审问题：固定块与动态块是否匹配实际块数、压缩率、可读摘要数量和
+    审计口径：固定块与动态块是否匹配实际块数、压缩率、可读摘要数量和
     计算量。本审计从落盘训练记录的 by_len / _stats / 参数量字段重算
     每臂的：参数量、（若启用块统计）块长分布与边界对齐读数，并输出
     「臂间块数是否对齐」的对照表。检查 `attn._stats`（enable_block_stats
@@ -917,9 +1126,17 @@ def audit_attribution(outdirs=None):
     out = {'status': 'ok', 'panels': {}}
     L = _import_exp_lib()
     import numpy as np
+    _missing_panels = []
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))
+        if summ is None:
+            continue
+        if not isinstance(summ, dict):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: summary.json is {type(summ).__name__}, not an object — the block attribution cannot be audited')
+            continue
         if not summ:
             continue
         panel = {}
@@ -969,8 +1186,17 @@ def audit_attribution(outdirs=None):
                     out.setdefault('blocking_contrasts', {})[f'{a} vs {b}'] = rec
             out['panels'][d] = panel
             if missing:
+                _missing_panels.append(d)
                 out['panels'][d]['note'] = f'no block-stat fields found for {sorted(missing)} — run evals with exp_lib.enable_block_stats(model, True) (or the kernel twin, same collection) before this audit can compare block counts/compression across arms'
-    if not out['panels']:
+    if _missing_panels and out['status'] == 'ok':
+        # A panel with records but no block statistics cannot support the
+        # block-attribution readout; calling it "ok" would treat an absent
+        # measurement as a passed audit.
+        if len(_missing_panels) == len(out['panels']):
+            out['status'] = 'not_verifiable_locally'
+        else:
+            out['status'] = 'warn'
+    if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no results_*/summary.json on this machine — the attribution readout needs the experiment artifacts; the collection hooks are already wired (enable_block_stats / attn._stats per design_notes §14)'
     print(json.dumps(out, ensure_ascii=False, indent=2)[:4000])
@@ -984,15 +1210,23 @@ def audit_attribution(outdirs=None):
 def audit_boundary(outdirs=None):
     """边界意义审计（零 GPU）：对齐读数必须超过「匹配块长分布的随机切割」。
 
-    评审问题：与标点/词边界的对齐是否超过匹配块长分布的随机基线——否则
+    审计口径：与标点/词边界的对齐是否超过匹配块长分布的随机基线——否则
     「语义边界」是块长分布的伪影。exp_lib 已实现该基线
     （`_random_cut_precision`，两种口径见 design_notes §10）；本审计把
     「对齐精度 − 随机基线」的差值与比值汇总成显式判读。"""
     out = {'status': 'ok', 'panels': {}}
     L = _import_exp_lib()
+    import numpy as np
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))
+        if summ is None:
+            continue
+        if not isinstance(summ, dict):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: summary.json is {type(summ).__name__}, not an object — boundary alignment cannot be audited')
+            continue
         if not summ:
             continue
         found = {}
@@ -1006,13 +1240,57 @@ def audit_boundary(outdirs=None):
                     break
         if found:
             agg = []
-            for key, b in list(found.items())[:200]:
+            bad = []
+            # Audit EVERY cell, not only the first 200: truncating the loop
+            # would let a failing cell beyond the cap disappear from the
+            # verdict while the audit still reports "ok".
+            for key, b in found.items():
                 p = b.get('precision')
                 rp = b.get('random_precision')
-                if p is not None and rp is not None:
-                    agg.append({'key': key, 'precision': p, 'random_baseline': rp, 'excess': p - rp, 'ratio': (p / rp) if rp else None, 'verdict': 'exceeds random baseline' if p > rp else ('at baseline (block-length artifact)' if abs(p - rp) < 1e-9 else 'below baseline')})
+                if p is None or rp is None:
+                    # A cell that only carries `excess` cannot be audited: both
+                    # the precision and the matched-length random baseline are
+                    # required to test the claim.
+                    bad.append(f'{key}: missing precision/random_precision')
+                    continue
+                if (isinstance(p, (bool, np.bool_))
+                        or isinstance(rp, (bool, np.bool_))):
+                    bad.append(f'{key}: precision/random_precision is boolean')
+                    continue
+                try:
+                    p = float(p)
+                    rp = float(rp)
+                except (TypeError, ValueError, OverflowError):
+                    bad.append(f'{key}: precision/random_precision is not numeric')
+                    continue
+                if not (math.isfinite(p) and math.isfinite(rp)):
+                    bad.append(f'{key}: precision/random_precision is not finite')
+                    continue
+                # Precision and a probability baseline are fractions in [0,1].
+                # An out-of-range value (e.g. -0.5 or 1.7) cannot support the
+                # "exceeds the random baseline" reading and must not be
+                # summarised as if it did.
+                if not (0.0 <= p <= 1.0 and 0.0 <= rp <= 1.0):
+                    bad.append(f'{key}: precision/random_precision outside [0,1] ({p!r}, {rp!r})')
+                    continue
+                agg.append({'key': key, 'precision': p, 'random_baseline': rp, 'excess': p - rp, 'ratio': (p / rp) if rp else None, 'verdict': 'exceeds random baseline' if p > rp else ('at baseline (block-length artifact)' if abs(p - rp) < 1e-9 else 'below baseline')})
             out['panels'][d] = agg
-    if not out['panels']:
+            out.setdefault('cells_audited', {})[d] = len(agg)
+            if bad:
+                out['status'] = 'fail'
+                out.setdefault('problems', []).extend(f'{d}: {msg}' for msg in bad)
+            if not agg:
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: boundary cells exist but none has a usable precision/random_precision pair')
+            # The audit's claim is that alignment EXCEEDS the matched-length
+            # random baseline; a cell at/below it is a failed claim, not a
+            # silent diagnostic.
+            if any(v['verdict'] != 'exceeds random baseline' for v in agg):
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: boundary alignment does not exceed the random baseline')
+    if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no boundary-alignment fields in the local results; fuse_analysis.py recomputes per-layer alignment (tol=1) from summary.json and exp_lib._random_cut_precision provides the matched-length random baseline — run them on the experiment machine'
     print(json.dumps(out, ensure_ascii=False, indent=2)[:4000])
@@ -1034,51 +1312,113 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
         out = {'status': 'not_verifiable_locally', 'note': f'{bylen_path} absent — P5T has not run; the same checks apply to results_v10_mech/summary.json by_len panels'}
         print(json.dumps(out, ensure_ascii=False))
         return out
+    if not isinstance(raw, dict):
+        out = {'status': 'fail', 'problems': [f'{bylen_path}: top-level JSON is {type(raw).__name__}, not an object — the length cells cannot be audited']}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
     L = _import_exp_lib()
+    import numpy as np
     by_len = {}
     problems = []
     for key, r in raw.items():
         if not isinstance(r, dict):
             continue
-        for k, c in (r.get('by_len') or {}).items():
-            try:
-                Ln = int(k)
-            except (TypeError, ValueError, OverflowError):
+        _cells = r.get('by_len')
+        if _cells is not None and not isinstance(_cells, dict):
+            problems.append(f'{key}: by_len is not an object — the per-length cells cannot be audited')
+            continue
+        for k, c in (_cells or {}).items():
+            # Exact integers only: int(True)==1, int(4.9)==4 and a float above
+            # 2**53 can all denote a length different from the one recorded.
+            Ln = _exact_int_scalar(k)
+            if Ln is None or abs(Ln) >= 2 ** 53:
+                # A key that cannot be read as an exact integer length is not
+                # silently skipped: doing so would let an unauditable cell
+                # leave the overall status at "ok".
+                problems.append(f'{key}: by_len key {k!r} is not an integer length')
+                continue
+            if Ln <= 0:
+                problems.append(f'{key}: by_len key {k!r} is not a positive sequence length')
+                continue
+            if Ln < 2:
+                # A length-1 row predicts no next token; its n_tok/eval_span
+                # equality would be a vacuous "measurement" rather than a
+                # scored target set (same rule as v12 admission).
+                problems.append(f'{key}: by_len key {k!r} has no next-token prediction (needs length >= 2)')
                 continue
             if not isinstance(c, dict):
+                problems.append(f'{key}: by_len[{k!r}] cell is not an object')
                 continue
             e = by_len.setdefault(Ln, {'n_tok': set(), 'eval_span': set(), 'truncated': set(), 'n_seq': set()})
-            e['n_tok'].add(c.get('n_tok'))
-            e['eval_span'].add(c.get('eval_span'))
-            e['truncated'].add(c.get('truncated'))
+
+            def _add_cell(field, value):
+                try:
+                    e[field].add(value)
+                except TypeError:
+                    # A list/dict is not a measurement; keep the audit running
+                    # and record the malformed cell instead of aborting with
+                    # an unhashable-type error.
+                    e[field].add(repr(value))
+                    problems.append(f'{key}: L{Ln} {field} is not a scalar value ({type(value).__name__})')
+
+            _add_cell('n_tok', c.get('n_tok'))
+            _add_cell('eval_span', c.get('eval_span'))
+            _add_cell('truncated', c.get('truncated'))
             _nseq_cell = None
             if isinstance(c.get('ppl_per_seq'), list):
                 _nseq_cell = len(c['ppl_per_seq'])
-                e['n_seq'].add(_nseq_cell)
+                _add_cell('n_seq', _nseq_cell)
             elif c.get('n_seq') is not None:
                 _nseq_cell = c.get('n_seq')
-                e['n_seq'].add(_nseq_cell)
+                _add_cell('n_seq', _nseq_cell)
             else:
                 # Keep the absence in the same set as the observed counts so
                 # one record with n_seq cannot mask another record without it.
                 e['n_seq'].add(None)
+            # Finite, positive measurements only.  NaN/Inf would otherwise
+            # form a one-element set and pass the cross-arm agreement check;
+            # an all-zero (n_tok, n_seq) pair would satisfy the identity
+            # below without scoring a single target token.
+            for _field, _val in (('n_tok', c.get('n_tok')),
+                                 ('eval_span', c.get('eval_span')),
+                                 ('n_seq', _nseq_cell)):
+                if _val is None:
+                    continue
+                if isinstance(_val, (bool, np.bool_)):
+                    problems.append(f'{key}: L{Ln} {_field} is a boolean, not a measurement')
+                    continue
+                try:
+                    _fval = float(_val)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if not math.isfinite(_fval):
+                    problems.append(f'{key}: L{Ln} {_field} is not finite ({_val!r}) — unverifiable')
+                elif not _fval.is_integer() or abs(_fval) >= 2 ** 53:
+                    # int(4.9) would truncate the count, and a float above
+                    # 2**53 cannot represent every integer; either could
+                    # satisfy the n_tok == n_seq*(L-1) identity with corrupted
+                    # evidence.
+                    problems.append(f'{key}: L{Ln} {_field} is not an integer count ({_val!r})')
+                elif _field in ('n_tok', 'n_seq', 'eval_span') and _fval <= 0:
+                    problems.append(f'{key}: L{Ln} {_field} must be positive, got {_val!r}')
             # The complete-cell identity is n_tok == n_seq * (Ln - 1).  Equal
             # (but equally wrong) counts across arms are not a valid target
             # set, so verify the formula whenever the cell claims to be a
             # full-length measurement.
             if c.get('truncated') is False and _nseq_cell is not None:
-                try:
-                    _nt = int(c.get('n_tok'))
-                    _ns = int(_nseq_cell)
-                except (TypeError, ValueError, OverflowError):
-                    # The set-based agreement check below already fails on a
-                    # missing/non-numeric value.
-                    pass
-                else:
+                _nt = _exact_int_scalar(c.get('n_tok'))
+                _ns = _exact_int_scalar(_nseq_cell)
+                if _nt is not None and _ns is not None:
                     if Ln >= 2 and _nt != _ns * (Ln - 1):
                         problems.append(f'{key}: L{Ln} n_tok={_nt} != n_seq*(L-1)={_ns * (Ln - 1)} — the cell did not score one next-token target per row')
+                # A missing/non-numeric value is already reported by the
+                # per-field check above (or by the cross-record sets below).
             if 'truncated' not in c:
                 problems.append(f'{key}: L{Ln} cell has NO `truncated` flag — a missing truncation marker is treated as unverifiable, not as a full-length measurement')
+            elif not isinstance(c.get('truncated'), (bool, np.bool_)):
+                # An explicit null/string is just as unverifiable as a missing
+                # flag; only a real boolean False certifies a full-length cell.
+                problems.append(f'{key}: L{Ln} cell has a non-boolean `truncated` value {c.get("truncated")!r} — unverifiable, not a full-length measurement')
             elif c.get('truncated'):
                 problems.append(f'{key}: L{Ln} cell is marked truncated — it must not enter cross-length means')
     out = {'status': 'ok', 'by_length': {}}
@@ -1095,7 +1435,15 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
         if not nseq_ok:
             problems.append(f'L{Ln}: records disagree on the per-document row count n_seq — the arms did not score the same documents')
     out['problems'] = problems
-    out['status'] = 'fail' if problems else 'ok'
+    if problems:
+        out['status'] = 'fail'
+    elif not by_len:
+        # An empty file (or records with no by_len cells) proves nothing; it
+        # must not be reported as a clean length audit.
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = f'{bylen_path} contains no auditable by_len cells'
+    else:
+        out['status'] = 'ok'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
@@ -1115,6 +1463,13 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
     if summ is None:
         out = {'status': 'not_verifiable_locally', 'note': f'{summary_path} absent — needs the training records of the frozen arms'}
         print(json.dumps(out, ensure_ascii=False))
+        return out
+    if not isinstance(summ, dict):
+        out = {'status': 'fail', 'arms': {}, 'controlled_variables': None,
+               'seed_coverage': {},
+               'problems': [f'{summary_path} is {type(summ).__name__}, not an object — the frozen-arm records cannot be audited'],
+               'warnings': [], 'tuning': {}}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
     L = _import_exp_lib()
     arms = arms or ['csa_fixed_rope', 'full_rope', 'csa_fixed_rope_randidx', 'csa_fixed_rope_allblocks']
@@ -1221,7 +1576,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
 def audit_failures(outdirs=None):
     """失败集中度（零 GPU）：error/NaN/截断记录按臂分布的读数。
 
-    评审问题：崩溃/NaN/超时是否集中在某些臂；仅保留成功运行是否构成
+    审计口径：崩溃/NaN/超时是否集中在某些臂；仅保留成功运行是否构成
     选择偏差。本审计把 error 记录按 (臂, 错误类型) 计数，并给出描述性
     集中度（不主张显著性——小样本下显著性检验本身功效不足）。"""
     L = _import_exp_lib()
@@ -1229,6 +1584,13 @@ def audit_failures(outdirs=None):
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))
+        if summ is None:
+            continue
+        if not isinstance(summ, dict):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: summary.json is {type(summ).__name__}, not an object — failures cannot be audited')
+            continue
         if not summ:
             continue
         by_arm = {}
@@ -1243,7 +1605,7 @@ def audit_failures(outdirs=None):
                 n_ok[v] = n_ok.get(v, 0) + 1
         if by_arm:
             out['panels'][d] = {'errors_by_arm': {v: len(e) for v, e in by_arm.items()}, 'ok_by_arm': n_ok, 'error_samples': {v: e[:2] for v, e in by_arm.items()}}
-    if not out['panels']:
+    if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no error records found in local results (or no results) — run after each phase on the experiment machine; failures are already written as error records by the drivers'
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -1257,7 +1619,7 @@ def audit_failures(outdirs=None):
 def audit_metrics(outdirs=None):
     """指标口径审计（零 GPU）：主指标/方向/聚合/不平衡声明 + 落盘记录核验。
 
-    评审要求：类别不平衡不能只看 accuracy；多分类 F1 必须注明 macro/
+    审计口径：类别不平衡不能只看 accuracy；多分类 F1 必须注明 macro/
     micro/weighted；极度不平衡优先 PR-AUC；指标必须对齐任务目标。本审计
     先检查 `exp_lib.METRIC_POLICY` 是否完整声明，再对本地面板检查边界
     指标是否同时给出 precision/recall/随机基线、NIAH 是否同时给出 answer
@@ -1266,7 +1628,22 @@ def audit_metrics(outdirs=None):
     out = {'status': 'ok', 'policy': L.metric_policy_audit(), 'panels': {}}
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
-        summ = _load(os.path.join(d, 'summary.json'))
+        sp = os.path.join(d, 'summary.json')
+        summ = _load(sp)
+        if summ is None:
+            if os.path.exists(sp):
+                # Exists but is unreadable: this is a failed panel, not an
+                # absent one.  Silently skipping it would leave status "ok"
+                # with the record-level checks never run.
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: summary.json exists but cannot be parsed — metric policy cannot be audited')
+            continue
+        if not isinstance(summ, dict):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: summary.json is {type(summ).__name__}, not an object — metric policy cannot be audited')
+            continue
         if not summ:
             continue
         rep = L.metric_policy_audit(summ)
@@ -1275,7 +1652,8 @@ def audit_metrics(outdirs=None):
             out['status'] = 'warn'
     if out['policy']['warnings']:
         out['status'] = 'warn'
-    if not out['panels']:
+    if not out['panels'] and out['status'] == 'ok':
+        out['status'] = 'not_verifiable_locally'
         out['note'] = 'no local summaries — policy declarations were checked; record-level checks run on the experiment machine'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
@@ -1353,6 +1731,13 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
     for d in dirs:
         _dir = d if os.path.isabs(d) else os.path.join(REPO, d)
         summ = _load(os.path.join(_dir, 'summary.json'))
+        if summ is None:
+            continue
+        if not isinstance(summ, dict):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: summary.json is {type(summ).__name__}, not an object — methodology cannot be audited')
+            continue
         if not summ:
             continue
         rep = L.methodology_audit(summ, design=design, alpha=alpha, min_n=min_n,
@@ -1380,7 +1765,7 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
         out['panels'][d] = _panel
         if _panel['arms_below_min_seeds'] or _panel['warnings']:
             out['status'] = 'warn'
-    if not out['panels']:
+    if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no results_*/summary.json found — run the experiment phases first; the audit is zero-GPU over saved records'
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -1396,10 +1781,22 @@ def train_flops_estimate(params, tokens, attn_overhead=0.35):
 
     6·N·D 是前向+反向的常用近似；稀疏选择/池化/激活重算与长序列注意力
     不与参数量成比例，因此用一个**显式声明的**注意力项系数。"""
-    n = float(params)
-    d_tok = float(tokens)
+    # Parameters and tokens are exact positive counts.
+    n = _exact_int_scalar(params)
+    d_tok = _exact_int_scalar(tokens)
+    if n is None or n <= 0 or d_tok is None or d_tok <= 0:
+        raise ValueError(f'train_flops_estimate: params/tokens must be positive integers (got {params!r}, {tokens!r})')
+    if (isinstance(attn_overhead, bool)
+            or getattr(getattr(attn_overhead, 'dtype', None), 'kind', None) == 'b'):
+        raise ValueError(f'train_flops_estimate: attn_overhead={attn_overhead!r} is a boolean, not a coefficient')
+    try:
+        overhead = float(attn_overhead)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'train_flops_estimate: attn_overhead={attn_overhead!r} is not numeric') from None
+    if not math.isfinite(overhead) or overhead < 0.0:
+        raise ValueError(f'train_flops_estimate: attn_overhead={attn_overhead!r} must be finite and non-negative')
     base = 6.0 * n * d_tok
-    return {'flops_6nd': base, 'flops_with_attn_proxy': base * (1.0 + attn_overhead), 'attn_overhead_assumed': attn_overhead, 'note': 'analytic PROXY, not a measurement; report alongside TimeGuard seconds'}
+    return {'flops_6nd': base, 'flops_with_attn_proxy': base * (1.0 + overhead), 'attn_overhead_assumed': overhead, 'note': 'analytic PROXY, not a measurement; report alongside TimeGuard seconds'}
 
 
 def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.json'), panels=(('results_lm_v10_scale_s', 'csa_fixed', 8000), ('results_lm_v10_scale_l8k', 'csa_fixed', 8000), ('results_lm_v10_scale_lflop', 'csa_fixed', None))):
@@ -1410,18 +1807,70 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
         if summ is None:
             out['panels'][d] = 'not present locally'
             continue
-        recs = [r for r in summ.values() if isinstance(r, dict) and r.get('variant') == v and isinstance(r.get('params'), (int, float))]
+        if not isinstance(summ, dict):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: summary.json is {type(summ).__name__}, not an object — the allocation cannot be reconciled')
+            out['panels'][d] = 'not an object'
+            continue
+        recs = [r for r in summ.values()
+                if isinstance(r, dict) and r.get('variant') == v
+                and r.get('params') is not None]
         if not recs:
             out['panels'][d] = 'no param records'
             continue
-        r0 = recs[0]
-        _steps = steps or r0.get('steps')
-        tok = r0.get('tokens_seen') or (_steps * r0.get('batch_size', 12) * r0.get('seq_len', 512) if _steps else None)
-        est = train_flops_estimate(r0['params'], tok) if tok else None
-        out['panels'][d] = {'params': r0.get('params'), 'steps': _steps, 'tokens': tok, 'estimate': est}
+        _valid = []
+        for r in recs:
+            p_i = _exact_int_scalar(r.get('params'))
+            if p_i is None or p_i <= 0:
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: param count {r.get("params")!r} is not a positive integer — the FLOP estimate would use corrupted bookkeeping')
+                continue
+            _valid.append((r, p_i))
+        if not _valid:
+            out['panels'][d] = 'no usable param records'
+            continue
+        r0, p0 = _valid[0]
+        _steps = steps if steps is not None else r0.get('steps')
+        _steps_i = _exact_int_scalar(_steps)
+        if _steps is not None and (_steps_i is None or _steps_i <= 0):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: step count {_steps!r} is not a positive integer — the token count cannot be derived')
+            out['panels'][d] = {'params': p0, 'steps': _steps, 'tokens': None, 'estimate': None}
+            continue
+        _tok_raw = r0.get('tokens_seen')
+        if _tok_raw is not None:
+            tok = _exact_int_scalar(_tok_raw)
+            if tok is None or tok <= 0:
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: tokens_seen={_tok_raw!r} is not a positive integer — the FLOP estimate would truncate it')
+                out['panels'][d] = {'params': p0, 'steps': _steps, 'tokens': None, 'estimate': None}
+                continue
+        elif _steps_i is not None:
+            _batch = _exact_int_scalar(r0.get('batch_size', 12))
+            _seq = _exact_int_scalar(r0.get('seq_len', 512))
+            if _batch is None or _batch <= 0 or _seq is None or _seq <= 0:
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: batch_size/seq_len {r0.get("batch_size", 12)!r}/{r0.get("seq_len", 512)!r} are not positive integers — the token count cannot be derived')
+                out['panels'][d] = {'params': p0, 'steps': _steps, 'tokens': None, 'estimate': None}
+                continue
+            tok = _steps_i * _batch * _seq
+        else:
+            tok = None
+        est = train_flops_estimate(p0, tok) if tok else None
+        out['panels'][d] = {'params': p0, 'steps': _steps, 'tokens': tok, 'estimate': est}
     for sf in state_files:
         st = _load(sf)
         if st is not None:
+            if not isinstance(st, dict):
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{sf}: TimeGuard state is {type(st).__name__}, not an object — the run ledger cannot be reconciled')
+                continue
             # TimeGuard stores `runs` as an integer counter; older/foreign
             # state files may store a list.  len(integer) would crash the whole
             # audit on any machine that has actually run a cell.
@@ -1429,11 +1878,16 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
             if isinstance(_runs, (list, tuple, dict, set)):
                 _run_count = len(_runs)
             elif isinstance(_runs, (int, float)) and not isinstance(_runs, bool):
-                _run_count = int(_runs)
+                # A run counter is an exact integer; int(3.9) would silently
+                # report a different number of completed runs.  A malformed
+                # counter falls back to an alternative field instead.
+                _run_count = _exact_int_scalar(_runs)
+                if _run_count is None:
+                    _run_count = st.get('run_count')
             else:
                 _run_count = st.get('run_count')
             out.setdefault('measured', {})[sf] = {'booked_seconds': st.get('booked_seconds'), 'run_count': _run_count}
-    if all(not isinstance(x, dict) for x in out['panels'].values()):
+    if all(not isinstance(x, dict) for x in out['panels'].values()) and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'scale panels not present locally; estimates + TimeGuard bookkeeping run on the experiment machine'
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -1517,13 +1971,13 @@ def audit_efficiency_demo():
 def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
     """Zero-GPU audit of MEASURED prefill time between arms.
 
-    The review's efficiency point is not "is there a timing field" but "is a
-    speed/cheapness claim supported".  This audit pairs records only when both
+    The efficiency question is not "is there a timing field" but "is a
+    directional time claim supported".  This audit pairs records only when both
     arms have `efficiency.status == 'ok'` at the SAME token count, on the same
     device and torch version, with the same KV-cache semantics; it reports the
-    p50 ratio and refuses the words "faster/cheaper" unless the ratio is
+    p50 ratio and refuses a directional claim unless the ratio is
     outside `tolerance` in the claimed direction.  It never converts analytic
-    FLOPs into a latency claim.
+    FLOPs into a timing claim.
 
     `pairs` may be a list of (arm_a, arm_b); by default every arm pair sharing
     a panel is reported (descriptive)."""
@@ -1534,6 +1988,13 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
            'note': 'measured prefill only; no KV cache in this model; analytic FLOPs are never substituted for timing'}
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))
+        if summ is None:
+            continue
+        if not isinstance(summ, dict):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: summary.json is {type(summ).__name__}, not an object — efficiency pairs cannot be audited')
+            continue
         if not summ:
             continue
         eff = {}
@@ -1552,23 +2013,81 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
             if a not in eff or b not in eff:
                 continue
             def _med(rows, key):
-                _v = [float(r[key]) for r in rows if isinstance(r.get(key), (int, float)) and math.isfinite(float(r[key]))]
+                _v = []
+                for r in rows:
+                    x = r.get(key)
+                    # Boolean flags are not measured milliseconds.
+                    if isinstance(x, (bool, np.bool_)) or not isinstance(x, (int, float)):
+                        continue
+                    f = float(x)
+                    if math.isfinite(f):
+                        _v.append(f)
                 return (float(np.median(_v)) if _v else None)
             ra, rb = eff[a][0], eff[b][0]
-            same_env = (ra.get('device') == rb.get('device') and ra.get('torch') == rb.get('torch'))
-            same_kv = bool(ra.get('decode_has_kv_cache')) == bool(rb.get('decode_has_kv_cache'))
-            # Median over seeds, not the first record: a single slow seed must
-            # not decide a "faster" claim.
+
+            def _env_rows(rows):
+                envs = {(r.get('device'), r.get('torch')) for r in rows}
+                return (envs.pop() if len(envs) == 1 else None)
+
+            def _kv_rows(rows):
+                vals = {r.get('decode_has_kv_cache') for r in rows}
+                if len(vals) != 1:
+                    return None
+                v = next(iter(vals))
+                return v if isinstance(v, (bool, np.bool_)) else None
+
+            def _batch_rows(rows):
+                vals = set()
+                for r in rows:
+                    b = r.get('batch')
+                    if b is None or isinstance(b, (bool, np.bool_)):
+                        return None
+                    try:
+                        f = float(b)
+                        if not math.isfinite(f) or f != math.floor(f):
+                            return None
+                        vals.add(int(f))
+                    except (TypeError, ValueError, OverflowError):
+                        return None
+                return frozenset(vals) if vals else None
+
+            _ea, _eb = _env_rows(eff[a]), _env_rows(eff[b])
+            _ka, _kb = _kv_rows(eff[a]), _kv_rows(eff[b])
+            _ba, _bb = _batch_rows(eff[a]), _batch_rows(eff[b])
+            # The batch shape is part of the measured environment.
+            # Records without `batch` stay unverifiable (None) rather
+            # than being rejected as a mismatch; when both sides record it,
+            # every seed must agree and the two arms must use the same batch.
+            _same_batch = (None if (_ba is None or _bb is None)
+                           else bool(_ba == _bb and len(_ba) == 1))
+            # Every record of both arms must share one measured environment.
+            # Comparing only the first seed would let a panel that mixes CPU
+            # and GPU (or torch versions / KV semantics) still be read as comparable.
+            same_env = bool(_ea is not None and _ea == _eb
+                            and _ea[0] is not None and _ea[1] is not None)
+            same_kv = bool(_ka is not None and _kb is not None and _ka == _kb)
+            # Median over seeds, not the first record: a single outlier seed
+            # must not decide a comparative claim.
             _ta, _tb = _med(eff[a], 'prefill_ms_p50'), _med(eff[b], 'prefill_ms_p50')
-            _na = sorted({int(r['n_tokens']) for r in eff[a] if isinstance(r.get('n_tokens'), int)})
-            _nb = sorted({int(r['n_tokens']) for r in eff[b] if isinstance(r.get('n_tokens'), int)})
+            def _tok_counts(rows):
+                return sorted({int(r['n_tokens']) for r in rows
+                               if isinstance(r.get('n_tokens'), (int, np.integer))
+                               and not isinstance(r.get('n_tokens'), (bool, np.bool_))
+                               and int(r['n_tokens']) > 0})
+            _na, _nb = _tok_counts(eff[a]), _tok_counts(eff[b])
             rec = {'a': a, 'b': b, 'same_device_torch': same_env, 'same_kv_semantics': same_kv,
+                   'same_batch': _same_batch,
+                   'a_batches': (sorted(_ba) if _ba is not None else None),
+                   'b_batches': (sorted(_bb) if _bb is not None else None),
                    'a_ms_p50': _ta, 'b_ms_p50': _tb, 'a_tokens': _na, 'b_tokens': _nb,
                    'ratio_b_over_a': None, 'speed_claim_allowed': False, 'faster_arm': None, 'reason': None}
             if not (isinstance(_ta, (int, float)) and isinstance(_tb, (int, float)) and _ta > 0 and _tb > 0):
                 rec['reason'] = 'missing or non-positive measured prefill time'
             elif _na != _nb or len(_na) != 1 or len(_nb) != 1:
-                rec['reason'] = f'different or ambiguous measured token counts ({_na} vs {_nb}); a latency ratio across shapes is not a speed comparison'
+                rec['reason'] = f'different or ambiguous measured token counts ({_na} vs {_nb}); a timing ratio across shapes is not a paired comparison'
+            elif _same_batch is False:
+                rec['reason'] = (f'different or ambiguous batch sizes ({sorted(_ba) if _ba is not None else None} '
+                                 f'vs {sorted(_bb) if _bb is not None else None}); latency depends on the batch shape')
             elif not same_env:
                 rec['reason'] = 'different device or torch version recorded'
             elif not same_kv:
@@ -1579,12 +2098,12 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
                 rec['faster_arm'] = (b if ratio < 1.0 - tolerance else (a if ratio > 1.0 + tolerance else None))
                 rec['speed_claim_allowed'] = rec['faster_arm'] is not None
                 if not rec['speed_claim_allowed']:
-                    rec['reason'] = f'ratio {ratio:.3f} is within +/-{tolerance:.0%} of 1: no measured speed difference'
+                    rec['reason'] = f'ratio {ratio:.3f} is within +/-{tolerance:.0%} of 1: no measured timing difference'
             panel[f'{a} vs {b}'] = rec
             (out['claims_allowed'] if rec['speed_claim_allowed'] else out['refused']).append(f'{d}: {a} vs {b}')
         if panel:
             out['panels'][d] = panel
-    if not out['panels']:
+    if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
         out['note'] = ('no records carry a measured `efficiency` block with status ok — the efficiency panel needs '
                        'checkpoints measured with exp_lib.measure_efficiency / measure_efficiency_sweep; analytic FLOPs do not qualify')
@@ -1595,7 +2114,7 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
 def audit_release_readiness(path='RELEASES.md'):
     """Zero-GPU check that a numeric claim has an auditable evidence release.
 
-    The review's point 17: "reproducible code" is not "auditable results".
+    "Reproducible code" is not "auditable results".
     This audit parses the tracked release index and refuses to call the
     repository auditable unless at least one row names a commit, an archive
     URL, both SHA-256 digests and a verifier.  It also reports whether the
@@ -1643,7 +2162,10 @@ def audit_release_readiness(path='RELEASES.md'):
             missing.append('archive SHA-256')
         if not re.fullmatch(r'[0-9a-fA-F]{64}', msha or ''):
             missing.append('manifest SHA-256')
-        if not verifier or verifier in ('—', '-', 'n/a', 'none'):
+        _verifier = (verifier or '').strip().lower()
+        if (not _verifier
+                or _verifier in ('—', '-', 'n/a', 'na', 'none', 'null',
+                                 'unknown', 'tbd', 'todo')):
             missing.append('verifier')
         if missing:
             out['problems'].append(f'{tag}: missing {missing}')
@@ -1707,20 +2229,63 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         if not isinstance(c.get('per_seed'), dict):
             out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed must be a seed -> measurement object')
             continue
+        # Boolean flags are not measurements: int(True)==1 and
+        # float(False)==0.0 would let a boolean-only cell pass the range and
+        # geometry checks and even set claim_allowed.
+        import numpy as np
+        _bool_fields = [k for k in ('eval_len', 'k', 'n_blocks', 'n_queries',
+                                    'recall_at_k', 'mass_covered',
+                                    'random_baseline')
+                        if isinstance(c.get(k), (bool, np.bool_))]
+        if _bool_fields:
+            out['problems'].append(
+                f'cell {i} ({c.get("arm")}): boolean values in numeric fields {_bool_fields}')
+            continue
+        def _exact_int(v):
+            if isinstance(v, (bool, np.bool_)):
+                return None
+            try:
+                f = float(v)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if (not (math.isfinite(f) and f == math.floor(f))
+                    or abs(f) >= 2 ** 53):
+                # Beyond 2**53 a float cannot represent every integer, so
+                # the recorded geometry count may denote a different value.
+                return None
+            return int(f)
+
+        _ints = {name: _exact_int(c[name]) for name in
+                 ('eval_len', 'k', 'n_blocks', 'n_queries')}
+        _bad_int = [name for name, v in _ints.items() if v is None]
+        if _bad_int:
+            out['problems'].append(
+                f'cell {i} ({c.get("arm")}): non-integral geometry fields {_bad_int}')
+            continue
         try:
-            k, B = int(c['k']), int(c['n_blocks'])
             rec, mass, base = (float(c['recall_at_k']), float(c['mass_covered']), float(c['random_baseline']))
-            nq = int(c['n_queries'])
         except (TypeError, ValueError, OverflowError):
             out['problems'].append(f'cell {i}: non-numeric fields')
             continue
-        if not (0.0 <= rec <= 1.0 and 0.0 <= mass <= 1.0 and 0.0 <= base <= 1.0):
+        k, B = _ints['k'], _ints['n_blocks']
+        nq = _ints['n_queries']
+        _range_ok = bool(0.0 <= rec <= 1.0 and 0.0 <= mass <= 1.0 and 0.0 <= base <= 1.0)
+        if not _range_ok:
             out['problems'].append(f'cell {i}: recall/mass/baseline outside [0,1]')
-        if k <= 0 or B <= 0 or k > B:
+        _geom_ok = bool(k > 0 and B > 0 and k <= B)
+        if not _geom_ok:
             out['problems'].append(f'cell {i}: require 0 < k <= n_blocks (got k={k}, B={B})')
-        if nq <= 0:
+        _nq_ok = bool(nq > 0)
+        if not _nq_ok:
             out['problems'].append(f'cell {i}: n_queries must be positive')
         _seeds = c.get('per_seed')
+        if not _seeds:
+            # An empty per_seed is not evidence: requiring the key but
+            # accepting {} would mark a cell with no seed-level measurements
+            # as structurally valid ("ok").
+            out['problems'].append(
+                f'cell {i} ({c.get("arm")}): per_seed is empty — no seed-level evidence')
+            continue
         _n_seeds = len(_seeds)
         _st = None
         # Only complete seed rows enter the paired test.  A malformed row must
@@ -1731,12 +2296,23 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
             if not isinstance(v, dict) or v.get('mass_covered') is None or v.get('random_baseline') is None:
                 _bad_seed.append(str(_sk))
                 continue
+            if isinstance(v.get('mass_covered'), (bool, np.bool_)) or isinstance(v.get('random_baseline'), (bool, np.bool_)):
+                _bad_seed.append(str(_sk))
+                continue
             try:
-                _d.append(float(v.get('mass_covered')) - float(v.get('random_baseline')))
+                _mv = float(v.get('mass_covered'))
+                _bv = float(v.get('random_baseline'))
             except (TypeError, ValueError, OverflowError):
                 _bad_seed.append(str(_sk))
+                continue
+            # Per-seed fractions must be finite probabilities in [0,1].
+            if (not (math.isfinite(_mv) and math.isfinite(_bv))
+                    or not (0.0 <= _mv <= 1.0 and 0.0 <= _bv <= 1.0)):
+                _bad_seed.append(str(_sk))
+                continue
+            _d.append(_mv - _bv)
         if _bad_seed:
-            out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed rows lack mass_covered/random_baseline: {_bad_seed[:5]}')
+            out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed rows lack usable mass_covered/random_baseline: {_bad_seed[:5]}')
         _n_valid = len(_d)
         if _n_valid >= 2:
             try:
@@ -1750,7 +2326,11 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
                              'mass_excess': mass - base, 'recall_excess': rec - base,
                              'n_queries': nq, 'n_seeds': _n_seeds, 'n_seeds_valid': _n_valid,
                              'seed_test': _st,
-                             'claim_allowed': bool(mass > base and rec > base and nq > 0 and _st is not None and _st.get('p_exact_signflip', 1.0) < 0.05 and int(_st.get('n', 0)) >= 6)})
+                             'claim_allowed': bool(_range_ok and _geom_ok and _nq_ok
+                                                   and mass > base and rec > base
+                                                   and _st is not None
+                                                   and _st.get('p_exact_signflip', 1.0) < 0.05
+                                                   and int(_st.get('n', 0)) >= 6)})
     out['status'] = 'fail' if out['problems'] else 'ok'
     out['note'] = ('cells pass the structural contract; `claim_allowed` additionally requires mass/recall above the '
                    'random baseline and a seed-level exact sign-flip p<0.05 with n>=6')
@@ -1758,8 +2338,28 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
     return out
 
 
+def _aggregate_audit_status(results):
+    """Worst status across the sub-audits, so `report` can fail the CLI."""
+    statuses = [r.get('status') for r in results.values() if isinstance(r, dict)]
+    if 'fail' in statuses:
+        return 'fail'
+    if any(s in ('warnings', 'warn') for s in statuses):
+        return 'warnings'
+    if 'not_verifiable_locally' in statuses:
+        return 'not_verifiable_locally'
+    # Fail closed for any other non-ok verdict (no_release, incomplete,
+    # skipped_no_torch, ...).  Treating an unknown status as clean would let a
+    # sub-audit's explicit refusal disappear from the aggregate exit code.
+    if any(s not in (None, 'ok') for s in statuses):
+        return 'not_verifiable_locally'
+    return 'ok'
+
+
 def run_report(out='audit_report.json'):
     res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'failures': audit_failures(), 'budget': audit_budget(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection()}
+    # The CLI exit code follows the aggregate status, not only the top-level
+    # record's own status.
+    res['status'] = _aggregate_audit_status(res)
     L_atomic = None
     try:
         L = _import_exp_lib()
