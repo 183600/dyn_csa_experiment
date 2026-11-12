@@ -1985,6 +1985,33 @@ def t_batch_iter_uint16():
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]), 'the uint16 transport form must yield the exact int64 batch (CPU index kernels lack uint16)'
 
 
+def t_ids_narrow_does_not_trust_stale_max_id():
+    # The int32 transport cast must be decided by the ACTUAL ids, not by a
+    # metadata max_id that can be stale/corrupted.  A wrong bound would wrap
+    # 2**31 into a negative token id, which PyTorch then indexes from the end
+    # of the embedding table (silent wrong training data).
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, 'train_ids_x.npy')
+        wide = np.array([2 ** 31, 5, -3], dtype=np.int64)
+        np.save(p, wide)
+        with open(os.path.join(d, 'meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'max_id': 5}, f)
+        mm = np.load(p, mmap_mode='r')
+        got = L._ids_narrow(mm)
+        assert got.dtype == np.int64, got.dtype
+        assert np.array_equal(np.asarray(got), wide), got
+        # In-range caches still narrow exactly, and the v2 sidecar is reusable.
+        p2 = os.path.join(d, 'train_ids_y.npy')
+        safe = np.array([0, 1, 70000], dtype=np.int64)
+        np.save(p2, safe)
+        with open(os.path.join(d, 'meta_y.json'), 'w', encoding='utf-8') as f:
+            json.dump({'max_id': 70000}, f)
+        a = L._ids_narrow(np.load(p2, mmap_mode='r'))
+        b = L._ids_narrow(np.load(p2, mmap_mode='r'))
+        assert a.dtype == b.dtype == np.int32, (a.dtype, b.dtype)
+        assert np.array_equal(np.asarray(a), safe) and np.array_equal(np.asarray(b), safe)
+
+
 def t_batch_contract_check():
     ids = np.arange(5000, dtype=np.int64) % 997
     ok = L.batch_contract_check(ids, 32, 4, torch.device('cpu'), seed=7, vocab=997)
@@ -5841,6 +5868,7 @@ def main():
     _check('E1b explicit RNG seed contract', t_seed_contract_check)
     _check('E2 batch_iter reproducibility', t_batch_iter_reproducible)
     _check('E2b batch_iter uint16 transport', t_batch_iter_uint16)
+    _check('E2b2 int32 narrowing ignores a stale max_id bound', t_ids_narrow_does_not_trust_stale_max_id)
     _check('E2c real batch-iterator contract check', t_batch_contract_check)
     _check('E2d failed loader contract blocks the panel', t_panel_blocks_on_loader_contract_failure)
     _check('E2e parallel child gets the seed hash', t_parallel_child_env_seed)

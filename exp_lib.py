@@ -6900,9 +6900,13 @@ def _disk_ids_chunk(buf, disk_dt, vocab):
     return np.empty(0, dtype=disk_dt)
 
 def _i32_sidecar_path(path):
-    """Identity-bound int32 sidecar path for a wide on-disk token cache."""
+    """Identity-bound int32 sidecar path for a wide on-disk token cache.
+
+    The ``v2`` marker invalidates sidecars written before the narrowing path
+    stopped trusting a stale ``max_id`` metadata field: such a sidecar could
+    contain silently wrapped ids and must never be served again."""
     st = os.stat(path)
-    return (f'{path}.i32-{int(st.st_size)}-'
+    return (f'{path}.i32v2-{int(st.st_size)}-'
             f'{int(getattr(st, "st_mtime_ns", 0))}-'
             f'{int(getattr(st, "st_ctime_ns", int(st.st_ctime * 1e9)))}-'
             f'{int(getattr(st, "st_ino", 0))}.npy')
@@ -8213,10 +8217,14 @@ def _ids_narrow(train_ids):
                         and np.dtype(_n.dtype) == np.dtype(np.int32)):
                     _narrow_memo_put(_key, train_ids, _n)
                     return _n
-            _mx = _cache_id_upper_bound(_path)
-            if _mx is None:
-                _mx = int(train_ids.max()) if train_ids.size else -1
-            if _mx < 2 ** 31:
+            # Never trust a metadata `max_id` to decide the cast: a stale or
+            # hand-edited value below 2**31 would make the int32 cast wrap an
+            # out-of-range token into a negative id (which PyTorch then indexes
+            # from the end of the embedding table).  The sidecar + binding mean
+            # this full scan happens once per cache build, not per run.
+            _mn = int(train_ids.min()) if train_ids.size else 0
+            _mx = int(train_ids.max()) if train_ids.size else -1
+            if -2 ** 31 <= _mn and _mx < 2 ** 31:
                 _dir = os.path.dirname(os.path.abspath(_side)) or '.'
                 _fd, _tmp = tempfile.mkstemp(dir=_dir, prefix=os.path.basename(_side) + '.', suffix='.tmp')
                 os.close(_fd)
@@ -8242,10 +8250,9 @@ def _ids_narrow(train_ids):
                 return _n
         except (OSError, ValueError, TypeError):
             pass
-    _mx = _cache_id_upper_bound(getattr(train_ids, 'filename', None))
-    if _mx is None:
-        _mx = int(train_ids.max()) if train_ids.size else -1
-    if train_ids.size and _mx < 2 ** 31:
+    _mn = int(train_ids.min()) if train_ids.size else 0
+    _mx = int(train_ids.max()) if train_ids.size else -1
+    if train_ids.size and -2 ** 31 <= _mn and _mx < 2 ** 31:
         _n = train_ids.astype(np.int32)
         _narrow_memo_put(_key, train_ids, _n)
         return _n
