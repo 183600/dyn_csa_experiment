@@ -5732,13 +5732,19 @@ def _validate_token_ids(ids, vocab, label='token ids'):
     the split.  It runs on every cold build and every cache hit.
     """
     arr = np.asarray(ids)
+    # A vocabulary size is an exact positive count.  int(True)=1 or
+    # int(8192.9)=8192 would silently accept malformed metadata and check the
+    # ids against a different vocabulary than the tokenizer actually used.
+    _v = _as_seed_int(vocab)
+    if _v is None or _v <= 0:
+        raise ValueError(f'{label}: vocab must be a positive integer, got {vocab!r}')
     if arr.size == 0:
         return arr
     if not np.issubdtype(arr.dtype, np.integer):
         raise TypeError(f'{label}: expected integer token ids, got dtype {arr.dtype}')
     mn, mx = int(arr.min()), int(arr.max())
-    if mn < 0 or mx >= int(vocab):
-        raise ValueError(f'{label}: token id range [{mn}, {mx}] is outside vocab [0, {int(vocab)})')
+    if mn < 0 or mx >= _v:
+        raise ValueError(f'{label}: token id range [{mn}, {mx}] is outside vocab [0, {_v})')
     return arr
 
 
@@ -5755,9 +5761,8 @@ def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=N
     blessed as verified.
     """
     problems = []
-    try:
-        vocab = int(vocab)
-    except (TypeError, ValueError, OverflowError):
+    vocab = _as_seed_int(vocab)
+    if vocab is None or vocab <= 0:
         return ['metadata has no usable vocab size']
     if not fingerprints_trusted and meta.get('src_fp') != _ids_fp(train_ids):
         problems.append('train id fingerprint does not match the meta file')
@@ -5766,8 +5771,12 @@ def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=N
         problems.append(f'validation batch is not 2-D (shape {vb.shape})')
     elif vb.shape[0] == 0:
         problems.append('validation batch is empty')
-    elif seq_len is not None and vb.shape[1] != int(seq_len):
-        problems.append(f'validation sequence length {vb.shape[1]} != requested {seq_len}')
+    elif seq_len is not None:
+        _sl = _as_seed_int(seq_len)
+        if _sl is None or _sl <= 0:
+            problems.append(f'requested sequence length {seq_len!r} is not a positive integer')
+        elif vb.shape[1] != _sl:
+            problems.append(f'validation sequence length {vb.shape[1]} != requested {seq_len}')
     if np.asarray(val_bnd).shape != vb.shape:
         problems.append(f'validation boundary mask shape {np.asarray(val_bnd).shape} != {vb.shape}')
     if (not fingerprints_trusted and 'val_fp' in meta

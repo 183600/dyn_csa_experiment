@@ -3658,6 +3658,19 @@ def t_categorical_and_cache_guards():
     bad3 = dict(meta, tokenizer_fit_split='test')
     assert any('tokenizer' in p for p in
                L._cached_split_problems(bad3, tr, va, np.zeros_like(va, dtype=bool), 11, seq_len=8))
+    # Malformed vocab/seq_len metadata must fail closed instead of being
+    # truncated by int(): 11.9 -> 11 would silently bless the cache.
+    bad_vocab = dict(meta, vocab=11.9)
+    assert any('vocab' in p for p in
+               L._cached_split_problems(bad_vocab, tr, va, np.zeros_like(va, dtype=bool), 11.9, seq_len=8))
+    assert any('positive integer' in p for p in
+               L._cached_split_problems(meta, tr, va, np.zeros_like(va, dtype=bool), 11, seq_len=8.5))
+    try:
+        L._validate_token_ids(np.array([0, 1], dtype=np.int64), 2.5, 'unit')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('fractional vocab size was accepted by the token-id range check')
 
 
 def t_public_exports_resolve():
