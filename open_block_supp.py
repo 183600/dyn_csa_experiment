@@ -421,6 +421,10 @@ def _controlled_reason(a, b):
         return 'unverifiable hyperparams (only one record carries the descriptor)'
     if ha is not None and (not isinstance(ha, dict) or not isinstance(hb, dict)):
         return 'unverifiable hyperparams (not an object)'
+    if (isinstance(ha, dict) and not ha) or (isinstance(hb, dict) and not hb):
+        # An empty descriptor is not evidence that the training controls
+        # matched; only a populated record can be compared field by field.
+        return 'unverifiable hyperparams (empty descriptor)'
     ha, hb = (ha or {}), (hb or {})
     keys = ('steps', 'tokens_seen', 'n_train_tokens', 'seq_len', 'batch_size',
             'lr', 'weight_decay', 'warmup', 'comp_lambda', 'delta_lr_mult',
@@ -465,6 +469,8 @@ def _controlled_reason(a, b):
         return 'unverifiable open_block_config (at least one record omits it)'
     oa = a.get('open_block_config')
     ob = b.get('open_block_config')
+    if not oa or not ob:
+        return 'unverifiable open_block_config (empty descriptor)'
     if oa.get('fingerprint') is not None and oa.get('fingerprint') == ob.get('fingerprint'):
         return None
     # The only allowed layer-level differences are max_block/open mode/scope.
@@ -604,7 +610,9 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     for mb in (128, None):
         for mode in ('summary', 'singletons'):
             va, vb = variant(mb, mode, 'outside_window'), variant(mb, 'closed', 'outside_window')
-            if (va, seeds[0]) in cells and (vb, seeds[0]) in cells:
+            # The panel may be ragged: a missing first seed must not hide an
+            # auxiliary comparison that other requested seeds can pair.
+            if any((va, s) in cells and (vb, s) in cells for s in seeds):
                 add(f'{mode} - closed @{mb} (outside-window)',
                     va, vb, family='auxiliary_outside_window')
 

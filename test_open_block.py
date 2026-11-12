@@ -546,6 +546,15 @@ def t_record_identity_and_completeness():
     _rec_b = dict(base, open_block_config={'fingerprint': None,
                                            'layers': [{}]})
     assert OB._controlled_reason(_rec_a, _rec_b) is not None
+    # Empty descriptors are not evidence that two arms shared the training
+    # controls: they must stay unverifiable rather than compare as equal.
+    _empty_hp_a = dict(base, hyperparams={},
+                       open_block_config={'fingerprint': None, 'layers': [{}]})
+    _empty_hp_b = dict(base, hyperparams={},
+                       open_block_config={'fingerprint': None, 'layers': [{}]})
+    assert OB._controlled_reason(_empty_hp_a, _empty_hp_b) is not None
+    _empty_ob = dict(base, hyperparams={'steps': 1}, open_block_config={})
+    assert OB._controlled_reason(_empty_ob, _empty_ob) is not None
 
 
 def t_summary_refuses_nonobject():

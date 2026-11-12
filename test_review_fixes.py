@@ -3894,6 +3894,15 @@ def t_fuse_sample_std_negative_axis():
         want = np.std(x, axis=axis, ddof=1)
         assert np.asarray(got).shape == np.asarray(want).shape, (axis, np.asarray(got).shape, np.asarray(want).shape)
         assert np.allclose(got, want, atol=1e-12), (axis, got, want)
+    # A boolean flag is not an axis: int(True) == 1 must not silently turn it
+    # into a reduction over dimension 1.
+    for bad_axis in (True, False, np.bool_(True), 1.5, '1'):
+        try:
+            FA.sample_std(x, axis=bad_axis)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError(f'sample_std accepted a non-integer axis {bad_axis!r}')
 
 
 def t_classification_positive_label_and_rare_floor():
@@ -4715,6 +4724,11 @@ def t_data_guard_index_label_and_shift_edges():
     repz = L.data_quality_report(Xz, train_idx=[0], val_idx=[1], test_idx=[2, 3])
     assert repz['checks']['duplicate_rows_across_splits']['train__val'] == 1, repz
     assert repz['status'] == 'fail', repz
+    # The content fingerprint follows the same logical-equality rule: signed
+    # zero must not make an identical table hash differently.
+    import data_guard as _DG
+    assert _DG._matrix_fingerprint(np.array([[0.0, 1.0]])) == \
+        _DG._matrix_fingerprint(np.array([[-0.0, 1.0]])), 'signed zero changed the matrix fingerprint'
     # Different non-finite values are not exact duplicate rows: NaN, +Inf and
     # -Inf share a non-finite mask but are distinct corrupted values.  Only the
     # repeated NaN row is a duplicate.
@@ -6922,6 +6936,35 @@ def t_targeted_contract_edges():
     finally:
         BR._LOADED.pop(_k1, None)
         BR._LOADED.pop(_k2, None)
+    # Seed helpers use the shared exact-integer contract: a boolean flag or a
+    # fractional seed must not be truncated into a different run.
+    for _bad in (True, False, 1.5, '1.5'):
+        for _fn in (L.set_seed, L.dataloader_generator):
+            try:
+                _fn(_bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'{_fn.__name__} accepted non-exact seed {_bad!r}')
+    with L._preserve_rng_state():
+        assert L.set_seed(3.0) == 3
+        assert L.dataloader_generator(3.0).initial_seed() == 3
+    # NIAH construction refuses impossible geometry instead of raising an
+    # assertion or dividing by zero.
+    for _kw in ({'n_pairs': 0}, {'seq_len': 15, 'n_pairs': 4},
+                {'vocab': 8, 'n_pairs': 4}, {'n_pairs': True},
+                {'n_seq': 1.5}):
+        _args = dict(n_seq=2, seq_len=32, n_pairs=4, vocab=64)
+        _args.update(_kw)
+        try:
+            V7.build_niah_batch(seed=0, **_args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'NIAH accepted impossible geometry {_kw}')
+    _ids, _tgt, _dist, _kdist = V7.build_niah_batch(2, 16, 4, 64, seed=0)
+    assert _ids.shape == (2, 16) and _tgt.shape == (2, 15), (_ids.shape, _tgt.shape)
+    assert (_tgt >= -100).all() and _dist.shape == _tgt.shape, (_tgt, _dist)
 
 
 def t_statistical_and_config_regressions():

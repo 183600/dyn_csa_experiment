@@ -896,7 +896,10 @@ def sec_p0e():
     # (tokens_seen / steps), never hard-coded.
     _tok_hdr = 'token 数未知'
     for _k, _r in (s or {}).items():
-        if isinstance(_r, dict) and _measurable(_r) and isinstance(_r.get('tokens_seen'), (int, float)) and _r['tokens_seen'] > 0:
+        if (isinstance(_r, dict) and _measurable(_r)
+                and isinstance(_r.get('tokens_seen'), (int, float))
+                and not isinstance(_r.get('tokens_seen'), (bool, np.bool_))
+                and _r['tokens_seen'] > 0):
             _tok_hdr = f'~{_r['tokens_seen'] / 1e6:.0f}M tokens'
             break
     lines = [f'## P0-2 「渐近线更差」是否成立？（延长到 40k 步 / {_tok_hdr}）', '', '**待检验论断**：20k 步时两臂都未平台化、差距在收窄。要么延长，要么改述为「等训练量下收敛更慢」。', '', '**做法**：`csa_fixed` + `full`（seed 数见下表），同 LONG 配置延到 40k 步（seq 512、bs 12、同一 110M token 池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。', '', '| variant | PPL@40k (pooled/mean; ±seed sd) | n | params |', '|---|---|---|---|']
@@ -1002,7 +1005,13 @@ def sec_p0e():
             def _dir_word(r):
                 return '下降' if r < 0 else ('上升' if r > 0 else '持平')
             _lastk = steps[-1] / 1000.0
-            _tps = next((r['tokens_seen'] / r['steps'] for _k, r in _s_items if isinstance(r, dict) and isinstance(r.get('tokens_seen'), (int, float)) and isinstance(r.get('steps'), (int, float)) and r['steps']), None)
+            _tps = next((r['tokens_seen'] / r['steps'] for _k, r in _s_items
+                         if (isinstance(r, dict)
+                             and isinstance(r.get('tokens_seen'), (int, float))
+                             and not isinstance(r.get('tokens_seen'), (bool, np.bool_))
+                             and isinstance(r.get('steps'), (int, float))
+                             and not isinstance(r.get('steps'), (bool, np.bool_))
+                             and r['steps'])), None)
             _tok_m = f'{steps[-1] * _tps / 1e6:.0f}M' if _tps else 'token 数未知'
             if _unpaired_gap:
                 _gap_calib = '非配对逐步均值差（两臂尾段无公共 seed，仅作方向性参考）'
@@ -1421,7 +1430,9 @@ def sec_p1l():
             _ptag = ''
             _rl = {}
             for _r in recs:
-                if _r.get('variant') in ('csa_fixed_rope', 'full_rope') and isinstance(_r.get('params'), (int, float)):
+                if (_r.get('variant') in ('csa_fixed_rope', 'full_rope')
+                        and isinstance(_r.get('params'), (int, float))
+                        and not isinstance(_r.get('params'), (bool, np.bool_))):
                     _rl.setdefault(_r.get('variant'), set()).add(_r['params'])
             _ok = set(_rl) == {'csa_fixed_rope', 'full_rope'} and all((len(v) == 1 for v in _rl.values()))
             if _ok:
@@ -1946,7 +1957,8 @@ def sec_efficiency():
              '| panel | cell | params (M) | prefill p50/p95 ms | tokens/s | prefix-prefill p50 ms | peak alloc MB | peak reserved MB |', '|---|---|---|---|---|---|---|---|']
     for name, key, rec, eff in rows[:200]:
         p = rec.get('params')
-        pm = (p / 1e6) if isinstance(p, (int, float)) else None
+        pm = (p / 1e6) if (isinstance(p, (int, float))
+                           and not isinstance(p, (bool, np.bool_))) else None
         lines.append('| %s | `%s` | %s | %s / %s | %s | %s | %s | %s |' % (
             name, key, fm(pm), fm(eff.get('prefill_ms_p50'), 2), fm(eff.get('prefill_ms_p95'), 2),
             fm(eff.get('tokens_per_s_prefill'), 1), fm(eff.get('prefix_prefill_ms_p50'), 2),

@@ -6595,6 +6595,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     test_rows = None
     ds_test = None
     ds_train = None
+    last_err = None
     raw_txt = os.environ.get('WT103_RAW_TXT')
     _cands = []
     if raw_txt:
@@ -14685,7 +14686,12 @@ def set_seed(seed):
     seed so callers can record exactly what was used.  torch's deterministic
     algorithm / cuDNN switches are pinned at the same time, so two runs with
     the same seed on the same machine follow the same kernels."""
-    seed = int(seed)
+    # A seed is an exact integer: int(True) == 1 and int(1.5) == 1 would make a
+    # malformed request silently reproduce a different declared run.
+    _seed = _as_seed_int(seed)
+    if _seed is None:
+        raise ValueError(f'set_seed: seed must be an exact integer, got {seed!r}')
+    seed = _seed
     os.environ['PYTHONHASHSEED'] = str(seed)
     random.seed(seed)
     # NumPy's global RNG only accepts [0, 2**32-1], while the panel planner
@@ -14848,7 +14854,10 @@ def dataloader_generator(seed):
     # Match set_seed's torch-domain folding: a planned exact integer seed can
     # exceed the signed/unsigned 64-bit range, and manual_seed would raise
     # instead of deriving the same in-range stream.
-    _s = int(seed)
+    _s = _as_seed_int(seed)
+    if _s is None:
+        raise ValueError(
+            f'dataloader_generator: seed must be an exact integer, got {seed!r}')
     if not (-(2 ** 63) <= _s < 2 ** 64):
         _s %= 2 ** 64
     g.manual_seed(_s)

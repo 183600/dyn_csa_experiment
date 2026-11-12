@@ -1473,8 +1473,37 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
     return summary
 
 def build_niah_batch(n_seq, seq_len, n_pairs=4, vocab=8192, seed=0):
-    rng = np.random.default_rng(seed)
+    n_seq, seq_len, n_pairs, vocab = (
+        L._as_seed_int(n_seq), L._as_seed_int(seq_len),
+        L._as_seed_int(n_pairs), L._as_seed_int(vocab))
+    if any(_v is None for _v in (n_seq, seq_len, n_pairs, vocab)):
+        raise ValueError(
+            'build_niah_batch: n_seq/seq_len/n_pairs/vocab must be exact integers')
+    if n_seq < 1 or seq_len < 2 or vocab < 4:
+        raise ValueError(
+            f'build_niah_batch needs n_seq>=1, seq_len>=2 and vocab>=4 '
+            f'(got n_seq={n_seq}, seq_len={seq_len}, vocab={vocab})')
+    if n_pairs < 1:
+        raise ValueError(f'build_niah_batch needs n_pairs>=1, got {n_pairs}')
+    # The key/value couples occupy the first `hay` positions and the query
+    # pairs the trailing 2*n_pairs; with a band of at least two tokens each
+    # couple needs room for key < value inside its band.  Refuse a too-short
+    # sequence explicitly instead of letting the construction hit an assert
+    # or index past the haystack.
+    if seq_len < 4 * n_pairs:
+        raise ValueError(
+            f'build_niah_batch needs seq_len>={4 * n_pairs} for {n_pairs} '
+            f'pairs (got seq_len={seq_len}); the key/value bands would overlap '
+            'the query tail')
     key_hi = max(2 + (vocab // 2 - 2) // 4, 2 + 2 * n_pairs)
+    if key_hi >= vocab // 2:
+        raise ValueError(
+            f'build_niah_batch needs vocab large enough for {n_pairs} distinct '
+            f'keys and values (got vocab={vocab}, key range starts at {key_hi})')
+    _seed = L._as_seed_int(seed)
+    if _seed is None:
+        raise ValueError(f'build_niah_batch: seed must be an exact integer, got {seed!r}')
+    rng = np.random.default_rng(_seed)
     ids = rng.integers(key_hi, vocab // 2, size=(n_seq, seq_len)).astype(np.int64)
     tgt = np.full((n_seq, seq_len - 1), -100, dtype=np.int64)
     dist = np.full((n_seq, seq_len - 1), -1, dtype=np.int64)

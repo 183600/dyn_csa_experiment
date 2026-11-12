@@ -177,7 +177,9 @@ def sample_std(deltas, axis=None):
         if not np.isfinite(d).all():
             d = d[np.isfinite(d)]
         return float(np.std(d, ddof=1)) if d.size > 1 else 0.0
-    if not isinstance(axis, (int, np.integer)):
+    if isinstance(axis, (bool, np.bool_)) or not isinstance(axis, (int, np.integer)):
+        # A boolean flag is not an axis: int(True) == 1 would silently reduce
+        # over the second dimension instead of refusing the malformed request.
         raise TypeError(f'axis must be an integer, got {axis!r}')
     axis = int(axis)
     if axis < 0:
