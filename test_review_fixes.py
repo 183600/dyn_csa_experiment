@@ -5056,6 +5056,14 @@ def t_scale_ladder_budget_and_transfer_audit():
     _b = tier('S2', 2000, 2000)
     _a['cfg']['vocab'] = _b['cfg']['vocab'] = 8000
     assert L.scale_ladder_audit([_a, _b])['status'] != 'fail'
+    # A boolean corpus/tokenizer provenance is not a shared identity.
+    for _bad_fp in (True, np.bool_(False)):
+        _a = tier('S1', 1000, 1000)
+        _b = tier('S2', 2000, 2000)
+        _a['cfg']['corpus_fp'] = _b['cfg']['corpus_fp'] = _bad_fp
+        _out = L.scale_ladder_audit([_a, _b])
+        assert _out['status'] == 'fail', (_bad_fp, _out)
+        assert any('corpus_fp' in p for p in _out['problems']), (_bad_fp, _out)
     # A boolean learning rate is a flag, not float(True)=1.0.
     for _bad_lr in (True, np.bool_(False)):
         _a = tier('S1', 1000, 1000)
@@ -5934,7 +5942,8 @@ def t_scale_point_provenance_roundtrip():
     # Booleans and fractional vocabulary sizes are not provenance.
     for bad in ({'label': 'S1', 'scale': True, 'effects': [0.1]},
                 {'label': 'S1', 'scale': 1, 'effects': [0.1], 'vocab': True},
-                {'label': 'S1', 'scale': 1, 'effects': [0.1], 'vocab': 1.5}):
+                {'label': 'S1', 'scale': 1, 'effects': [0.1], 'vocab': 1.5},
+                {'label': 'S1', 'scale': 1, 'effects': [0.1], 'corpus_fp': True}):
         try:
             L._scale_points([bad])
         except ValueError:

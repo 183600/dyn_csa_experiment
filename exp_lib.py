@@ -10186,6 +10186,11 @@ def _scale_points(points):
             sc = float(scale)
         except (TypeError, ValueError, OverflowError):
             sc = float('nan')
+        if isinstance(corpus_fp, (bool, np.bool_)):
+            # A boolean flag is not a corpus/tokenizer identity; str(True)
+            # would compare equal across unrelated panels.
+            raise ValueError('scale point %r: corpus_fp=%r is a boolean flag, not a fingerprint'
+                             % (label, corpus_fp))
         if vocab is not None:
             # A tokenizer vocabulary is an exact positive count; int(True)=1
             # or int(1.9)=1 would masquerade as a real vocabulary and could
@@ -10620,6 +10625,11 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                 if _v <= 0:
                     problems.append(f'{name}: vocab={_v!r} must be positive')
                     continue
+            elif isinstance(_v, (bool, np.bool_)):
+                # A boolean is a flag, not a corpus/tokenizer fingerprint;
+                # otherwise two unrelated tiers would look "shared".
+                problems.append(f'{name}: {_fpk}={_v!r} is a boolean, not a fingerprint')
+                continue
             row[_fpk] = _v
         try:
             steps = _as_int(cfg['steps'], 'steps')
