@@ -235,19 +235,17 @@ def t_scale_robustness_edges():
 
 
 def t_scale_aggregate_and_claim_edges():
-    # Seed ordering must stay exact above the binary64 range; converting the
-    # id through float() would abort the whole aggregate.
+    # Seed ordering stays exact above the binary64 range.
     _huge_seed = 10 ** 400
     _summ = {'x': {'variant': 'csa', 'seed': _huge_seed, 'ppl': 10.0,
                    'nll_sum': 10.0, 'n_tokens': 1}}
     _agg = L.aggregate(_summ)
     assert _agg['csa']['seeds'] == [_huge_seed], _agg
-    # A malformed integral p-value is an invalid family slot, not a crash.
+    # A malformed integral p-value is an invalid family slot.
     _entries = [{'p_exact_signflip': _huge_seed}]
     L._holm_assign(_entries, 1, 0.05, 'p_holm')
     assert _entries[0]['p_holm'] is None, _entries
-    # The claim gate rejects malformed alpha/min_n instead of coercing a
-    # boolean to a permissive level or overflowing on a huge value.
+    # The claim gate rejects malformed alpha/min_n values.
     _base = {'n': 10, 'mean': -1.0, 'std': 0.1,
              'p_exact_signflip': 0.01, 'p_holm': 0.02}
     assert L.reportable_claim(_base)['allowed'] is True
@@ -257,8 +255,7 @@ def t_scale_aggregate_and_claim_edges():
     for _bad_min_n in (True, np.bool_(False), 1.5, '6', None, 0, -1):
         _r = L.reportable_claim(_base, min_n=_bad_min_n)
         assert _r['allowed'] is False and _r['reasons'], (_bad_min_n, _r)
-    # A huge but internally consistent ladder must report a finite ratio even
-    # when each per-tier tokens/params ratio overflows binary64.
+    # A huge internally consistent ladder reports a finite ratio.
     def _tier(name, params):
         return {'name': name,
                 'cfg': {'steps': 10 ** 200, 'batch_size': 2, 'seq_len': 8,
@@ -273,8 +270,8 @@ def t_scale_aggregate_and_claim_edges():
                                   _tier('b', _huge_seed * 2)])
     assert _diff['budget_matched'] is False, _diff
     assert _diff['tokens_per_param_ratio'] == 2.0, _diff
-    # Cache signatures carry nanosecond/inode integers above 2**53; a lossy
-    # float or boolean spelling must not certify the same file identity.
+    # Cache signatures carry nanosecond/inode integers above 2**53 and are
+    # compared exactly.
     _sigs = {'a': [1, 2 ** 60, 3, 4]}
     assert L._cache_file_sigs_match({'file_sigs': {'a': [1, 2 ** 60, 3, 4]}},
                                     _sigs) is True
@@ -1478,8 +1475,8 @@ def t_seed_plan_exact_counts():
 
 
 def t_t_critical_high_confidence():
-    # A fixed upper bound is too small for high-confidence intervals; df=1
-    # has the analytic t = 1/tan(pi*alpha).
+    # df=1 has the analytic t = 1/tan(pi*alpha); high-confidence intervals
+    # need the full-range bracket.
     for conf in (0.9999, 0.999999):
         got = L._t_critical(conf, 1)
         want = 1.0 / math.tan(math.pi * (1.0 - conf) / 2.0)

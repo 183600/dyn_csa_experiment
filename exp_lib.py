@@ -5616,9 +5616,8 @@ def _cache_file_sigs_match(meta, sigs):
         _got = rec.get(_k)
         if not isinstance(_got, (list, tuple)) or len(_got) != len(_v):
             return False
-        # Exact integer fields only: a lossy float spelling of a nanosecond
-        # timestamp (above 2**53) or a boolean must not certify a different
-        # file as the recorded one.
+        # Compare each recorded signature field as an exact integer; nanosecond
+        # timestamps and inodes can exceed 2**53.
         if any(_as_seed_int(a) != int(b) for a, b in zip(_got, _v)):
             return False
     return True
@@ -11060,9 +11059,8 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             if all(math.isfinite(x) and x > 0 for x in tpp):
                 tpp_ratio = max(tpp) / min(tpp)
             else:
-                # The per-tier ratio can overflow binary64 while the ladder is
-                # internally consistent.  Compare on the log scale using the
-                # exact integer counts so equal huge ratios still read as 1.
+                # Compare on the log scale using the exact integer counts so
+                # ratios above the binary64 range stay finite.
                 try:
                     _logs = [math.log(r['effective_tokens']) - math.log(r['params'])
                              for r in rows]
