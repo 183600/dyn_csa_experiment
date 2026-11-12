@@ -2850,7 +2850,7 @@ def _open_block_geometry(bid, n_blocks=None):
     integers are exact functions of that row; no block-tail quantity is read.
     The geometry is therefore cached on the immutable block-id row: every
     open-block layer reads the same bid object, so the bincount/cumsum/gather
-    work is shared instead of rebuilt per layer.
+    work is shared across layers.
     """
     if bid.dim() != 1:
         raise ValueError(f'_open_block_geometry expects a 1-D block-id row, got {tuple(bid.shape)}')
@@ -6063,8 +6063,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                     kept.append((r, None))
                     continue
                 # The deduplicator hashes the exact document anyway; reuse
-                # that fingerprint for the document-id sidecar instead of
-                # hashing every kept row a second time.
+                # that fingerprint for the document-id sidecar.
                 _fp = _doc_exact_fp(r)
                 _dup, _kind = _dedup.is_duplicate(r, fp=_fp)
                 if _dup:
@@ -9095,8 +9094,8 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
                 out['reasons'].append('|mean| <= std: effect is within seed noise')
     # Leave-one-seed-out instability is a direct contradiction of a stable
     # directional effect: dropping one seed must not flip the sign.  Only
-    # enforced when the caller supplied the diagnostic (old stats dicts do not
-    # carry it); the verdict is never silently assumed robust.
+    # enforced when the caller supplied the diagnostic (stats without the field
+    # do not carry it); the verdict is never silently assumed robust.
     _seed_driven = stats.get('seed_driven')
     if isinstance(_seed_driven, (bool, np.bool_)) and bool(_seed_driven):
         out['reasons'].append('leave-one-seed-out stability fails: dropping one seed flips the mean sign')
@@ -9323,8 +9322,8 @@ def exact_signflip_p(deltas):
     if n <= _SIGNFLIP_ENUM_MAX_N:
         total = 1 << n
         cnt = 0
-        # Same scale-free tie slack as the MITM/saddlepoint paths.  The old
-        # absolute 1e-12 turned tiny effects into p=1 regardless of sign
+        # Same scale-free tie slack as the MITM/saddlepoint paths: an absolute
+        # 1e-12 would turn tiny effects into p=1 regardless of sign
         # consistency (the floor should be 2/2**n when all signs agree).
         _tol_mean = 1e-12 * float(np.abs(d).sum()) / n
         bitpos = np.arange(n, dtype=np.int64)[None, :]
@@ -10114,8 +10113,8 @@ def _t_critical(conf, df):
     target = (1.0 - conf) / 2.0
     # Expand the bracket instead of hard-coding t<=1000: a very high
     # confidence level (or df=1) needs a critical value far above 1000
-    # (conf=0.9999, df=1 -> t~6366), and a fixed cap silently returned a
-    # too-small interval.  Stop if the bracket reaches the float range cap.
+    # (conf=0.9999, df=1 -> t~6366), and a fixed cap can return a too-small
+    # interval.  Stop if the bracket reaches the float range cap.
     lo, hi = 0.0, 1.0
     while hi < 1e18 and _student_t_sf(hi, df) > target:
         lo = hi
@@ -10781,7 +10780,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         # Corpus/tokenizer binding across the ladder: a MISMATCH is a hard
         # problem (the cross-tier log-ratios the ladder exists to compute are
         # not defined), while missing fingerprints stay a warning (the audit
-        # cannot attest, but old panels predate the field).
+        # cannot attest when the field is absent).
         binding = {}
         for _fpk, _what in (('corpus_fp', 'corpus fingerprint'),
                             ('fit_fp', 'tokenizer-fit fingerprint'),
@@ -16141,8 +16140,8 @@ def training_knobs(*, amp_dtype='auto', eager_batch='auto'):
     values so the record describes what ran instead of what the default would
     have been.  Keeping both fields in this descriptor makes them enter the
     resume fingerprint (`training_knobs_fingerprint`) and the per-record
-    pairing gate, so an old fp32 / row-by-row cell can never be silently
-    reused by a bf16 / batched-twin run.
+    pairing gate, so an fp32 / row-by-row cell can never be silently reused
+    by a bf16 / batched-twin run.
     """
     if amp_dtype == 'auto':
         amp_dtype = _active_amp()
@@ -16504,8 +16503,8 @@ def _params_all_finite(model):
 class _HashingWriter:
     """File proxy that hashes bytes as `torch.save` writes them.
 
-    Hashing the same bytes on the way out avoids a second full-file read for
-    the checkpoint digest."""
+    Hashing the same bytes on the way out binds the checkpoint digest to what
+    was actually written."""
 
     __slots__ = ('_f', '_h')
 

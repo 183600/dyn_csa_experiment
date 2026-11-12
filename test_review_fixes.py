@@ -732,7 +732,7 @@ def t_legacy_modes_bitexact():
             for jj in range(0, 9, 3):
                 a = V10._corrupt_row(_PANEL, 128, rho, mode, jj, _VOCAB, 32)
                 b = _legacy_corrupt_row(_PANEL, 128, rho, mode, jj, _VOCAB, 32)
-                assert np.array_equal(a, b), f'legacy mode {mode} rho={rho} jj={jj} diverged from the reference algorithm'
+                assert np.array_equal(a, b), f'compatibility mode {mode} rho={rho} jj={jj} diverged from the reference algorithm'
 
 
 def t_corruption_deterministic_and_paired():
@@ -1178,7 +1178,7 @@ def t_pair_reason_train_knobs_mixed():
     r = L.pair_reason(a, b)
     assert r is not None and 'unverifiable train_knobs' in r, f'one-sided train_knobs presence must be refused, got {r!r}'
     r2 = L.pair_reason({k: v for k, v in a.items() if k != 'train_knobs'}, b)
-    assert r2 is None, 'both records missing the descriptor is the legacy path and may still pair'
+    assert r2 is None, 'both records missing the descriptor is the permissive path and may still pair'
 
 
 def t_pair_reason_fingerprint_gate():
@@ -1282,8 +1282,8 @@ def t_seed_plan_exact_counts():
 
 
 def t_t_critical_high_confidence():
-    # The old fixed upper bound (1000) made high-confidence intervals too
-    # narrow; df=1 has the analytic t = 1/tan(pi*alpha).
+    # A fixed upper bound is too small for high-confidence intervals; df=1
+    # has the analytic t = 1/tan(pi*alpha).
     for conf in (0.9999, 0.999999):
         got = L._t_critical(conf, 1)
         want = 1.0 / math.tan(math.pi * (1.0 - conf) / 2.0)
@@ -4147,8 +4147,7 @@ def t_label_shift_and_split_counts():
 def t_sample_tokens_uniform_rejection():
     # Force the scale-safe rejection path even on tiny arrays.  The sample must
     # remain a uniform without-replacement draw; taking the smallest CAP of a
-    # sorted candidate pool (the previous implementation) has mean ~n/9 for
-    # cap=4, not ~n/2.
+    # sorted candidate pool has mean ~n/9 for cap=4, not ~n/2.
     old = A._CHOICE_PERM_MAX_ELEMS
     try:
         A._CHOICE_PERM_MAX_ELEMS = 0
@@ -5811,7 +5810,7 @@ def t_audit_length_missing_n_seq_flag():
 
 def t_scale_edge_case_regressions():
     # Tiny but perfectly consistent effects must still hit the exact floor;
-    # an absolute tie tolerance used to force p=1.
+    # an absolute tie tolerance would force p=1.
     assert abs(L.exact_signflip_p([1e-13] * 6)['p'] - 2.0 / 64) < 1e-12
     assert abs(L.exact_signflip_p([1e-13] * 22)['p'] - 2.0 / (1 << 22)) < 1e-18
     # The exact-test floor comes from the NONZERO pair count.
@@ -6017,7 +6016,7 @@ def t_scale_corpus_binding_refuses_mixed_tokenizers():
     m = L.meta_analyze_effects([{'label': 'S1', 'scale': 1, 'effects': [0.1, 0.2, 0.3], 'seeds': [0, 1, 2]},
                                 {'label': 'S2', 'scale': 2, 'effects': [0.15, 0.25, 0.35], 'seeds': [0, 1, 2]}])
     assert m['corpus_binding']['corpus_binding'] == 'unverifiable', m
-    assert m['status'] == 'ok', 'legacy points without fingerprints stay analysable, just unattested'
+    assert m['status'] == 'ok', 'points without fingerprints stay analysable, just unattested'
     # The ladder audit fails CLOSED on a corpus/tokenizer mismatch.
     def _tier(name, corpus_fp=None, vocab=None):
         cfg = {'steps': 100, 'batch_size': 4, 'seq_len': 512, 'n_train_tokens': 204800,

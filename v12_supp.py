@@ -496,8 +496,8 @@ def _file_sig(path):
 
 def _file_sha256(path, chunk=1 << 20):
     # Bind the digest to the full metadata identity (size, mtime, ctime, inode),
-    # so an unchanged file is not re-read while any rewrite — even one that
-    # preserves size and mtime — still forces a fresh hash.
+    # so any rewrite — even one that preserves size and mtime — still forces a
+    # fresh hash.
     try:
         _key = (os.path.abspath(path),) + _file_sig(path)
         _hit = _FILE_SHA_CACHE.get(_key)

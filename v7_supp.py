@@ -86,7 +86,7 @@ def apply_rope(x, cos, sin, rope_dim):
     sin_h = sin[..., :half] if sin.shape[-1] > half else sin
     x1 = x[..., :half]
     x2 = x[..., half:2 * half]
-    # Same elementwise expressions as the previous slice-write path; the
+    # Same elementwise expressions as the slice-write path; the
     # prefix is overwritten and every lane from 2*half onward (including the
     # unpaired odd lane and any tail beyond rope_dim) passes through.
     out = x.clone()
@@ -1599,7 +1599,7 @@ def exact_sign_permutation(deltas):
         if (not isinstance(_sd, (int, float))) or (not math.isfinite(_mu)):
             res['cohens_dz'] = float('nan')
         else:
-            # Scale-free threshold: the previous absolute 1e-12 made a
+            # Scale-free threshold: an absolute 1e-12 would make a
             # small-magnitude but variable panel report an infinite d_z.
             _mag = max(float(np.max(np.abs(d))) if d.size else 0.0, abs(_mu), 1e-300)
             if _sd > 1e-12 * _mag:
