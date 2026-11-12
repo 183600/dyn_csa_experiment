@@ -4967,6 +4967,30 @@ def t_report_stale_trajectory_refused():
     assert '陈旧记录已排除' in txt2 and '**10.0**' not in txt2, txt2
 
 
+def t_sec_p1l_rejects_malformed_length_keys():
+    # A by-length key must be an exact positive integer.  Boolean/float keys
+    # and length 0 are not lengths; mapping 4.9 -> 4 would quote a cell
+    # measured at a different (non-integral) length under a valid column.
+    rec = {'v::s0': {'variant': 'v', 'seed': 0, '_code': BR._CUR_CS, 'by_len': {
+        True: {'ppl': 11.0, 'truncated': False},
+        '4.9': {'ppl': 22.0, 'truncated': False},
+        '0': {'ppl': 33.0, 'truncated': False},
+        '-512': {'ppl': 44.0, 'truncated': False},
+        '512': {'ppl': 10.0, 'truncated': False},
+        '4096': {'ppl': 20.0, 'truncated': False},
+    }}}
+    BR._LOADED[('summary', 'results_len')] = rec
+    try:
+        txt = BR.sec_p1l()
+    finally:
+        BR._LOADED.pop(('summary', 'results_len'), None)
+    assert 'PPL@512' in txt and 'PPL@4096' in txt, txt[:600]
+    for _bad in ('PPL@0', 'PPL@1 ', 'PPL@4 ', 'PPL@-512'):
+        assert _bad not in txt, (_bad, txt[:600])
+    for _bad_val in ('11.0', '22.0', '33.0', '44.0'):
+        assert _bad_val not in txt, (_bad_val, txt[:600])
+
+
 def t_stale_aggregate_refused():
     cur = BR._CUR_CS
     d = {'a@cfg1': {'variant': 'a', 'run_cfg': f'steps1_d8_L1_csOLD1', 'n_seeds': 4, 'ppl_mean': 10.0},
@@ -6027,6 +6051,7 @@ def main():
     _check('L5 param breakdown + measured compute control', t_param_and_compute_control_detail)
     _check('L6 stale aggregate refused', t_stale_aggregate_refused)
     _check('L7 stale length panel excluded from report', t_sec_p1l_excludes_stale_records)
+    _check('L7b report length table rejects malformed length keys', t_sec_p1l_rejects_malformed_length_keys)
     _check('L8 efficiency-pair audit + shape sweep', t_efficiency_pairs_audit_and_sweep)
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L9b archive verifier requires the external checksum', t_archive_verify_requires_external_checksum)

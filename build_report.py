@@ -1224,19 +1224,33 @@ def sec_p1l():
                      '本节不引用这些数值、不计算 ratio，也不给出外推结论。重跑长度面板后再纳入。\n\n')
         return _msg
     def _len_key(Ln):
+        # A displayed length must be an exact positive integer.  int(True)==1
+        # and int(4.9)==4 would otherwise admit a boolean/fractional key (or a
+        # length-0 column) into the table, and a cell measured at 4.9 tokens
+        # would be quoted as PPL@4.  Mirror the length audit's contract.
+        if isinstance(Ln, (bool, np.bool_)):
+            return None
         try:
-            return int(Ln)
+            f = float(Ln)
         except (TypeError, ValueError, OverflowError):
             return None
+        if not math.isfinite(f) or f != math.floor(f) or f <= 0:
+            return None
+        return int(f)
 
     def _cell_at(by_len, Ln):
         # by_len keys are normally the integer length or its string spelling,
-        # but integral floats/other encodings are accepted by the audit too.
-        # Resolve them by value so a cell is never silently shown as "—".
+        # but integral floats/other encodings are also validated by value.
+        # Resolve them so a cell is never silently shown as "—", while a
+        # malformed key (including the dict-equality alias True == 1) never
+        # supplies a cell for a different real length.
         if Ln in by_len:
-            return by_len[Ln]
-        if str(Ln) in by_len:
-            return by_len[str(Ln)]
+            for _k in by_len:
+                if _k == Ln and _len_key(_k) == Ln:
+                    return by_len[_k]
+        _sk = str(Ln)
+        if _sk in by_len and _len_key(_sk) == Ln:
+            return by_len[_sk]
         for _k, _c in by_len.items():
             if _len_key(_k) == Ln:
                 return _c
