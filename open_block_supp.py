@@ -468,7 +468,8 @@ def _controlled_reason(a, b):
 def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     summary = _load_summary(outdir)
     _fps = {rec.get('run_fingerprint') for rec in summary.values()
-            if isinstance(rec, dict) and L.ppl_is_usable(rec.get('ppl'))}
+            if isinstance(rec, dict) and not rec.get('synthesized')
+            and L.ppl_is_usable(rec.get('ppl'))}
     _fps.discard(None)
     if len(_fps) > 1:
         raise SystemExit(

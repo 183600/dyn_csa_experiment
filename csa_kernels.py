@@ -156,7 +156,9 @@ def _det_scatter_add_multi(n_rows, indices, values_list, device, dtype):
     for values, out in zip(values_list, outs):
         if values is None:
             continue
-        val_s = values.index_select(0, order).to(torch.float32)
+        val_s = values.index_select(0, order)
+        _wdt = torch.promote_types(val_s.dtype, torch.float32)
+        val_s = val_s.to(_wdt)
         csum = val_s.cumsum_(dim=0)
         hi = csum.index_select(0, seg_end)
         lo = torch.zeros_like(hi)
@@ -205,7 +207,10 @@ def _seg_apply(seg, values, out_flat):
     未被任何键覆盖的行保持零，与「零初始化全头缓冲后按 seg_id·nh+h
     写入、末尾一次 cast」逐头 cast 的参考形式逐位一致）。"""
     order, seg_end, seg_id_k, keep = seg
-    val_s = values.index_select(0, order).to(torch.float32)
+    # Accumulate in the caller's output precision (fp32 for the fp32/bf16
+    # paths, fp64 when a fp64 pool calls here) so index_copy_ dtypes match and
+    # an fp64 gradient is not silently rounded through fp32.
+    val_s = values.index_select(0, order).to(out_flat.dtype)
     csum = val_s.cumsum_(dim=0)
     hi = csum.index_select(0, seg_end)
     lo = torch.zeros_like(hi)
@@ -564,6 +569,10 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     Bm = geom.Bm
     dev = Xa.device
     dtype = Xa.dtype
+    # Work in max(dtype, fp32), the same contract as the indexer reference:
+    # fp32/bf16/fp16 accumulate in fp32, while fp64 inputs keep fp64.  A
+    # hard-coded fp32 here silently rounded fp64 gradients.
+    acc = torch.promote_types(dtype, torch.float32)
     L, W = geom.max_len, geom.W_b
     has_b = Xb is not None and W > 0
     gXa = torch.zeros_like(Xa) if need_xa else None
@@ -592,15 +601,15 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     ov_start_l = _i64['ov_start']
     nblk_l = _i64['n_blocks'][:, None]
     _bpb_rows = int(B_pos_b.shape[0]) if need_bpb else 0
-    gBpb32 = torch.zeros((_bpb_rows, c), device=dev, dtype=torch.float32) if need_bpb else None
-    gBpb_tmp = torch.zeros((_bpb_rows, c), device=dev, dtype=torch.float32) if need_bpb else None
+    gBpb32 = torch.zeros((_bpb_rows, c), device=dev, dtype=acc) if need_bpb else None
+    gBpb_tmp = torch.zeros((_bpb_rows, c), device=dev, dtype=acc) if need_bpb else None
     ch = _pool_chunk_b(R, L + (W if has_b else 0), c, temps=8)
     # 单 chunk（ch >= Bm）时 in_ch / b2 的 chunk 范围条件恒真（geom 与 bid
     # 同源——Bm 由同一分段表的 counts 给出，bid 值恒 < Bm）：where(全真,
     # x, 0) 逐位返回 x（含 ±0/NaN）。
     single_chunk = ch >= Bm
     # 广播用的零标量只读，循环外建立。
-    zero32 = torch.zeros((), device=dev, dtype=torch.float32)
+    zero32 = torch.zeros((), device=dev, dtype=acc)
     for b0 in range(0, Bm, ch):
         b1 = min(b0 + ch, Bm)
         av = av_all[:, b0:b1]
@@ -616,12 +625,12 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
             WinZ = torch.cat([logit_a, logit_b], dim=2)
         else:
             WinZ = logit_a
-        sc = torch.nan_to_num(torch.softmax(WinZ, dim=2)).to(torch.float32)
+        sc = torch.nan_to_num(torch.softmax(WinZ, dim=2)).to(acc)
         sc_a, sc_b = sc[:, :, :L], (sc[:, :, L:] if has_b else None)
-        dc = dcomp[:, b0:b1].to(torch.float32)
-        gsc_a = dc[:, :, None] * _gather_rows(Xa, g_a[:, b0:b1]).to(torch.float32)
+        dc = dcomp[:, b0:b1].to(acc)
+        gsc_a = dc[:, :, None] * _gather_rows(Xa, g_a[:, b0:b1]).to(acc)
         if has_b:
-            gsc_b = dc[:, :, None] * _gather_rows(Xb, g_b[:, b0:b1]).to(torch.float32)
+            gsc_b = dc[:, :, None] * _gather_rows(Xb, g_b[:, b0:b1]).to(acc)
             Srow = (gsc_a * sc_a).sum(dim=2) + (gsc_b * sc_b).sum(dim=2)
             glogit_b = sc_b * (gsc_b - Srow[:, :, None])
         else:
@@ -632,7 +641,7 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
             in_ch = None if single_chunk else (bid_l >= b0) & (bid_l < b1)
             sel = bid_l.clamp(b0, b1 - 1)
             jA_t = (t_idx - starts_l.gather(1, sel)).clamp(0, L - 1)
-            dc_sel = dcomp.gather(1, sel[:, :, None].expand(R, T, c)).to(torch.float32)
+            dc_sel = dcomp.gather(1, sel[:, :, None].expand(R, T, c)).to(acc)
             if need_xa:
                 # sc_a/glogit_a are chunk-local ([R, b1-b0, L, c]); rebase the
                 # global clamped block id into chunk coordinates before the
@@ -650,7 +659,7 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
                 ok2 = ok2 & (b2 >= b0) & (b2 < b1)
             b2c = b2.clamp(b0, b1 - 1)
             j2c = j2.clamp(0, W - 1)
-            dc2 = dcomp.gather(1, b2c[:, :, None].expand(R, T, c)).to(torch.float32)
+            dc2 = dcomp.gather(1, b2c[:, :, None].expand(R, T, c)).to(acc)
             if need_xb:
                 sc_b_sel = _take_lane(sc_b, r_idx, b2c - b0, j2c)
                 gXb += torch.where(ok2[:, :, None], sc_b_sel * dc2, zero32).to(dtype)
@@ -698,6 +707,9 @@ class FusedPool(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, impl, Xa, Xb, Za, Zb, bid, geom, B_pos_a, B_pos_b):
+        if impl == 'triton' and not _triton_dtype_ok(Xa.dtype):
+            _warn_shape_fallback('pool', f'dtype={Xa.dtype} is not supported by the Triton kernel')
+            impl = 'ref'
         if impl == 'triton':
             comp = _pool_fwd_triton(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b)
         else:
@@ -1000,9 +1012,19 @@ def _warn_shape_fallback(op, detail):
           'declared backend tolerance)')
 
 
+def _triton_dtype_ok(dtype):
+    """Triton kernels are compiled for fp16/bf16/fp32; fp64 stays on ref."""
+    return dtype in (torch.float16, torch.bfloat16, torch.float32)
+
+
 def _indexer_impl_for_shape(impl, kI):
     # The scoring kernel and the runner-up path both handle long-context
-    # shapes (Bm can be tens of thousands) on the Triton scorer.
+    # shapes (Bm can be tens of thousands) on the Triton scorer.  A dtype the
+    # kernels do not implement (fp64) must fall back instead of being silently
+    # downcast to fp32, which would disagree with the reference contract.
+    if impl == 'triton' and not _triton_dtype_ok(kI.dtype):
+        _warn_shape_fallback('indexer', f'dtype={kI.dtype} is not supported by the Triton scorer')
+        return 'ref'
     return impl
 
 
@@ -1034,10 +1056,22 @@ class FusedIndexer(torch.autograd.Function):
             return (None,) * 7
         ng = ctx.needs_input_grad
         _ic = (_env_cached('CSA_KERNEL_IDX_CHUNK') or '').strip()
+        _tchunk = None
+        if _ic:
+            try:
+                _tchunk = int(_ic)
+            except (TypeError, ValueError, OverflowError):
+                _tchunk = None
+            if _tchunk is not None and _tchunk <= 0:
+                # A negative/zero chunk makes range(0, T, t_chunk) empty (or
+                # raises), silently returning all-zero gradients; fall back to
+                # the default chunking instead.
+                print(f'[kernel] indexer: ignoring non-positive CSA_KERNEL_IDX_CHUNK={_ic!r}; using the default chunk size')
+                _tchunk = None
         dqI, dkI, dw = _indexer_bwd_ref(
             gs, idx, valid, soft, qI, kI, w_idx, last_tok,
             need_dq=bool(ng[1]), need_dk=bool(ng[2]), need_dw=bool(ng[3]),
-            t_chunk=int(_ic) if _ic else None)
+            t_chunk=_tchunk)
         return (None, dqI, dkI, dw, None, None, None)
 
 
@@ -1079,13 +1113,14 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     M = nb + w
     dev = q.device
     dtype = q.dtype
-    MINL = _finfo_min(torch.float32)
+    _wdt = torch.promote_types(dtype, torch.float32)
+    MINL = _finfo_min(_wdt)
     out = torch.empty_like(q)
     t_idx = torch.arange(T, device=dev)[None, :, None]
     if valid is None:
         valid = torch.ones_like(topk_idx, dtype=torch.bool)
     win_raw = (t_idx - (w - 1) + torch.arange(w, device=dev)[None, None, :]).expand(R, T, w)
-    sink_v = torch.nan_to_num(sink).to(torch.float32) if sink is not None else None
+    sink_v = torch.nan_to_num(sink).to(_wdt) if sink is not None else None
     tc = _attn_t_chunk(R, M, nh, hd)
     # t-chunk 在外、头在内：各 (t,h) 的前向计算相互独立，循环顺序交换
     # 不改变任何元素值。chunk 内的 lt_sel/sel_ok/src_win/win_ok/anyrow
@@ -1107,11 +1142,11 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
         anyrow = (sel_ok.any(dim=-1) | win_ok.any(dim=-1)) if sink_v is None else None
         src_sel = src32.to(torch.int64)
         for h in range(nh):
-            qh = q_heads[h][:, t0:t1].to(torch.float32)
-            Kb = _gather_rows(kb_heads[h], src_sel).to(torch.float32)
-            Kw = _gather_rows(kw_heads[h], src_win).to(torch.float32)
-            Vb = _gather_rows(vb_heads[h], src_sel).to(torch.float32)
-            Vw = _gather_rows(vw_heads[h], src_win).to(torch.float32)
+            qh = q_heads[h][:, t0:t1].to(_wdt)
+            Kb = _gather_rows(kb_heads[h], src_sel).to(_wdt)
+            Kw = _gather_rows(kw_heads[h], src_win).to(_wdt)
+            Vb = _gather_rows(vb_heads[h], src_sel).to(_wdt)
+            Vw = _gather_rows(vw_heads[h], src_win).to(_wdt)
             zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1)
             if scale != 1.0:
                 # x·1.0 is the IEEE identity; the fresh cat output is safe to
@@ -1152,13 +1187,14 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     Bm = k_blk.shape[1]
     dev = q.device
     dtype = q.dtype
-    MINL = _finfo_min(torch.float32)
+    _wdt = torch.promote_types(dtype, torch.float32)
+    MINL = _finfo_min(_wdt)
     M = nb + w
     t_idx = torch.arange(T, device=dev)[None, :, None]
     if valid is None:
         valid = torch.ones_like(topk_idx, dtype=torch.bool)
     win_raw = (t_idx - (w - 1) + torch.arange(w, device=dev)[None, None, :]).expand(R, T, w)
-    sink_v = torch.nan_to_num(sink).to(torch.float32) if sink is not None else None
+    sink_v = torch.nan_to_num(sink).to(_wdt) if sink is not None else None
     dq = torch.zeros_like(q) if need_dq else None
     dsoft = torch.zeros_like(soft) if (need_dsoft and soft is not None) else None
     dsink = torch.zeros_like(sink) if (need_dsink and sink is not None) else None
@@ -1183,12 +1219,12 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else None
     dk_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dksw else None
     dv_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dvsw else None
-    dk_slab = torch.zeros((group, R * Bm, hd), device=dev, dtype=torch.float32) if need_dkb else None
-    dv_slab = torch.zeros((group, R * Bm, hd), device=dev, dtype=torch.float32) if need_dvb else None
-    dksw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=torch.float32) if need_dksw else None
-    dvsw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=torch.float32) if need_dvsw else None
-    dk_scratch = torch.zeros((R * Bm, hd), device=dev, dtype=torch.float32) if (need_dkb or need_dvb) else None
-    dksw_scratch = torch.zeros((R * T, hd), device=dev, dtype=torch.float32) if (need_dksw or need_dvsw) else None
+    dk_slab = torch.zeros((group, R * Bm, hd), device=dev, dtype=_wdt) if need_dkb else None
+    dv_slab = torch.zeros((group, R * Bm, hd), device=dev, dtype=_wdt) if need_dvb else None
+    dksw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=_wdt) if need_dksw else None
+    dvsw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=_wdt) if need_dvsw else None
+    dk_scratch = torch.zeros((R * Bm, hd), device=dev, dtype=_wdt) if (need_dkb or need_dvb) else None
+    dksw_scratch = torch.zeros((R * T, hd), device=dev, dtype=_wdt) if (need_dksw or need_dvsw) else None
 
     for h0 in range(0, nh, group):
         h1 = min(h0 + group, nh)
@@ -1205,7 +1241,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             win_ok = win_raw[:, t0:t1, :] >= 0
             lane_ok = torch.cat([sel_ok, win_ok], dim=-1)
             anyrow = (sel_ok.any(dim=-1) | win_ok.any(dim=-1)) if sink_v is None else None
-            soft_c = soft[:, t0:t1, :].to(torch.float32) if soft is not None else None
+            soft_c = soft[:, t0:t1, :].to(_wdt) if soft is not None else None
             seg_b_c = None
             if need_dkb or need_dvb:
                 kb_keys = r_idx.expand(R, t1 - t0, nb) * Bm + src64
@@ -1218,12 +1254,12 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                 del kw_keys
             for h in range(h0, h1):
                 hi = h - h0
-                qh = q_heads[h][:, t0:t1].to(torch.float32)
-                dOh = dO_heads[h][:, t0:t1].to(torch.float32)
-                Kb = _gather_rows(kb_heads[h], src64).to(torch.float32)
-                Kw = _gather_rows(kw_heads[h], src_win).to(torch.float32)
-                Vb = _gather_rows(vb_heads[h], src64).to(torch.float32)
-                Vw = _gather_rows(vw_heads[h], src_win).to(torch.float32)
+                qh = q_heads[h][:, t0:t1].to(_wdt)
+                dOh = dO_heads[h][:, t0:t1].to(_wdt)
+                Kb = _gather_rows(kb_heads[h], src64).to(_wdt)
+                Kw = _gather_rows(kw_heads[h], src_win).to(_wdt)
+                Vb = _gather_rows(vb_heads[h], src64).to(_wdt)
+                Vw = _gather_rows(vw_heads[h], src_win).to(_wdt)
                 Kl = torch.cat([Kb, Kw], dim=-2)
                 Vl = torch.cat([Vb, Vw], dim=-2)
                 zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1)
@@ -1331,6 +1367,9 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
 def _attn_impl_for_shape(impl, q, w):
     if impl != 'triton':
         return impl
+    if not _triton_dtype_ok(q.dtype):
+        _warn_shape_fallback('attention', f'dtype={q.dtype} is not supported by the Triton kernels')
+        return 'ref'
     hd = int(q.shape[-1])
     if int(w) < 1 or hd < 16 or (hd & (hd - 1)) != 0:
         _warn_shape_fallback('attention', f'w={int(w)}, hd={hd} require w >= 1 and a power-of-two hd >= 16')
@@ -2554,8 +2593,19 @@ import contextlib
 
 @contextlib.contextmanager
 def kernel_env(mode):
-    """临时设置 CSA_KERNEL（exp_lib 的分发按每次 forward 读取环境变量）。"""
-    old = os.environ.get('CSA_KERNEL')
+    """临时设置 CSA_KERNEL（exp_lib 的分发按每次 forward 读取环境变量）。
+
+    Per-operator overrides (CSA_KERNEL_POOL/_IDX/_ATTN) take precedence over
+    the global mode, so they are cleared for the duration as well: otherwise a
+    stray ``CSA_KERNEL_POOL=ref`` makes a nominally "triton" validation run
+    silently execute the reference pool and still certify the kernel path.
+    """
+    _names = ('CSA_KERNEL', 'CSA_KERNEL_POOL', 'CSA_KERNEL_IDX', 'CSA_KERNEL_ATTN')
+    old = {name: os.environ.get(name) for name in _names}
+    _miss = object()
+    _saved_cache = {name: _ENV_CACHE.pop(name, _miss) for name in _names[1:]}
+    for name in _names[1:]:
+        os.environ.pop(name, None)
     if mode is None:
         os.environ.pop('CSA_KERNEL', None)
     else:
@@ -2563,10 +2613,17 @@ def kernel_env(mode):
     try:
         yield
     finally:
-        if old is None:
-            os.environ.pop('CSA_KERNEL', None)
-        else:
-            os.environ['CSA_KERNEL'] = old
+        for name, value in old.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        # _op_impl reads through the cache-once helper, so a value cached
+        # before this context must not survive the temporary override.
+        for name in _names[1:]:
+            _ENV_CACHE.pop(name, None)
+            if _saved_cache[name] is not _miss:
+                _ENV_CACHE[name] = _saved_cache[name]
 
 
 def _rand_counts(T, min_block, max_block, gen):

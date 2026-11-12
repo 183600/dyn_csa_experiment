@@ -156,7 +156,9 @@ def _search_final_seeds(protocol):
     if raw_search is None:
         raw_search = [protocol.get('search_seed', 0)]
     search = _seeds(raw_search)
-    final = _seeds(protocol.get('final_seeds') or [])
+    # 0 is a valid seed; ``or []`` would silently discard a scalar final_seeds=0.
+    _final_raw = protocol.get('final_seeds')
+    final = _seeds([] if _final_raw is None else _final_raw)
     if not search:
         raise ValueError('search_seeds must contain at least one seed')
     return search, final, sorted(set(search) & set(final))
@@ -335,7 +337,7 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
         'declared_trials': len(declared_trials),
         'trials_run': len(trials),
         'search_complete': bool(len(trials) == len(declared_trials)),
-        'final_seeds': list(protocol.get('final_seeds') or []),
+        'final_seeds': list(final_seeds_declared),
         'arms': selected,
         'code': L.code_stamp(),
         'provenance': _prov_any or L.code_provenance(),

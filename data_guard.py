@@ -1570,22 +1570,35 @@ def _matrix_fingerprint(X):
                 _obj_int = False
     _integral = _integral or _obj_int
     _wide_int = False
+    _wide_neg = False
     if _integral and arr.size:
         _lim = 2 ** 53
         if arr.dtype == object:
-            _wide_int = bool(any(abs(int(v)) >= _lim for v in arr.reshape(-1).tolist()))
+            _vals_wide = [int(v) for v in arr.reshape(-1).tolist()]
+            _wide_int = bool(any(abs(v) >= _lim for v in _vals_wide))
+            _wide_neg = bool(any(v < 0 for v in _vals_wide))
         elif np.issubdtype(arr.dtype, np.unsignedinteger):
             _wide_int = bool((arr > _lim).any())
         else:
             _wide_int = bool(((arr > _lim) | (arr < -_lim)).any())
+            _wide_neg = bool((arr < 0).any())
     for start in range(0, arr.shape[0], _step):
         _blk = arr[start:start + _step]
         if _wide_int:
             if _blk.dtype == object:
-                _flat = [int(v) & (2 ** 64 - 1) for v in _blk.reshape(-1).tolist()]
+                _flat_vals = [int(v) for v in _blk.reshape(-1).tolist()]
+                _flat = [v & (2 ** 64 - 1) for v in _flat_vals]
                 block = np.asarray(_flat, dtype=np.uint64).reshape(_blk.shape)
+                if _wide_neg:
+                    h.update(np.ascontiguousarray(
+                        [v < 0 for v in _flat_vals], dtype=np.uint8).tobytes())
             else:
                 block = np.ascontiguousarray(_blk, dtype=np.uint64)
+                if _wide_neg:
+                    # The uint64 bit pattern of -1 equals 2**64-1; without the
+                    # sign lane those logically different values would share a
+                    # fingerprint.
+                    h.update(np.ascontiguousarray(_blk < 0, dtype=np.uint8).tobytes())
         else:
             block = np.asarray(_blk, dtype=np.float64)
         h.update(np.ascontiguousarray(block).tobytes())

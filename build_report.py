@@ -1102,7 +1102,10 @@ def sec_p1t():
         if r.get('error'):
             v = r.get('variant', rid.split('::')[0])
             failed.setdefault(v, []).append(r.get('seed'))
-        elif _measurable(r):
+        elif _measurable(r) and (not _CUR_CS or r.get('_code') == _CUR_CS):
+            # A stale record must not mask a missing current sweep point: the
+            # table and _nblocks_measured/_agg_entry only quote current-stamp
+            # rows.
             _measured.add(r.get('variant', rid.split('::')[0]))
     _grid = ['csa_fix_m1', 'csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512']
     missing = [v for v in _grid if v not in _measured and v not in failed]

@@ -809,9 +809,14 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP', par=None):
         for v, seed in cells:
             run_probe_cell(cfg, v, seed, guard=guard, val_ids=val_ids, mech_summ=mech_summ)
     summary = L.locked_json_read(spath)
-    _measured = len({(_r.get('variant'), _r.get('seed')) for _r in summary.values()
-                     if isinstance(_r, dict)
-                     and (L.ppl_is_usable(_r.get('ppl_mean')) or _r.get('task') == 'niah_natural')})
+    _measured_pairs = {(_r.get('variant'), L._as_seed_int(_r.get('seed')))
+                       for _r in summary.values()
+                       if isinstance(_r, dict) and not _r.get('synthesized')
+                       and _r.get('_code') == V.CKPT_CODE
+                       and (L.ppl_is_usable(_r.get('ppl_mean')) or _r.get('task') == 'niah_natural')}
+    # Only planned cells count: an extra/stale summary record must not hide a
+    # missing planned seed by inflating the measured total.
+    _measured = sum(1 for _v, _sd in cells if (_v, L._as_seed_int(_sd)) in _measured_pairs)
     L.log_experiment_event(outdir, {
         'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
         'phase': 'probe', 'started_at': _panel_started,
@@ -1325,6 +1330,15 @@ def _equal_token_slices():
                     step_l = min(_steps_l, key=lambda x: abs(x * _tps_l - target_tokens))
                 else:
                     step_l = step
+                tokens_large = step_l * _tps_l
+                # If the large arm stops before the small arm's target (e.g.
+                # P3SL has 4000 steps vs P3SS's 8000), the nearest step is the
+                # arm's LAST step and calling it an equal-token slice would
+                # compare 24.58M against 49.15M tokens under an equal label.
+                _tok_tol = 0.5 * max(abs(float(_tps_s)), abs(float(_tps_l)))
+                if abs(tokens_large - target_tokens) > _tok_tol:
+                    print(f'[stats] equal-token slice {name} @ {target_tokens / 1000000.0:.2f}M: the nearest large-arm step {step_l} has {tokens_large / 1000000.0:.2f}M tokens (difference exceeds half a step) — slice OMITTED rather than mislabelled')
+                    continue
                 _g_s = _gap_at('P3SS', step)
                 _g_l = _gap_at(name, step_l)
                 common = sorted(set(_g_s) & set(_g_l))
@@ -1333,7 +1347,7 @@ def _equal_token_slices():
                 dg = [_g_l[s] - _g_s[s] for s in common]
                 res = V.exact_sign_permutation(dg)
                 tokens = step * _tps_s
-                slices[f'{name} - P3SS @ {tokens / 1000000.0:.2f}M tokens (gap_L - gap_S)'] = {'n': res['n'], 'mean': res['mean'], 'std': res.get('std', 0.0), 'p_exact_signflip': res['p_exact_signflip'], 'per_seed': res.get('per_seed'), 'p_floor': res.get('p_floor'), 'cohens_dz': res.get('cohens_dz'), 'seeds': common, 'gap_L': {str(s): _g_l[s] for s in common}, 'gap_S': {str(s): _g_s[s] for s in common}, 'small_step': step, 'large_step': step_l, 'tokens_small': target_tokens, 'tokens_large': step_l * _tps_l, 'note': 'positive = the CSA-dense gap is larger in the large arm at (approximately) the same cumulative tokens'}
+                slices[f'{name} - P3SS @ {tokens / 1000000.0:.2f}M tokens (gap_L - gap_S)'] = {'n': res['n'], 'mean': res['mean'], 'std': res.get('std', 0.0), 'p_exact_signflip': res['p_exact_signflip'], 'per_seed': res.get('per_seed'), 'p_floor': res.get('p_floor'), 'cohens_dz': res.get('cohens_dz'), 'seeds': common, 'gap_L': {str(s): _g_l[s] for s in common}, 'gap_S': {str(s): _g_s[s] for s in common}, 'small_step': step, 'large_step': step_l, 'tokens_small': target_tokens, 'tokens_large': tokens_large, 'note': 'positive = the CSA-dense gap is larger in the large arm at (approximately) the same cumulative tokens'}
     return {'panels': conf, 'equal_token_slices': slices}
 
 def v10_analysis(out='analysis_v10/stats.json'):
@@ -1418,6 +1432,10 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 return False
             if a.get('_code') != b.get('_code') or _recipe_norm(a.get('recipe')) != _recipe_norm(b.get('recipe')):
                 print(f"[v10 stats] L{Ln} r{rho} {mode} {tag}: the two arms carry DIFFERENT code/recipe stamps (learned {a.get('_code')}/{a.get('recipe')} vs {b.get('_code')}/{b.get('recipe')}) — pairing them would mix two measurement semantics, so the contrast is omitted; re-run the stale arm's phase to refresh it")
+                return False
+            _cur_code = L.code_stamp()
+            if a.get('_code') != _cur_code or b.get('_code') != _cur_code:
+                print(f"[v10 stats] L{Ln} r{rho} {mode} {tag}: probe stamp {a.get('_code')}/{b.get('_code')} is not the current code semantics {_cur_code!r} — both arms are stale, so the contrast is omitted (re-run P3MP to refresh)")
                 return False
             return True
 
@@ -1505,6 +1523,10 @@ def v10_analysis(out='analysis_v10/stats.json'):
             return v if math.isfinite(v) else float('nan')
 
         for (v, arm, Ln, rho, mode, _pp, _cd, _recipe), by_seed in sorted(cells.items()):
+            if _cd != L.code_stamp():
+                # Stale probe semantics cannot enter the delta-NLL family either
+                # (the uniform contrasts already enforce this in _pairable).
+                continue
             if mode == 'uniform' and abs(float(rho)) < 1e-12:
                 continue
             # the clean baseline is the SAME arm's rho=0 uniform cell under the
@@ -1609,6 +1631,10 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 if r.get('synthesized'):
                     continue
                 if r.get('variant') is None or r.get('seed') is None or r.get('arm') is None or r.get('condition') is None:
+                    continue
+                if r.get('_code') != L.code_stamp():
+                    # Same fail-closed rule as the corruption contrasts: stale
+                    # NIAH records cannot contribute p-values.
                     continue
                 _seed = L._as_seed_int(r.get('seed'))
                 if _seed is None:
@@ -1984,8 +2010,18 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             e = dnll[k]
             _ck = f"{e['variant']}::{e['arm']}::L{e['eval_len']}"
             if _ck not in _clean_nll_cache:
-                _cl = [x for x in dnll.values() if x['variant'] == e['variant'] and x['arm'] == e['arm'] and x['eval_len'] == e['eval_len'] and x['mode'] == 'uniform' and abs(float(x['rho'])) < 1e-12]
-                _clean_nll_cache[_ck] = float(np.mean([np.mean(list(x.get('clean_nll_by_seed', {}).values())) for x in _cl])) if _cl else float('nan')
+                # The clean rho=0 cells are omitted from delta_nll by design,
+                # so scanning delta_nll for a clean entry always came back
+                # empty and this column was always nan.  Recover the per-seed
+                # clean values that every corrupted entry already carries.
+                _cl = {}
+                for x in dnll.values():
+                    if (x['variant'] == e['variant'] and x['arm'] == e['arm']
+                            and x['eval_len'] == e['eval_len']):
+                        for _s, _v in (x.get('clean_nll_by_seed') or {}).items():
+                            _cl.setdefault(_s, _v)
+                _clean_nll_cache[_ck] = (float(np.mean(list(_cl.values())))
+                                         if _cl else float('nan'))
             A(f"| `{e['variant']}::{e['arm']}` | {e['eval_len']} | {e['mode']} | {e['rho']:g} | {e['mean']:+.4f} ± {e.get('std', 0):.4f} | {e['n']} | {_clean_nll_cache[_ck]:.4f} |")
         A('')
         _dnll_c = {k: v for k, v in contr.items() if k.startswith('ΔNLL')}

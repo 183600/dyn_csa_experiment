@@ -2800,8 +2800,12 @@ def t_atomic_torch_save():
         # A configured variant name cannot escape ckpt_dir through the
         # checkpoint filename.
         assert '/' not in L.ckpt_file_name('../escape', 0, 'final')
-        assert os.path.basename(L.ckpt_file_name('/tmp/escape', 1, 'final')) == '_tmp_escape_seed1_final.pt'
+        _esc = os.path.basename(L.ckpt_file_name('/tmp/escape', 1, 'final'))
+        assert _esc.startswith('_tmp_escape-') and _esc.endswith('_seed1_final.pt'), _esc
         assert os.path.basename(L.ckpt_file_name('csa_dynamic', 2, 'final')) == 'csa_dynamic_seed2_final.pt'
+        # Sanitisation must be injective: two distinct arms may not share a
+        # checkpoint filename.
+        assert L.ckpt_file_name('a/b', 2, 'final') != L.ckpt_file_name('a_b', 2, 'final')
         # A boolean/fractional/lossy seed is not silently truncated into a
         # different checkpoint identity.
         for _bad_seed in (True, 1.5, float(2 ** 53)):
@@ -2815,6 +2819,7 @@ def t_atomic_torch_save():
         # and seed-safety contract.
         assert L.direct_ckpt_name('csa_dynamic', 2) == 'csa_dynamic_seed2.pt'
         assert '/' not in L.direct_ckpt_name('../escape', 0)
+        assert L.direct_ckpt_name('a/b', 0) != L.direct_ckpt_name('a_b', 0)
         for _bad_seed in (True, 1.5, float(2 ** 53)):
             try:
                 L.direct_ckpt_name('csa_dynamic', _bad_seed)
@@ -6398,6 +6403,78 @@ def t_known_labels_audit():
         raise AssertionError('known_labels without y must fail closed')
 
 
+
+def t_bug_hunt_regressions():
+    # ce_loss: the default None still means cross_entropy's -100 sentinel, so
+    # ignored targets must not inflate the denominator.
+    torch.manual_seed(0)
+    m = L.SmallGPT(64, 32, 1, 2, 16, 16, L.make_layer_cfgs(1, 'full'))
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    y[0, 0] = -100
+    y[1, 3] = -100
+    _a = float(m.ce_loss(x, y, 64).detach())
+    _b = float(m.ce_loss(x, y, 64, ignore_index=-100).detach())
+    _lg = m.head(m.trunk(x))
+    _ref = float(torch.nn.functional.cross_entropy(
+        _lg.reshape(-1, 64), y.reshape(-1)).detach())
+    assert abs(_a - _b) < 1e-12 and abs(_a - _ref) < 1e-5, (_a, _b, _ref)
+    _ce, _acc = L._lm_batch_metrics(m, x, y, 64)
+    assert abs(_ce - _ref) < 1e-5, (_ce, _ref)
+    # Family resolution floor uses the nonzero pair count.
+    _s = {'n': 10, 'n_nonzero': 6, 'mean': -1.0, 'std': 0.1,
+          'p_exact_signflip': 0.03125, 'p_holm': 0.03125}
+    _r = L.reportable_claim(_s, family_size=4, min_n=6)
+    assert _r['allowed'] is False and _r['min_attainable_p_holm_family'] > 0.05, _r
+    # A synthetic overfit report cannot match a requested real-data fingerprint.
+    _saved = dict(L._OVERFIT_REPORTS)
+    try:
+        L._OVERFIT_REPORTS.clear()
+        L._OVERFIT_REPORTS[('v', 'synthetic', 'K')] = {
+            'data_fp': None, 'guard_probe_semantics': 'S'}
+        assert L.overfit_reports_for(['v'], data_fp='REAL') == []
+    finally:
+        L._OVERFIT_REPORTS.clear()
+        L._OVERFIT_REPORTS.update(_saved)
+    # The LSH near-duplicate guarantee requires bands > near_threshold.
+    try:
+        L._DocDeduplicator(bands=2, near_threshold=3)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('unsafe LSH configuration was accepted')
+    # Truthy non-boolean shuffle metadata must fail closed.
+    assert A._declares_shuffle(1) and A._declares_shuffle('yes')
+    assert not A._declares_shuffle(False) and not A._declares_shuffle(None)
+    # A top-level training fingerprint declaration is as binding as one under
+    # `binding`, and an explicit null by_length grid is refused at load time.
+    assert V12._train_fp_required(
+        {'binding': {}, 'training_data_fingerprint': {'canonical_train_fp': None}})
+    with tempfile.TemporaryDirectory() as td:
+        pp = os.path.join(td, 'm.json')
+        with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
+            _man = json.load(f)
+        _man['eval']['by_length_ppl'] = None
+        with open(pp, 'w', encoding='utf-8') as f:
+            json.dump(_man, f)
+        try:
+            V12._load_manifest(pp)
+        except SystemExit as e:
+            assert 'by_length_ppl' in str(e), str(e)[:200]
+        else:
+            raise AssertionError('explicit null eval.by_length_ppl was accepted')
+    # 0 is a valid final seed and must not be discarded as falsy.
+    assert BT._search_final_seeds({'search_seeds': [1], 'final_seeds': 0}) == ([1], [0], [])
+    # Metadata without its arrays is an incomplete cache, not a silent skip.
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, 'meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 10, 'split_strategy': 'ordered',
+                       'shuffle_at_split': False, 'tokenizer_fit_split': 'train'}, f)
+        _out = A.audit_split_discipline(cache_dirs=[td])
+        _rec = _out['caches'][os.path.abspath(td)]['corpora']['x']
+        assert _rec['status'] == 'fail', _rec
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -6638,6 +6715,7 @@ def main():
     _check('L15 cross-scale pooling refuses mixed corpus/tokenizer bindings', t_scale_corpus_binding_refuses_mixed_tokenizers)
     _check('L15b scale-point corpus provenance roundtrip', t_scale_point_provenance_roundtrip)
     _check('L15c scale-edge regressions (tiny effects, zero deltas, tiny corpora)', t_scale_edge_case_regressions)
+    _check('L16 targeted bug-hunt regressions', t_bug_hunt_regressions)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

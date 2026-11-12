@@ -1457,6 +1457,10 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
             _cell_recs[_k]['warm_steps'] = int(_w.replace('w', ''))
         except Exception:
             continue
+    # Count only the PLANNED cells that produced a usable record; scanning all
+    # of summary.values() let stale/extra cells inflate completeness and hide
+    # a missing planned cell.
+    _measured = len(_cell_recs)
     _write_phase_manifest(outdir, cfg, _fp, _panel_prov, phase='warmup', planned_cells=_planned, cell_records=_cell_recs, status='complete', started_at=_panel_started, data_contract=_data_contract)
     L.log_experiment_event(outdir, {
         'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
@@ -1790,6 +1794,21 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
             _dropped = [s for _g, _ss in _ranked[1:] for s in _ss]
             print(f'[stats] WARNING: {k}: seed(s) {_dropped} were measured under a DIFFERENT run_cfg group than seed(s) {_keep_seeds} — the per-variant mean pools only one configuration group ({len(_keep_seeds)} seed(s), current code stamp preferred); pooling across configurations is not allowed')
             _m = {s: _m[s] for s in _keep_seeds}
+        # Records that carry an explicit but outdated code stamp are stale
+        # measurements of another semantics.  Exclude them (and the whole tag
+        # when none is current) instead of emitting p-values from them.  Rows
+        # without a stamp keep the legacy permissive path.
+        _codes = {r.get('_code') for r in _m.values() if r.get('_code') is not None}
+        if _codes:
+            if L.code_stamp() not in _codes:
+                print(f'[stats] {k}: no record carries the current code semantics {L.code_stamp()!r} (found {sorted(_codes)}) — tag EXCLUDED from comparisons')
+                _m = {}
+            elif any(r.get('_code') not in (None, L.code_stamp()) for r in _m.values()):
+                _m = {s: r for s, r in _m.items()
+                      if r.get('_code') in (None, L.code_stamp())}
+        if not _m:
+            recs[k] = {}
+            continue
         # The comparisons below must use the SAME single configuration group
         # that supplies the per-variant mean.  Keeping the unfiltered records
         # here would pair seed 0 from cfgA with seed 1 from cfgB even though
@@ -2237,6 +2256,7 @@ def run_niah_phase(payload, guard=None, label=''):
             _ck['by_len_acc'] = {str(int(x.get('seq_len'))): x.get('acc') for x in _evs}
             _ck['curve_ref'] = f'experiments.jsonl#{_v}::seed{_sd}::niah_train.losses'
             _niah_cells[f'{_v}::seed{_sd}'] = _ck
+    _measured = len(_niah_cells)
     _write_phase_manifest(outdir, {'seeds': seeds, 'variants': list(variants), 'seq_len': 512},
                           _niah_panel_cfg, _panel_prov, phase='niah',
                           planned_cells=_planned_niah, cell_records=_niah_cells,
@@ -2785,6 +2805,7 @@ def run_lenphase(payload, guard=None, label='', par=None):
             _len_cells[_k]['eval_lens'] = list(eval_lens)
         except Exception:
             continue
+    _measured = len(_len_cells)
     _write_phase_manifest(outdir, {'seeds': seeds, 'variants': list(variants), 'seq_len': train_len},
                           _len_panel_cfg, _panel_prov, phase='lenphase',
                           planned_cells=_planned_len, cell_records=_len_cells,

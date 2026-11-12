@@ -52,18 +52,34 @@ def _variant_records(variant):
         if not groups:
             _RESOLVED[rkey] = {}
         else:
-            if len(groups) > 1:
-                _cur_sfx = f'_cs{L.code_stamp()}'
+            _cur_sfx = f'_cs{L.code_stamp()}'
 
-                def _stamped(recs):
-                    return any((isinstance(r, dict) and isinstance(r.get('run_cfg'), str) and r['run_cfg'].endswith(_cur_sfx) for r in recs.values()))
+            def _stamped(recs):
+                return any((isinstance(r, dict) and isinstance(r.get('run_cfg'), str) and r['run_cfg'].endswith(_cur_sfx) for r in recs.values()))
+            if len(groups) > 1:
                 _ranked = sorted(groups.items(), key=lambda kv: (not _stamped(kv[1]), -len(kv[1])))
                 _keep_tag, _keep = _ranked[0]
                 _dropped = {t: sorted(g) for t, g in _ranked[1:]}
                 print(f'[fuse_analysis] WARNING: {panel_name}: `{variant}` spans {len(_ranked)} protocol groups — pooling across protocols is not allowed (design §3.3), so the analysis keeps only the `{_keep_tag or '(untagged)'}` group ({len(_keep)} seeds) and drops {_dropped}')
-                _RESOLVED[rkey] = _keep
             else:
-                _RESOLVED[rkey] = next(iter(groups.values()))
+                _keep = next(iter(groups.values()))
+            # A protocol tag can still contain several run_cfg groups (e.g.
+            # seeds run under different recipes).  Pairing seeds from different
+            # configurations would fabricate n, so keep one group: current
+            # code stamp first, then the largest group.
+            _cfg_groups = {}
+            for _s, _r in _keep.items():
+                _cfg_groups.setdefault(_r.get('run_cfg') if isinstance(_r, dict) else None, []).append(_s)
+            if len(_cfg_groups) > 1:
+                _ranked_cfg = sorted(
+                    _cfg_groups.items(),
+                    key=lambda kv: (not (isinstance(kv[0], str) and kv[0].endswith(_cur_sfx)),
+                                    -len(kv[1]), str(kv[0])))
+                _keep_seeds = _ranked_cfg[0][1]
+                _drop_cfg = {str(_g): sorted(_ss) for _g, _ss in _ranked_cfg[1:]}
+                print(f'[fuse_analysis] WARNING: {panel_name}: `{variant}` group spans {len(_ranked_cfg)} run_cfg groups — keeping one configuration ({sorted(_keep_seeds)} seeds) and dropping {_drop_cfg}; seeds from different configurations are never pooled')
+                _keep = {_s: _keep[_s] for _s in _keep_seeds}
+            _RESOLVED[rkey] = _keep
     return _RESOLVED[rkey]
 
 def _require_panels():

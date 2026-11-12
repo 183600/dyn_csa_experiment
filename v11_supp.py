@@ -163,6 +163,10 @@ def v11_analysis(out='analysis_v11/stats.json'):
                     if learned.get('_code') != other.get('_code') or V10._recipe_norm(learned.get('recipe')) != V10._recipe_norm(other.get('recipe')):
                         print(f"[v11 stats] L{Ln} r{rho} {tag}: the two arms carry DIFFERENT code/recipe stamps (learned {learned.get('_code')}/{learned.get('recipe')} vs {other.get('_code')}/{other.get('recipe')}) — pairing them would mix two measurement semantics, so the contrast is omitted; re-run the stale arm's phase to refresh it")
                         continue
+                    _cur_code = L.code_stamp()
+                    if learned.get('_code') != _cur_code or other.get('_code') != _cur_code:
+                        print(f"[v11 stats] L{Ln} r{rho} {tag}: probe stamp {learned.get('_code')}/{other.get('_code')} is not the current code semantics {_cur_code!r} — both arms are stale, so the contrast is omitted (re-run P4MP to refresh)")
+                        continue
                     common = sorted(set(learned['ppl_by_seed']) & set(other['ppl_by_seed']))
                     if len(common) >= 2:
                         dl = [other['ppl_by_seed'][s] - learned['ppl_by_seed'][s] for s in common]
@@ -393,7 +397,11 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
                     print(f'[v11 report] {v}: {len(_rv) - len(_cur)} by-length record(s) predate the current code semantics — the table uses only the {len(_cur)} current one(s)')
                 _rv = _cur
             elif _rv:
-                print(f'[v11 report] {v}: no by-length record carries the current code semantics ({L.code_stamp()}) — quoting all {len(_rv)} (they predate it; re-run P4MT to refresh)')
+                # Fail closed, matching v10: a panel with no record under the
+                # current code stamp is excluded from the table and from every
+                # conclusion instead of being quoted with a warning marker.
+                print(f'[v11 report] {v}: no by-length record carries the current code semantics ({L.code_stamp()}) — EXCLUDED from the table and conclusions ({len(_rv)} stale record(s) left on disk)')
+                _rv = []
             _rows_by_v[v] = _one_record_per_seed(_rv, label=v)
         n_by_v = {v: {r['seed'] for r in _rv} for v, _rv in _rows_by_v.items() if _rv}
         if len(n_by_v) > 1:

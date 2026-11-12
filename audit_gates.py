@@ -53,6 +53,20 @@ for _stream in (sys.stdout, sys.stderr):
 REPO = os.path.dirname(os.path.abspath(__file__))
 
 
+def _declares_shuffle(value):
+    """True when split metadata declares (or cannot deny) a shuffled split.
+
+    Only a real boolean ``False``/``None`` is a clean declaration.  A JSON
+    ``1``/``"yes"`` is malformed provenance and must fail closed rather than
+    silently pass an ``is True`` check.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    return True
+
+
 def _exact_int_scalar(value):
     """Exact non-lossy integer view of a metadata scalar, or None.
 
@@ -708,6 +722,14 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             trp = os.path.join(cd, f'train_ids_{tag}.npy')
             vap = os.path.join(cd, f'val_batch_{tag}.npy')
             if not (os.path.exists(trp) and os.path.exists(vap)):
+                # Metadata without its arrays is an incomplete/corrupt cache.
+                # Skipping it silently lets a clean sibling make the whole
+                # audit report ``ok`` while this corpus was never verified.
+                rec = {'status': 'fail', 'meta': os.path.basename(mp),
+                       'error': 'cache metadata exists but its train/val arrays are missing'}
+                cache['corpora'][tag] = rec
+                cache['status'] = 'fail'
+                _fail(f'{cd}/{tag}: cache metadata exists but train/val arrays are missing — split contract cannot be verified')
                 continue
             rec = {'status': 'ok', 'meta': os.path.basename(mp)}
             try:
@@ -725,7 +747,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             rec['shuffle_at_split'] = meta.get('shuffle_at_split')
             rec['tokenizer_fit_split'] = meta.get('tokenizer_fit_split')
             rec['val_fingerprint_recorded'] = bool(meta.get('val_fp'))
-            if meta.get('shuffle_at_split') is True:
+            if _declares_shuffle(meta.get('shuffle_at_split')):
                 rec['status'] = 'fail'
                 _fail(f'{cd}/{tag}: metadata declares a shuffled split')
             if meta.get('tokenizer_fit_split') not in (None, 'train'):
@@ -857,8 +879,15 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                         continue
                     if _tv != _mv:
                         continue
+                elif meta.get('vocab') is None or _tm.get('vocab') is None:
+                    # A missing vocab cannot prove the two caches share a token
+                    # space; keep the candidate (the overlap/sidecar checks are
+                    # still useful) but never report the pair as fully verified.
+                    _warn(f'{cd}/{tag}: train/test vocab metadata is missing — token-space identity cannot be verified')
                 if meta.get('fit_fp') and _tm.get('fit_fp') and meta['fit_fp'] != _tm['fit_fp']:
                     continue
+                if not meta.get('fit_fp') and not _tm.get('fit_fp'):
+                    _warn(f'{cd}/{tag}: train/test tokenizer fit-corpus fingerprint (fit_fp) is missing — fit provenance is not independently verified')
                 _cands.append((_tfp, _ttag, _tm))
             te = None
             if len(_cands) == 1:
@@ -866,7 +895,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 rec['test_split_strategy'] = _tmeta.get('split_strategy') or 'unrecorded'
                 rec['test_shuffle_at_split'] = _tmeta.get('shuffle_at_split')
                 rec['test_tokenizer_fit_split'] = _tmeta.get('tokenizer_fit_split')
-                if _tmeta.get('shuffle_at_split') is True:
+                if _declares_shuffle(_tmeta.get('shuffle_at_split')):
                     rec['status'] = 'fail'
                     _fail(f'{cd}/{tag}: test metadata declares a shuffled split')
                 if _tmeta.get('tokenizer_fit_split') not in (None, 'train'):
@@ -2377,6 +2406,8 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
                              'n_queries': nq, 'n_seeds': _n_seeds, 'n_seeds_valid': _n_valid,
                              'seed_test': _st,
                              'claim_allowed': bool(_range_ok and _geom_ok and _el_ok and _nq_ok
+                                                   and not _bad_seed
+                                                   and _n_valid == _n_seeds
                                                    and mass > base and rec > base
                                                    and _st is not None
                                                    and _st.get('p_exact_signflip', 1.0) < 0.05

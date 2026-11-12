@@ -127,12 +127,15 @@ def _eager_batch_active(device=None, batch_size=None):
         return False
     return True
 
-def _uses_batched_eager(cfgs, device=None, batch_size=None):
+def _uses_batched_eager(cfgs, device=None, batch_size=None, forced=None):
     """Whether at least one layer in ``cfgs`` will take the batched twin.
 
     Mirrors the condition in ``HybridAttention.forward`` so a record can state
-    the implementation it actually ran instead of the process default."""
-    if not _eager_batch_active(device, batch_size):
+    the implementation it actually ran instead of the process default.
+    ``forced`` lets a caller carry an explicitly resolved eager mode into the
+    model (the forward path reads the same value from the block attribute)."""
+    _active = _eager_batch_active(device, batch_size) if forced is None else bool(forced)
+    if not _active:
         return False
     return any(
         getattr(c, 'kind', None) in ('csa', 'hca')
@@ -5014,7 +5017,9 @@ class HybridAttention(nn.Module):
                         and _open_mode == 'closed'
                         and int(getattr(self.cfg, 'max_block', 128) or 0) == 128
                         and int(getattr(self.cfg, 'position_capacity', lambda: 129)()) == 129
-                        and _eager_batch_active(x.device, B))
+                        and (_eager_batch_active(x.device, B)
+                             if getattr(self, '_eager_batch_override', None) is None
+                             else bool(self._eager_batch_override)))
         _batch_path = _kernel_path or _eager_batch
         pre_all = None
         pres = None
@@ -5301,13 +5306,11 @@ class SmallGPT(nn.Module):
         h = self.trunk(ids)
         # When targets contain ignored positions, the mean must be taken over
         # the valid targets only (F.cross_entropy's own reduction), exactly as
-        # the unchunked form did.  The default None means every target is valid.
-        if ignore_index is None:
-            _ign = -100
-            n_tok = int(targets.numel())
-        else:
-            _ign = int(ignore_index)
-            n_tok = int((targets != _ign).sum().item())
+        # the unchunked form did.  The default None still uses
+        # cross_entropy's own -100 sentinel, so the denominator must exclude
+        # those positions too (a valid token id can never be negative).
+        _ign = -100 if ignore_index is None else int(ignore_index)
+        n_tok = int((targets != _ign).sum().item())
         n_tok = max(n_tok, 1)
         ce = None
         _ck = torch.is_grad_enabled() and h.requires_grad
@@ -7073,10 +7076,27 @@ class _DocDeduplicator:
     """
 
     def __init__(self, *, near_threshold=3, bands=4):
+        if isinstance(bands, (bool, np.bool_)) or not isinstance(bands, numbers.Integral):
+            raise ValueError(f'bands must be an integer in [1, 8], got {bands!r}')
+        bands = int(bands)
         if bands < 1 or bands > 8:
             raise ValueError('bands must be in [1, 8]')
-        self.near_threshold = int(near_threshold)
-        self.bands = int(bands)
+        if (isinstance(near_threshold, (bool, np.bool_))
+                or not isinstance(near_threshold, numbers.Integral)):
+            raise ValueError(f'near_threshold must be a non-negative integer, got {near_threshold!r}')
+        near_threshold = int(near_threshold)
+        if near_threshold < 0:
+            raise ValueError(f'near_threshold must be non-negative, got {near_threshold!r}')
+        # The pigeonhole guarantee needs more bands than bits that may differ:
+        # if bands <= near_threshold, two near-duplicate hashes can differ in
+        # every band and the LSH index silently misses them.
+        if bands <= near_threshold:
+            raise ValueError(
+                f'bands={bands} must exceed near_threshold={near_threshold}: '
+                'otherwise a near-duplicate can differ in every band and be '
+                'missed by the LSH index')
+        self.near_threshold = near_threshold
+        self.bands = bands
         self.bits = 64 // self.bands
         self.mask = (1 << self.bits) - 1
         self.exact = set()
@@ -7760,8 +7780,14 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
         report['exact_row_overlap_in_sample'] = int(_shared)
         report['sampled_val_rows'] = int(_rows.size)
         report['train_tokens_scanned'] = int(_scanned)
-        report['train_tokens_scanned_fraction'] = round(
-            float(_scanned) / float(tr.size), 6) if tr.size else 1.0
+        _scan_frac = (float(_scanned) / float(tr.size)) if tr.size else 1.0
+        report['train_tokens_scanned_fraction'] = round(_scan_frac, 6)
+        if _scan_frac < 1.0:
+            # A sampled scan can miss a duplicate outside its windows; an
+            # unqualified "ok" would read as proof of the whole corpus.
+            report['warnings'].append(
+                f'train/validation exact-row scan covered only {_scan_frac:.1%} '
+                'of the training stream; a clean result is not a full-corpus proof')
         if _shared:
             report['hard_failures'].append(
                 f'{_shared} sampled validation rows occur verbatim in train')
@@ -8922,6 +8948,7 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     # effects are -- a diagnostic that must be printed next to p_holm=1.0
     # instead of leaving the reader to infer that the effect is null.
     _ns = []
+    _ns_floor = []
     for v in (comparisons or {}).values():
         if not isinstance(v, dict):
             continue
@@ -8931,15 +8958,24 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         _n = _as_seed_int(v.get('n'))
         if _n is not None and _n > 0:
             _ns.append(_n)
+        # The exact test drops zero deltas, so the attainable p floor is set
+        # by the NONZERO pair count (n_nonzero), not the declared seed count.
+        # Using n here would claim a finer resolution than a family with
+        # identical arms actually has.
+        _nn = _as_seed_int(v.get('n_nonzero')) if v.get('n_nonzero') is not None else _n
+        if _nn is not None and 0 <= _nn <= (_n if _n is not None else _nn):
+            _ns_floor.append(_nn)
     _m = int(len(comparisons or {}))
     # The family's smallest attainable raw p is min_i 2/2**n_i, which is set
     # by the LARGEST seed count in the family (more seeds -> finer p grid).
     # Using the smallest n here overstated the floor and could call a family
     # resolution-limited even when its best-resolved comparison can reject.
-    _fam_floor = holm_min_attainable_p(max(_ns), _m, alpha) if _ns else None
+    _fam_n = max(_ns_floor) if _ns_floor else (max(_ns) if _ns else None)
+    _fam_floor = (holm_min_attainable_p(_fam_n, _m, alpha)
+                  if _fam_n is not None and _fam_n > 0 else None)
     _fam_limited = bool(_fam_floor is not None and math.isfinite(_fam_floor) and _fam_floor > alpha)
     if _fam_limited:
-        print(f'[stats] WARNING: family {family!r} has m={_m} declared comparisons and n_max={max(_ns)} seeds — '
+        print(f'[stats] WARNING: family {family!r} has m={_m} declared comparisons and n_nonzero_max={_fam_n} seeds — '
               f'the smallest attainable Holm p is {_fam_floor:.4g} > alpha={alpha}; NO comparison in this family can be significant. '
               'That is a resolution ceiling, not a null result; report it as such and add seeds before interpreting p_holm=1.0')
     return {
@@ -9109,12 +9145,13 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             out['reasons'].append(f'family_size {family_size!r} must be positive')
             _fs = None
         try:
-            _fl = holm_min_attainable_p(n, _fs, alpha) if _fs is not None else None
+            _fl = (holm_min_attainable_p(_n_eff, _fs, alpha)
+                   if _fs is not None and _n_eff > 0 else None)
         except Exception:
             _fl = None
         out['min_attainable_p_holm_family'] = _fl
         if _fl is not None and math.isfinite(_fl) and _fl > alpha:
-            out['reasons'].append(f'family of m={_fs} at n={n} has minimum attainable Holm p {_fl:.4g} > alpha')
+            out['reasons'].append(f'family of m={_fs} at n_nonzero={_n_eff} has minimum attainable Holm p {_fl:.4g} > alpha')
     out['allowed'] = not out['reasons']
     if out['allowed']:
         out['level'] = 'confirmatory' if str(evidence_level).lower() == 'confirmatory' else 'exploratory_significant'
@@ -12435,14 +12472,40 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     if selected.get('search_complete') is False:
         warnings.append('the search grid was truncated (search_complete=False); it is equal across arms, but describe it as a bounded search, not the full declared grid')
     final_records = selected.get('final_records') or {}
-    final_seeds = selected.get('final_seeds') or protocol.get('final_seeds') or []
+
+    def _as_seed_values(_raw, _label):
+        # A scalar seed (including 0) is a one-element list; only an absent
+        # value means "not declared".  ``or`` would turn 0 into the protocol
+        # fallback and audit the wrong partition.
+        if _raw is None:
+            return []
+        if isinstance(_raw, (bool, np.bool_)):
+            problems.append(f'{_label} contains a boolean flag ({_raw!r})')
+            return []
+        if isinstance(_raw, numbers.Integral):
+            return [int(_raw)]
+        if isinstance(_raw, (str, bytes)):
+            _raw = normalize_seed_list(_raw, default=())
+        try:
+            return list(_raw)
+        except TypeError:
+            problems.append(f'{_label} is not a seed list ({_raw!r})')
+            return []
+
+    _final_raw = selected.get('final_seeds')
+    if _final_raw is None:
+        _final_raw = protocol.get('final_seeds')
+    final_seeds = _as_seed_values(_final_raw, 'final_seeds')
     # Selection/evaluation partition: the final tuned records must not be
     # measured on the same seed draws that chose the hyper-parameters.
-    _declared_search = selected.get('search_seeds') or protocol.get('search_seeds')
+    _declared_search = selected.get('search_seeds')
+    if _declared_search is None:
+        _declared_search = protocol.get('search_seeds')
     _search_set = set()
     if _declared_search is not None:
         try:
-            _norm_search = [_as_seed_int(s) for s in _declared_search]
+            _norm_search = [_as_seed_int(s)
+                            for s in _as_seed_values(_declared_search, 'search_seeds')]
             if any(s is None for s in _norm_search):
                 raise ValueError
             _search_set = set(_norm_search)
@@ -16392,6 +16455,9 @@ def _normalise_eager_batch(v):
             return True
         if s in ('0', 'false', 'no', 'off'):
             return False
+        # A typo like 'flase' must not be silently read as True (which would
+        # switch the numerical implementation on a CUDA box).
+        raise ValueError(f'unknown eager_batch {v!r} (use true/false/auto)')
     return bool(v)
 
 
@@ -16504,8 +16570,18 @@ class _HashingWriter:
 
 
 def _safe_path_component(value):
-    """A single safe filename component (no separators / traversal)."""
-    s = ''.join(ch if (ch.isalnum() or ch in '._-') else '_' for ch in str(value))
+    """A single safe filename component (no separators / traversal).
+
+    When sanitisation actually changes the value, append a short digest of the
+    original: plain replacement is not injective (``a/b`` and ``a_b`` would
+    otherwise name the same checkpoint and silently overwrite each other).
+    Ordinary safe names are unchanged, so existing panels/resume logic keep
+    the same paths.
+    """
+    raw = str(value)
+    s = ''.join(ch if (ch.isalnum() or ch in '._-') else '_' for ch in raw)
+    if s != raw:
+        s = f'{s}-{hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:12]}'
     return s or '_'
 
 
@@ -16760,14 +16836,20 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     if variant in PARAM_MATCHED | PARAM_MATCHED_V7 and float(mlp_ratio) == 4.0:
         raise ValueError(f'{variant} is a PARAM-MATCHED baseline but was given the default mlp_ratio=4; its MLP must be widened to match its sparse reference arm, or the comparison is not parameter-controlled. Pass mlp_ratio=variant_mlp_ratio(variant, vocab, d=..., n_layers=..., n_heads=..., d_head=..., seq_len=...).')
     cfgs = make_layer_cfgs(n_layers, variant)
-    # Validate an explicitly requested eager mode against this environment before
-    # claiming it in the record; the concrete per-variant choice is still
-    # `_uses_batched_eager` (a variant with no CSA/HCA layer never takes the
-    # batched twin even when the backend is available).
-    _resolve_impl_modes({'amp_dtype': amp_dtype, 'eager_batch': eager_batch,
-                         'batch_size': batch_size}, device=device)
-    _eager_batch_used = _uses_batched_eager(cfgs, device, batch_size)
+    # Resolve and APPLY an explicitly requested eager mode before claiming it
+    # in the record: the forward path must run the same implementation the
+    # record's run_cfg describes.  The concrete per-variant choice still goes
+    # through `_uses_batched_eager` (a variant with no CSA/HCA layer never
+    # takes the batched twin even when the backend is available).
+    _impl_amp, _impl_eb = _resolve_impl_modes(
+        {'amp_dtype': amp_dtype, 'eager_batch': eager_batch,
+         'batch_size': batch_size}, device=device)
+    _eager_batch_used = _uses_batched_eager(cfgs, device, batch_size, forced=_impl_eb)
     model = SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
+    for _blk in getattr(model, 'blocks', ()):
+        _attn = getattr(_blk, 'attn', None)
+        if _attn is not None:
+            _attn._eager_batch_override = bool(_impl_eb)
     _inner_model = model
     # Matched-initialization evidence for paired seeds: the shared trunk is
     # built before the variant-specific blocks, so two arms at the same seed
@@ -17332,17 +17414,22 @@ def _lm_batch_metrics(model, x, y, vocab, chunk=64, ignore_index=None):
         total = torch.zeros((), dtype=torch.float64, device=dev)
         correct = torch.zeros((), dtype=torch.long, device=dev)
         n = 0
+        # None still means cross_entropy's own -100 ignore sentinel, so a
+        # target table that happens to contain -100 must not be counted as a
+        # valid prediction.  The common no-sentinel path keeps the original
+        # unmasked reduction order.
+        _ign = -100 if ignore_index is None else int(ignore_index)
         n_cols = min(int(x.shape[1]), int(y.shape[1]))
         for s in range(0, n_cols, chunk):
             sl = slice(s, min(s + chunk, n_cols))
             lg = model.head(h[:, sl, :])
             tg = y[:, sl]
-            if ignore_index is None:
+            valid = tg != _ign
+            if ignore_index is None and bool(valid.all()):
                 total += F.cross_entropy(lg.reshape(-1, vocab), tg.reshape(-1), reduction='sum').double()
                 correct += (lg.argmax(-1) == tg).sum()
                 n += int(tg.numel())
             else:
-                valid = tg != int(ignore_index)
                 if bool(valid.any()):
                     lgf = lg.reshape(-1, vocab)[valid.reshape(-1)]
                     tgf = tg.reshape(-1)[valid.reshape(-1)]
@@ -17435,6 +17522,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
         ids = torch.as_tensor(np.ascontiguousarray(vb[r0:r1]), dtype=torch.long, device=device)
         h = model.trunk(ids)
         row_nll = np.zeros(r1 - r0, dtype=np.float64)
+        row_ok = np.zeros(r1 - r0, dtype=np.int64)
         for s0 in range(0, span, 64):
             s1 = min(s0 + 64, span)
             lg = model.head(h[:, s0:s1, :])
@@ -17447,6 +17535,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                 n_nonfinite += int((~finite).sum())
             ce_safe = torch.where(finite, ce_f, torch.zeros_like(ce_f))
             row_nll += ce_safe.double().sum(dim=1).cpu().numpy()
+            row_ok += finite.sum(dim=1).cpu().numpy().astype(np.int64)
             # Entropy from one log_softmax table; top-k works directly on the
             # fp32 logits.
             lg_work = lg.float()
@@ -17475,15 +17564,24 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             _flat_b = bidx.reshape(-1)
             _flat_ce = ce_safe.reshape(-1).double()
             _flat_rare = rare.reshape(-1)
-            _bsum[:4] += torch.bincount(_flat_b, weights=_flat_ce, minlength=4)
-            _bcnt[:4] += torch.bincount(_flat_b, minlength=4)
-            _bsum[4] += _flat_ce[_flat_rare].sum()
-            _bcnt[4] += int(_flat_rare.sum())
-            _bsum[5] += _flat_ce[~_flat_rare].sum()
-            _bcnt[5] += int((~_flat_rare).sum())
-            _bsum[6] += _flat_ce[_bnd.reshape(-1)].sum()
-            _bcnt[6] += int(_bnd.sum())
-            n_targets += _b * _s
+            _flat_finite = finite.reshape(-1)
+            _flat_bnd = _bnd.reshape(-1)
+            # Non-finite CE is counted in n_nonfinite and excluded from BOTH
+            # numerator and denominator: folding it to 0 but still counting
+            # the target would report a broken token as a perfect prediction.
+            _bsum[:4] += torch.bincount(_flat_b[_flat_finite],
+                                        weights=_flat_ce[_flat_finite], minlength=4)
+            _bcnt[:4] += torch.bincount(_flat_b[_flat_finite], minlength=4)
+            _sel_rare = _flat_finite & _flat_rare
+            _bsum[4] += _flat_ce[_sel_rare].sum()
+            _bcnt[4] += int(_sel_rare.sum())
+            _sel_common = _flat_finite & ~_flat_rare
+            _bsum[5] += _flat_ce[_sel_common].sum()
+            _bcnt[5] += int(_sel_common.sum())
+            _sel_bnd = _flat_finite & _flat_bnd
+            _bsum[6] += _flat_ce[_sel_bnd].sum()
+            _bcnt[6] += int(_sel_bnd.sum())
+            n_targets += int(_flat_finite.sum())
             # The per-token loop is bounded by top_tokens, not by B*T.
             _sel_n = min(int(top_tokens), _b * _s)
             _pick_val, _pick_idx = torch.topk(torch.where(finite.reshape(-1), ce_f.reshape(-1),
@@ -17512,10 +17610,9 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                         _heapq.heapreplace(tok_heap, rec)
             del lg, tg, ce, ce_f, ce_safe, finite, pred, margin, topi, ent
             del bidx, rare, _bnd, _flat_b, _flat_ce
-        row_n = span
         for i in range(r1 - r0):
-            n = max(1, row_n)
-            ce_mean = float(row_nll[i] / n)
+            n = int(row_ok[i])
+            ce_mean = float(row_nll[i] / n) if n else float('nan')
             seq_rows.append((ce_mean, r0 + i, float(row_nll[i]), n))
         del h, ids
     _bsum_cpu = _bsum.detach().cpu().tolist()
@@ -18104,7 +18201,10 @@ def overfit_reports_for(variants, *, source=None, probe_semantics=None, probe_ke
             continue
         if probe_key is not None and _r.get('guard_probe_key') != probe_key:
             continue
-        if data_fp is not None and (_v, _src, *rest) and len(rest) >= 2 and rest[1] != data_fp:
+        # Match the report's own fingerprint, not the cache-key shape: a
+        # synthetic key has only three elements, so the old ``rest[1]`` test
+        # silently admitted it for a caller requesting a real-data fingerprint.
+        if data_fp is not None and _r.get('data_fp') != data_fp:
             continue
         out.append(dict(_r))
     return out

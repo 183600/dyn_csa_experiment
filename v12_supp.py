@@ -130,6 +130,9 @@ def run_training_health(cfg=None):
     rows = {}
     unhealthy = []
     missing = []
+    _require_tfp = _train_fp_required(manifest)
+    _want_tfp = _frozen_train_fp(manifest)
+    _seen_tfps = set()
     for v in manifest['arms']:
         for seed in manifest['seeds']:
             key = f'{v}::s{seed}'
@@ -151,8 +154,16 @@ def run_training_health(cfg=None):
             # held-out split is read and locked.  A healthy curve alone proves
             # nothing about the code/recipe that produced these weights.
             _code_ok = d.get('code') == V.CKPT_CODE
-            _want_tfp = _frozen_train_fp(manifest)
-            _tfp_ok = (_want_tfp is None or d.get('train_fp') == _want_tfp)
+            _ck_tfp = d.get('train_fp')
+            if isinstance(_ck_tfp, str) and _ck_tfp:
+                _seen_tfps.add(_ck_tfp)
+            # A manifest that declares a training-corpus binding but has its
+            # canonical value still null still requires every checkpoint to
+            # carry a non-null fingerprint.  Otherwise P5H says healthy, P5T
+            # reads/locks the test split, and only then refuses the checkpoint.
+            _tfp_ok = ((_ck_tfp == _want_tfp) if _want_tfp is not None
+                       else ((not _require_tfp)
+                             or (isinstance(_ck_tfp, str) and bool(_ck_tfp))))
             if not _code_ok:
                 status = 'stale_code'
             elif not _tfp_ok:
@@ -170,6 +181,14 @@ def run_training_health(cfg=None):
                 gc.collect()
             except Exception:
                 pass
+    if _require_tfp and len(_seen_tfps) > 1:
+        # Checkpoints from different corpora cannot be pooled as one frozen
+        # panel even if each individually has a fingerprint.
+        for _key, _row in rows.items():
+            if _row.get('status') == 'healthy' and _row.get('train_fp'):
+                _row['status'] = 'mixed_train_fp'
+                if _key not in unhealthy:
+                    unhealthy.append(_key)
     report = {'kind': 'training_health', 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
               'manifest': cfg.get('manifest') or FREEZE_MANIFEST,
               'n_arms': len(manifest['arms']), 'n_seeds': len(manifest['seeds']),
@@ -306,6 +325,8 @@ def _load_manifest(path):
     if not isinstance(_ts, dict):
         raise SystemExit(f'[v12] REFUSE: binding.test_slice must be an object ({_ts!r})')
     _eval = m.get('eval') or {}
+    if isinstance(_eval, dict) and 'by_length_ppl' in _eval and _eval.get('by_length_ppl') is None:
+        raise SystemExit('[v12] REFUSE: eval.by_length_ppl is explicitly null; omit it (to use the runtime default) or provide a non-empty list of frozen lengths')
     _bl = _eval.get('by_length_ppl') if isinstance(_eval, dict) else None
     _bl_ints = []
     if _bl is not None:
@@ -558,10 +579,16 @@ def _train_fp_required(manifest):
     A ``bool(want) or bool(ckpt) or bool(record)`` rule would be fail-open
     (all three empty -> no check at all), so it is not used.
     """
-    _bind = manifest.get('binding') or {}
-    if not isinstance(_bind, dict):
-        return False
-    return _bind.get('training_data_fingerprint') is not None or _bind.get('train_fp') is not None
+    # Inspect the same locations/keys as _frozen_train_fp: a top-level
+    # training_data_fingerprint (or its aliases) is just as binding as one
+    # nested under `binding`.
+    _keys = ('training_data_fingerprint', 'canonical_train_fp', 'train_fp', 'training_fp')
+    for _obj in (manifest.get('binding') or {}, manifest):
+        if not isinstance(_obj, dict):
+            continue
+        if any(_obj.get(_k) is not None for _k in _keys):
+            return True
+    return False
 
 
 def _frozen_train_fp(manifest):
@@ -924,7 +951,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         del d
         out['status'] = 'skipped_train_fp_mismatch'
         return out
-    eval_lens = [int(x) for x in manifest.get('eval', {}).get('by_length_ppl', cfg['eval_lens'])]
+    eval_lens = [int(x) for x in ((manifest.get('eval') or {}).get('by_length_ppl') or cfg['eval_lens'])]
     _dfp = L._ids_fp(np.ascontiguousarray(test_ids).reshape(-1))
     _cur = L.locked_json_read(spath).get(f'{v}::s{seed}')
     _ck_sha = None
@@ -1060,7 +1087,7 @@ def run_finaltest(cfg=None, guard=None):
     manifest = _load_manifest(cfg['manifest'])
     outdir = cfg['outdir']
     os.makedirs(outdir, exist_ok=True)
-    need = max([int(x) for x in manifest.get('eval', {}).get('by_length_ppl', cfg['eval_lens'])]) + 1
+    need = max([int(x) for x in ((manifest.get('eval') or {}).get('by_length_ppl') or cfg['eval_lens'])]) + 1
     _nseq_clean = int((manifest.get('eval') or {}).get('n_seqs_clean') or cfg.get('n_seq', 16))
     test_ids = cfg.get('test_ids')
     _smoke = bool(cfg.get('smoke'))
@@ -1166,8 +1193,14 @@ def run_finaltest(cfg=None, guard=None):
                                   split=_split_label, train_fp=_want_train_fp)
     # 2) frozen uniform-corruption probe on the SAME test rows (secondary,
     #    descriptive-only per the manifest)
-    _probe_eval = manifest.get('eval', {}).get('distractor_probe') or {}
-    pcfg = dict(V10.PROBE, outdir=outdir, ckpt_dir=cfg['ckpt_dir'], summary=cfg['probe_summary'], variants=list(manifest['arms']), seeds=[int(s) for s in manifest['seeds']], eval_lens=[int(x) for x in (_probe_eval.get('eval_lens') or [2048, 4096])], rhos=[float(x) for x in (_probe_eval.get('rhos') or [0.0, 0.125, 0.25, 0.5])], modes={'uniform': [float(x) for x in (_probe_eval.get('rhos') or [0.0, 0.125, 0.25, 0.5])]}, niah=None, arm_overrides={v: ['learned'] for v in V10.SCRATCH_CONTROLS}, target=int(_probe_eval.get('target', cfg.get('target', 512))), n_seq=int(_probe_eval.get('n_seq', cfg.get('n_seq', 16))), chunk=int(cfg.get('chunk', 4)))
+    _probe_eval = (manifest.get('eval') or {}).get('distractor_probe') or {}
+    _probe_mode = str(_probe_eval.get('mode') or 'uniform')
+    if _probe_mode not in V10.PROBE_MODES:
+        raise SystemExit(f"[v12] REFUSE: eval.distractor_probe.mode={_probe_mode!r} is not one of {sorted(V10.PROBE_MODES)}")
+    _probe_rhos = [float(x) for x in (_probe_eval.get('rhos') or V10.PROBE_MODES[_probe_mode])]
+    if _probe_mode in ('mask', 'delete', 'doc') and any(abs(x - 1.0) > 1e-9 for x in _probe_rhos):
+        raise SystemExit(f"[v12] REFUSE: eval.distractor_probe.mode={_probe_mode!r} is all-or-nothing and only admits rho=1.0 (got {_probe_rhos})")
+    pcfg = dict(V10.PROBE, outdir=outdir, ckpt_dir=cfg['ckpt_dir'], summary=cfg['probe_summary'], variants=list(manifest['arms']), seeds=[int(s) for s in manifest['seeds']], eval_lens=[int(x) for x in (_probe_eval.get('eval_lens') or [2048, 4096])], rhos=_probe_rhos, modes={_probe_mode: _probe_rhos}, niah=None, arm_overrides={v: ['learned'] for v in V10.SCRATCH_CONTROLS}, target=int(_probe_eval.get('target', cfg.get('target', 512))), n_seq=int(_probe_eval.get('n_seq', cfg.get('n_seq', 16))), chunk=int(cfg.get('chunk', 4)))
     mech_summ = {}
     if os.path.exists(cfg['mech_summary']):
         mech_summ = json.load(open(cfg['mech_summary'], encoding='utf-8'))
@@ -2189,6 +2222,13 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
     # omits probe eval_lens/target/n_seq can pass here and only fail when the
     # probe indexes outside the frozen slice.
     _probe_plan = _eval.get('distractor_probe') or {}
+    _probe_mode = str(_probe_plan.get('mode') or 'uniform')
+    if _probe_mode not in V10.PROBE_MODES:
+        errs.append(f'eval.distractor_probe.mode={_probe_mode!r} is not one of {sorted(V10.PROBE_MODES)}')
+    _probe_rhos = [float(x) for x in
+                   (_probe_plan.get('rhos') or V10.PROBE_MODES.get(_probe_mode, []))]
+    if _probe_mode in ('mask', 'delete', 'doc') and any(abs(x - 1.0) > 1e-9 for x in _probe_rhos):
+        errs.append(f'eval.distractor_probe.mode={_probe_mode!r} is all-or-nothing and only admits rho=1.0 (got {_probe_rhos})')
     _probe_lens = [int(x) for x in (_probe_plan.get('eval_lens') or [2048, 4096])]
     _probe_target = int(_probe_plan.get('target', FINALTEST_CFG.get('target', 512)))
     _probe_nseq = int(_probe_plan.get('n_seq', FINALTEST_CFG.get('n_seq', 16)))
