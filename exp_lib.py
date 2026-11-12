@@ -5738,6 +5738,20 @@ def _validate_token_ids(ids, vocab, label='token ids'):
     return arr
 
 
+def _meta_declares_shuffle(value):
+    """True when split metadata declares (or cannot deny) a shuffled split.
+
+    Only a real boolean ``False``/``None`` is a clean declaration.  A JSON
+    ``1``/``"yes"`` is malformed provenance and must fail closed instead of
+    silently passing an ``is True`` check, exactly like the audit gate.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    return True
+
+
 def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=None,
                            fingerprints_trusted=False, ranges_trusted=False):
     """Reasons a cached (train, val) pair cannot be trusted.
@@ -5772,7 +5786,7 @@ def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=N
     if (not fingerprints_trusted and 'val_fp' in meta
             and meta.get('val_fp') != _ids_fp(vb.reshape(-1))):
         problems.append('validation id fingerprint does not match the meta file')
-    if meta.get('shuffle_at_split') is True:
+    if _meta_declares_shuffle(meta.get('shuffle_at_split')):
         problems.append('metadata records a shuffled split; time/group order cannot be trusted')
     if meta.get('tokenizer_fit_split') not in (None, 'train'):
         problems.append(f"tokenizer was fitted on {meta.get('tokenizer_fit_split')!r}, not train")
@@ -6333,7 +6347,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             _problems.append('test id fingerprint does not match the test meta file')
         if np.asarray(test_bnd).shape != np.asarray(test_ids).shape:
             _problems.append(f'test boundary mask shape {np.asarray(test_bnd).shape} != {np.asarray(test_ids).shape}')
-        if meta.get('shuffle_at_split') is True:
+        if _meta_declares_shuffle(meta.get('shuffle_at_split')):
             _problems.append('metadata records a shuffled split')
         if meta.get('tokenizer_fit_split') not in (None, 'train'):
             _problems.append(f"tokenizer was fitted on {meta.get('tokenizer_fit_split')!r}, not train")
@@ -9072,12 +9086,17 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     _n_eff_raw = stats.get('n_nonzero', n)
     if isinstance(_n_eff_raw, (bool, np.bool_)):
         _n_eff = n
+    elif _n_eff_raw is None:
+        _n_eff = n
     else:
-        try:
-            _n_eff = int(_n_eff_raw)
-        except (TypeError, ValueError, OverflowError):
-            _n_eff = n
-        if _n_eff < 0 or _n_eff > n:
+        # The nonzero-pair count is an exact integer, like every other seed
+        # count: int(4.9)=4 would silently claim a finer resolution floor
+        # than the panel actually has.  Malformed values fail closed (their
+        # reason blocks the claim) while the floor still uses the declared n.
+        _n_eff = _as_seed_int(_n_eff_raw)
+        if _n_eff is None or _n_eff < 0 or _n_eff > n:
+            out['reasons'].append(
+                f'n_nonzero {_n_eff_raw!r} is not an exact integer in [0, n={n}]')
             _n_eff = n
     out['p_floor'] = signflip_p_floor(_n_eff) if _n_eff > 0 else None
     if n < int(min_n):

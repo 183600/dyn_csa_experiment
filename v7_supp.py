@@ -2287,9 +2287,17 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
     for _ln in (eval_lens if eval_lens is not None else []):
         _li = L._as_seed_int(_ln)
         if _li is None:
-            out[_ln] = {'error': (f'evaluation length {_ln!r} is not an exact integer; a '
-                                  'fractional/boolean length would score a different span'),
-                        'truncated': False, 'eval_span': None}
+            # Malformed length keys must not crash the whole evaluation: an
+            # unhashable value (list/dict) cannot be a dict key, so use a
+            # stable repr fallback while keeping exact-integer keys unchanged.
+            try:
+                _bad_key = _ln
+                hash(_bad_key)
+            except TypeError:
+                _bad_key = repr(_ln)
+            out[_bad_key] = {'error': (f'evaluation length {_ln!r} is not an exact integer; a '
+                                       'fractional/boolean length would score a different span'),
+                             'truncated': False, 'eval_span': None}
             continue
         if _li < 2:
             out[_li] = {'error': (f'evaluation length {_li} has no next-token prediction '
@@ -2298,6 +2306,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
             continue
         _norm_lens.append(_li)
     eval_lens = _norm_lens
+    _val_width = int(np.asarray(val_ids).shape[1])
     # An absolute-position model cannot score beyond its learned table.  When
     # the caller passes max_pos=None (the "full context" request) a longer
     # length must be an explicit error, never a silent last-max_pos slice.
@@ -2316,8 +2325,23 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                              f'cannot evaluate L={Ln} with max_pos=None — use a RoPE arm '
                              'or pass max_pos to request the explicit truncated span'),
                    'truncated': False, 'eval_span': None}
+    # A non-truncated request consumes Ln contiguous tokens from val_ids.  If
+    # the supplied slice is shorter, the full-prefix branch would index past
+    # its end (and report a token count it never scored), so fail closed with
+    # a named error cell.  Truncated requests only need the (possibly shorter)
+    # tail window and are handled by the _trunc_lens branch below.
+    _too_long = [int(Ln) for Ln in eval_lens
+                 if int(Ln) not in _over
+                 and (_eff_max is None or int(Ln) <= _eff_max)
+                 and int(Ln) > _val_width]
+    for Ln in _too_long:
+        out[Ln] = {'error': (f'requested evaluation length {Ln} exceeds the supplied '
+                             f'validation slice width {_val_width}; pass a longer val_ids '
+                             'slice or a truncating max_pos'),
+                   'truncated': False, 'eval_span': None}
+    _skip_within = set(_over) | set(_too_long)
     _within = [int(Ln) for Ln in eval_lens
-               if (_eff_max is None or int(Ln) <= _eff_max) and int(Ln) not in _over]
+               if (_eff_max is None or int(Ln) <= _eff_max) and int(Ln) not in _skip_within]
     _trunc_lens = [int(Ln) for Ln in eval_lens
                    if _eff_max is not None and int(Ln) > _eff_max and int(Ln) not in _over]
     # The compression regulariser is a training side channel: disabling it for
@@ -2383,7 +2407,6 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                     out[Ln]['n_seq'] = int(ids.shape[0])
             del x, nll_cols, _cum
         _trunc_cache = {}
-        _val_width = int(np.asarray(val_ids).shape[1])
         for Ln in _trunc_lens:
             Ln = int(Ln)
             trunc = _eff_max is not None and Ln > _eff_max
@@ -2394,6 +2417,16 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
             _end = min(Ln, _val_width)
             _start = max(0, _end - int(_eff_max)) if trunc else 0
             _key = (_start, _end)
+            if _end - _start < 2:
+                # A truncated span shorter than 2 tokens has no next-token
+                # target at all; reporting exp(0) = 1.0 would look like a
+                # perfect measurement.  Fail closed with a named error cell.
+                _err = (f'evaluation length {Ln} truncates to a {_end - _start}-token '
+                        'span, which has no next-token prediction (needs >= 2 tokens; '
+                        'increase max_pos or supply a longer val_ids slice)')
+                out[Ln] = {'error': _err, 'truncated': trunc, 'eval_span': _end - _start}
+                _trunc_cache[_key] = {'error': _err}
+                continue
             _cached = _trunc_cache.get(_key)
             if _cached is not None:
                 if 'error' in _cached:
