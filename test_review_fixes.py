@@ -924,6 +924,13 @@ def t_admission_refuses():
             raise AssertionError(f'bad in-memory n_seqs_clean {_bad_nseq!r} must be refused')
         except SystemExit as e:
             assert 'row count' in str(e), e
+    for _bad in ([True], [1.5], [1, 1.0]):
+        try:
+            V12._manifest_seed_ids({'seeds': _bad})
+            raise AssertionError(f'bad frozen seeds {_bad!r} must be refused')
+        except SystemExit as e:
+            assert 'seed' in str(e).lower(), e
+    assert V12._manifest_seed_ids({'seeds': [0, 1.0, '2']}) == [0, 1, 2]
 
 
 def t_recipe_signature():

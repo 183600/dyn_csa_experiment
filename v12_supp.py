@@ -1206,6 +1206,19 @@ def _record_int(value):
     return int(f)
 
 
+def _manifest_seed_ids(manifest):
+    """Exact, unique frozen seed ids (also for an in-memory manifest)."""
+    _ids = []
+    for _s in manifest.get('seeds') or []:
+        _si = L._as_seed_int(_s)
+        if _si is None:
+            raise SystemExit(f'[p5t stats] REFUSE: frozen seed {_s!r} is not an exact integer')
+        _ids.append(_si)
+    if len(set(_ids)) != len(_ids):
+        raise SystemExit(f'[p5t stats] REFUSE: frozen seeds are not unique ({manifest.get("seeds")!r})')
+    return _ids
+
+
 def _admit_confirmation_records(raw, manifest):
     """Strict admission gate for confirmation records.
 
@@ -1221,15 +1234,7 @@ def _admit_confirmation_records(raw, manifest):
     # This gate is also callable with an in-memory manifest (finaltest_stats /
     # tests).  Apply the loader's exact seed identity here too: int(True)==1
     # or int(4.9)==4 would admit a record under a different planned seed.
-    _seed_ids = []
-    for _s in manifest['seeds']:
-        _si = L._as_seed_int(_s)
-        if _si is None:
-            raise SystemExit(f'[p5t stats] REFUSE: frozen seed {_s!r} is not an exact integer')
-        _seed_ids.append(_si)
-    if len(set(_seed_ids)) != len(_seed_ids):
-        raise SystemExit(f'[p5t stats] REFUSE: frozen seeds are not unique ({manifest["seeds"]!r})')
-    seed_whitelist = set(_seed_ids)
+    seed_whitelist = set(_manifest_seed_ids(manifest))
     exp_code = L.code_stamp()  # eager-only; kernel mode is refused at load
     impl = _frozen_implementation(manifest)
     msha = manifest.get('manifest_sha256')
@@ -1428,7 +1433,7 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
     out['available'] = True
     out['n_records'] = len(raw)
     arms = set(manifest['arms'])
-    seeds = {int(s) for s in manifest['seeds']}
+    seeds = set(_manifest_seed_ids(manifest))
     exp_code = L.code_stamp()
     impl = _frozen_implementation(manifest)
     want_train_fp = _frozen_train_fp(manifest)
@@ -1684,7 +1689,15 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             continue
         res = V.exact_sign_permutation(dl)
         _n_eff = len(usable)
-        _n_min = int((manifest.get('statistics') or {}).get('min_seeds_for_confirmation') or len(manifest['seeds']))
+        _n_min_raw = (manifest.get('statistics') or {}).get('min_seeds_for_confirmation')
+        if _n_min_raw is None:
+            _n_min = len(_manifest_seed_ids(manifest))
+        else:
+            _n_min = _record_int(_n_min_raw)
+            if _n_min is None or _n_min < 2 or _n_min > len(_manifest_seed_ids(manifest)):
+                raise SystemExit(
+                    f'[p5t stats] REFUSE: statistics.min_seeds_for_confirmation={_n_min_raw!r} '
+                    'is not an exact integer in [2, number of frozen seeds]')
         res['seeds'] = usable
         res['n_effective'] = int(_n_eff)
         res['coverage_ok'] = bool(_n_eff == len(manifest['seeds']))
