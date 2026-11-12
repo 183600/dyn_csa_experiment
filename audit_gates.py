@@ -1329,6 +1329,9 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                 # leave the overall status at "ok".
                 problems.append(f'{key}: by_len key {k!r} is not an integer length')
                 continue
+            if Ln <= 0:
+                problems.append(f'{key}: by_len key {k!r} is not a positive sequence length')
+                continue
             if not isinstance(c, dict):
                 problems.append(f'{key}: by_len[{k!r}] cell is not an object')
                 continue
@@ -1380,7 +1383,7 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                     # int(4.9) would truncate the count and could satisfy the
                     # n_tok == n_seq*(L-1) identity with corrupted evidence.
                     problems.append(f'{key}: L{Ln} {_field} is not an integer count ({_val!r})')
-                elif _field in ('n_tok', 'n_seq') and _fval <= 0:
+                elif _field in ('n_tok', 'n_seq', 'eval_span') and _fval <= 0:
                     problems.append(f'{key}: L{Ln} {_field} must be positive, got {_val!r}')
             # The complete-cell identity is n_tok == n_seq * (Ln - 1).  Equal
             # (but equally wrong) counts across arms are not a valid target

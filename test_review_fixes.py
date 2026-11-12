@@ -4326,6 +4326,16 @@ def t_audit_length_malformed_cells_do_not_crash():
             json.dump({'a::s0': {'by_len': {'4096': 42}}}, f)
         r4 = A.audit_length(p)
         assert r4['status'] == 'fail' and any('cell is not an object' in x for x in r4['problems']), r4
+        # A zero/negative length or eval span is not a scored sequence; it must
+        # not enter the cross-arm tables as a clean cell.
+        for key, span in ((0, 1), ('4096', 0)):
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump({'a::s0': {'by_len': {str(key): {
+                    'n_tok': 1, 'eval_span': span, 'n_seq': 1,
+                    'truncated': False}}}}, f)
+            bad = A.audit_length(p)
+            assert bad['status'] == 'fail', bad
+            assert any('positive' in x for x in bad['problems']), bad
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
