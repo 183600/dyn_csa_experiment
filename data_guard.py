@@ -988,8 +988,7 @@ class LeakageSafePreprocessor:
             raise ValueError('cannot fit the preprocessor on zero training rows')
         stats = []
         for j in range(p):
-            # Convert one column at a time: the full matrix never needs a
-            # second float64 copy (large inputs can be float32/uint8).
+            # Convert one column at a time to float64.
             base = _col_float64(X, j)
             col = np.where(np.isfinite(base), base, np.nan)
             finite = col[np.isfinite(col)]
@@ -1673,8 +1672,6 @@ def _row_keys(X):
         # ``-0.0 == 0.0`` but their byte patterns differ, so raw hashing would
         # miss an exact duplicate split across train/val/test.  Normalize the
         # sign of zero before hashing (NaN values are handled separately).
-        # The copy is only made when a zero is actually present, so the common
-        # all-nonzero block is not duplicated.
         if np.any(arr == 0.0):
             arr = arr.copy()
             arr[arr == 0.0] = 0.0

@@ -1712,8 +1712,7 @@ def t_panel_ablation_flag_does_not_overclaim():
 
 
 def t_adaptive_threshold_guard():
-    # Row chunking keeps a large batch feasible; an explicit safety ceiling is
-    # still honoured.
+    # Row chunking with an explicit safety ceiling.
     L.causal_adaptive_threshold(torch.randn(64, 4096), 16)
     # Empty inputs keep their shape (batch x length), not a flat [0] tensor.
     for shape in ((0,), (0, 5), (3, 0), (0, 0)):

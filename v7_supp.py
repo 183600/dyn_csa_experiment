@@ -2400,9 +2400,8 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                                 torch.cuda.empty_cache()
                             continue
                         raise
-                    # Keep the per-token losses in a small float32 table and
-                    # sum once, so the reduction order matches the
-                    # full-logits cross_entropy(reduction='sum').
+                    # Sum the per-token losses once so the reduction order
+                    # matches the full-logits cross_entropy(reduction='sum').
                     _nll_rows = _head_ce_none(_h, _sub[:, 1:], int(_sub.shape[0]), int(_sub.shape[1]) - 1)
                     nll += _nll_rows.sum().double()
                     ntok += int(_sub[:, 1:].numel())

@@ -1675,11 +1675,8 @@ def _cache_put(cache, key, tensor, limit, total_of):
     st['total'] += _cache_item_bytes(key, tensor, total_of)
     total = st['total']
     if total > limit:
-        # Oldest-first eviction without copying the whole key list on every
-        # insert (the cache can hold thousands of small index tables).  A
-        # pinned entry is rotated to the recent end so the next iteration can
-        # reach an evictable one; if a full rotation finds none, the loop
-        # stops exactly like the former single-pass form.
+        # Oldest-first eviction.  A pinned entry is rotated to the recent end
+        # so the next iteration can reach an evictable one.
         while total > limit and cache:
             _seen = 0
             _n = len(cache)
@@ -3677,9 +3674,9 @@ def _indexer_trainable(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
     """Training wrapper around `lightning_indexer` with activation recompute.
 
     The indexer builds `raw`/`c`/`soft` tables of shape [T, B_blocks, nIH]
-    (plus the [T, topk] prior) that stay alive until backward.  Recomputing
-    the whole pure function in backward keeps only its inputs, matching the
-    FusedIndexer save policy.  Values and gradients are unchanged (no RNG in the learned path
+    (plus the [T, topk] prior).  Backward recomputes the whole pure function,
+    matching the FusedIndexer save policy.  Values and gradients are unchanged
+    (no RNG in the learned path
     unless `random_select`, which is a fixed function of the row/column ids).
     """
     def _run(_h, _ck, _lt):
@@ -4529,9 +4526,8 @@ class HybridAttention(nn.Module):
         if cfg.kind == 'full':
             return None
         _want_idx = cfg.kind != 'hca' and cfg.indexer_mode != 'random'
-        # Training never builds the concatenated weight: it is only a cached
-        # constant on the eval path.  The separate projections produce the
-        # same independent output columns without the per-step cat.
+        # The concatenated weight is only a cached constant on the eval path.
+        # The separate projections produce the same independent output columns.
         if x.device.type != 'cuda' or torch.is_grad_enabled():
             pre['q'] = self.W_q(x)
             pre['Ca'] = x @ self.W_aKV
@@ -7024,9 +7020,8 @@ def _doc_simhash(text, *, shingle_words=5, max_shingles=128):
     documents stay bounded; the same text always yields the same hash
     across processes (blake2b, no Python salted hash).
     """
-    # Only the first 1M words can ever be used: streaming the matches with
-    # islice keeps the working set bounded on pathologically long documents
-    # (a full findall would materialise every word before truncating).
+    # Only the first 1M words can ever be used; the matches are streamed with
+    # islice.
     import itertools as _it
     words = [m.group() for m in _it.islice(
         re.finditer(r"[\w']+", str(text).lower()), 1 << 20)]
@@ -8124,8 +8119,7 @@ def _gpu_corpus_cache_fits(nbytes, device):
         return True
 
 _NARROW_MEMO = {}
-# Keep a small LRU of narrowed corpora and drop entries whose source array
-# has died.
+# LRU of narrowed corpora; entries whose source array has died are dropped.
 _NARROW_MEMO_CAP = 8
 
 
@@ -8326,8 +8320,8 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
             ids = _h2d_async(ids, ids.dtype, device)
         return ids
 
-    # A small bounded producer queue runs the identical seeded draw and gather
-    # one step ahead.  Values and order are unchanged (same RNG, same indices).
+    # A bounded producer queue runs the identical seeded draw and gather.
+    # Values and order are unchanged (same RNG, same indices).
     _prefetch = device.type == 'cuda' and (host_np is not None or (host is not None and host.device.type == 'cpu'))
     if not _prefetch:
         while True:
@@ -9389,9 +9383,7 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
     if d.size < 2:
         return None
     # Draws are generated in chunks, so the panel size does not require a
-    # correspondingly large index table: the seed-completion path can grow a
-    # panel to hundreds/thousands of seeds and paired_effect_stats calls this
-    # for every displayed contrast.
+    # correspondingly large index table.
     nb = _as_seed_int(n_boot)
     sd = _as_seed_int(seed)
     if nb is None or sd is None or nb < 2:
@@ -14927,13 +14919,10 @@ def _eval_row_working_bytes(model, T, d, elem_size, bytes_per_value=8):
 
 
 def _eval_adaptive_chunk(model, val_batch, device, chunk, _free_frac=0.5, _bytes_per_value=8):
-    """Bound an evaluation chunk by both token count and currently-free device capacity.
+    """Bound an evaluation chunk by token count and currently-free device capacity.
 
-    Rows are independent, so the partition changes no value; it only keeps a
-    long-sequence eval from launching a chunk whose attention/indexer
-    workspace cannot fit.  The estimate uses the model's actual parameter
-    element size (bf16 halves it) and the real per-layer attention shape, not
-    just `T*d`; the existing OOM retry remains the final backstop."""
+    Rows are independent, so the partition changes no value; it keeps a
+    long-sequence eval from launching a chunk whose workspace cannot fit."""
     rows = int(val_batch.shape[0])
     T = int(val_batch.shape[1])
     span = max(1, T - 1)
@@ -15321,8 +15310,8 @@ class _BlockStats:
     """Incremental replacement for the per-sequence bincount list.
 
     compression_report only needs the pooled mean/std/min/max/fractions over
-    block lengths.  Each append folds the integer counts into running moments
-    and drops the tensor immediately; values are accumulated in float64 so the
+    block lengths.  Each append folds the integer counts into running moments;
+    values are accumulated in float64 so the
     pooled statistics are at least as accurate as the concatenated float32
     form."""
 
@@ -16572,8 +16561,8 @@ def _atomic_torch_save(obj, path, hash_out=None):
 
 
 def _checkpoint_payload(model, *, variant, seed, step, val_ppl, train_ce, health, extra=None):
-    # Keep the tensors where they live; torch.save streams each storage to the
-    # file.  Loaders already use map_location='cpu' (error_analysis / v7_supp).
+    # torch.save streams each storage to the file; loaders use
+    # map_location='cpu' (error_analysis / v7_supp).
     sd = {k: v.detach() for k, v in model.state_dict().items()}
     payload = {'format': 'csa-analysis-ckpt-v1', 'variant': variant, 'seed': int(seed),
                'step': int(step), 'val_ppl': val_ppl, 'train_ce_fixed': train_ce,
@@ -17495,8 +17484,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             _bsum[6] += _flat_ce[_bnd.reshape(-1)].sum()
             _bcnt[6] += int(_bnd.sum())
             n_targets += _b * _s
-            # Only the chunk's top candidates enter the Python heap; the
-            # per-token loop is bounded by top_tokens, not by B*T.
+            # The per-token loop is bounded by top_tokens, not by B*T.
             _sel_n = min(int(top_tokens), _b * _s)
             _pick_val, _pick_idx = torch.topk(torch.where(finite.reshape(-1), ce_f.reshape(-1),
                                                           torch.full_like(ce_f.reshape(-1), float('inf'))),
@@ -17703,8 +17691,6 @@ def _batch_arrays(batch, vocab=None):
 def _param_change_sample(model, max_per_tensor=4096):
     """Small, deterministic per-tensor sample for the overfit probe.
 
-    Comparing a fixed small sample avoids duplicating the whole parameter
-    vector (and its grad) just to answer "did the optimizer move anything?".
     The sample spans the tensor uniformly, including its first and last
     element."""
     parts = []
