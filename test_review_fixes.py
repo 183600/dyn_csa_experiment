@@ -4480,6 +4480,15 @@ def t_selection_audit_rejects_out_of_range_claims():
         out = A.audit_selection(p)
         assert out['status'] == 'fail', out
         assert out['cells'][0]['claim_allowed'] is False, out['cells'][0]
+        # A huge integral float is no longer an exact geometry count.
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'cells': [{
+                'arm': 'a', 'eval_len': 4096, 'k': 2 ** 60, 'n_blocks': 2 ** 61,
+                'n_queries': 10, 'recall_at_k': 0.5, 'mass_covered': 0.7,
+                'random_baseline': 0.03, 'per_seed': per_seed}]}, f)
+        out = A.audit_selection(p)
+        assert out['status'] == 'fail', out
+        assert any('non-integral geometry' in x for x in out['problems']), out
 
 
 def t_split_audit_fails_on_unreadable_meta():

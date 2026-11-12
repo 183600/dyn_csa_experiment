@@ -2200,7 +2200,10 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
                 f = float(v)
             except (TypeError, ValueError, OverflowError):
                 return None
-            if not (math.isfinite(f) and f == math.floor(f)):
+            if (not (math.isfinite(f) and f == math.floor(f))
+                    or abs(f) >= 2 ** 53):
+                # Beyond 2**53 a float no longer represents every integer, so
+                # the recorded geometry count may denote a different value.
                 return None
             return int(f)
 
