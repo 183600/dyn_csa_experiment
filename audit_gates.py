@@ -1868,8 +1868,18 @@ def train_flops_estimate(params, tokens, attn_overhead=0.35):
         raise ValueError(f'train_flops_estimate: attn_overhead={attn_overhead!r} is not numeric') from None
     if not math.isfinite(overhead) or overhead < 0.0:
         raise ValueError(f'train_flops_estimate: attn_overhead={attn_overhead!r} must be finite and non-negative')
-    base = 6.0 * n * d_tok
-    return {'flops_6nd': base, 'flops_with_attn_proxy': base * (1.0 + overhead), 'attn_overhead_assumed': overhead, 'note': 'analytic PROXY, not a measurement; report alongside TimeGuard seconds'}
+    try:
+        base = 6.0 * n * d_tok
+    except OverflowError:
+        # The counts are exact integers with no declared upper bound; a
+        # scale-up request can leave the binary64 range.  Saturating the
+        # analytic proxy is explicit, unlike crashing the budget audit.
+        base = float('inf')
+    try:
+        with_attn = base * (1.0 + overhead)
+    except OverflowError:
+        with_attn = float('inf')
+    return {'flops_6nd': base, 'flops_with_attn_proxy': with_attn, 'attn_overhead_assumed': overhead, 'note': 'analytic PROXY, not a measurement; report alongside TimeGuard seconds'}
 
 
 def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.json'), panels=(('results_lm_v10_scale_s', 'csa_fixed', 8000), ('results_lm_v10_scale_l8k', 'csa_fixed', 8000), ('results_lm_v10_scale_lflop', 'csa_fixed', None))):

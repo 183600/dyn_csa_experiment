@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import math
 import numbers
+from fractions import Fraction
 
 import numpy as np
 
@@ -135,11 +136,14 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
         # rows remain; clamping to the remaining count keeps every size
         # non-negative even when an explicit size or a large fraction would
         # otherwise overdraw it (the last split then takes whatever is left).
-        fracs = (train_frac, val_frac, test_frac)
+        # Evaluate n*frac exactly: at a scale-up n can exceed the float range,
+        # where n * frac would raise OverflowError (or lose the low bits of a
+        # count that is an exact integer).
+        fracs = (Fraction(train_frac), Fraction(val_frac), Fraction(test_frac))
         unspecified = [i for i in range(3) if sizes[i] is None]
         remaining = n - sum(v for v in sizes if v is not None)
         for i in unspecified[:-1]:
-            take = min(int(math.floor(n * fracs[i])), remaining)
+            take = min(int(Fraction(n) * fracs[i]), remaining)
             sizes[i] = take
             remaining -= take
         if unspecified:
@@ -163,7 +167,10 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
     # (negative remainder).  Renormalising the accepted fractions keeps the
     # targets summing to n exactly for every n; the deviation is already
     # inside the declared tolerance.
-    fracs = tuple(f / frac_sum for f in (train_frac, val_frac, test_frac))
+    _frac_total = (Fraction(train_frac) + Fraction(val_frac)
+                   + Fraction(test_frac))
+    fracs = tuple(Fraction(f) / _frac_total
+                  for f in (train_frac, val_frac, test_frac))
     requested = [f > 0 for f in fracs]
     if n < sum(requested):
         raise ValueError(
@@ -171,9 +178,11 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
     # Largest-remainder apportionment: floor every target, then give the
     # leftover rows to the splits with the largest fractional parts.  This
     # keeps small-n splits close to their requested proportions and never
-    # puts rows into a split whose requested fraction is zero.
-    targets = [n * f for f in fracs]
-    sizes = [int(math.floor(t)) for t in targets]
+    # puts rows into a split whose requested fraction is zero.  Exact
+    # rational arithmetic keeps the targets usable at any integer scale
+    # (n*frac as a float overflows once n leaves the binary64 range).
+    targets = [Fraction(n) * f for f in fracs]
+    sizes = [int(t) for t in targets]
     remaining = n - sum(sizes)
     order = sorted(range(3), key=lambda i: (-(targets[i] - sizes[i]), -i))
     eligible = [i for i in order if requested[i]]

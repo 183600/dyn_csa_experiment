@@ -487,7 +487,10 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
         nll, ntok = pair
         total_nll += nll
         total_tok += ntok
-        doc_ce.append(nll / ntok)
+        try:
+            doc_ce.append(nll / ntok)
+        except OverflowError:
+            doc_ce.append(0.0)
     if len(doc_ce) < 2 or total_tok <= 0:
         return {'ppl': (_safe_exp_ppl(total_nll / total_tok) if total_tok else None),
                 'doc_ce_mean': None, 'doc_ce_sem': None,
@@ -495,7 +498,12 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     mean = sum(doc_ce) / len(doc_ce)
     var = sum((x - mean) ** 2 for x in doc_ce) / (len(doc_ce) - 1)
     sem = math.sqrt(max(var, 0.0) / len(doc_ce))
-    ce = total_nll / total_tok
+    try:
+        ce = total_nll / total_tok
+    except OverflowError:
+        # An exact token count beyond the float range: the pooled CE
+        # underflows to zero rather than crashing the whole report.
+        ce = 0.0
     # The point estimate is token-pooled, so the interval must be for that
     # same estimand.  Resampling/weighting per-document CEs as if the pooled
     # CE were their unweighted mean mixes two different estimators and is
@@ -510,9 +518,17 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
         if pair is None:
             continue
         nll, ntok = pair
-        _resid.append(nll - ce * ntok)
+        try:
+            _term = ce * ntok
+        except OverflowError:
+            _term = float('inf')
+        _resid.append(nll - _term)
     n_docs = len(_resid)
-    _var = (n_docs / (n_docs - 1.0)) * sum(r * r for r in _resid) / (total_tok * total_tok)
+    try:
+        _var = ((n_docs / (n_docs - 1.0)) * sum(r * r for r in _resid)
+                / (total_tok * total_tok))
+    except OverflowError:
+        _var = 0.0
     _sem_ce = math.sqrt(max(_var, 0.0))
     _tc = _t_critical(0.95, n_docs - 1)
     if not math.isfinite(_tc):
@@ -9874,6 +9890,37 @@ def global_multiplicity_audit(named_pvals, *, alpha=0.05,
 _BINOM_EXACT_MAX_N = 1 << 20
 
 
+def _sqrt_int_ratio(num, den):
+    """sqrt(num/den) for non-negative integers, without int->float overflow.
+
+    Scale-up planning can pass seed/family counts far above the binary64
+    range.  Converting either operand to float first raises OverflowError even
+    when the ratio itself is small (e.g. n/sqrt(n)); shifting each operand by
+    its own scale keeps the quotient representable and the result exact to
+    float precision."""
+    if num <= 0:
+        return 0.0
+    if den <= 0:
+        return float('inf')
+    _nb = int(num).bit_length()
+    _db = int(den).bit_length()
+    _sn = max(0, _nb - 500)
+    _sd = max(0, _db - 500)
+    _ns = int(num) >> _sn
+    _ds = int(den) >> _sd
+    if _ds <= 0:
+        return float('inf')
+    _ratio = _ns / _ds
+    _exp = _sn - _sd
+    if _exp % 2:
+        _ratio *= 2.0
+        _exp -= 1
+    try:
+        return math.ldexp(math.sqrt(_ratio), _exp // 2)
+    except OverflowError:
+        return float('inf')
+
+
 def _binom_cdf_half_asymptotic(n, m):
     """P(Bin(n,1/2) <= m) via a continuity-corrected Edgeworth CDF.
 
@@ -9881,9 +9928,11 @@ def _binom_cdf_half_asymptotic(n, m):
     F(z) ~= Phi(z) + phi(z) * (gamma2/24) * (3z - z^3), gamma2 = -2/n.
     This is used for very large n where the O(1)-ish incomplete beta becomes
     numerically unreliable; its error is O(1/n^2), far below any planning
-    threshold."""
-    sd = math.sqrt(n) * 0.5
-    z = (m + 0.5 - 0.5 * n) / sd
+    threshold.  The z computation avoids materialising sqrt(n) as a float, so
+    a planning count above the binary64 range still returns a probability."""
+    _num = 2 * int(m) + 1 - int(n)
+    _zabs = _sqrt_int_ratio(_num * _num, n)
+    z = (_zabs if _num > 0 else -_zabs) if _num else 0.0
     # erfc of the negated argument evaluates the lower tail accurately far
     # from the bulk.
     cdf = 0.5 * math.erfc(-z / math.sqrt(2.0))
@@ -9892,7 +9941,11 @@ def _binom_cdf_half_asymptotic(n, m):
     # normal term, so it is applied only where the expansion is accurate.
     if abs(z) <= 8.0:
         phi = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
-        correction = phi * ((-2.0 / n) / 24.0) * (3.0 * z - z ** 3)
+        try:
+            _inv_n = 2.0 / float(n)
+        except OverflowError:
+            _inv_n = 0.0
+        correction = phi * ((-_inv_n) / 24.0) * (3.0 * z - z ** 3)
         corrected = cdf + correction
         if 0.0 <= corrected <= 1.0:
             cdf = corrected
@@ -9902,11 +9955,21 @@ def _binom_cdf_half_asymptotic(n, m):
 def _binom_sf_normal(n, k, q):
     """P(Bin(n,q) >= k) via a continuity-corrected normal tail.
 
-    Used only for very large n; `q` can differ from 1/2 (power planning)."""
-    sd = math.sqrt(n * q * (1.0 - q))
-    if sd <= 0.0:
+    Used only for very large n; `q` can differ from 1/2 (power planning).
+    The z numerator/denominator are evaluated with integer ratios so huge
+    exact counts do not overflow on the intermediate n*q or sqrt."""
+    if q <= 0.0:
+        return 1.0 if k <= 0 else 0.0
+    if q >= 1.0:
+        return 1.0 if k <= n else 0.0
+    _num_q, _den_q = float(q).as_integer_ratio()
+    # z = ((2k-1)*den - 2*n*num) / (2*sqrt(n*num*(den-num))).
+    _a = (2 * int(k) - 1) * _den_q - 2 * int(n) * _num_q
+    _b = int(n) * _num_q * (_den_q - _num_q)
+    if _b <= 0:
         return 1.0 if k <= n * q else 0.0
-    z = (k - 0.5 - n * q) / sd
+    _zabs = _sqrt_int_ratio(_a * _a, 4 * _b)
+    z = (_zabs if _a > 0 else -_zabs) if _a else 0.0
     return float(min(1.0, max(0.0, 0.5 * math.erfc(z / math.sqrt(2.0)))))
 
 
@@ -9976,7 +10039,12 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
         # Holm rejects at p_holm <= alpha, so the planning helper must use the
         # same inclusive boundary.  A strict '<' would report a plan as
         # impossible at the exact boundary that holm_adjust accepts.
-        return m * p <= a + 1e-15
+        # Compare via alpha/p instead of m*p: a family size above the float
+        # range would make int->float conversion overflow even though the
+        # comparison is trivially false for any p>0.
+        if p <= 0.0:
+            return True
+        return m <= (a + 1e-15) / p
 
     # p(k) decreases monotonically as k grows, so "clears the gate" is a
     # suffix of [0, n].  Binary search finds its left edge.
@@ -10213,14 +10281,34 @@ def _betai(a, b, x):
 
 def _student_t_sf(t, df):
     """Student t 的上尾概率 P(T >= t)。"""
-    if not (df > 0.0) or math.isnan(t):
+    if not (df > 0.0):
+        return float('nan')
+    # `t != t` detects NaN without converting arbitrary-size integers to
+    # float (math.isnan(10**400) overflows).
+    if t != t:
         return float('nan')
     if t == float('inf'):
         return 0.0
     if t == float('-inf'):
         return 1.0
-    if not math.isfinite(t):
+    if isinstance(t, float) and not math.isfinite(t):
         return float('nan')
+    # The incomplete-beta branch is O(1) but loses all significant digits
+    # once df is very large (the continued fraction/ lgamma cancellation
+    # returns a far too small tail: t critical ~90 at df=1e20).  Above this
+    # cutoff the t/normal Edgeworth expansion is both accurate and stable.
+    if df == float('inf') or df > 1e6:
+        sf = 0.5 * math.erfc(t / math.sqrt(2.0))
+        try:
+            _inv_df = 1.0 / df
+        except (OverflowError, ZeroDivisionError):
+            _inv_df = 0.0
+        if _inv_df:
+            # F_t(x) = Phi(x) - (x^3+x)/(4df) phi(x) + O(df^-2), so the
+            # upper tail gets the opposite-signed correction (heavier tail).
+            _phi = math.exp(-0.5 * t * t) / math.sqrt(2.0 * math.pi)
+            sf += (t * t * t + t) * _inv_df * 0.25 * _phi
+        return float(min(1.0, max(0.0, sf)))
     x = df / (df + t * t)
     tail = 0.5 * _betai(df / 2.0, 0.5, x)
     return float(tail if t >= 0 else 1.0 - tail)
@@ -10228,7 +10316,13 @@ def _student_t_sf(t, df):
 
 def student_t_two_sided_p(t, df):
     """双侧 Student t 检验 p 值（小样本斜率/交互推断用）。"""
-    sf = _student_t_sf(abs(float(t)), float(df))
+    try:
+        _t = abs(float(t))
+    except (TypeError, ValueError, OverflowError):
+        _t = float('inf')
+    # Keep df as an exact integer: converting a scale-up degree count to
+    # float overflows even though _student_t_sf can handle it exactly.
+    sf = _student_t_sf(_t, df)
     if not math.isfinite(sf):
         return float('nan')
     return float(min(1.0, 2.0 * sf))
@@ -10260,15 +10354,47 @@ def _t_critical(conf, df):
 
 def chi2_sf(x, df):
     """卡方分布上尾概率 P(chi2_df >= x)（Cochran Q 用）。"""
-    if not (df > 0.0) or math.isnan(x):
+    if not (df > 0.0):
+        return float('nan')
+    # Same non-converting NaN/infinity checks as _student_t_sf.
+    if x != x:
         return float('nan')
     if x == float('inf'):
         return 0.0
-    if not math.isfinite(x):
+    if x == float('-inf'):
+        return float('nan')
+    if isinstance(x, float) and not math.isfinite(x):
         return float('nan')
     if x <= 0.0:
         return 1.0
-    return _gammaincc(df / 2.0, x / 2.0)
+    # `_gammaincc` loses precision for very large df (at df=1e12, x=df it
+    # reported 0.999 instead of ~0.5).  The Wilson-Hilferty transformation is
+    # accurate to O(1/df) and never materialises df as a float.
+    if df == float('inf') or df > 1e5:
+        try:
+            _ratio = x / df
+        except (OverflowError, ZeroDivisionError):
+            return 0.0
+        try:
+            _inv_df = 1.0 / df
+        except (OverflowError, ZeroDivisionError):
+            _inv_df = 0.0
+        if _inv_df:
+            _mean = 1.0 - 2.0 * _inv_df / 9.0
+            _sd = math.sqrt(2.0 * _inv_df / 9.0)
+            if _sd > 0.0:
+                _z = (_ratio ** (1.0 / 3.0) - _mean) / _sd
+                return float(min(1.0, max(0.0,
+                                       0.5 * math.erfc(_z / math.sqrt(2.0)))))
+        # df is beyond the float range: the distribution is degenerate at df
+        # at every scale this arithmetic can resolve.
+        return 1.0 if x < df else (0.5 if x == df else 0.0)
+    try:
+        return _gammaincc(df / 2.0, x / 2.0)
+    except OverflowError:
+        # x is a finite exact integer beyond the float range with a small df:
+        # the upper tail is smaller than any representable probability.
+        return 0.0
 
 
 def paired_log_ratio(with_values, without_values, seeds=None):
@@ -10768,6 +10894,14 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
     policy = dict(SCALE_TRANSFER_POLICY if policy is None else policy)
     tol = float(policy.get('tokens_per_param_tolerance', 0.25) if tolerance is None else tolerance)
 
+    def _safe_ratio(num, den):
+        if not den:
+            return None
+        try:
+            return num / den
+        except OverflowError:
+            return float('inf')
+
     def _as_int(value, label, *, allow_none=False):
         if value is None and allow_none:
             return None
@@ -10848,7 +10982,9 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         if not (math.isfinite(lr) and lr > 0):
             problems.append(f'{name}: lr={lr!r} is not a positive finite number')
         effective_tokens = steps * batch * seq
-        if declared_tokens > 0 and abs(effective_tokens - declared_tokens) > 0.01 * declared_tokens:
+        # Exact integer 1% comparison: `0.01 * declared_tokens` raises
+        # OverflowError once a scale-up token count leaves the float range.
+        if declared_tokens > 0 and abs(effective_tokens - declared_tokens) * 100 > declared_tokens:
             problems.append(
                 f'{name}: declared n_train_tokens={declared_tokens:,} differs from '
                 f'steps*batch_size*seq_len={effective_tokens:,} by more than 1%')
@@ -10865,9 +11001,9 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             'steps': steps, 'batch_size': batch, 'seq_len': seq,
             'declared_tokens': (declared_tokens or None),
             'effective_tokens': int(effective_tokens),
-            'tokens_per_param': (effective_tokens / params if params else None),
+            'tokens_per_param': _safe_ratio(effective_tokens, params),
             'params': params, 'lr': lr, 'warmup': warmup,
-            'warmup_fraction': (warmup / steps if steps else None),
+            'warmup_fraction': _safe_ratio(warmup, steps),
             'n_seeds': len(set(seeds)),
             'p_floor': signflip_p_floor(len(set(seeds))),
             'min_seeds_for_family_significance': signflip_min_n_for_holm(int(policy.get('family_m', 4)), 0.05),
@@ -19075,10 +19211,15 @@ def _pooled_ppl_from_records(recs):
             return None, None, None
         nlls.append(nll)
         nts.append(nt)
-    total_n, total_t = float(sum(nlls)), float(sum(nts))
-    if total_t <= 0:
+    total_n, _total_t_int = float(sum(nlls)), int(sum(nts))
+    if _total_t_int <= 0:
         return None, None, None
-    return _safe_exp_ppl(total_n / total_t), total_n, int(total_t)
+    try:
+        _pooled_ce = total_n / _total_t_int
+    except OverflowError:
+        # Exact token totals beyond binary64 underflow the pooled CE to 0.
+        _pooled_ce = 0.0
+    return _safe_exp_ppl(_pooled_ce), total_n, _total_t_int
 
 def _seed_t_ci(ppls, alpha=0.05):
     n = len(ppls)
