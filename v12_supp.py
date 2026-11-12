@@ -2162,6 +2162,25 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
         errs.append('manifest eval.by_length_ppl is empty; P5T has no endpoint grid')
     if _nseq <= 0:
         errs.append('manifest eval.n_seqs_clean is missing/zero; the frozen row count is part of the slice')
+    # P5T fills a missing distractor-probe field from FINALTEST_CFG, so the
+    # pre-flight must validate those DEFAULTS too.  Otherwise a manifest that
+    # omits probe eval_lens/target/n_seq can pass here, spend the one-shot test
+    # access, and only then index outside the frozen slice.
+    _probe_plan = _eval.get('distractor_probe') or {}
+    _probe_lens = [int(x) for x in (_probe_plan.get('eval_lens') or [2048, 4096])]
+    _probe_target = int(_probe_plan.get('target', FINALTEST_CFG.get('target', 512)))
+    _probe_nseq = int(_probe_plan.get('n_seq', FINALTEST_CFG.get('n_seq', 16)))
+    if _probe_nseq <= 0:
+        errs.append(f'distractor probe n_seq={_probe_nseq} must be positive')
+    elif _nseq > 0 and _probe_nseq > _nseq:
+        errs.append(f'distractor probe n_seq={_probe_nseq} exceeds the frozen test row count {_nseq} — the probe would index outside the frozen slice')
+    if not _probe_lens:
+        errs.append('distractor probe eval_lens is empty; the probe has no evaluation length')
+    else:
+        if _lens and max(_probe_lens) > max(_lens):
+            errs.append(f'distractor probe eval_lens={_probe_lens} extends beyond the frozen test slice width max(by_length_ppl)={max(_lens)}')
+        if _probe_target < 0 or _probe_target >= min(_probe_lens):
+            errs.append(f'distractor probe target={_probe_target} must be non-negative and smaller than every probe eval_len {sorted(_probe_lens)}')
     if _n_min < 2 or _n_min > len(seeds):
         errs.append(f'statistics.min_seeds_for_confirmation={_n_min} is outside [2, {len(seeds)}]')
     _min_holm = L.holm_min_attainable_p(_n_min, len(m['primary_comparisons']), _alpha) if _n_min >= 2 else float('inf')
@@ -2288,7 +2307,8 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
         print('[v12 plan] REFUSED — the frozen plan is not runnable end-to-end:')
         for _e in errs:
             print(f'  - {_e}')
-        raise SystemExit('[v12 plan] FAILED: correct the plan/records BEFORE any P5C training or P5T test access')
+        raise SystemExit('[v12 plan] FAILED: ' + '; '.join(errs)
+                         + ' — correct the plan/records BEFORE any P5C training or P5T test access')
     print(f'[v12 plan] OK: {len(admitted)}/{len(arms) * len(seeds)} synthetic records admitted; {len(_comp_report)} comparisons form all pairs; min n={_n_min} (min Holm p={_min_holm:.4g} <= alpha={_alpha})')
     for _a, _p in _pred.items():
         print(f'  [plan] {_a:32s} eager_batch={_p["eager_batch"]} amp={_p["amp_dtype"]} mr={(_per_arm.get(_a) or {}).get("mr", 4.0)} params={_p.get("params")}')

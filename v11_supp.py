@@ -239,15 +239,17 @@ def _fmt_pm(cell, std=None):
     return f'{mean:.2f} ±{std or 0.0:.2f}'
 
 def _one_record_per_seed(rows, label=''):
-    """Drop invalid seeds and exclude every ambiguous duplicate seed.
+    """Drop invalid/synthesized records and exclude ambiguous duplicate seeds.
 
     The by-length table means each seed once; averaging two records for one
     seed would bias the column while the reported n (a set) still counts one.
+    A synthesized reconstruction has no weights and is not an independent
+    measurement, so it must never enter the by-length columns.
     """
     by_seed = {}
     dup = set()
     for r in rows:
-        if not isinstance(r, dict):
+        if not isinstance(r, dict) or r.get('synthesized'):
             continue
         s = L._as_seed_int(r.get('seed'))
         if s is None:

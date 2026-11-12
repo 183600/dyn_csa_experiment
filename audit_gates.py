@@ -1426,7 +1426,9 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             # (but equally wrong) counts across arms are not a valid target
             # set, so verify the formula whenever the cell claims to be a
             # full-length measurement.
-            if c.get('truncated') is False and _nseq_cell is not None:
+            _full_cell = (isinstance(c.get('truncated'), (bool, np.bool_))
+                          and not bool(c.get('truncated')))
+            if _full_cell and _nseq_cell is not None:
                 _nt = _exact_int_scalar(c.get('n_tok'))
                 _ns = _exact_int_scalar(_nseq_cell)
                 if _nt is not None and _ns is not None:
@@ -1437,7 +1439,7 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             # A non-truncated cell must state the full requested span.  A
             # shorter eval_span means it scored a different (truncated) span
             # under the full-length label.
-            if c.get('truncated') is False and _exact_int_scalar(c.get('eval_span')) not in (None, Ln):
+            if _full_cell and _exact_int_scalar(c.get('eval_span')) not in (None, Ln):
                 problems.append(
                     f'{key}: L{Ln} is marked non-truncated but eval_span={c.get("eval_span")!r} '
                     '!= the requested length')

@@ -560,6 +560,32 @@ def t_summary_refuses_nonobject():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def t_analyse_respects_requested_seeds():
+    # `analyse(seeds=[...])` must restrict the panel to the requested seeds;
+    # resetting the loop variable used to discard the request and analyse every
+    # available seed instead.
+    import json
+    import shutil
+    import tempfile
+    import open_block_supp as O
+    d = tempfile.mkdtemp()
+    try:
+        v = O._variant(128, 'closed', 'full_prefix')
+        summary = {}
+        for seed in (0, 1, 2):
+            summary[f'{v}::seed{seed}'] = {
+                'variant': v, 'seed': seed, 'ppl': 10.0 + seed,
+                'nll_sum': 100.0 + seed, 'n_tokens': 100,
+                'run_fingerprint': 'fp'}
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump(summary, f)
+        st = O.analyse(d, seeds=[1], analysis_dir=os.path.join(d, 'analysis'))
+        assert st['seeds_requested'] == [1], st['seeds_requested']
+        assert st['cells_available'] == [f'{v}::seed{s}' for s in (0, 1, 2)], st['cells_available']
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 CHECKS = [
     ('K1 open-block config/segmenter', t_config_and_segmenter),
     ('K2 prefix pooling reference/grad', t_prefix_pool_reference),
@@ -575,6 +601,7 @@ CHECKS = [
     ('K12 paired seeds are unique', t_paired_seeds_are_unique),
     ('K13 record identity/completeness', t_record_identity_and_completeness),
     ('K14 summary refuses non-object payloads', t_summary_refuses_nonobject),
+    ('K15 analyse respects requested seeds', t_analyse_respects_requested_seeds),
 ]
 
 

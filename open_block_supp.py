@@ -480,11 +480,15 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     if not cells:
         raise SystemExit(f'no usable records in {outdir}/summary.json')
     avail_seeds = sorted({s for (_, s) in cells})
+    # Keep the caller's request separate from the normalised list below;
+    # assigning `seeds = []` first silently discarded it and analysed every
+    # available seed instead of the requested subset.
+    _requested_seeds = seeds
     # A caller may repeat a seed on the command line; deduplicate while
     # preserving the requested order so n stays the number of unique seeds.
     _seen_seeds = set()
     seeds = []
-    for s in (seeds or avail_seeds):
+    for s in (_requested_seeds or avail_seeds):
         s = L._as_seed_int(s)
         if s is None:
             raise SystemExit(f'open-block: invalid seed identifier {s!r} — seeds must be integers')

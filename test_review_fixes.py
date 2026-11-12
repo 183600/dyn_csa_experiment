@@ -355,6 +355,21 @@ def t_manifest_v3_admission_can_succeed():
     assert all(c['pairs_planned'] == rep['n_seeds'] for c in rep['comparisons'].values()), rep
     assert rep['predicted']['full_rope']['eager_batch'] is False, rep
     assert rep['predicted']['csa_fixed_rope']['amp_dtype'] == 'bf16', rep
+    # The probe's omitted fields are filled from FINALTEST_CFG at run time;
+    # the pre-flight must validate those defaults, not only explicit fields.
+    with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
+        _m = json.load(f)
+    _m['eval']['by_length_ppl'] = [512, 1024]
+    _m['eval'].pop('distractor_probe', None)
+    with tempfile.TemporaryDirectory() as td:
+        _p = os.path.join(td, 'm.json')
+        with open(_p, 'w', encoding='utf-8') as f:
+            json.dump(_m, f)
+        try:
+            V12.plan_check(_p)
+            raise AssertionError('a probe whose default eval lengths exceed the frozen slice must be refused')
+        except SystemExit as e:
+            assert 'probe' in str(e), str(e)[:300]
 
 
 def t_v7_rope_gather_rotation_order():
@@ -5332,9 +5347,12 @@ def t_v11_by_length_deduplicates_seeds():
     rows = [{'variant': 'v', 'seed': 0, 'by_len': {512: {'ppl': 10.0}}},
             {'variant': 'v', 'seed': 0, 'by_len': {512: {'ppl': 20.0}}},
             {'variant': 'v', 'seed': 1, 'by_len': {512: {'ppl': 30.0}}},
-            {'variant': 'v', 'seed': True, 'by_len': {512: {'ppl': 40.0}}}]
+            {'variant': 'v', 'seed': True, 'by_len': {512: {'ppl': 40.0}}},
+            {'variant': 'v', 'seed': 2, 'synthesized': True,
+             'by_len': {512: {'ppl': 50.0}}}]
     kept = V11._one_record_per_seed(rows, label='test')
     assert [r['seed'] for r in kept] == [1], kept
+    assert all(not r.get('synthesized') for r in kept), kept
 
 
 def t_report_stale_trajectory_refused():
