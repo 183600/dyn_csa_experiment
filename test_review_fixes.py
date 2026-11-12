@@ -232,6 +232,16 @@ def t_scale_robustness_edges():
     for _bad_conf in (True, np.bool_(False), 0, 1, 1.5, float('nan'), 'x'):
         _r = L._combined_seed_doc_ci(_ok_recs, n_boot=20, conf=_bad_conf)
         assert _r['status'] == 'invalid_options' and _r['ci95_ppl'] is None, _r
+    # Bootstrap controls are exact counts too: a boolean/fractional draw count
+    # or a lossy seed must not crash or silently become a different bootstrap.
+    for _bad_boot in (True, np.bool_(False), 0, 1, 1.5, 2 ** 53 + 1, 10 ** 7 + 1, 'x'):
+        assert L._doc_bootstrap_ppl_ci(_ok_recs, n_boot=_bad_boot) is None, _bad_boot
+        _r = L._combined_seed_doc_ci(_ok_recs, n_boot=_bad_boot)
+        assert _r['status'] == 'invalid_options' and _r['ci95_ppl'] is None, (_bad_boot, _r)
+    for _bad_seed in (True, np.bool_(False), 1.5, 'x', float('nan')):
+        assert L._doc_bootstrap_ppl_ci(_ok_recs, n_boot=20, seed=_bad_seed) is None, _bad_seed
+        _r = L._combined_seed_doc_ci(_ok_recs, n_boot=20, seed=_bad_seed)
+        assert _r['status'] == 'invalid_options' and _r['ci95_ppl'] is None, (_bad_seed, _r)
     # Panel readers ignore a malformed per-layer stats payload.
     _agg_bad = L.aggregate({'x': {'variant': 'csa', 'seed': 0, 'ppl': 10.0,
                                   'nll_sum': 10.0, 'n_tokens': 1, 'stats': [1]}})
@@ -472,6 +482,18 @@ def t_bootstrap_mean_ci():
     u1 = L.unpaired_bootstrap_ci(d + 1.0, d, n_boot=600, seed=11)
     u2 = L.unpaired_bootstrap_ci(d + 1.0, d, n_boot=600, seed=11)
     assert u1 == u2 and u1[0] < 1.0 < u1[1], u1
+    # Draw counts are materialised as arrays: a huge exact count must fail
+    # closed instead of raising MemoryError, and booleans are not counts.
+    for _bad_nb in (True, np.bool_(False), 1.5, 10 ** 7 + 1, 2 ** 60):
+        assert L.bootstrap_mean_ci(vals, n_boot=_bad_nb) is None, _bad_nb
+        assert L.paired_bootstrap_ci(vals, n_boot=_bad_nb) is None, _bad_nb
+        assert L.unpaired_bootstrap_ci(vals, vals, n_boot=_bad_nb) is None, _bad_nb
+    # Seed-level t intervals reject a malformed confidence level / boolean
+    # measurements instead of returning a NaN-width interval.
+    assert L._seed_t_ci(vals) is not None
+    for _bad_alpha in (True, np.bool_(False), 0, 1, 1.5, float('nan'), 'x'):
+        assert L._seed_t_ci(vals, alpha=_bad_alpha) is None, _bad_alpha
+    assert L._seed_t_ci([1.0, True, 2.0]) is not None
 
 
 def t_training_health_classifier():
@@ -661,6 +683,25 @@ def t_scale_input_guards():
     assert r['n'] == 2 and r['dropped_seeds'] == [0], r
     assert L.scale_interaction([True, 0.1], [1.0, 0.2])['n'] == 1
     assert L.loglog_regression([(True, 1.0), (2, 4), (4, 16)])['n_points'] == 2
+    # Test options on the scale-analysis entry points are part of the claim
+    # contract: a boolean/fractional alpha or seed floor must not be coerced
+    # (float(True)=1.0, int(4.9)=4) into a permissive test.
+    _pts = [{'label': 'A', 'scale': 1.0, 'effects': [1.0, 2.0, 3.0], 'seeds': [0, 1, 2]},
+            {'label': 'B', 'scale': 2.0, 'effects': [1.1, 2.1, 3.1], 'seeds': [0, 1, 2]}]
+    for _bad_alpha in (True, np.bool_(False), 0.0, 1.0, 1.5, float('nan'), 'x'):
+        _m = L.meta_analyze_effects(_pts, alpha=_bad_alpha)
+        assert _m['status'] == 'invalid_options' and _m['poolable'] is False, (_bad_alpha, _m)
+        _t = L.scaling_trend(_pts, alpha=_bad_alpha)
+        assert _t['status'] == 'invalid_options' and _t['significant'] is False, (_bad_alpha, _t)
+        _g = L.loglog_regression([(1, 2), (2, 4), (4, 16)], alpha=_bad_alpha)
+        assert _g['status'] == 'invalid_options', (_bad_alpha, _g)
+    for _bad_floor in (True, np.bool_(False), 0, -1, 1.5, float('nan')):
+        _m = L.meta_analyze_effects(_pts, min_seeds=_bad_floor)
+        assert _m['status'] == 'invalid_options' and _m['poolable'] is False, (_bad_floor, _m)
+        _t = L.scaling_trend(_pts, min_seeds=_bad_floor)
+        assert _t['status'] == 'invalid_options' and _t['significant'] is False, (_bad_floor, _t)
+        _t2 = L.scaling_trend(_pts, min_points=_bad_floor)
+        assert _t2['status'] == 'invalid_options' and _t2['significant'] is False, (_bad_floor, _t2)
 
 
 def t_exact_signflip_baseline():
@@ -1345,6 +1386,16 @@ def t_finaltest_requires_parameter_matching():
                                       bylen_path=os.path.join(td, 'bylen.json'),
                                       probe_path=os.path.join(td, 'probe.json'),
                                       out=os.path.join(td, 'stats4.json'))
+            # A by-length n_seq is an exact positive count, not a boolean or a
+            # fractional value that int() would silently coerce.
+            _bad_ns = _records(params=1000, init='INIT')
+            for _r in _bad_ns.values():
+                _r['by_len']['4096']['n_seq'] = True
+            V12._admit_confirmation_records = lambda raw, man: (_bad_ns, None)
+            st5 = V12.finaltest_stats(manifest=manifest,
+                                      bylen_path=os.path.join(td, 'bylen.json'),
+                                      probe_path=os.path.join(td, 'probe.json'),
+                                      out=os.path.join(td, 'stats5.json'))
         finally:
             V12._admit_confirmation_records = _old_admit
             V12._test_probe_stats = _old_probe
@@ -1353,6 +1404,7 @@ def t_finaltest_requires_parameter_matching():
         assert st4['comparisons']['c1']['init_core_fp_recorded'] is False, st4['comparisons']['c1']
         assert st4['comparisons']['c1']['same_init_core_fp'] is False, st4['comparisons']['c1']
         assert st4['confirmed'] == [], st4['confirmed']
+        assert st5['by_length']['a_arm']['4096']['n_seqs'] is None, st5['by_length']['a_arm']['4096']
 
 
 def t_freeze_lock():
@@ -5491,6 +5543,20 @@ def t_scale_ladder_budget_and_transfer_audit():
     # S1/S2 allocation ratio rather than silently calling it matched.
     pol = L.SCALE_TRANSFER_POLICY
     assert pol.get('lr_transfer') and pol.get('tokens_per_param_tolerance') is not None, pol
+    # A malformed tolerance/family size would otherwise relax the budget gate
+    # (float(True)=1.0) or shrink the Holm family (int(True)=1).
+    for _bad_tol in (True, np.bool_(False), -0.1, float('nan')):
+        _out = L.scale_ladder_audit([a, b], tolerance=_bad_tol)
+        assert _out['status'] == 'fail', (_bad_tol, _out)
+        assert any('tolerance' in p for p in _out['problems']), (_bad_tol, _out)
+    for _bad_fm in (True, np.bool_(False), 1.5, '4', 0, -1):
+        _pol = dict(L.SCALE_TRANSFER_POLICY)
+        _pol['family_m'] = _bad_fm
+        _out = L.scale_ladder_audit([a, b], policy=_pol)
+        assert _out['status'] == 'fail', (_bad_fm, _out)
+        assert any('family_m' in p for p in _out['problems']), (_bad_fm, _out)
+    _out = L.scale_ladder_audit([a, b], policy=[1])
+    assert _out['status'] == 'fail' and any('policy' in p for p in _out['problems']), _out
 
 
 def t_init_core_fingerprint_and_pair_gate():
@@ -5855,6 +5921,11 @@ def t_efficiency_pairs_audit_and_sweep():
         r5 = A.audit_efficiency_pairs(outdirs=[td])
         rec5 = r5['panels'][td]['a vs b']
         assert rec5['speed_claim_allowed'] is False, rec5
+        # A boolean/NaN/negative tolerance would relax or destroy the timing
+        # claim gate; fail the audit instead of coercing it.
+        for _bad_tol in (True, np.bool_(False), -0.1, float('nan')):
+            _r = A.audit_efficiency_pairs(outdirs=[td], tolerance=_bad_tol)
+            assert _r['status'] == 'fail' and _r.get('problems'), (_bad_tol, _r)
     finally:
         shutil.rmtree(td, ignore_errors=True)
     L.set_seed(0)

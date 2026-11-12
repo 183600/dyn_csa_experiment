@@ -2075,9 +2075,26 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
     `pairs` may be a list of (arm_a, arm_b); by default every arm pair sharing
     a panel is reported (descriptive)."""
     import numpy as np
+    if isinstance(tolerance, (bool, np.bool_)):
+        return {'status': 'fail', 'panels': {}, 'claims_allowed': [], 'refused': [],
+                'tolerance': None,
+                'problems': [f'tolerance={tolerance!r} is a boolean flag, not a fraction'],
+                'note': 'measured prefill only; no KV cache in this model; analytic FLOPs are never substituted for timing'}
+    try:
+        tolerance = float(tolerance)
+    except (TypeError, ValueError, OverflowError):
+        return {'status': 'fail', 'panels': {}, 'claims_allowed': [], 'refused': [],
+                'tolerance': None,
+                'problems': [f'tolerance={tolerance!r} is not numeric'],
+                'note': 'measured prefill only; no KV cache in this model; analytic FLOPs are never substituted for timing'}
+    if not (math.isfinite(tolerance) and tolerance >= 0.0):
+        return {'status': 'fail', 'panels': {}, 'claims_allowed': [], 'refused': [],
+                'tolerance': None,
+                'problems': [f'tolerance={tolerance!r} must be a finite non-negative fraction'],
+                'note': 'measured prefill only; no KV cache in this model; analytic FLOPs are never substituted for timing'}
     dirs = outdirs or list(_iter_result_dirs())
     out = {'status': 'ok', 'panels': {}, 'claims_allowed': [], 'refused': [],
-           'tolerance': float(tolerance),
+           'tolerance': tolerance,
            'note': 'measured prefill only; no KV cache in this model; analytic FLOPs are never substituted for timing'}
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))

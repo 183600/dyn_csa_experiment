@@ -1763,7 +1763,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                                                   'ppl_pooled': _pooled, 'n_tokens': _n_tok,
                                                                   'n': len(_dl), 'ppl_by_seed': {str(s): p for s, p in _by_seed.items()}, 'params': next((L._as_seed_int(r.get('params')) for r in rows
                                                                      if L._as_seed_int(r.get('params')) is not None
-                                                                     and L._as_seed_int(r.get('params')) > 0), None), 'n_seqs': next((c.get('n_seq') for _r in rows for c in [((_r.get('by_len') or {}).get(Ln) or (_r.get('by_len') or {}).get(str(Ln)) or {})] if isinstance(c, dict) and c.get('n_seq') is not None), None)}
+                                                                     and L._as_seed_int(r.get('params')) > 0), None), 'n_seqs': next((_record_int(c.get('n_seq')) for _r in rows for c in [((_r.get('by_len') or {}).get(Ln) or (_r.get('by_len') or {}).get(str(Ln)) or {})] if isinstance(c, dict) and _record_int(c.get('n_seq')) is not None and _record_int(c.get('n_seq')) > 0), None)}
     for comp in manifest['primary_comparisons']:
         name = comp['name']
         a, b = (comp['a'], comp['b'])

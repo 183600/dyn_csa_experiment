@@ -159,14 +159,10 @@ def _finite_float(value):
     """Finite float for a real numeric measurement (None otherwise).
 
     Exact integers can exceed the binary64 range; such a value is not a
-    representable measurement and is treated as unusable."""
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float)):
-        return None
-    try:
-        f = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return f if math.isfinite(f) else None
+    representable measurement and is treated as unusable.  Delegating to the
+    shared scalar contract also accepts NumPy scalars and rejects booleans.
+    """
+    return L._finite_scalar(value)
 
 
 def _is_current(rec, fp):

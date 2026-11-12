@@ -482,6 +482,19 @@ def _valid_min_n(min_n):
     return n if n is not None and n > 0 else None
 
 
+# Bootstrap draws are materialised as float arrays, so an exact-but-enormous
+# count (e.g. a JSON integer above 2**53) must fail closed instead of raising
+# MemoryError halfway through a report build.
+_BOOTSTRAP_MAX_DRAWS = 10_000_000
+
+
+def _valid_bootstrap_count(n_boot, *, minimum=2):
+    n = _as_seed_int(n_boot)
+    if n is None or n < minimum or n > _BOOTSTRAP_MAX_DRAWS:
+        return None
+    return n
+
+
 def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     """Approximate 95% CI for PPL from per-DOCUMENT NLL (not per-token).
 
@@ -9532,11 +9545,11 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
         c = float(conf)
     except (TypeError, ValueError, OverflowError):
         return None
-    nb = _as_seed_int(n_boot)
+    nb = _valid_bootstrap_count(n_boot, minimum=20)
     sd = _as_seed_int(seed)
     if nb is None or sd is None or isinstance(conf, (bool, np.bool_)):
         return None
-    if nb < 20 or not (0.0 < c < 1.0):
+    if not (0.0 < c < 1.0):
         return None
     rng = np.random.default_rng(sd)
     means = np.empty(nb, dtype=float)
@@ -9559,9 +9572,9 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
     if d.size < 2:
         return None
     # Draws are generated in chunks.
-    nb = _as_seed_int(n_boot)
+    nb = _valid_bootstrap_count(n_boot, minimum=2)
     sd = _as_seed_int(seed)
-    if nb is None or sd is None or nb < 2:
+    if nb is None or sd is None:
         return None
     rng = np.random.default_rng(sd)
     means = np.empty(nb, dtype=float)
@@ -9579,9 +9592,9 @@ def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=2026
                     if f is not None], dtype=float)
     if a.size < 2 or b.size < 2:
         return None
-    nb = _as_seed_int(n_boot)
+    nb = _valid_bootstrap_count(n_boot, minimum=2)
     sd = _as_seed_int(seed)
-    if nb is None or sd is None or nb < 2:
+    if nb is None or sd is None:
         return None
     rng = np.random.default_rng(sd)
     diff = np.empty(nb, dtype=float)
@@ -10687,6 +10700,23 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     （I² 低、Q 的 p>=alpha）且点数足够时才把 pooled 当作「共同效应」；
     否则 `poolable=False`，pooled 只作描述性摘要，结论必须按规模分开报。
     """
+    _alpha = _valid_alpha01(alpha)
+    _min_seeds = _valid_min_n(min_seeds)
+    if _alpha is None or _min_seeds is None:
+        # The significance level and the per-scale seed floor decide whether a
+        # pooled estimate may be treated as an effect.  A boolean/fractional
+        # value must not be coerced into a permissive test (float(True)=1.0,
+        # int(4.9)=4); fail closed instead of producing a claim.
+        _alpha_display = _finite_scalar(alpha)
+        return {'alpha': (_alpha_display if _alpha_display is not None else float('nan')),
+                'min_seeds': (_min_seeds if _min_seeds is not None else 0),
+                'per_point': [], 'n_points': 0, 'n_usable': 0,
+                'corpus_binding': {}, 'poolable': False,
+                'status': 'invalid_options',
+                'note': ('alpha must be a finite number in (0,1) and min_seeds a '
+                         'positive exact integer; no pooled estimate is reported'),
+                'convention': 'input effects are scale-free; positive = with arm worse (higher PPL)'}
+    alpha, min_seeds = _alpha, _min_seeds
     pts = _scale_points(points)
     labels = [p['label'] for p in pts]
     if len(set(labels)) != len(labels):
@@ -10816,6 +10846,19 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
          并明确标注 `paired=False`（点间独立、不能利用配对降噪）。
     同时报告两点交互（最小 vs 最大规模）和异质性；异质性高时不得用单一
     斜率概括整个阶梯。"""
+    _alpha = _valid_alpha01(alpha)
+    _min_seeds = _valid_min_n(min_seeds)
+    _min_points = _valid_min_n(min_points)
+    if _alpha is None or _min_seeds is None or _min_points is None:
+        return {'alpha': float('nan'), 'min_seeds': _min_seeds or 0,
+                'min_points': _min_points or 0, 'n_points': 0, 'labels': [],
+                'scales': [], 'corpus_binding': {}, 'paired': {},
+                'significant': False, 'underpowered': True,
+                'resolution_limited': False, 'verdict': 'invalid_options',
+                'status': 'invalid_options',
+                'note': ('alpha must be a finite number in (0,1), min_seeds and '
+                         'min_points positive exact integers; no trend is reported')}
+    alpha, min_seeds, min_points = _alpha, _min_seeds, _min_points
     pts = _scale_points(points)
     pts = [p for p in pts if math.isfinite(p['scale']) and p['scale'] > 0.0 and p['effects']]
     pts.sort(key=lambda p: p['scale'])
@@ -11008,8 +11051,32 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
     unverifiable).  An allocation mismatch is a disclosure warning (a scale
     study may deliberately change allocation), never a silent "matched" claim.
     """
-    policy = dict(SCALE_TRANSFER_POLICY if policy is None else policy)
-    tol = float(policy.get('tokens_per_param_tolerance', 0.25) if tolerance is None else tolerance)
+    problems, warnings, rows = [], [], []
+    if policy is None:
+        policy = dict(SCALE_TRANSFER_POLICY)
+    elif not isinstance(policy, dict):
+        problems.append(
+            f'policy is {type(policy).__name__}, not an object — the declared '
+            'transfer assumptions cannot be audited; using the shipped defaults')
+        policy = dict(SCALE_TRANSFER_POLICY)
+    else:
+        policy = dict(policy)
+    _tol_raw = (policy.get('tokens_per_param_tolerance', 0.25)
+                if tolerance is None else tolerance)
+    if isinstance(_tol_raw, (bool, np.bool_)):
+        problems.append(f'tolerance={_tol_raw!r} is a boolean flag, not a fraction')
+        tol = 0.0
+    else:
+        try:
+            tol = float(_tol_raw)
+        except (TypeError, ValueError, OverflowError):
+            problems.append(f'tolerance={_tol_raw!r} is not numeric')
+            tol = 0.0
+        else:
+            if not math.isfinite(tol) or tol < 0.0:
+                problems.append(
+                    f'tolerance={_tol_raw!r} must be a finite non-negative fraction')
+                tol = 0.0
 
     def _safe_ratio(num, den):
         if not den:
@@ -11034,7 +11101,15 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             return int(as_float)
         raise ValueError(f'{label} must be an integer, got {value!r}')
 
-    problems, warnings, rows = [], [], []
+    try:
+        family_m = _as_int(policy.get('family_m', 4), 'family_m')
+    except (TypeError, ValueError, OverflowError):
+        problems.append(
+            f"policy.family_m={policy.get('family_m')!r} is not an exact integer")
+        family_m = 4
+    if family_m <= 0:
+        problems.append(f'policy.family_m={family_m} must be positive')
+        family_m = 4
     for i, tier in enumerate(tiers or []):
         if not isinstance(tier, dict):
             problems.append(f'tier #{i} is not a dict')
@@ -11123,7 +11198,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             'warmup_fraction': _safe_ratio(warmup, steps),
             'n_seeds': len(set(seeds)),
             'p_floor': signflip_p_floor(len(set(seeds))),
-            'min_seeds_for_family_significance': signflip_min_n_for_holm(int(policy.get('family_m', 4)), 0.05),
+            'min_seeds_for_family_significance': signflip_min_n_for_holm(family_m, 0.05),
         })
         if params is None:
             warnings.append(f'{name}: params missing — tokens-per-parameter and allocation matching are unverifiable')
@@ -11229,6 +11304,13 @@ def loglog_regression(points, *, alpha=0.05):
     t 区间与双侧 p；k=2 时直线是恒等拟合，只报斜率并显式标注「无残差
     自由度、无 R²」。x 本身的测量误差未计入（观测性拟合，不是因果估计）。
     """
+    _alpha = _valid_alpha01(alpha)
+    if _alpha is None:
+        return {'alpha': float('nan'), 'n_points': 0, 'labels': [],
+                'status': 'invalid_options',
+                'note': ('alpha must be a finite number in (0,1); no fit is reported'),
+                'fit_alpha_note': 'observational log-log fit; x measurement error is not modelled'}
+    alpha = _alpha
     rows = []
     for i, p in enumerate(points if points is not None else []):
         if isinstance(p, dict):
@@ -19408,14 +19490,22 @@ def _pooled_ppl_from_records(recs):
     return _safe_exp_ppl(_pooled_ce), total_n, _total_t_int
 
 def _seed_t_ci(ppls, alpha=0.05):
-    n = len(ppls)
+    _alpha = _valid_alpha01(alpha)
+    if _alpha is None:
+        return None
+    v = np.asarray([f for f in (_finite_scalar(x) for x in
+                                (ppls if ppls is not None else []))
+                    if f is not None], dtype=float)
+    n = int(v.size)
     if n < 2:
         return None
-    mu = float(np.mean(ppls))
-    sd = float(np.std(ppls, ddof=1))
+    mu = float(v.mean())
+    sd = float(v.std(ddof=1))
     try:
-        tc = _t_critical(1.0 - alpha, n - 1)
+        tc = _t_critical(1.0 - _alpha, n - 1)
     except Exception:
+        return None
+    if not math.isfinite(tc):
         return None
     half = tc * sd / math.sqrt(n)
     return [mu - half, mu + half]
@@ -19429,6 +19519,11 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     missing-evidence state rather than a narrow interval computed from the
     wrong unit.
     """
+    _n_boot = _valid_bootstrap_count(n_boot, minimum=2)
+    _seed = _as_seed_int(seed)
+    if _n_boot is None or _seed is None:
+        return None
+    n_boot, seed = _n_boot, _seed
     rows = []
     for r in (recs if recs is not None else []):
         if not isinstance(r, dict):
@@ -19506,6 +19601,11 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     component is never silently treated as zero."""
     _recs = list(recs) if recs is not None else []
     _conf = _valid_alpha01(conf)
+    _n_boot = _valid_bootstrap_count(n_boot, minimum=2)
+    _seed = _as_seed_int(seed)
+    _bad_boot = _n_boot is None or _seed is None
+    if not _bad_boot:
+        n_boot, seed = _n_boot, _seed
     rows = []
     for r in _recs:
         if not isinstance(r, dict):
@@ -19550,6 +19650,11 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         out['status'] = 'invalid_options'
         out['note'] = ('conf must be a finite significance level in (0,1); '
                        'no interval is reported')
+        return out
+    if _bad_boot:
+        out['status'] = 'invalid_options'
+        out['note'] = ('n_boot must be an exact integer >= 2 and seed an exact '
+                       'integer; no interval is reported')
         return out
     S = len(_recs)
     if S < 1:
