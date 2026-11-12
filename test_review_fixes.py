@@ -2410,6 +2410,32 @@ def t_ids_fp_is_storage_width_invariant():
             del mm
 
 
+def t_audit_sidecar_fp_matches_exp_lib():
+    # The zero-GPU audit keeps a torch-free copy of the id fingerprint.  It
+    # must stay byte-identical to exp_lib._ids_fp for every integer storage
+    # width; otherwise a sidecar written by the loader (canonical int64) is
+    # reported as corrupt merely because the cache stored it as int32/uint16.
+    for value in (0, 1, 255, 70000):
+        fps = set()
+        for dt in (np.int8, np.uint8, np.int16, np.uint16,
+                   np.int32, np.uint32, np.int64, np.uint64):
+            try:
+                arr = np.array([value], dtype=dt)
+            except (OverflowError, ValueError):
+                continue
+            a = A._sidecar_fp(arr)
+            b = L._ids_fp(arr)
+            assert a == b, (value, np.dtype(dt).name, a, b)
+            fps.add(a)
+        assert len(fps) == 1, (value, fps)
+    # uint64 ids above int64's range must stay exact and match the loader.
+    hi = np.array([2 ** 63 + 1], dtype=np.uint64)
+    hi2 = np.array([2 ** 63 + 2], dtype=np.uint64)
+    assert A._sidecar_fp(hi) == L._ids_fp(hi)
+    assert A._sidecar_fp(hi2) == L._ids_fp(hi2)
+    assert A._sidecar_fp(hi) != A._sidecar_fp(hi2)
+
+
 def t_data_version_identity():
     cfg = {'dataset': 'unit', 'n_train_tokens': 512, 'seq_len': 32, 'cache_dir': './unit_cache'}
     tr = np.arange(512, dtype=np.int64) % 97
@@ -6018,6 +6044,7 @@ def main():
     _check('L13b global audit fail-closed rules', t_global_multiplicity_audit_fail_closed)
     _check('L13c build_report twin matches exp_lib audit', t_global_multiplicity_twin_consistency)
     _check('L13d report registers every displayed comparison', t_build_report_global_multiplicity_section)
+    _check('L13e audit sidecar fingerprint matches exp_lib across storage widths', t_audit_sidecar_fp_matches_exp_lib)
     _check('L14 combined seed x document uncertainty interval', t_combined_seed_doc_uncertainty)
     _check('L15 cross-scale pooling refuses mixed corpus/tokenizer bindings', t_scale_corpus_binding_refuses_mixed_tokenizers)
     _check('L15b scale-point corpus provenance roundtrip', t_scale_point_provenance_roundtrip)

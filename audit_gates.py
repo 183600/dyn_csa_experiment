@@ -549,22 +549,30 @@ def _window_hashes(values, width):
 def _sidecar_fp(arr):
     """Content fingerprint for a document-id sidecar.
 
-    Mirrors ``exp_lib._ids_fp`` for the integer arrays the loaders persist as
-    sidecars (uint8/uint16 are widened to int32; wider dtypes are hashed as
-    stored).  Keeping the same digest here lets the zero-GPU audit compare a
-    sidecar against the fingerprint recorded at build time without importing
-    the torch-backed experiment library.
+    Mirrors ``exp_lib._ids_fp`` exactly: every integer storage width is hashed
+    through one canonical int64 form (uint64 only when a value exceeds int64),
+    so the same document ids keep one digest whether a sidecar was stored as
+    uint8/uint16/int32/int64.  Keeping the same digest here lets the zero-GPU
+    audit compare a sidecar against the fingerprint recorded at build time
+    without importing the torch-backed experiment library.  A width-dependent
+    hash would make a valid cache look corrupted (or, worse, let two different
+    id arrays collide) after a storage-only rebuild.
     """
     import hashlib
     import numpy as np
     h = hashlib.sha256()
     a = np.asarray(arr)
-    _widen = a.dtype in (np.dtype(np.uint8), np.dtype(np.uint16))
+    _canon = None
+    if np.issubdtype(a.dtype, np.integer):
+        _canon = np.dtype(np.int64)
+        if (a.dtype == np.dtype(np.uint64) and a.size
+                and int(a.max()) > np.iinfo(np.int64).max):
+            _canon = np.dtype(np.uint64)
     step = 1 << 24
     for off in range(0, len(a), step):
         part = a[off:off + step]
-        if _widen:
-            part = part.astype(np.int32, copy=False)
+        if _canon is not None and part.dtype != _canon:
+            part = part.astype(_canon, copy=False)
         elif not part.flags.c_contiguous:
             part = np.ascontiguousarray(part)
         h.update(memoryview(part).cast('B'))
