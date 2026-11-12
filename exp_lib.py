@@ -7975,9 +7975,8 @@ def load_run_corpus(cfg):
     """Serve the corpus tuple for a run cfg (data-source switch).
 
     A cfg without a 'dataset' key keeps WikiText-103 with exactly the arguments
-    the drivers have always passed — behaviour is bit-identical to the former
-    hard-wired load_wikitext call, so no existing panel, fingerprint or record
-    is touched.  'dataset': 'fineweb' selects the B-tier corpus
+    the drivers pass, so the resulting panel, fingerprint and record are
+    unchanged.  'dataset': 'fineweb' selects the B-tier corpus
     with its own cache directory, tokenizer width,
     source name and fit protocol."""
     name = cfg.get('dataset') or 'wikitext'
@@ -16015,13 +16014,11 @@ def prefix_stats_summary(attn, seq_len=None):
     return None
 
 class _BlockStats:
-    """Incremental replacement for the per-sequence bincount list.
+    """Running pooled statistics over block lengths.
 
     compression_report only needs the pooled mean/std/min/max/fractions over
     block lengths.  Each append folds the integer counts into running moments;
-    values are accumulated in float64 so the
-    pooled statistics are at least as accurate as the concatenated float32
-    form."""
+    values are accumulated in float64."""
 
     def __init__(self, min_block=None, max_block=None, position_capacity=None):
         self.min_block = min_block
@@ -16943,9 +16940,8 @@ _CURVE_SIDECAR_INLINE_PPL = 4096
 
 def _curve_sidecar_rel(key):
     # The readable prefix is for humans; the digest makes the mapping
-    # injective.  Replacing every unsafe character with '_' alone collided
-    # (a#1 and a@1 both became a_1), letting one cell overwrite another's
-    # curves.
+    # injective (a#1 and a@1 would both become a_1), so one cell cannot
+    # overwrite another's curves.
     safe = ''.join(ch if (ch.isalnum() or ch in '._:-') else '_' for ch in str(key))
     digest = hashlib.sha1(str(key).encode('utf-8')).hexdigest()[:16]
     return f'curves/{safe}-{digest}.json'

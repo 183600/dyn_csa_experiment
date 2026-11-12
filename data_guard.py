@@ -1653,9 +1653,9 @@ def _matrix_fingerprint(X):
                     h.update(np.ascontiguousarray(_blk < 0, dtype=np.uint8).tobytes())
         else:
             block = np.asarray(_blk, dtype=np.float64)
-            # `-0.0 == 0.0` but their byte patterns differ.  The duplicate
-            # detector already canonicalises the sign of zero; the content
-            # fingerprint must do the same so a cache round-trip through a
+            # `-0.0 == 0.0` but their byte patterns differ.  The content
+            # fingerprint canonicalises the sign of zero, matching the
+            # duplicate detector, so a cache round-trip through a
             # representation that normalises signed zero does not make the
             # same logical table look like a different corpus.
             if np.any(block == 0.0):
