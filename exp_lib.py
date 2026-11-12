@@ -443,6 +443,45 @@ def _finite_scalar(v):
     return f if math.isfinite(f) else None
 
 
+def _exact_count_float(v):
+    """Non-negative integer count as an exactly representable float, else None.
+
+    Token counts are exact integers.  A count above 2**53 cannot be stored in
+    a float without rounding (2**53+1 silently becomes 2**53), and a count
+    above the float range cannot be stored at all; both would corrupt the
+    pooled denominator instead of failing closed.  Python integers beyond the
+    float range are also rejected here because the downstream reductions are
+    binary64.
+    """
+    n = _as_seed_int(v)
+    if n is None or n < 0:
+        return None
+    try:
+        f = float(n)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(f) or int(f) != n:
+        return None
+    return f
+
+
+def _valid_alpha01(alpha):
+    """Significance level in (0,1), or None for a malformed/boolean value."""
+    if isinstance(alpha, (bool, np.bool_)):
+        return None
+    try:
+        a = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return a if (math.isfinite(a) and 0.0 < a < 1.0) else None
+
+
+def _valid_min_n(min_n):
+    """Positive exact integer seed-count floor, or None."""
+    n = _as_seed_int(min_n)
+    return n if n is not None and n > 0 else None
+
+
 def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     """Approximate 95% CI for PPL from per-DOCUMENT NLL (not per-token).
 
@@ -492,7 +531,15 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
         except OverflowError:
             doc_ce.append(0.0)
     if len(doc_ce) < 2 or total_tok <= 0:
-        return {'ppl': (_safe_exp_ppl(total_nll / total_tok) if total_tok else None),
+        _early_ce = None
+        if total_tok:
+            try:
+                _early_ce = total_nll / total_tok
+            except OverflowError:
+                # An exact token total beyond the binary64 range underflows
+                # the pooled cross-entropy to zero rather than crashing.
+                _early_ce = 0.0
+        return {'ppl': (_safe_exp_ppl(_early_ce) if _early_ce is not None else None),
                 'doc_ce_mean': None, 'doc_ce_sem': None,
                 'ppl_ci95_low': None, 'ppl_ci95_high': None, 'n_docs': len(doc_ce)}
     mean = sum(doc_ce) / len(doc_ce)
@@ -5616,10 +5663,13 @@ def _cache_file_sigs_match(meta, sigs):
         _got = rec.get(_k)
         if not isinstance(_got, (list, tuple)) or len(_got) != len(_v):
             return False
-        # Compare each recorded signature field as an exact integer; nanosecond
-        # timestamps and inodes can exceed 2**53.
-        if any(_as_seed_int(a) != int(b) for a, b in zip(_got, _v)):
-            return False
+        # Compare each signature field as an exact integer on BOTH sides;
+        # nanosecond timestamps and inodes can exceed 2**53, while a
+        # boolean/fractional expected field is malformed, not an identity.
+        for a, b in zip(_got, _v):
+            _ai, _bi = _as_seed_int(a), _as_seed_int(b)
+            if _ai is None or _bi is None or _ai != _bi:
+                return False
     return True
 
 
@@ -5771,8 +5821,8 @@ def _meta_declares_shuffle(value):
     """
     if value is None:
         return False
-    if isinstance(value, bool):
-        return value
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
     return True
 
 
@@ -8951,8 +9001,14 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     over-claiming but cannot turn validation-selected v7-v11 panels into
     pre-registered confirmation (design_notes §17).
     """
+    if comparisons is None:
+        comparisons = {}
+    if not isinstance(comparisons, dict):
+        raise ValueError(
+            f'attach_holm needs a comparisons object (name -> record), got '
+            f'{type(comparisons).__name__}')
     pairs, omitted, tested = [], [], 0
-    for k, v in (comparisons or {}).items():
+    for k, v in comparisons.items():
         if not isinstance(v, dict):
             pairs.append((str(k), 1.0))
             omitted.append(str(k))
@@ -8982,7 +9038,7 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         else:
             pairs.append((str(k), 1.0))
     h = holm_adjust(pairs, alpha=alpha) if pairs else {}
-    for k, v in (comparisons or {}).items():
+    for k, v in comparisons.items():
         if isinstance(v, dict):
             v['p_holm'] = (h.get(str(k)) or {}).get('p_holm')
     # Family-level resolution ceiling: with m declared slots and n seeds the
@@ -8992,7 +9048,7 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     # instead of leaving the reader to infer that the effect is null.
     _ns = []
     _ns_floor = []
-    for v in (comparisons or {}).values():
+    for v in comparisons.values():
         if not isinstance(v, dict):
             continue
         # A boolean/fractional n is not a seed count; int(True)=1 or
@@ -9007,7 +9063,7 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         _nn = _as_seed_int(v.get('n_nonzero')) if v.get('n_nonzero') is not None else _n
         if _nn is not None and 0 <= _nn <= (_n if _n is not None else _nn):
             _ns_floor.append(_nn)
-    _m = int(len(comparisons or {}))
+    _m = int(len(comparisons))
     # The family's smallest attainable raw p is min_i 2/2**n_i, which is set
     # by the LARGEST seed count in the family (more seeds -> finer p grid).
     # Using the smallest n here overstated the floor and could call a family
@@ -9209,7 +9265,10 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
         elif isinstance(family_size, numbers.Integral):
             _fs = int(family_size)
         elif isinstance(family_size, numbers.Real):
-            _f = float(family_size)
+            try:
+                _f = float(family_size)
+            except (TypeError, ValueError, OverflowError):
+                _f = float('nan')
             if (math.isfinite(_f) and _f == math.floor(_f)
                     and abs(_f) < 2 ** 53):
                 _fs = int(_f)
@@ -9634,6 +9693,18 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     n = int(d.size)
     if n == 0:
         return {'n': 0, 'n_nonzero': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None}
+    # The significance level and the seed-count floor are part of the test
+    # contract.  Booleans, non-finite values and fractional counts fail closed
+    # (no effect may be called significant) instead of being coerced by
+    # float()/int() into a permissive level.
+    _alpha = _valid_alpha01(alpha)
+    _min_n = _valid_min_n(min_n)
+    _bad_options = _alpha is None or _min_n is None
+    if _alpha is None:
+        _alpha = float('nan')
+    if _min_n is None:
+        # Force the underpowered branch without trying int(nan).
+        _min_n = n + 1
     mean = float(d.mean())
     std = float(d.std(ddof=1)) if n > 1 else 0.0
     sem = float(std / math.sqrt(n)) if n > 1 else float('nan')
@@ -9652,10 +9723,11 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     # the floor and labels a resolution-limited panel as decidable.
     n_nonzero = int(np.count_nonzero(d))
     p_floor = signflip_p_floor(n_nonzero)
-    underpowered = n < int(min_n)
-    resolution_limited = bool(math.isfinite(p_floor) and p_floor > alpha)
+    underpowered = n < _min_n
+    resolution_limited = bool(math.isfinite(p_floor) and p_floor > _alpha)
     within_seed_noise = abs(mean) <= std
-    significant = bool(math.isfinite(p) and p < alpha and (not within_seed_noise))
+    significant = bool((not _bad_options) and math.isfinite(p)
+                       and p < _alpha and (not within_seed_noise))
     # Two-sided 95% CI on the paired mean (t interval; the normal approximation
     # is intentionally avoided at the 3-5 seed counts this repo reports).
     ci_lo = ci_hi = float('nan')
@@ -9674,16 +9746,18 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
             _full_sign = 1.0 if mean > 0 else -1.0
             seed_driven = any((_m == 0.0) or ((_m > 0) != (_full_sign > 0)) for _m in loo_means)
     seed_robust = None if seed_driven is None else (not seed_driven)
-    if underpowered:
-        verdict = 'underpowered (n<%d)' % int(min_n)
+    if _bad_options:
+        verdict = 'invalid test options (alpha must be in (0,1) and min_n a positive exact integer); no significance claim is made'
+    elif underpowered:
+        verdict = 'underpowered (n<%d)' % _min_n
     elif within_seed_noise:
         verdict = 'effect within seed noise (|mean|<=std)'
     elif significant:
-        verdict = 'effect exceeds seed noise (p<%.3g)' % alpha
+        verdict = 'effect exceeds seed noise (p<%.3g)' % _alpha
     elif resolution_limited:
         verdict = 'not decidable at this n: exact-test p floor %.4g > alpha (add seeds to resolve; this is a resolution ceiling, not a null result)' % p_floor
     else:
-        verdict = 'not significant at this n (p>=%.3g)' % alpha
+        verdict = 'not significant at this n (p>=%.3g)' % _alpha
     if seed_driven:
         verdict += ' | UNSTABLE: dropping one seed flips the mean sign'
     # Robustness readouts: the exact sign-flip test is a
@@ -10717,9 +10791,12 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
             diff.append(fy - fx)
             kept.append(s)
     st = paired_effect_stats(diff, alpha=alpha, min_n=min_n)
+    _min_label = _valid_min_n(min_n)
     st.update({'low_label': str(low_label), 'high_label': str(high_label), 'seeds': kept,
                'convention': 'delta = effect_high - effect_low; positive = effect is larger at the higher scale',
-               'claim_level': 'confirmatory only if n>=%d and p_floor<alpha' % int(min_n)})
+               'claim_level': ('confirmatory only if n>=%d and p_floor<alpha' % _min_label
+                               if _min_label is not None else
+                               'no claim: min_n is not a positive exact integer')})
     return st
 
 
@@ -11769,12 +11846,24 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     unigram model, never by the previous row's last token.  The effect size is
     token-weighted, matching the LM metric policy."""
     ids = np.asarray(train_ids, dtype=np.int64).ravel()
-    vocab_size = int(vocab_size)
-    alpha = float(alpha)
-    if alpha <= 0:
-        raise ValueError('alpha must be positive')
-    if order not in (1, 2):
+    # The vocabulary is an exact positive count, not a boolean/fractional
+    # coercion target.
+    _vocab = _as_seed_int(vocab_size)
+    if _vocab is None or _vocab <= 0:
+        raise ValueError(f'vocab_size must be a positive integer, got {vocab_size!r}')
+    vocab_size = _vocab
+    if isinstance(alpha, (bool, np.bool_)):
+        raise ValueError(f'alpha must be a finite positive number, got {alpha!r}')
+    try:
+        alpha = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'alpha must be a finite positive number, got {alpha!r}') from None
+    if not (math.isfinite(alpha) and alpha > 0):
+        raise ValueError('alpha must be positive and finite')
+    _order = _as_seed_int(order)
+    if _order not in (1, 2):
         raise ValueError('order must be 1 (unigram) or 2 (bigram)')
+    order = _order
     all_eval, prev, nxt = _ngram_eval_parts(eval_ids)
     if all_eval.size == 0:
         return {'order': int(order), 'alpha': alpha, 'interpolation': float(interpolation),
@@ -11794,8 +11883,13 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
         return {'order': 1, 'alpha': alpha, 'interpolation': 0.0,
                 'n_tokens': int(all_eval.size), 'nll': nll, 'ppl': float(_safe_exp_ppl(nll))}
     _uni, uniq, ctx, pair_counts = counts
-    lam = float(interpolation)
-    if not (0.0 <= lam <= 1.0):
+    if isinstance(interpolation, (bool, np.bool_)):
+        raise ValueError(f'interpolation must be a finite number in [0, 1], got {interpolation!r}')
+    try:
+        lam = float(interpolation)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'interpolation must be a finite number in [0, 1], got {interpolation!r}') from None
+    if not (math.isfinite(lam) and 0.0 <= lam <= 1.0):
         raise ValueError('interpolation must be in [0, 1]')
     # First token of each row: unigram only (no cross-row conditioning).  A
     # 1-D evaluation stream is ONE row, so only its first token is
@@ -12134,9 +12228,13 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
     Direction `predicted_sign=0` is legal for an exploratory "difference
     exists" hypothesis, but it can never support a directional superiority
     claim; such components are listed separately as direction_unspecified."""
+    _bad_table = table is not None and not isinstance(table, dict)
     if table is None:
         table = HYPOTHESIS_DESIGN if kind == 'component' else BASELINE_HYPOTHESIS_DESIGN
-    policy = METRIC_POLICY if policy is None else policy
+    elif _bad_table:
+        table = {}
+    _bad_policy = policy is not None and not isinstance(policy, dict)
+    policy = METRIC_POLICY if policy is None else ({} if _bad_policy else policy)
     allowed = set()
     for p in policy.values():
         for key in ('primary', 'secondary'):
@@ -12149,6 +12247,14 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
     out = {'status': 'ok', 'kind': kind, 'hypotheses': {},
            'invalid': [], 'metric_unknown': [], 'direction_unspecified': [],
            'warnings': []}
+    if _bad_table:
+        out['warnings'].append(
+            f'hypothesis table is {type(table).__name__}, not an object — '
+            'the pre-registration cannot be audited')
+    if _bad_policy:
+        out['warnings'].append(
+            f'metric policy is {type(policy).__name__}, not an object — metric '
+            'alignment cannot be audited')
     for name in sorted(wanted):
         spec = table.get(name)
         if not isinstance(spec, dict):
@@ -12397,9 +12503,19 @@ def metric_policy_audit(summary=None, policy=None):
     needed to interpret them (precision/recall plus random baseline for
     boundaries; answer NLL for retrieval; PR-AUC alongside ROC-AUC for rare
     positives)."""
-    policy = METRIC_POLICY if policy is None else policy
     out = {'status': 'ok', 'policies': {}, 'checks': [], 'warnings': []}
+    if policy is None:
+        policy = METRIC_POLICY
+    elif not isinstance(policy, dict):
+        out['warnings'].append(
+            f'metric policy is {type(policy).__name__}, not an object — the '
+            'declared contract cannot be audited')
+        policy = {}
     for name, p in policy.items():
+        if not isinstance(p, dict):
+            out['policies'][name] = {'complete': False}
+            out['warnings'].append(f'metric policy `{name}` is not an object')
+            continue
         missing = [k for k in ('task', 'primary', 'direction', 'aggregation', 'imbalance') if not p.get(k)]
         primary = str(p.get('primary') or '')
         if primary.startswith('f1') and not p.get('primary_average'):
@@ -12411,6 +12527,11 @@ def metric_policy_audit(summary=None, policy=None):
                                  'complete': not missing}
         if missing:
             out['warnings'].append(f'metric policy `{name}` is missing {missing}')
+    if summary is not None and not isinstance(summary, dict):
+        out['warnings'].append(
+            f'summary is {type(summary).__name__}, not an object — record-level '
+            'metric checks were skipped')
+        summary = None
     if summary:
         recs = [r for r in summary.values() if isinstance(r, dict)]
         lm = [r for r in recs if ppl_is_usable(r.get('ppl'))]
@@ -13642,6 +13763,10 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
 
     Returns the report dict and, when `outdir` is given, writes
     `methodology_audit.json`."""
+    if not isinstance(summary, dict):
+        raise ValueError(
+            f'methodology_audit needs a summary object (variant/cell -> record), '
+            f'got {type(summary).__name__}; a list/scalar cannot be audited as a panel')
     default_design = design is None
     design = ABLATION_DESIGN if design is None else design
     recs, amb = _variant_seed_map(summary)
@@ -19305,15 +19430,17 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     wrong unit.
     """
     rows = []
-    for r in recs:
+    for r in (recs if recs is not None else []):
+        if not isinstance(r, dict):
+            return None
         nll = r.get('nll_per_row')
         ntok = r.get('n_tokens_per_row')
         if not isinstance(nll, list) or not isinstance(ntok, list) or len(nll) != len(ntok) or not nll:
             return None
         _nll, _ntok = [], []
         for _a, _b in zip(nll, ntok):
-            _fa, _fb = _finite_scalar(_a), _finite_scalar(_b)
-            if (_fa is None or _fb is None or _fa < 0.0 or _fb < 0.0 or _fb != math.floor(_fb)):
+            _fa, _fb = _finite_scalar(_a), _exact_count_float(_b)
+            if (_fa is None or _fb is None or _fa < 0.0):
                 return None
             _nll.append(_fa)
             _ntok.append(_fb)
@@ -19377,8 +19504,13 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     component is unmeasurable (S<2, records without per-row NLL, or fewer
     than two scored documents) the status says so explicitly and the missing
     component is never silently treated as zero."""
+    _recs = list(recs) if recs is not None else []
+    _conf = _valid_alpha01(conf)
     rows = []
-    for r in recs:
+    for r in _recs:
+        if not isinstance(r, dict):
+            rows = None
+            break
         nll = r.get('nll_per_row')
         ntok = r.get('n_tokens_per_row')
         if not isinstance(nll, list) or not isinstance(ntok, list) or len(nll) != len(ntok) or not nll:
@@ -19386,8 +19518,8 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
             break
         _nll, _ntok = [], []
         for _a, _b in zip(nll, ntok):
-            _fa, _fb = _finite_scalar(_a), _finite_scalar(_b)
-            if (_fa is None or _fb is None or _fa < 0.0 or _fb < 0.0 or _fb != math.floor(_fb)):
+            _fa, _fb = _finite_scalar(_a), _exact_count_float(_b)
+            if (_fa is None or _fb is None or _fa < 0.0):
                 rows = None
                 break
             _nll.append(_fa)
@@ -19407,13 +19539,19 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         ntok_mat = ntok_mat[:, keep]
         if not np.isfinite(nll_mat).all() or not np.isfinite(ntok_mat).all() or (ntok_mat < 0).any():
             rows = None
-    out = {'status': 'unverifiable', 'n_seeds': len(recs), 'n_docs': None,
+    out = {'status': 'unverifiable', 'n_seeds': len(_recs), 'n_docs': None,
            'n_docs_dropped_zero_token': None,
            'se_seed_logppl': None, 'se_doc_logppl': None,
            'se_combined_logppl': None, 'ci95_ppl': None,
-           'component_ratio_seed_over_doc': None, 'conf': float(conf),
+           'component_ratio_seed_over_doc': None,
+           'conf': (_conf if _conf is not None else float('nan')),
            'method': 'two-source variance combination on log-PPL (seed training noise x evaluation-document bootstrap); approximation, not a fitted hierarchical model'}
-    S = len(recs)
+    if _conf is None:
+        out['status'] = 'invalid_options'
+        out['note'] = ('conf must be a finite significance level in (0,1); '
+                       'no interval is reported')
+        return out
+    S = len(_recs)
     if S < 1:
         return out
     # Seed-level component: per-seed pooled PPL over the SAME doc set.
@@ -19481,7 +19619,7 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     if se_d > 0:
         out['component_ratio_seed_over_doc'] = float(se_s / se_d)
     try:
-        tc = _t_critical(float(conf), S - 1)
+        tc = _t_critical(_conf, S - 1)
     except Exception:
         tc = None
     if tc is not None and math.isfinite(tc):
@@ -19648,7 +19786,8 @@ def aggregate(summary):
                  'ppl_mean_arithmetic': float(ppls.mean()),
                  'ppl_std': float(ppls.std(ddof=1)) if len(ppls) > 1 else 0.0,
                  'ppls': [float(p) for p in ppls], 'seeds': [r.get('seed') for r in recs],
-                 'params': _group_params(recs), 'tokens_seen': recs[0].get('tokens_seen'),
+                 'params': _group_params(recs),
+                 'tokens_seen': _as_seed_int(recs[0].get('tokens_seen')),
                  'ppl_median': _med, 'ppl_iqr': [_q1, _q3],
                  'ppl_ci95_seed_t': _seed_t_ci(ppls),
                  'nll_sum': _nll_total, 'n_tokens': _ntok_total,
@@ -19679,7 +19818,10 @@ def aggregate(summary):
             return _finite_scalar(layer.get(k))
         for r in recs:
             r_f1, r_ex, r_dl = ([], [], [])
-            for lk, lv in r.get('stats', {}).items():
+            _stats = r.get('stats')
+            if not isinstance(_stats, dict):
+                continue
+            for lk, lv in _stats.items():
                 if not isinstance(lv, dict):
                     continue
                 lm = _cell(lv, 'len_mean')
@@ -19786,10 +19928,16 @@ def aggregate(summary):
             entry['_group_records'] = recs
         rates = []
         for r in recs:
-            _ts = _finite_scalar(r.get('tokens_seen'))
-            _st = _finite_scalar(r.get('steps'))
-            if _ts is not None and _st is not None and _st > 0.0:
+            # Training counts are exact integers; a boolean/fractional value
+            # is corrupted bookkeeping, not a rate measurement.
+            _ts = _as_seed_int(r.get('tokens_seen'))
+            _st = _as_seed_int(r.get('steps'))
+            if _ts is None or _st is None or _ts <= 0 or _st <= 0:
+                continue
+            try:
                 rates.append(_ts / _st)
+            except OverflowError:
+                continue
         if rates:
             entry['tokens_per_step'] = float(np.mean(rates))
     _full_groups = {(tag, fp_idx): recs for (v, tag, fp_idx), recs in _split_groups if v == 'full'}

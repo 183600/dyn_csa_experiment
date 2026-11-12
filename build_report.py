@@ -1045,7 +1045,10 @@ def sec_p1t():
                 # A stale record's block count must not set the displayed
                 # selection rate for a current aggregate row.
                 continue
-            for _e in (_r.get('stats') or {}).values():
+            _stats = _r.get('stats')
+            if not isinstance(_stats, dict):
+                continue
+            for _e in _stats.values():
                 if not isinstance(_e, dict):
                     continue
                 _b = _e.get('blocks')
@@ -1435,10 +1438,12 @@ def _agg_entry(d, v):
 def _agg_entry_scan(d, v):
     if v in d:
         e = d[v]
+        if not isinstance(e, dict):
+            return None
         # A single entry that *does* carry a run_cfg must be
         # stamped with the current code semantics; quoting it otherwise would
         # put a stale number in a main table without any visible marker.
-        rc = e.get('run_cfg') if isinstance(e, dict) else None
+        rc = e.get('run_cfg')
         if isinstance(rc, str) and bool(_CUR_CS) and not rc.endswith(f'_cs{_CUR_CS}'):
             print(f'[report] _agg_entry: `{v}` carries run_cfg `{rc[-24:]}` which does not end in the current code stamp `_cs{_CUR_CS}` — REFUSED (stale aggregate; re-run the panel)')
             return None

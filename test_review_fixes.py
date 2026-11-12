@@ -211,6 +211,75 @@ def t_scale_robustness_edges():
         [{'nll_sum': 100.0, 'n_tokens': _huge_tok},
          {'nll_sum': 100.0, 'n_tokens': _huge_tok}])
     assert _ppl == 1.0 and _ntok == 2 * _huge_tok, (_ppl, _nll, _ntok)
+    # The short-panel branch of the per-document CI must also survive a token
+    # total beyond binary64 (it used to divide a huge int and raise).
+    _early = L._nll_doc_ci([100.0], [_huge_tok])
+    assert _early['n_docs'] == 1 and _early['ppl'] == 1.0, _early
+    # Per-row token counts are exact: a value that rounds through float64
+    # (2**53+1) must not silently become a different denominator.
+    _row = [{'variant': 'csa', 'seed': s, 'ppl': 10.0,
+             'nll_per_row': [1.0, 1.0],
+             'n_tokens_per_row': [2 ** 53 + 1, 2 ** 53 + 1]} for s in range(3)]
+    assert L._doc_bootstrap_ppl_ci(_row, n_boot=20) is None
+    assert L._combined_seed_doc_ci(_row, n_boot=20)['status'] == 'unverifiable'
+    # A missing/non-object record cannot certify either uncertainty
+    # component; the helpers must report unverifiable rather than crash.
+    for _bad_recs in (None, [None], [1], ['x']):
+        assert L._doc_bootstrap_ppl_ci(_bad_recs, n_boot=20) is None
+        assert L._combined_seed_doc_ci(_bad_recs, n_boot=20)['status'] == 'unverifiable'
+    _ok_recs = [{'nll_per_row': [1.0, 1.0], 'n_tokens_per_row': [4, 4]}
+                for _ in range(2)]
+    for _bad_conf in (True, np.bool_(False), 0, 1, 1.5, float('nan'), 'x'):
+        _r = L._combined_seed_doc_ci(_ok_recs, n_boot=20, conf=_bad_conf)
+        assert _r['status'] == 'invalid_options' and _r['ci95_ppl'] is None, _r
+    # Panel readers must not crash on a malformed per-layer stats payload.
+    _agg_bad = L.aggregate({'x': {'variant': 'csa', 'seed': 0, 'ppl': 10.0,
+                                  'nll_sum': 10.0, 'n_tokens': 1, 'stats': [1]}})
+    assert 'avg_dyn_block_len' not in _agg_bad['csa'], _agg_bad
+    # Panel readers refuse a non-object summary instead of raising a raw
+    # AttributeError halfway through.
+    for _bad_summary in (None, [], 123, 'x'):
+        try:
+            L.methodology_audit(_bad_summary, design={}, baselines={}, verbose=False)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'methodology_audit accepted {_bad_summary!r}')
+    # None is the documented empty family for attach_holm; a non-object is not.
+    assert L.attach_holm(None) is not None
+    for _bad_comparisons in ([], 123, 'x'):
+        try:
+            L.attach_holm(_bad_comparisons)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'attach_holm accepted {_bad_comparisons!r}')
+    # Aggregate training counts use the exact integer contract too.
+    for _bad_count in (True, 48.5):
+        _a = L.aggregate({'x': {'variant': 'csa', 'seed': 0, 'ppl': 10.0,
+                                'nll_sum': 10.0, 'n_tokens': 1,
+                                'steps': _bad_count, 'tokens_seen': _bad_count}})
+        assert _a['csa']['tokens_seen'] is None, _a
+        assert 'tokens_per_step' not in _a['csa'], _a
+    # Paired effect options are part of the test contract: a boolean/out-of-
+    # range alpha or a fractional/NaN seed floor cannot make an effect
+    # "significant", and must not raise halfway through.
+    _strong = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    for _bad_alpha in (True, np.bool_(False), 0.0, 1.0, 1.5, float('nan'), 'x'):
+        _st = L.paired_effect_stats(_strong, alpha=_bad_alpha, min_n=6)
+        assert _st['significant'] is False, (_bad_alpha, _st)
+    for _bad_min in (True, np.bool_(False), 4.9, 0, -1, float('nan')):
+        _st = L.paired_effect_stats(_strong, alpha=0.05, min_n=_bad_min)
+        assert _st['underpowered'] is True, (_bad_min, _st)
+        assert _st['significant'] is False, (_bad_min, _st)
+    # Metric/hypothesis audits fail closed on a non-object artifact instead of
+    # raising from dict-only methods.
+    assert L.metric_policy_audit([1])['status'] == 'warn'
+    assert L.hypothesis_audit(5)['status'] == 'warn'
+    # The open-block and v10 readers follow the same underflow convention.
+    import open_block_supp as _OB
+    assert _OB._nll_per_token({'n_tokens': _huge_tok, 'nll_sum': 10.0}) == 0.0
+    assert V10._cell_ppl([10.0], [_huge_tok]) == 1.0
     # Frozen by-length row/token counts are exact integers even above 2**53.
     _nseq = 2 ** 53 + 1
     _cell = {'n_tok': _nseq * 7, 'n_seq': _nseq, 'truncated': False, 'eval_span': 8}
@@ -255,6 +324,9 @@ def t_scale_aggregate_and_claim_edges():
     for _bad_min_n in (True, np.bool_(False), 1.5, '6', None, 0, -1):
         _r = L.reportable_claim(_base, min_n=_bad_min_n)
         assert _r['allowed'] is False and _r['reasons'], (_bad_min_n, _r)
+    for _bad_fs in (True, np.bool_(False), 1.5, '4', _huge_seed):
+        _r = L.reportable_claim(_base, family_size=_bad_fs)
+        assert _r['allowed'] is False and _r['reasons'], (_bad_fs, _r)
     # A huge internally consistent ladder reports a finite ratio.
     def _tier(name, params):
         return {'name': name,
@@ -279,6 +351,12 @@ def t_scale_aggregate_and_claim_edges():
                  [1, 2 ** 60, 3], [1, 2 ** 60, 3, 4.5]):
         assert L._cache_file_sigs_match({'file_sigs': {'a': _bad}},
                                         _sigs) is False, _bad
+    # The freshly computed side is an identity too; a boolean/fractional
+    # expected field cannot be coerced into a matching signature.
+    for _bad_sig in ({'a': [1, True, 3, 4]}, {'a': [1, 2 ** 60, 3, 4.5]},
+                     {'a': [1, float(2 ** 60), 3, 4]}):
+        assert L._cache_file_sigs_match({'file_sigs': {'a': [1, 2 ** 60, 3, 4]}},
+                                        _bad_sig) is False, _bad_sig
 
 
 def t_power():
@@ -5771,6 +5849,13 @@ def t_efficiency_pairs_audit_and_sweep():
         r4 = A.audit_efficiency_pairs(outdirs=[td])
         rec4 = r4['panels'][td]['a vs b']
         assert rec4['speed_claim_allowed'] is False, rec4
+        # An out-of-float-range timing is not a measurement, not a crash.
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'variant': 'a', 'efficiency': dict(eff_a, prefill_ms_p50=10 ** 400)},
+                       'b::s0': {'variant': 'b', 'efficiency': eff_b}}, f)
+        r5 = A.audit_efficiency_pairs(outdirs=[td])
+        rec5 = r5['panels'][td]['a vs b']
+        assert rec5['speed_claim_allowed'] is False, rec5
     finally:
         shutil.rmtree(td, ignore_errors=True)
     L.set_seed(0)
@@ -6105,6 +6190,19 @@ def t_scale_edge_case_regressions():
     # must fall back to unigrams instead of indexing an empty array.
     ng = L.ngram_lm_score([1], [1, 2, 1], 4, order=2)
     assert math.isfinite(ng['nll']) and ng['n_tokens'] == 3, ng
+    # Count-model hyper-parameters use the same exact/boolean contracts.
+    for _bad_kw in ({'vocab_size': True}, {'vocab_size': 4.5},
+                    {'vocab_size': 0}, {'order': True}, {'order': 1.5},
+                    {'alpha': True}, {'alpha': float('nan')},
+                    {'interpolation': True}, {'interpolation': float('nan')}):
+        _args = {'vocab_size': 4, 'order': 2}
+        _args.update(_bad_kw)
+        try:
+            L.ngram_lm_score([1, 2, 1], [1, 2, 1], **_args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'ngram_lm_score accepted {_bad_kw!r}')
     # Object-dtype large integers stay exact in the corpus fingerprint.
     import data_guard as DG
     assert DG._matrix_fingerprint(np.array([[2 ** 53]], dtype=object)) != \
@@ -6647,9 +6745,12 @@ def t_targeted_contract_edges():
         pass
     else:
         raise AssertionError('unsafe LSH configuration was accepted')
-    # Truthy non-boolean shuffle metadata must fail closed.
+    # Truthy non-boolean shuffle metadata must fail closed.  A NumPy boolean
+    # is still a boolean declaration, not malformed provenance.
     assert A._declares_shuffle(1) and A._declares_shuffle('yes')
     assert not A._declares_shuffle(False) and not A._declares_shuffle(None)
+    for _fn in (A._declares_shuffle, L._meta_declares_shuffle):
+        assert _fn(np.bool_(True)) is True and _fn(np.bool_(False)) is False, _fn
     # A top-level training fingerprint declaration is as binding as one under
     # `binding`, and an explicit null by_length grid is refused at load time.
     assert V12._train_fp_required(
@@ -6677,6 +6778,22 @@ def t_targeted_contract_edges():
         _out = A.audit_split_discipline(cache_dirs=[td])
         _rec = _out['caches'][os.path.abspath(td)]['corpora']['x']
         assert _rec['status'] == 'fail', _rec
+    # A malformed per-layer stats payload must be ignored by the top-k table,
+    # not crash the report builder.
+    _cur = f'_cs{BR._CUR_CS}'
+    _k1 = ('agg', 'results_lm_v7_seq2k')
+    _k2 = ('summary', 'results_lm_v7_seq2k')
+    BR._LOADED[_k1] = {'csa_fixed': {'variant': 'csa_fixed', 'n_seeds': 1,
+                                     'ppl_mean': 10.0, 'run_cfg': 'steps1' + _cur}}
+    BR._LOADED[_k2] = {'csa_fixed::s0': {'variant': 'csa_fixed', 'seed': 0,
+                                         'ppl': 10.0, '_code': BR._CUR_CS,
+                                         'run_cfg': 'steps1' + _cur,
+                                         'stats': [1]}}
+    try:
+        BR.sec_p1t()
+    finally:
+        BR._LOADED.pop(_k1, None)
+        BR._LOADED.pop(_k2, None)
 
 
 def main():

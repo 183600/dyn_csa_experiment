@@ -61,8 +61,10 @@ def _declares_shuffle(value):
     """
     if value is None:
         return False
-    if isinstance(value, bool):
-        return value
+    # np.bool_ is a genuine boolean declaration on NumPy 2 (where it is not an
+    # instance of Python bool); its dtype kind is the stable spelling.
+    if isinstance(value, bool) or getattr(getattr(value, 'dtype', None), 'kind', None) == 'b':
+        return bool(value)
     return True
 
 
@@ -2110,7 +2112,10 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
                     # Boolean flags are not measured milliseconds.
                     if isinstance(x, (bool, np.bool_)) or not isinstance(x, (int, float)):
                         continue
-                    f = float(x)
+                    try:
+                        f = float(x)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
                     if math.isfinite(f):
                         _v.append(f)
                 return (float(np.median(_v)) if _v else None)

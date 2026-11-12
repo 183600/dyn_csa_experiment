@@ -297,11 +297,18 @@ def _nll_per_token(rec):
     v = L._finite_scalar(rec.get('nll_sum'))
     if n is None or n <= 0 or v is None:
         return None
-    return v / n
+    try:
+        return v / n
+    except OverflowError:
+        # An exact token total beyond the binary64 range underflows the
+        # per-token NLL to zero rather than crashing the panel reader.
+        return 0.0
 
 
 def _rec_by_cell(summary, run_fingerprint=None):
     out = {}
+    if not isinstance(summary, dict):
+        return out
     for key, rec in summary.items():
         if not isinstance(rec, dict):
             continue
@@ -466,11 +473,15 @@ def _controlled_reason(a, b):
         return None
     # The only allowed layer-level differences are max_block/open mode/scope.
     la, lb = oa.get('layers') or [], ob.get('layers') or []
+    if not isinstance(la, (list, tuple)) or not isinstance(lb, (list, tuple)):
+        return 'unverifiable open_block_config.layers (not a list)'
     if len(la) != len(lb):
         return 'different layer counts'
     # max_block_tokens is the same factor under its public alias.
     allowed = {'max_block', 'max_block_tokens', 'open_block_mode', 'open_block_scope'}
     for i, (x, y) in enumerate(zip(la, lb)):
+        if not isinstance(x, dict) or not isinstance(y, dict):
+            return f'unverifiable layer {i} descriptor (not an object)'
         for k in set(x) | set(y):
             if k in allowed:
                 continue

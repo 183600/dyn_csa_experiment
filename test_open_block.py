@@ -539,6 +539,13 @@ def t_record_identity_and_completeness():
                                              n_tokens=1.5)}, fp)
     assert cells == {}, cells
     assert OB._rec_by_cell({'A::seed0': base}, fp)
+    # A malformed summary/descriptor is refused, not crashed through.
+    assert OB._rec_by_cell([base], fp) == {}
+    _rec_a = dict(base, open_block_config={'fingerprint': None,
+                                           'layers': [1]})
+    _rec_b = dict(base, open_block_config={'fingerprint': None,
+                                           'layers': [{}]})
+    assert OB._controlled_reason(_rec_a, _rec_b) is not None
 
 
 def t_summary_refuses_nonobject():

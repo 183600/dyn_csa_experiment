@@ -367,9 +367,15 @@ def _cell_ppl(nll_sum, n_tok):
     nt = int(sum(n_tok))
     if nt <= 0:
         return float('nan')
-    if total / nt > 709.0:
+    try:
+        ce = total / nt
+    except OverflowError:
+        # An exact token total beyond the binary64 range underflows the
+        # per-token NLL to zero (PPL 1.0) rather than crashing the panel.
+        return 1.0
+    if ce > 709.0:
         return float('inf')
-    return math.exp(total / nt)
+    return math.exp(ce)
 
 def _probe_fingerprint(cfg):
     _need = max((int(_x) for _x in cfg['eval_lens'])) + 1
@@ -641,7 +647,9 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
 
     def _niah_stale(_key, _summary_n, _fp_n=None):
         _rec = (_summary_n or {}).get(_key)
-        return not (isinstance(_rec, dict) and (_rec.get('task') == 'niah_natural') and (isinstance(_rec.get('acc'), (int, float)) and (not isinstance(_rec.get('acc'), bool)) and math.isfinite(float(_rec['acc']))) and (isinstance(_rec.get('nll'), (int, float)) and (not isinstance(_rec.get('nll'), bool)) and math.isfinite(float(_rec['nll']))) and _rec.get('_code') == V.CKPT_CODE and _rec.get('probe_params') == (_niah_fp_of('clean') if _fp_n is None else _fp_n) and _rec.get('recipe') == _ck_recipe and (_rec.get('val_fp') is None or _rec.get('val_fp') == _val_fp))
+        _acc = L._finite_scalar(_rec.get('acc')) if isinstance(_rec, dict) else None
+        _nll = L._finite_scalar(_rec.get('nll')) if isinstance(_rec, dict) else None
+        return not (isinstance(_rec, dict) and (_rec.get('task') == 'niah_natural') and _acc is not None and _nll is not None and _rec.get('_code') == V.CKPT_CODE and _rec.get('probe_params') == (_niah_fp_of('clean') if _fp_n is None else _fp_n) and _rec.get('recipe') == _ck_recipe and (_rec.get('val_fp') is None or _rec.get('val_fp') == _val_fp))
     _summary = L.locked_json_read(spath)
     _summary_n = L.locked_json_read(_nspath) if _nspath else {}
     _todo = False

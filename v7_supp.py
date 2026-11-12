@@ -2235,14 +2235,13 @@ def run_niah_phase(payload, guard=None, label=''):
             gc.collect()
             torch.cuda.empty_cache()
     _measured = len({(r.get('variant'), r.get('seed')) for r in summary.values()
-                     if isinstance(r, dict) and isinstance(r.get('acc'), (int, float))
-                     and not isinstance(r.get('acc'), bool) and math.isfinite(float(r['acc']))})
+                     if isinstance(r, dict) and L._finite_scalar(r.get('acc')) is not None})
     _niah_cells = {}
     for _v in variants:
         for _sd in seeds:
             _evs = [summary.get(f'{_v}::seed{_sd}::len{Ln}') for Ln in seq_lens]
-            _evs = [x for x in _evs if isinstance(x, dict) and isinstance(x.get('acc'), (int, float))
-                    and not isinstance(x.get('acc'), bool) and math.isfinite(float(x['acc']))]
+            _evs = [x for x in _evs if isinstance(x, dict)
+                    and L._finite_scalar(x.get('acc')) is not None]
             if not _evs:
                 continue
             _base = dict(_evs[0])

@@ -1750,11 +1750,20 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                         _pool_ok = False
             if _by_seed:
                 _dl = list(_by_seed.values())
-                _pooled = L._safe_exp_ppl(_nll_sum / _n_tok) if (_pool_ok and _n_tok > 0) else None
+                if _pool_ok and _n_tok > 0:
+                    try:
+                        _pooled_ce = _nll_sum / _n_tok
+                    except OverflowError:
+                        _pooled_ce = 0.0
+                    _pooled = L._safe_exp_ppl(_pooled_ce)
+                else:
+                    _pooled = None
                 stats['by_length'].setdefault(v, {})[str(Ln)] = {'mean': float(_pooled if _pooled is not None else np.mean(_dl)),
                                                                   'mean_arithmetic': float(np.mean(_dl)),
                                                                   'ppl_pooled': _pooled, 'n_tokens': _n_tok,
-                                                                  'n': len(_dl), 'ppl_by_seed': {str(s): p for s, p in _by_seed.items()}, 'params': next((r.get('params') for r in rows if isinstance(r.get('params'), (int, float))), None), 'n_seqs': next((c.get('n_seq') for _r in rows for c in [((_r.get('by_len') or {}).get(Ln) or (_r.get('by_len') or {}).get(str(Ln)) or {})] if isinstance(c, dict) and c.get('n_seq') is not None), None)}
+                                                                  'n': len(_dl), 'ppl_by_seed': {str(s): p for s, p in _by_seed.items()}, 'params': next((L._as_seed_int(r.get('params')) for r in rows
+                                                                     if L._as_seed_int(r.get('params')) is not None
+                                                                     and L._as_seed_int(r.get('params')) > 0), None), 'n_seqs': next((c.get('n_seq') for _r in rows for c in [((_r.get('by_len') or {}).get(Ln) or (_r.get('by_len') or {}).get(str(Ln)) or {})] if isinstance(c, dict) and c.get('n_seq') is not None), None)}
     for comp in manifest['primary_comparisons']:
         name = comp['name']
         a, b = (comp['a'], comp['b'])
@@ -1828,8 +1837,12 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             res['p_floor_effective'] = _fl_eff
             res['min_attainable_p_holm_effective'] = L.holm_min_attainable_p(_n_eff_nonzero, len(manifest['primary_comparisons']), _alpha)
             res['power_first_holm_gate_effective'] = {f'q={q:.2f}': L.signflip_power(_n_eff_nonzero, len(manifest['primary_comparisons']), q, _alpha) for q in (0.8, 0.85, 0.9, 0.95)}
-        _pa = [p for p in (L._finite_scalar(recs_a[s].get('params')) for s in usable) if p is not None]
-        _pb = [p for p in (L._finite_scalar(recs_b[s].get('params')) for s in usable) if p is not None]
+        # Parameter counts are exact positive integers; bool/fractional or
+        # lossy large values are malformed provenance, not a matched arm.
+        _pa = [p for p in (L._as_seed_int(recs_a[s].get('params')) for s in usable)
+               if p is not None and p > 0]
+        _pb = [p for p in (L._as_seed_int(recs_b[s].get('params')) for s in usable)
+               if p is not None and p > 0]
         if _pa and _pb:
             _am, _bm = float(np.mean(_pa)), float(np.mean(_pb))
             _rel = abs(_am - _bm) / max(_am, _bm, 1.0)
@@ -1859,9 +1872,9 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             for s in usable:
                 _pbd = _recs[s].get('param_breakdown')
                 if isinstance(_pbd, dict):
-                    _act_f = L._finite_scalar(_pbd.get('active'))
-                    if _act_f is not None:
-                        _act.append(_act_f)
+                    _act_i = L._as_seed_int(_pbd.get('active'))
+                    if _act_i is not None and _act_i > 0:
+                        _act.append(_act_i)
         res['active_params_mean'] = (float(np.mean(_act)) if _act else None)
         res['data_fp'] = unified_fp
         res['manifest_sha256'] = manifest.get('manifest_sha256')
