@@ -264,6 +264,18 @@ def _load_manifest(path):
             if abs(_iv) >= 2 ** 53:
                 raise SystemExit(f'[v12] REFUSE: {label}={value!r} is outside the exact integer range (< 2**53)')
             return _iv
+        if isinstance(value, (str, bytes)):
+            # A manifest integer spelling must be an actual integer.  The
+            # float path below would accept "512.0"/"1e3" and hand the raw
+            # string to downstream int() calls, which then crash AFTER a test
+            # access.  Reject non-canonical spellings at load time.
+            try:
+                _iv = int(value)
+            except (TypeError, ValueError, OverflowError):
+                raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an integer')
+            if abs(_iv) >= 2 ** 53:
+                raise SystemExit(f'[v12] REFUSE: {label}={value!r} is outside the exact integer range (< 2**53)')
+            return _iv
         try:
             f = float(value)
         except (TypeError, ValueError, OverflowError):
@@ -295,6 +307,7 @@ def _load_manifest(path):
         raise SystemExit(f'[v12] REFUSE: binding.test_slice must be an object ({_ts!r})')
     _eval = m.get('eval') or {}
     _bl = _eval.get('by_length_ppl') if isinstance(_eval, dict) else None
+    _bl_ints = []
     if _bl is not None:
         if not isinstance(_bl, list) or not _bl:
             raise SystemExit(f'[v12] REFUSE: eval.by_length_ppl must be a non-empty list of positive integer lengths ({_bl!r})')
@@ -338,13 +351,30 @@ def _load_manifest(path):
                     raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.{_pk} contains a non-finite value ({_x!r})')
                 if _pk == 'rhos' and not (0.0 <= _xf <= 1.0):
                     raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.rhos value {_xf!r} is outside [0,1]')
-                if _pk == 'eval_lens' and (_xf <= 0 or _xf != math.floor(_xf)):
-                    raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.eval_lens value {_x!r} is not a positive integer')
+                if _pk == 'eval_lens':
+                    if _int_field(_x, 'eval.distractor_probe.eval_lens entry') <= 0:
+                        raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.eval_lens value {_x!r} is not a positive integer')
         for _pk in ('target', 'n_seq'):
             if _pk in _probe:
                 _iv = _int_field(_probe.get(_pk), f'eval.distractor_probe.{_pk}')
                 if _iv <= 0:
                     raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.{_pk} must be positive ({_iv})')
+        # The probe runs on the SAME frozen test slice as the by-length panel.
+        # If it asks for a longer sequence or more rows, run_finaltest sizes
+        # the slice from by_length_ppl/n_seqs_clean and the probe indexes out
+        # of bounds AFTER the one-shot test access has already been spent.
+        _plens = [int(float(_x)) for _x in (_probe.get('eval_lens') or [])]
+        if _plens:
+            if _bl_ints and max(_plens) > max(_bl_ints):
+                raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.eval_lens={_plens} extends beyond the frozen test slice width max(by_length_ppl)={max(_bl_ints)} — enlarge by_length_ppl (and re-freeze) or shrink the probe')
+            if _eval.get('n_seqs_clean') is not None:
+                _nseq_frozen = _int_field(_eval.get('n_seqs_clean'), 'eval.n_seqs_clean')
+                if 'n_seq' in _probe and _int_field(_probe.get('n_seq'), 'eval.distractor_probe.n_seq') > _nseq_frozen:
+                    raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.n_seq={_probe.get("n_seq")} exceeds the frozen test row count n_seqs_clean={_nseq_frozen}')
+            if 'target' in _probe:
+                _ptarget = _int_field(_probe.get('target'), 'eval.distractor_probe.target')
+                if min(_plens) <= _ptarget:
+                    raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.target={_ptarget} must be smaller than every probe eval_len {sorted(_plens)} (the far context would be empty/negative)')
     _tokb = (_bind.get('tokenizer') or {}) if isinstance(_bind, dict) else {}
     if _tokb and not isinstance(_tokb, dict):
         raise SystemExit(f'[v12] REFUSE: binding.tokenizer must be an object ({_tokb!r})')
@@ -1686,6 +1716,9 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             continue
         res = V.exact_sign_permutation(dl)
         _n_eff = len(usable)
+        # Zero paired deltas do not change the sign-flip null distribution, so
+        # the resolution floor/power describe the NONZERO pairs only.
+        _n_eff_nonzero = int(sum(1 for _d in dl if _d != 0.0))
         _n_min_raw = (manifest.get('statistics') or {}).get('min_seeds_for_confirmation')
         if _n_min_raw is None:
             _n_min = len(_manifest_seed_ids(manifest))
@@ -1697,6 +1730,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                     'is not an exact integer in [2, number of frozen seeds]')
         res['seeds'] = usable
         res['n_effective'] = int(_n_eff)
+        res['n_nonzero_effective'] = int(_n_eff_nonzero)
         res['coverage_ok'] = bool(_n_eff == len(manifest['seeds']))
         res['missing_seeds'] = sorted(set(int(s) for s in manifest['seeds']) - set(int(s) for s in usable))
         res['dropped_pairs'] = dropped
@@ -1704,11 +1738,11 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         # Diagnostics must use the n that actually entered THIS comparison,
         # so p_floor / min_attainable_p_holm / power describe the test that
         # really ran.
-        _fl_eff = L.signflip_p_floor(_n_eff)
+        _fl_eff = L.signflip_p_floor(_n_eff_nonzero)
         if math.isfinite(_fl_eff):
             res['p_floor_effective'] = _fl_eff
-            res['min_attainable_p_holm_effective'] = L.holm_min_attainable_p(_n_eff, len(manifest['primary_comparisons']), _alpha)
-            res['power_first_holm_gate_effective'] = {f'q={q:.2f}': L.signflip_power(_n_eff, len(manifest['primary_comparisons']), q, _alpha) for q in (0.8, 0.85, 0.9, 0.95)}
+            res['min_attainable_p_holm_effective'] = L.holm_min_attainable_p(_n_eff_nonzero, len(manifest['primary_comparisons']), _alpha)
+            res['power_first_holm_gate_effective'] = {f'q={q:.2f}': L.signflip_power(_n_eff_nonzero, len(manifest['primary_comparisons']), q, _alpha) for q in (0.8, 0.85, 0.9, 0.95)}
         _pa = [p for p in (L._finite_scalar(recs_a[s].get('params')) for s in usable) if p is not None]
         _pb = [p for p in (L._finite_scalar(recs_b[s].get('params')) for s in usable) if p is not None]
         if _pa and _pb:

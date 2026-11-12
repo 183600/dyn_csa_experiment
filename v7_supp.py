@@ -1598,12 +1598,16 @@ def exact_sign_permutation(deltas):
         _mu = res.get('mean', float('nan'))
         if (not isinstance(_sd, (int, float))) or (not math.isfinite(_mu)):
             res['cohens_dz'] = float('nan')
-        elif _sd > 1e-12:
-            res['cohens_dz'] = float(_mu / _sd)
-        elif abs(_mu) < 1e-300:
-            res['cohens_dz'] = 0.0
         else:
-            res['cohens_dz'] = float('inf') if _mu > 0 else float('-inf')
+            # Scale-free threshold: the previous absolute 1e-12 made a
+            # small-magnitude but variable panel report an infinite d_z.
+            _mag = max(float(np.max(np.abs(d))) if d.size else 0.0, abs(_mu), 1e-300)
+            if _sd > 1e-12 * _mag:
+                res['cohens_dz'] = float(_mu / _sd)
+            elif abs(_mu) < 1e-300:
+                res['cohens_dz'] = 0.0
+            else:
+                res['cohens_dz'] = float('inf') if _mu > 0 else float('-inf')
         _m = str(res.get('method', 'exact'))
         if _m.startswith('exact'):
             res['test'] = 'exact two-sided sign-flip over paired per-seed deltas'
@@ -1622,11 +1626,12 @@ def exact_sign_permutation(deltas):
         # Monte-Carlo draw, beyond that).  Do not label a sampled p-value as
         # an exact sign-flip p.
         _r = L.exact_signflip_p(d)
-        # The saddlepoint branch drops zero deltas (they do not change the
-        # null distribution), so its attainable floor is 2/2**m with m the
-        # number of NONZERO deltas — not 2/2**n.  Report the floor of the
-        # test that actually ran.  MITM/enumeration keep all n slots.
-        _m_nonzero = int(np.count_nonzero(d)) if str(_r.get('method', '')).startswith('saddlepoint') else n
+        # Zero deltas multiply the number of sign assignments without
+        # changing the null distribution, so the attainable floor is 2/2**m
+        # with m the number of NONZERO deltas — not 2/2**n.  This applies to
+        # the saddlepoint AND the exact/MITM paths (both include the zeros in
+        # the 2**n count but the all-same-sign mass is 2**z times larger).
+        _m_nonzero = int(np.count_nonzero(d))
         return _extras({'n': n, 'mean': float(d.mean()),
                         'std': float(d.std(ddof=1)) if n > 1 else 0.0,
                         'p_exact_signflip': float(_r['p']),
@@ -1635,15 +1640,18 @@ def exact_sign_permutation(deltas):
                         'n_dropped': n_dropped}, d, n, floor_n=_m_nonzero)
     cnt = 0
     total = 1 << n
+    # Scale-free tie slack, matching exp_lib.exact_signflip_p: a fixed
+    # absolute slack makes tiny consistent effects report p=1.
+    _tol_mean = 1e-12 * float(np.abs(d).sum()) / n
     bitpos = np.arange(n, dtype=np.int64)[None, :]
     step = max(1, min(total, (1 << 24) // max(n, 1)))
     for off in range(0, total, step):
         bs = min(step, total - off)
         masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
         flips = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
-        cnt += int((np.abs((flips * d[None, :]).mean(1)) >= obs - 1e-12).sum())
+        cnt += int((np.abs((flips * d[None, :]).mean(1)) >= obs - _tol_mean).sum())
     p = float(cnt / total)
-    return _extras({'n': n, 'mean': float(d.mean()), 'std': float(d.std(ddof=1)) if n > 1 else 0.0, 'p_exact_signflip': p, 'n_flips': int(total), 'n_dropped': n_dropped}, d, n)
+    return _extras({'n': n, 'mean': float(d.mean()), 'std': float(d.std(ddof=1)) if n > 1 else 0.0, 'p_exact_signflip': p, 'n_flips': int(total), 'n_dropped': n_dropped}, d, n, floor_n=int(np.count_nonzero(d)))
 
 def flops_analysis(outdir='analysis_v7', seq_lens=None):
     os.makedirs(outdir, exist_ok=True)
@@ -1653,8 +1661,10 @@ def flops_analysis(outdir='analysis_v7', seq_lens=None):
     nIH, cI = (4, 64)
     rows = []
     for n in seq_lens:
-        B = max(n // m, 1)
-        Bh = max(n // mph, 1)
+        # blocks_fixed/indexer emit ceil(n/block) blocks (the trailing
+        # partial block exists), not floor.
+        B = max((n + m - 1) // m, 1)
+        Bh = max((n + mph - 1) // mph, 1)
         dense = 2 * (2 * H * Dh * n)
         idx = 2 * cI * B + 2 * nIH * B
         core = 2 * (2 * H * Dh * min(k, B) + 2 * H * Dh * min(w, n))

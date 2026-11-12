@@ -323,10 +323,13 @@ def main(argv=None):
             # Both the exact enumeration and the meet-in-the-middle branch
             # have the two-sided floor 2/2**n; the saddlepoint branch for
             # n>40 is clamped to the same floor.
-            _ppl_floor0 = L.signflip_p_floor(_n_ppl)
-            _floor_txt = (f'（n={_n_ppl} 时 p 分辨率下限 {_ppl_floor0:.3g}）'
+            # Zero deltas do not change the sign-flip null, so the attainable
+            # floor uses the NONZERO pair count (matching exp_lib's test).
+            _n_ppl_eff = int(np.count_nonzero(d_ppl))
+            _ppl_floor0 = L.signflip_p_floor(_n_ppl_eff)
+            _floor_txt = (f'（n={_n_ppl}，非零配对 {_n_ppl_eff}；p 分辨率下限 {_ppl_floor0:.3g}）'
                           if math.isfinite(_ppl_floor0) and _ppl_floor0 > 0
-                          else f'（n={_n_ppl} 使用确定性鞍点近似，p 已钳制在精确下限之上）')
+                          else f'（n={_n_ppl}，非零配对 {_n_ppl_eff}；使用确定性鞍点近似，p 已钳制在精确下限之上）')
             lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {sample_std(d_ppl):.2f}，p({_rppl["method"]}) = {p_ppl:.3f}{_floor_txt}\n')
         elif not _ok_seeds:
             p_f1 = p_ppl = None

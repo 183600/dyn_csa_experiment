@@ -73,6 +73,14 @@ def _exact_int_scalar(value):
         if not math.isfinite(f) or f != math.floor(f) or abs(f) >= 2 ** 53:
             return None
         return int(f)
+    if isinstance(value, (str, bytes)):
+        # A JSON spelling is either an exact integer ("3") or not; float()
+        # would accept "3.0"/"1e3" and silently map it to a different
+        # canonical value than the strict manifest/record contracts.
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
     try:
         f = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -263,7 +271,10 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             _tm_doc = (test_meta or {}).get('doc_ids') or {}
             _train_doc = (train_meta or {}).get('doc_ids') or {}
             if _tm_doc:
-                if _exact_int_scalar(_tm_doc.get('test_count')) != int(_ted.size):
+                # A missing count is unverifiable, not a disagreement (the
+                # train/validation checks already guard on `is not None`).
+                if (_tm_doc.get('test_count') is not None
+                        and _exact_int_scalar(_tm_doc['test_count']) != int(_ted.size)):
                     _doc_leak.append('test document-id sidecar count disagrees with the test metadata')
                 if (_tm_doc.get('test_fp')
                         and _tm_doc['test_fp'] != _sidecar_fp(_ted)):
@@ -890,6 +901,10 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 _warn(f'{cd}/{tag}: {len(_cands)} test caches match the same protocol; refusing to guess which test split to audit')
             else:
                 rec['test_pairing'] = 'not_found'
+                # A train/validation-only cache cannot demonstrate test
+                # isolation; leaving the overall status at "ok" would treat an
+                # unaudited held-out split as a passed gate.
+                _warn(f'{cd}/{tag}: no test cache matches this protocol — the held-out split was NOT audited')
             if te is not None:
                 rec['test_shape'] = list(te.shape)
                 if np.issubdtype(np.asarray(te).dtype, np.integer):
@@ -925,7 +940,8 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                         _ted = np.load(_ted_path)
                         _mtdoc = (_tmeta or {}).get('doc_ids') or {}
                         if _mtdoc:
-                            if _exact_int_scalar(_mtdoc.get('test_count')) != int(np.asarray(_ted).size):
+                            if (_mtdoc.get('test_count') is not None
+                                    and _exact_int_scalar(_mtdoc['test_count']) != int(np.asarray(_ted).size)):
                                 rec['status'] = 'fail'
                                 _fail(f'{cd}/{tag}: test document-id sidecar count '
                                       'disagrees with the test metadata')
@@ -1367,6 +1383,11 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             _nseq_cell = None
             if isinstance(c.get('ppl_per_seq'), list):
                 _nseq_cell = len(c['ppl_per_seq'])
+                if (c.get('n_seq') is not None
+                        and _exact_int_scalar(c.get('n_seq')) != _nseq_cell):
+                    problems.append(
+                        f'{key}: L{Ln} n_seq={c.get("n_seq")!r} contradicts the '
+                        f'{_nseq_cell} per-document rows in ppl_per_seq')
                 _add_cell('n_seq', _nseq_cell)
             elif c.get('n_seq') is not None:
                 _nseq_cell = c.get('n_seq')
@@ -1413,6 +1434,13 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                         problems.append(f'{key}: L{Ln} n_tok={_nt} != n_seq*(L-1)={_ns * (Ln - 1)} — the cell did not score one next-token target per row')
                 # A missing/non-numeric value is already reported by the
                 # per-field check above (or by the cross-record sets below).
+            # A non-truncated cell must state the full requested span.  A
+            # shorter eval_span means it scored a different (truncated) span
+            # under the full-length label.
+            if c.get('truncated') is False and _exact_int_scalar(c.get('eval_span')) not in (None, Ln):
+                problems.append(
+                    f'{key}: L{Ln} is marked non-truncated but eval_span={c.get("eval_span")!r} '
+                    '!= the requested length')
             if 'truncated' not in c:
                 problems.append(f'{key}: L{Ln} cell has NO `truncated` flag — a missing truncation marker is treated as unverifiable, not as a full-length measurement')
             elif not isinstance(c.get('truncated'), (bool, np.bool_)):
@@ -1483,6 +1511,9 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
     problems = []
     warnings = []
     arms_present = [a for a in arms if a in per_arm]
+    _missing_arms = [a for a in arms if a not in per_arm]
+    if _missing_arms:
+        warnings.append('declared arm(s) absent from the summary: ' + ', '.join(_missing_arms) + ' — the frozen-arm comparison is only partially audited')
     for a, recs in per_arm.items():
         cfgs = {r.get('run_cfg') for r in recs}
         knob_vals = {json.dumps(r.get('train_knobs'), sort_keys=True)

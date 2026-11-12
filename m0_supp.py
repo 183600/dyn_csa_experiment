@@ -574,6 +574,10 @@ def _ppl_by_seed(summary, variant):
     for rec in summary.values():
         if not isinstance(rec, dict) or rec.get('variant') != variant:
             continue
+        if rec.get('synthesized'):
+            # A reconstructed value is not an independent run; every other
+            # reader excludes it from paired effects.
+            continue
         if not L.ppl_is_usable(rec.get('ppl')):
             continue
         seed = L._as_seed_int(rec.get('seed'))

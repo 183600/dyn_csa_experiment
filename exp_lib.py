@@ -6876,7 +6876,8 @@ _FWEB_MEMO_CAP = 2
 def _fineweb_disk_dtype(vocab):
     if vocab <= 65536:
         return np.uint16
-    if vocab < 2 ** 31:
+    # int32 holds ids 0..2**31-1, so vocab == 2**31 is still representable.
+    if vocab <= 2 ** 31:
         return np.int32
     raise ValueError(f'vocab {vocab} exceeds the id range representable by the on-disk corpus cache')
 
@@ -7644,7 +7645,13 @@ def _corpus_audit_cache_key(dataset, vocab, train_ids, val_batch, meta,
     """
     _mdoc = (meta or {}).get('doc_ids') or {}
     _va = np.asarray(val_batch)
-    return (str(dataset), int(vocab),
+    # Cache identity must use the SAME exact-integer contract as validation:
+    # int(8192.9)==8192 let a malformed exploratory call poison the memo slot
+    # of a later valid strict call.  Malformed values get a distinct key so
+    # their (failing) report cannot alias any valid vocabulary.
+    _vb = _as_seed_int(vocab)
+    _vkey = _vb if _vb is not None else ('__bad_vocab__', type(vocab).__name__, repr(vocab))
+    return (str(dataset), _vkey,
             _ids_fp(np.asarray(train_ids).reshape(-1)),
             # The report is shape-sensitive (row counts, duplicate rows, the
             # sampled rows): two holdouts with the same flattened tokens but
@@ -7678,7 +7685,7 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
         'dataset': dataset,
         'train_tokens': int(tr.size),
         'val_shape': list(va.shape),
-        'vocab': int(vocab),
+        'vocab': (_as_seed_int(vocab) if _as_seed_int(vocab) is not None else repr(vocab)),
         'hard_failures': [],
         'warnings': [],
         'meta_split_strategy': (meta or {}).get('split_strategy'),
@@ -9040,7 +9047,20 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             out['p_holm'] = float(ph) if ph is not None else None
         except (TypeError, ValueError, OverflowError):
             out['p_holm'] = None
-    out['p_floor'] = signflip_p_floor(n) if n > 0 else None
+    # The exact test drops zero deltas, so the resolution floor is controlled
+    # by the number of NONZERO pairs.  Fall back to n for older stats dicts
+    # that do not carry the diagnostic.
+    _n_eff_raw = stats.get('n_nonzero', n)
+    if isinstance(_n_eff_raw, (bool, np.bool_)):
+        _n_eff = n
+    else:
+        try:
+            _n_eff = int(_n_eff_raw)
+        except (TypeError, ValueError, OverflowError):
+            _n_eff = n
+        if _n_eff < 0 or _n_eff > n:
+            _n_eff = n
+    out['p_floor'] = signflip_p_floor(_n_eff) if _n_eff > 0 else None
     if n < int(min_n):
         out['reasons'].append(f'n={n} < min_n={int(min_n)}: the exact-test p floor is {out["p_floor"]:.3g} > alpha' if out['p_floor'] is not None else f'n={n} < min_n={int(min_n)}')
     elif out['p_floor'] is not None and math.isfinite(out['p_floor']) and out['p_floor'] > alpha:
@@ -9169,17 +9189,20 @@ def _signflip_mitm_count(d):
     scale-up panel can reach, while the 2**20 worst-case table stays small."""
     n = int(d.size)
     total = abs(float(d.sum()))
-    # The n<=20 enumeration accepts |mean| >= obs - 1e-12, i.e. |sum| >=
-    # total - n*1e-12.  If that threshold is non-positive every sign
-    # assignment qualifies; the two-tail formula below would double-count.
-    if total - 1e-12 * n <= 0.0:
+    # Tie tolerance must be scale-free: a fixed 1e-12 absolute slack makes
+    # every sign assignment "reach" the observed sum when the effects are
+    # themselves tiny (e.g. log-ratio deltas around 1e-13), silently forcing
+    # p=1.  Use the same relative slack (sum of |d_i|) as the enumeration.
+    _slack = 1e-12 * float(np.abs(d).sum())
+    # If that threshold is non-positive every sign assignment qualifies; the
+    # two-tail formula below would double-count.
+    if total - _slack <= 0.0:
         return 1 << n
     half = n // 2
     left = _signflip_signed_sums(d[:half])
     right = _signflip_signed_sums(d[half:])
     right.sort()
-    # Match the n<=20 enumeration's tolerance: mean comparison with 1e-12.
-    thr = total - 1e-12 * n
+    thr = total - _slack
     lo = np.searchsorted(right, -thr - left, side='right')
     hi = np.searchsorted(right, thr - left, side='left')
     return int(lo.sum() + (right.size - hi).sum())
@@ -9300,13 +9323,17 @@ def exact_signflip_p(deltas):
     if n <= _SIGNFLIP_ENUM_MAX_N:
         total = 1 << n
         cnt = 0
+        # Same scale-free tie slack as the MITM/saddlepoint paths.  The old
+        # absolute 1e-12 turned tiny effects into p=1 regardless of sign
+        # consistency (the floor should be 2/2**n when all signs agree).
+        _tol_mean = 1e-12 * float(np.abs(d).sum()) / n
         bitpos = np.arange(n, dtype=np.int64)[None, :]
         step = max(1, min(total, (1 << 22) // max(n, 1)))
         for off in range(0, total, step):
             bs = min(step, total - off)
             masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
             signs = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
-            cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
+            cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - _tol_mean).sum())
         return {'n': n, 'p': float(cnt / total), 'n_dropped': n_dropped, 'method': 'exact'}
     if n <= _SIGNFLIP_MITM_MAX_N:
         cnt = _signflip_mitm_count(d)
@@ -9424,17 +9451,21 @@ def wilcoxon_signed_rank_p(deltas):
     panels."""
     d = np.asarray([f for f in (_finite_scalar(x) for x in (deltas if deltas is not None else []))
                     if f is not None], dtype=float)
-    d = d[np.abs(d) > 1e-15]
+    # Only EXACT zeros are dropped: an absolute 1e-15 cutoff silently
+    # discards a valid panel whose effects are on a smaller scale.  Tie
+    # detection uses a relative tolerance for the same reason.
+    d = d[d != 0.0]
     n = int(d.size)
     if n == 0:
         return {'p': float('nan'), 'method': 'none', 'n_nonzero': 0}
+    _tol = 1e-12 * max(float(np.max(np.abs(d))), 1e-300)
     order = np.argsort(np.abs(d))
     ranks = np.empty(n, dtype=float)
     _abs = np.abs(d)[order]
     i = 0
     while i < n:
         j = i + 1
-        while j < n and abs(_abs[j] - _abs[i]) <= 1e-15:
+        while j < n and abs(_abs[j] - _abs[i]) <= _tol:
             j += 1
         ranks[order[i:j]] = (i + j + 1) / 2.0  # average rank (1-based)
         i = j
@@ -9504,18 +9535,25 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
                     if f is not None], dtype=float)
     n = int(d.size)
     if n == 0:
-        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None}
+        return {'n': 0, 'n_nonzero': 0, 'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None}
     mean = float(d.mean())
     std = float(d.std(ddof=1)) if n > 1 else 0.0
     sem = float(std / math.sqrt(n)) if n > 1 else float('nan')
     p = exact_signflip_p(d)['p']
-    if std > 1e-12:
+    # d_z is scale-free; an absolute 1e-12 cutoff turns a genuinely variable
+    # but small-magnitude panel (e.g. log-ratio effects ~1e-13) into |d_z|=inf.
+    _dz_scale = max(float(np.max(np.abs(d))), abs(mean), 1e-300)
+    if std > 1e-12 * _dz_scale:
         dz = float(mean / std)
     elif abs(mean) < 1e-300:
         dz = 0.0
     else:
         dz = float('inf') if mean > 0 else float('-inf')
-    p_floor = signflip_p_floor(n)
+    # Zero deltas do not change the null distribution, so the exact-test floor
+    # is 2/2**m for m NONZERO deltas, not 2/2**n.  Using n here understates
+    # the floor and labels a resolution-limited panel as decidable.
+    n_nonzero = int(np.count_nonzero(d))
+    p_floor = signflip_p_floor(n_nonzero)
     underpowered = n < int(min_n)
     resolution_limited = bool(math.isfinite(p_floor) and p_floor > alpha)
     within_seed_noise = abs(mean) <= std
@@ -9564,7 +9602,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     _assumption = ('exact sign-flip is valid as a sign test under symmetric paired differences; '
                    'same seed does NOT randomise the arm, and architecture-induced RNG/training '
                    'differences are part of the arm. p is SEED-level, never token-level.')
-    return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict,
+    return {'n': n, 'n_nonzero': n_nonzero, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict,
             'unit': 'seed', 'assumption': _assumption, 'sign_counts': _sign,
             'p_wilcoxon': _wil.get('p'), 'p_wilcoxon_method': _wil.get('method'),
             'ci95_paired_bootstrap': _paired_ci, 'ci95_unpaired_bootstrap': _unpaired_ci}
@@ -10199,6 +10237,11 @@ def _scale_points(points):
             # must be a hard error, not silently "n looks larger".  Normalise
             # first so 0 and "0" from a JSON round-trip cannot slip through.
             raise ValueError('scale point %r: duplicate seeds %r' % (label, seeds_kept))
+        # Keep the NORMALISED identity, not the raw spelling: otherwise a
+        # point that stores 0 and another that stores "0" pass the duplicate
+        # check but never pair in scaling_trend's by-seed map, silently
+        # discarding the primary paired test.
+        seeds_kept = [_seed_identity(x) for x in seeds_kept]
         if isinstance(scale, (bool, np.bool_)):
             raise ValueError('scale point %r: scale %r is a boolean flag, not a measurement'
                              % (label, scale))
@@ -11438,10 +11481,15 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     if prev.size:
         if lam > 0.0:
             keys = prev * vocab_size + nxt
-            idx = np.searchsorted(uniq, keys)
-            idx_clip = np.minimum(idx, max(uniq.size - 1, 0))
-            hit = (idx < uniq.size) & (uniq[idx_clip] == keys) if uniq.size else np.zeros(keys.shape, dtype=bool)
-            c_pair = np.where(hit, pair_counts[idx_clip], 0).astype(np.float64)
+            if uniq.size:
+                idx = np.searchsorted(uniq, keys)
+                idx_clip = np.minimum(idx, uniq.size - 1)
+                hit = (idx < uniq.size) & (uniq[idx_clip] == keys)
+                c_pair = np.where(hit, pair_counts[idx_clip], 0).astype(np.float64)
+            else:
+                # Fewer than two training tokens: there is no bigram table at
+                # all, so every bigram falls back to the unigram distribution.
+                c_pair = np.zeros(keys.shape, dtype=np.float64)
             c_ctx = ctx[prev].astype(np.float64)
             p_bg = np.where(c_ctx > 0.0, (c_pair + alpha) / (c_ctx + alpha * vocab_size), uni_prob[nxt])
             p = lam * p_bg + (1.0 - lam) * uni_prob[nxt]
@@ -13918,10 +13966,12 @@ def normalize_seed_list(seeds, *, default=(0,)):
                 # Above 2**53 a float cannot represent every integer; the
                 # requested seed may silently collapse to a different seed.
                 raise ValueError(f'seed {raw!r} exceeds the exact float-integer range (2**53); pass an int')
-        try:
-            s = int(raw)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(f'seed must be an integer, got {raw!r}') from None
+        # Shared exact-integer contract: int(Decimal('4.9'))/Fraction(9,2)
+        # truncates to a different valid seed, so reject non-exact
+        # number-like objects instead of coercing them.
+        s = _as_seed_int(raw)
+        if s is None:
+            raise ValueError(f'seed must be an integer, got {raw!r}')
         if s in seen:
             print(f'[seeds] WARNING: duplicate seed {s} removed from the panel plan (it would otherwise be trained twice under the same key)')
             continue
@@ -17651,6 +17701,13 @@ def _batch_arrays(batch, vocab=None):
         xv = x.reshape(-1)
         if xv.size and (int(xv.min()) < 0 or int(xv.max()) >= int(vocab)):
             raise ValueError(f'overfit batch inputs span [{int(xv.min())}, {int(xv.max())}], outside vocab [0, {int(vocab)})')
+        # Targets may carry a negative ignore sentinel, but every real target
+        # must address an embedding row.  Validating only the inputs let an
+        # out-of-vocabulary target reach cross_entropy (or silently index a
+        # wrapped row) during the probe.
+        yv = y.reshape(-1)
+        if yv.size and int(yv.max()) >= int(vocab):
+            raise ValueError(f'overfit batch targets span [{int(yv.min())}, {int(yv.max())}], outside vocab [0, {int(vocab)}) with negative ignore ids')
     return x, y
 
 def _param_change_sample(model, max_per_tensor=4096):
@@ -19045,8 +19102,11 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         tc = None
     if tc is not None and math.isfinite(tc):
         m = float(seed_logppl.mean())
-        out['ci95_ppl'] = [float(math.exp(m - tc * out['se_combined_logppl'])),
-                           float(math.exp(m + tc * out['se_combined_logppl']))]
+        # Use the same overflow-safe exponential as the rest of the PPL
+        # paths: a finite pooled CE near log(float max) can push the upper
+        # bound past math.exp's range, and a report builder must not crash.
+        out['ci95_ppl'] = [_safe_exp_ppl(m - tc * out['se_combined_logppl']),
+                           _safe_exp_ppl(m + tc * out['se_combined_logppl'])]
         out['status'] = 'ok'
     else:
         out['status'] = 'ci_unavailable'

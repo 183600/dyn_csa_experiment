@@ -5809,6 +5809,39 @@ def t_audit_length_missing_n_seq_flag():
         shutil.rmtree(td, ignore_errors=True)
 
 
+def t_scale_edge_case_regressions():
+    # Tiny but perfectly consistent effects must still hit the exact floor;
+    # an absolute tie tolerance used to force p=1.
+    assert abs(L.exact_signflip_p([1e-13] * 6)['p'] - 2.0 / 64) < 1e-12
+    assert abs(L.exact_signflip_p([1e-13] * 22)['p'] - 2.0 / (1 << 22)) < 1e-18
+    # The exact-test floor comes from the NONZERO pair count.
+    st = L.paired_effect_stats([0.7] * 5 + [0.0] * 15)
+    assert st['n_nonzero'] == 5 and st['p_floor'] == 2.0 / 2 ** 5, st
+    assert st['resolution_limited'] is True, st
+    # 0 and "0" are one seed, so the paired trend path must not disappear.
+    pts = [{'label': 'A', 'scale': 1.0, 'effects': [0.1, 0.2, 0.3], 'seeds': [0, 1, 2]},
+           {'label': 'B', 'scale': 2.0, 'effects': [0.2, 0.3, 0.4], 'seeds': ['0', '1', '2']}]
+    assert L.scaling_trend(pts, min_points=2, min_seeds=2)['paired']['n_complete_seeds'] == 3
+    # A training stream with fewer than two tokens has no bigram table; this
+    # must fall back to unigrams instead of indexing an empty array.
+    ng = L.ngram_lm_score([1], [1, 2, 1], 4, order=2)
+    assert math.isfinite(ng['nll']) and ng['n_tokens'] == 3, ng
+    # Object-dtype large integers stay exact in the corpus fingerprint.
+    import data_guard as DG
+    assert DG._matrix_fingerprint(np.array([[2 ** 53]], dtype=object)) != \
+        DG._matrix_fingerprint(np.array([[2 ** 53 + 1]], dtype=object))
+    # A non-truncated length cell must declare the requested span, not L-1.
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'bylen.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {
+                'n_tok': 16 * 4095, 'eval_span': 4095, 'n_seq': 16,
+                'truncated': False}}}}, f)
+        rep = A.audit_length(path)
+        assert rep['status'] == 'fail', rep
+        assert any('eval_span' in x for x in rep['problems']), rep
+
+
 def t_global_multiplicity_audit_basic():
     # Known BH case: p=[0.01, 0.02, 0.5] at m=3 -> q=[0.03, 0.03, 0.5].
     r = L.global_multiplicity_audit([('a', 0.01), ('b', 0.02), ('c', 0.5)])
@@ -6518,6 +6551,7 @@ def main():
     _check('L14 combined seed x document uncertainty interval', t_combined_seed_doc_uncertainty)
     _check('L15 cross-scale pooling refuses mixed corpus/tokenizer bindings', t_scale_corpus_binding_refuses_mixed_tokenizers)
     _check('L15b scale-point corpus provenance roundtrip', t_scale_point_provenance_roundtrip)
+    _check('L15c scale-edge regressions (tiny effects, zero deltas, tiny corpora)', t_scale_edge_case_regressions)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

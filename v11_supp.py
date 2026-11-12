@@ -255,7 +255,9 @@ def _one_record_per_seed(rows, label=''):
         if s in by_seed:
             dup.add(s)
         else:
-            by_seed[s] = r
+            # Canonicalise the seed so 0 and "0" cannot count as two
+            # independent seeds in the displayed n/paired maps.
+            by_seed[s] = dict(r, seed=s)
     if dup:
         print(f'[v11 report] {label}: seed(s) {sorted(dup)} hold more than one by-length record — '
               'the duplicate seed(s) are EXCLUDED rather than averaged into the column')

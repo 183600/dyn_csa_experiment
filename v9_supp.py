@@ -223,7 +223,10 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     def _sel_pct_of(v):
         _c = V.make_layer_cfgs_v7(1, v)[0]
         _bs = max(1, int(getattr(_c, 'block_size', 1) or 1))
-        _nb = max(1, _seq2k_len // _bs)
+        # The indexer sees ceil(seq_len/block) blocks, including the
+        # trailing partial block; flooring undercounts for non-divisible
+        # lengths.
+        _nb = max(1, (_seq2k_len + _bs - 1) // _bs)
         return 100.0 * min(int(_c.index_topk), _nb) / _nb, _bs, int(_c.index_topk)
     sel_ratio, _SEL_PCT = ({}, {})
     for _v in _SEL_VARIANTS:

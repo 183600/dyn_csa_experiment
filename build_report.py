@@ -129,9 +129,9 @@ def _signflip_mitm_count(deltas):
     d = _np.asarray(deltas, dtype=float)
     n = int(d.size)
     total = abs(float(d.sum()))
-    # Same tie tolerance as exp_lib._signflip_mitm_count: the compared means
-    # differ by at most 1e-12, i.e. the sums by n*1e-12.
-    thr = total - 1e-12 * n
+    # Same scale-free tie tolerance as exp_lib._signflip_mitm_count: an
+    # absolute slack turns tiny-but-consistent effects into p=1.
+    thr = total - 1e-12 * float(_np.abs(d).sum())
     if thr <= 0.0:
         return 1 << n
 
@@ -253,8 +253,8 @@ def exact_signflip(deltas):
         _np = None
     if _np is not None:
         _total = 1 << n
-        _thr = obs - 1e-12 * n
         _darr = _np.asarray(deltas, dtype=float)
+        _thr = obs - 1e-12 * float(_np.abs(_darr).sum())
         _ebnd = n * 2.220446049250313e-16 * float(_np.abs(_darr).sum())
         _bitpos = _np.arange(n, dtype=_np.int64)
         _step = max(1, min(_total, (1 << 24) // max(n, 1)))
@@ -271,9 +271,10 @@ def exact_signflip(deltas):
                     cnt += 1
     else:
         cnt = 0
+        _slack = 1e-12 * sum(abs(d) for d in deltas)
         for mask in range(1 << n):
             s = sum((d if mask >> i & 1 else -d for i, d in enumerate(deltas)))
-            if abs(s) >= obs - 1e-12 * n:
+            if abs(s) >= obs - _slack:
                 cnt += 1
     mu = sum(deltas) / n
     return {'n': n, 'mean': mu, 'std': (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0, 'p_exact_signflip': cnt / (1 << n), 'method': 'exact'}

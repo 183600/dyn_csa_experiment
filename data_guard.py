@@ -230,6 +230,13 @@ def _validated_index(values, *, name='index'):
             raise ValueError(f'{name} contains NaN/Inf; split indices must be finite')
         if np.any(f != np.floor(f)):
             raise ValueError(f'{name} contains non-integer row indices')
+        # Same exactness boundary as the object branch: above 2**53 a float
+        # cannot represent every integer, so it may silently alias another
+        # row index.
+        if np.any(np.abs(f) >= 2 ** 53):
+            raise ValueError(
+                f'{name} contains row indices outside the exact float-integer '
+                'range (< 2**53)')
         out = f.astype(np.int64)
     elif kind == 'O':
         # Reject strings, datetimes and booleans instead of coercing them:
@@ -1549,18 +1556,39 @@ def _matrix_fingerprint(X):
     _integral = (arr.dtype != object
                  and (np.issubdtype(arr.dtype, np.integer)
                       or np.issubdtype(arr.dtype, np.bool_)))
+    _obj_int = False
+    _obj_fits = True
+    if arr.dtype == object and arr.size:
+        # Object-dtype integer tables must keep the same exactness contract:
+        # the float64 fallback collapses 2**53 and 2**53+1.
+        _vals = arr.reshape(-1).tolist()
+        _obj_int = all(isinstance(v, numbers.Integral)
+                       and not isinstance(v, (bool, np.bool_))
+                       for v in _vals)
+        if _obj_int:
+            _obj_fits = all(-(2 ** 63) <= int(v) <= 2 ** 64 - 1 for v in _vals)
+            if not _obj_fits:
+                _obj_int = False
+    _integral = _integral or _obj_int
     _wide_int = False
     if _integral and arr.size:
         _lim = 2 ** 53
-        if np.issubdtype(arr.dtype, np.unsignedinteger):
+        if arr.dtype == object:
+            _wide_int = bool(any(abs(int(v)) >= _lim for v in arr.reshape(-1).tolist()))
+        elif np.issubdtype(arr.dtype, np.unsignedinteger):
             _wide_int = bool((arr > _lim).any())
         else:
             _wide_int = bool(((arr > _lim) | (arr < -_lim)).any())
     for start in range(0, arr.shape[0], _step):
+        _blk = arr[start:start + _step]
         if _wide_int:
-            block = np.ascontiguousarray(arr[start:start + _step], dtype=np.uint64)
+            if _blk.dtype == object:
+                _flat = [int(v) & (2 ** 64 - 1) for v in _blk.reshape(-1).tolist()]
+                block = np.asarray(_flat, dtype=np.uint64).reshape(_blk.shape)
+            else:
+                block = np.ascontiguousarray(_blk, dtype=np.uint64)
         else:
-            block = np.asarray(arr[start:start + _step], dtype=np.float64)
+            block = np.asarray(_blk, dtype=np.float64)
         h.update(np.ascontiguousarray(block).tobytes())
     return h.hexdigest()[:16]
 
@@ -1618,12 +1646,22 @@ def _row_keys(X):
     if _integral or (src.dtype != object and not np.issubdtype(src.dtype, np.floating)):
         _step = _hash_row_block(int(src.shape[1]), 1 << 16)
         for start in range(0, src.shape[0], _step):
+            _blk = src[start:start + _step]
             if _integral:
-                arr = np.ascontiguousarray(src[start:start + _step], dtype=np.uint64)
+                arr = np.ascontiguousarray(_blk, dtype=np.uint64)
             else:
-                arr = np.ascontiguousarray(src[start:start + _step])
-            for row_view in arr.view(np.uint8).reshape(arr.shape[0], -1):
+                arr = np.ascontiguousarray(_blk)
+            # A signed negative row must not collide with the raw unsigned
+            # value (int64 -1 vs uint64 2**64-1).  Tag only rows that carry a
+            # negative value, so the same nonnegative logical row still
+            # matches across all integer widths.
+            try:
+                _neg_rows = np.asarray(_blk < 0).reshape(_blk.shape[0], -1).any(axis=1)
+            except (TypeError, ValueError):
+                _neg_rows = np.zeros(_blk.shape[0], dtype=bool)
+            for _ri, row_view in enumerate(arr.view(np.uint8).reshape(arr.shape[0], -1)):
                 h = hashlib.blake2b(digest_size=8)
+                h.update(b'N' if bool(_neg_rows[_ri]) else b'P')
                 h.update(memoryview(row_view))
                 keys.append(h.digest())
         return keys
@@ -1809,11 +1847,22 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             raise ValueError(
                 'known_labels must be an iterable of labels, not a single string')
         try:
-            values = (known_labels.reshape(-1).tolist()
-                      if isinstance(known_labels, np.ndarray)
-                      else list(known_labels))
+            if isinstance(known_labels, np.ndarray) and known_labels.ndim > 1:
+                # Multi-output y rows are tuples; flattening a 2-D known-label
+                # table splits every tuple into scalar outputs and marks all
+                # real labels unknown.
+                values = [tuple(row) for row in
+                          known_labels.reshape(known_labels.shape[0], -1).tolist()]
+            else:
+                values = (known_labels.reshape(-1).tolist()
+                          if isinstance(known_labels, np.ndarray)
+                          else list(known_labels))
         except TypeError:
             raise ValueError('known_labels must be a flat iterable of labels') from None
+        _y_multi = (y is not None and np.asarray(y).ndim > 1)
+        if _y_multi:
+            values = [tuple(v) if isinstance(v, (list, tuple, np.ndarray)) else (v,)
+                      for v in values]
         known = {_hashable_label(_label_key(v)) for v in values}
         known.discard(None)
         if y is None:

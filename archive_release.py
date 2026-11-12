@@ -155,7 +155,11 @@ def _collect(dirs, include_ckpt=False):
     try:
         for n in sorted(os.listdir(REPO)):
             if n.startswith('run_') and n.endswith('.log'):
-                files.append(os.path.join(REPO, n))
+                _p = os.path.join(REPO, n)
+                if os.path.isfile(_p) and not os.path.islink(_p):
+                    files.append(_p)
+                else:
+                    print(f'[archive] WARNING: skipping non-regular root log {n} — only regular files are content-attested')
     except OSError:
         pass
     # The freeze lock can already be reached by the directory walk above;

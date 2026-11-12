@@ -416,7 +416,15 @@ def _controlled_reason(a, b):
             if va is None and vb is None:
                 continue
             return f'unverifiable {k} (only one record carries it)'
-        if va != vb:
+        if k in ('steps', 'tokens_seen'):
+            # Exact counts: 1000 and "1000" are the same measurement, while a
+            # boolean True must not pass as 1.
+            ia, ib = L._as_seed_int(va), L._as_seed_int(vb)
+            if ia is None or ib is None:
+                return f'{k} is not an exact integer count ({va!r} != {vb!r})'
+            if ia != ib:
+                return f'{k} differs ({ia!r} != {ib!r})'
+        elif va != vb:
             return f'{k} differs ({va!r} != {vb!r})'
     if (a.get('code') is None) != (b.get('code') is None):
         return 'unverifiable code stamp (only one record carries it)'

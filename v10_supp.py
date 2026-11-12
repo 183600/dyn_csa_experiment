@@ -1313,16 +1313,27 @@ def _equal_token_slices():
             _tps_l = (conf.get(name) or {}).get('tokens_per_step')
             if not _tps_l:
                 continue
+            # Equal TOKEN slices, not equal step indices: when the calibrated
+            # tokens/step differs, using the same step compares different
+            # cumulative token counts while the label claims equality.
+            _hn = _panel_hists.get(name) or {}
+            _steps_l = sorted(set().union(*[set(dict(v)) for v in _hn.get('csa_fixed', {}).values()],
+                                         *[set(dict(v)) for v in _hn.get('full', {}).values()])) if _hn else []
             for step in _common_steps:
+                target_tokens = step * _tps_s
+                if _steps_l:
+                    step_l = min(_steps_l, key=lambda x: abs(x * _tps_l - target_tokens))
+                else:
+                    step_l = step
                 _g_s = _gap_at('P3SS', step)
-                _g_l = _gap_at(name, step)
+                _g_l = _gap_at(name, step_l)
                 common = sorted(set(_g_s) & set(_g_l))
                 if not common:
                     continue
                 dg = [_g_l[s] - _g_s[s] for s in common]
                 res = V.exact_sign_permutation(dg)
                 tokens = step * _tps_s
-                slices[f'{name} - P3SS @ {tokens / 1000000.0:.2f}M tokens (gap_L - gap_S)'] = {'n': res['n'], 'mean': res['mean'], 'std': res.get('std', 0.0), 'p_exact_signflip': res['p_exact_signflip'], 'per_seed': res.get('per_seed'), 'p_floor': res.get('p_floor'), 'cohens_dz': res.get('cohens_dz'), 'seeds': common, 'gap_L': {str(s): _g_l[s] for s in common}, 'gap_S': {str(s): _g_s[s] for s in common}, 'note': 'positive = the CSA-dense gap is larger in the large arm AT THE SAME cumulative tokens'}
+                slices[f'{name} - P3SS @ {tokens / 1000000.0:.2f}M tokens (gap_L - gap_S)'] = {'n': res['n'], 'mean': res['mean'], 'std': res.get('std', 0.0), 'p_exact_signflip': res['p_exact_signflip'], 'per_seed': res.get('per_seed'), 'p_floor': res.get('p_floor'), 'cohens_dz': res.get('cohens_dz'), 'seeds': common, 'gap_L': {str(s): _g_l[s] for s in common}, 'gap_S': {str(s): _g_s[s] for s in common}, 'small_step': step, 'large_step': step_l, 'tokens_small': target_tokens, 'tokens_large': step_l * _tps_l, 'note': 'positive = the CSA-dense gap is larger in the large arm at (approximately) the same cumulative tokens'}
     return {'panels': conf, 'equal_token_slices': slices}
 
 def v10_analysis(out='analysis_v10/stats.json'):
@@ -1461,6 +1472,8 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     _add_contrast(f'L{Ln} r{rho}: arch-aligned: full_rope - csa_alltrain', allt, dense)
         # ---- delta-NLL on the corruption modes ----
         delta_nll = {}
+        _dn_id = {}
+        _dn_ambiguous = set()
 
         def _nll_tok(rec):
             # nll_sum and n_tok are PER-ROW arrays: they must align, and token
@@ -1525,17 +1538,39 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 means = {s: per_seed[s] for s in sorted(per_seed)}
                 _dl = list(means.values())
                 entry = {'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'n': len(_dl), 'mean': float(np.mean(_dl)), 'std': float(np.std(_dl, ddof=1)) if len(_dl) > 1 else 0.0, 'per_seed': means, 'clean_nll_by_seed': {s: _nll_tok(r) for s, r in clean_grp.items() if math.isfinite(_nll_tok(r))}, 'note': 'delta = NLL_corrupted - NLL_clean, nats per target token'}
-                delta_nll[f'{v}::{arm}::L{Ln}::{mode}::r{rho}'] = entry
+                _dnk = f'{v}::{arm}::L{Ln}::{mode}::r{rho}'
+                _dnident = (v, arm, Ln, rho, mode, _pp, _cd, _recipe)
+                if _dnk in _dn_ambiguous:
+                    continue
+                if _dnk in delta_nll:
+                    if _dn_id.get(_dnk) != _dnident:
+                        # Two distinct parameterisations/code/recipe stamps
+                        # share one display key; keeping either would make the
+                        # contrast depend on dict order.
+                        print(f'[v10 stats] ΔNLL cell {_dnk} has several probe parameterisations — the cell is EXCLUDED rather than overwritten')
+                        delta_nll.pop(_dnk, None)
+                        _dn_ambiguous.add(_dnk)
+                    continue
+                delta_nll[_dnk] = entry
+                _dn_id[_dnk] = _dnident
         # paired delta-NLL contrasts between arms at the same (L, mode, rho)
         for Ln in PROBE['eval_lens']:
             _modes = (PROBE.get('modes') or {}).keys() or ['uniform']
             for mode in [m for m in _modes if m != 'uniform'] + ['uniform']:
                 _rhos = ((PROBE.get('modes') or {}).get(mode) or ([r for r in PROBE['rhos'] if r > 0] if mode == 'uniform' else []))
                 for rho in [r for r in _rhos if r > 0]:
-                    learned = delta_nll.get(f'csa_fixed_rope::learned::L{Ln}::{mode}::r{rho}')
+                    _lk = f'csa_fixed_rope::learned::L{Ln}::{mode}::r{rho}'
+                    learned = delta_nll.get(_lk)
                     for arm, tag in (('dense', 'full_rope::dense'), ('randidx', 'csa_fixed_rope::randidx'), ('allblocks', 'csa_fixed_rope::allblocks')):
-                        other = delta_nll.get(f'{tag}::L{Ln}::{mode}::r{rho}')
+                        _ok = f'{tag}::L{Ln}::{mode}::r{rho}'
+                        other = delta_nll.get(_ok)
                         if not learned or not other:
+                            continue
+                        # Both sides must describe the SAME measurement
+                        # geometry/recipe/code; the display key alone omits
+                        # those identities.
+                        if _dn_id.get(_lk, (None,) * 8)[2:] != _dn_id.get(_ok, (None,) * 8)[2:]:
+                            print(f'[v10 stats] ΔNLL L{Ln} {mode} r{rho}: {arm} and learned were measured under different probe_params/code/recipe — contrast omitted')
                             continue
                         common = sorted(set(learned['per_seed']) & set(other['per_seed']))
                         if len(common) >= 2:
@@ -1596,7 +1631,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             for (v, arm, Ln, cond, _pp, _cd, _recipe), by_seed in sorted(ncells.items(), key=lambda kv: kv[0]):
                 accs = {s: r['acc'] for s, r in by_seed.items()}
                 nlls = {s: r['nll'] for s, r in by_seed.items()}
-                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'acc_mean': float(np.mean(list(accs.values()))), 'nll_mean': float(np.mean(list(nlls.values()))), 'n': len(accs), 'n_pairs': next(iter(by_seed.values())).get('n_pairs'), 'dist_mean': next(iter(by_seed.values())).get('dist_mean')})
+                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'acc_mean': float(np.mean(list(accs.values()))), 'nll_mean': float(np.mean(list(nlls.values()))), 'n': len(accs), 'n_pairs': next(iter(by_seed.values())).get('n_pairs'), 'dist_mean': next(iter(by_seed.values())).get('dist_mean'), '_pp': _pp, '_code': _cd, '_recipe': _recipe})
             niah_contrasts = {}
             _nidx = {}
             for c in niah_cells:
@@ -1612,6 +1647,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
                         other = _ncell('full_rope', 'dense', Ln, cond) if arm == 'dense' else _ncell(tag, arm, Ln, cond)
                         if not learned or not other:
                             continue
+                        if (learned.get('_pp'), learned.get('_code'), learned.get('_recipe')) != (other.get('_pp'), other.get('_code'), other.get('_recipe')):
+                            print(f'[v10 stats] NIAH-nat L{Ln} {cond}: {arm} and learned were measured under different probe_params/code/recipe — contrast omitted')
+                            continue
                         common = sorted(set(learned['acc_by_seed']) & set(other['acc_by_seed']))
                         if len(common) >= 2:
                             res = V.exact_sign_permutation([other['nll_by_seed'][s] - learned['nll_by_seed'][s] for s in common])
@@ -1620,6 +1658,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     for tag, ov in (('csa_randtrain', 'csa_fixed_rope_randidx'), ('csa_alltrain', 'csa_fixed_rope_allblocks')):
                         other = _ncell(ov, 'learned', Ln, cond)
                         if not learned or not other:
+                            continue
+                        if (learned.get('_pp'), learned.get('_code'), learned.get('_recipe')) != (other.get('_pp'), other.get('_code'), other.get('_recipe')):
+                            print(f'[v10 stats] NIAH-nat L{Ln} {cond}: {tag} and learned were measured under different probe_params/code/recipe — contrast omitted')
                             continue
                         common = sorted(set(learned['nll_by_seed']) & set(other['nll_by_seed']))
                         if len(common) >= 2:
@@ -1697,6 +1738,30 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 print(f'  crossover {label:10s} mean-traj: step {v['mean_crossover_step']:g} (tokens/step unknown)')
     return out_d
 
+def _one_record_per_seed(rows, label=''):
+    """Canonicalise seeds, drop synthesized reconstructions, and exclude
+    every ambiguous duplicate seed so a by-length column means each seed
+    exactly once."""
+    by_seed = {}
+    dup = set()
+    for r in rows:
+        if not isinstance(r, dict) or r.get('synthesized'):
+            continue
+        s = L._as_seed_int(r.get('seed'))
+        if s is None:
+            continue
+        if s in by_seed:
+            dup.add(s)
+        else:
+            by_seed[s] = dict(r, seed=s)
+    if dup:
+        print(f'[v10 report] {label}: seed(s) {sorted(dup)} hold more than one by-length record — '
+              'the duplicate seed(s) are EXCLUDED rather than averaged into the column')
+        for s in dup:
+            by_seed.pop(s, None)
+    return list(by_seed.values())
+
+
 def _fmt_pm(cell, std=None):
     if isinstance(cell, dict):
         if cell.get('mean') is None:
@@ -1752,7 +1817,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                 print(f'[v10 report] {v}: no by-length record carries the current code semantics ({L.code_stamp()}) — EXCLUDED from the table and conclusions ({len(_rv)} stale record(s) left on disk)')
                 _stale_vars.add(v)
                 _rv = []
-            _rows_by_v[v] = _rv
+            _rows_by_v[v] = _one_record_per_seed(_rv, label=v)
         n_by_v = {v: {r['seed'] for r in _rv} for v, _rv in _rows_by_v.items() if _rv}
         if len(n_by_v) > 1:
             _common_seeds = set.intersection(*n_by_v.values())
