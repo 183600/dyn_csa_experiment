@@ -1575,9 +1575,9 @@ def _matrix_fingerprint(X):
         _lim = 2 ** 53
         if arr.dtype == object:
             _vals_wide = [int(v) for v in arr.reshape(-1).tolist()]
-            # 2**53 is still exactly representable as float64, and the typed
-            # path below uses a strict comparison; a >= here would fingerprint
-            # the same logical table differently when it is object-dtype.
+            # 2**53 is exactly representable as float64; use the same strict
+            # comparison as the typed path below so object and typed tables
+            # share one boundary convention.
             _wide_int = bool(any(abs(v) > _lim for v in _vals_wide))
             _wide_neg = bool(any(v < 0 for v in _vals_wide))
         elif np.issubdtype(arr.dtype, np.unsignedinteger):
@@ -1621,8 +1621,8 @@ def _row_keys(X):
         # An all-integer object table has an exact fixed-width twin.  Route it
         # through the same uint64/int64 canonicalisation as a typed table so
         # the same logical row has the same key whether a cache serialised it
-        # as object, int64 or uint64 (otherwise cross-dtype leakage would be
-        # missed by the duplicate audit).
+        # as object, int64 or uint64, keeping cross-dtype duplicates visible
+        # to the duplicate audit.
         _flat_obj = src.reshape(-1).tolist()
         if _flat_obj and all(isinstance(v, numbers.Integral)
                              and not isinstance(v, (bool, np.bool_))

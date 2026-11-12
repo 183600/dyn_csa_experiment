@@ -1385,9 +1385,8 @@ def t_eval_length_invalid_lengths():
     # Malformed (unhashable) length identities must not crash the whole eval.
     out_bad = V7.eval_length_gen(model, ids, [[8]], dev, max_pos=None)
     assert len(out_bad) == 1 and 'error' in next(iter(out_bad.values())), out_bad
-    # Row count and truncation span are exact integers too: a fractional
-    # n_seq used to crash, and n_seq=0 used to report exp(0)=1 as a
-    # measurement.  Both must be named error cells, not silent samples.
+    # Row count and truncation span are exact integers too: fractional,
+    # boolean or non-positive values are named error cells, not silent samples.
     for bad_nseq in (0, -1, 4.9, True, False):
         out_ns = V7.eval_length_gen(model, ids, [8], dev, max_pos=None, n_seq=bad_nseq)
         assert 'error' in out_ns[8] and 'ppl' not in out_ns[8], (bad_nseq, out_ns)

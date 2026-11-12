@@ -2305,11 +2305,10 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
             continue
         _norm_lens.append(_li)
     eval_lens = _norm_lens
-    # Row count and truncation span are also exact integers: a fractional /
-    # boolean n_seq would crash or silently score a different number of rows
-    # (n_seq=0 would report exp(0)=1), and int(4.9) on max_pos would score a
-    # different span than the caller named.  Fail closed for every requested
-    # length instead of returning such a measurement.
+    # Row count and truncation span are also exact integers: a fractional,
+    # boolean or non-positive n_seq and a fractional/boolean max_pos are
+    # invalid arguments.  Fail closed for every requested length instead of
+    # returning a measurement under a different sample or span.
     _nseq = L._as_seed_int(n_seq)
     _max_norm = max_pos if max_pos is None else L._as_seed_int(max_pos)
     _arg_err = None

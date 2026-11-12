@@ -1220,8 +1220,8 @@ def _by_len_shape_reason(rec, n_seq):
     bl = rec.get('by_len') or {}
     if not isinstance(bl, dict) or not bl:
         return 'no by_len measurement'
-    # The frozen row count is an exact positive integer; int(4.9)=4 would
-    # validate a cell against a different estimand than the plan declares.
+    # The frozen row count is an exact positive integer; fractional, boolean
+    # or non-positive values are refused.
     _nseq_i = _record_int(n_seq)
     if _nseq_i is None or _nseq_i <= 0:
         return f'n_seq={n_seq!r} is not a positive exact integer row count'
@@ -1265,10 +1265,9 @@ def _by_len_shape_reason(rec, n_seq):
             return f'by_len[{_ln_i}].truncated={_c.get("truncated")!r} is not a boolean — an unverifiable cell is not admissible'
         if bool(_c.get('truncated')):
             return f'by_len[{_ln_i}] is marked truncated — a partial cell is not admissible'
-        # A non-truncated cell must cover exactly the requested span.  n_tok
-        # alone cannot catch a cell that scored L-1 tokens under an L label
-        # (the same rule as audit_length): eval_span is the cell's own record
-        # of how many positions it actually ran.
+        # A non-truncated cell must cover exactly the requested span:
+        # eval_span is the cell's own record of how many positions it
+        # actually ran (the same rule as audit_length).
         _es = _c.get('eval_span')
         if _es is not None:
             _es_i = _record_int(_es)
