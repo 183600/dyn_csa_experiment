@@ -480,9 +480,8 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     if not cells:
         raise SystemExit(f'no usable records in {outdir}/summary.json')
     avail_seeds = sorted({s for (_, s) in cells})
-    # Keep the caller's request separate from the normalised list below;
-    # assigning `seeds = []` first silently discarded it and analysed every
-    # available seed instead of the requested subset.
+    # Keep the caller's requested subset separate from the normalised list
+    # built below.
     _requested_seeds = seeds
     # A caller may repeat a seed on the command line; deduplicate while
     # preserving the requested order so n stays the number of unique seeds.

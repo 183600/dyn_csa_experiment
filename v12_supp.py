@@ -362,7 +362,7 @@ def _load_manifest(path):
         # The probe runs on the SAME frozen test slice as the by-length panel.
         # If it asks for a longer sequence or more rows, run_finaltest sizes
         # the slice from by_length_ppl/n_seqs_clean and the probe indexes out
-        # of bounds AFTER the one-shot test access has already been spent.
+        # of bounds.
         _plens = [int(float(_x)) for _x in (_probe.get('eval_lens') or [])]
         if _plens:
             if _bl_ints and max(_plens) > max(_bl_ints):
@@ -2164,8 +2164,8 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
         errs.append('manifest eval.n_seqs_clean is missing/zero; the frozen row count is part of the slice')
     # P5T fills a missing distractor-probe field from FINALTEST_CFG, so the
     # pre-flight must validate those DEFAULTS too.  Otherwise a manifest that
-    # omits probe eval_lens/target/n_seq can pass here, spend the one-shot test
-    # access, and only then index outside the frozen slice.
+    # omits probe eval_lens/target/n_seq can pass here and only fail when the
+    # probe indexes outside the frozen slice.
     _probe_plan = _eval.get('distractor_probe') or {}
     _probe_lens = [int(x) for x in (_probe_plan.get('eval_lens') or [2048, 4096])]
     _probe_target = int(_probe_plan.get('target', FINALTEST_CFG.get('target', 512)))

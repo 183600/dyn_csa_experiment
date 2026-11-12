@@ -561,9 +561,7 @@ def t_summary_refuses_nonobject():
 
 
 def t_analyse_respects_requested_seeds():
-    # `analyse(seeds=[...])` must restrict the panel to the requested seeds;
-    # resetting the loop variable used to discard the request and analyse every
-    # available seed instead.
+    # `analyse(seeds=[...])` must restrict the panel to the requested seeds.
     import json
     import shutil
     import tempfile
