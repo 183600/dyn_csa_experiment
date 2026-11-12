@@ -1244,7 +1244,7 @@ def sec_p1l():
                 v = int(Ln)
             except (TypeError, ValueError, OverflowError):
                 return None
-        return v if v > 0 else None
+        return v if v >= 2 else None
 
     def _cell_at(by_len, Ln):
         # by_len keys are normally the integer length or its string spelling,

@@ -5115,6 +5115,7 @@ def t_sec_p1l_rejects_malformed_length_keys():
         True: {'ppl': 11.0, 'truncated': False},
         '4.9': {'ppl': 22.0, 'truncated': False},
         '0': {'ppl': 33.0, 'truncated': False},
+        '1': {'ppl': 66.0, 'truncated': False},
         '-512': {'ppl': 44.0, 'truncated': False},
         '512': {'ppl': 10.0, 'truncated': False},
         '4096': {'ppl': 20.0, 'truncated': False},
@@ -5131,7 +5132,7 @@ def t_sec_p1l_rejects_malformed_length_keys():
         BR._LOADED.pop(('summary', 'results_len'), None)
     assert 'PPL@512' in txt and 'PPL@4096' in txt, txt[:600]
     assert '99.0' not in txt, txt[:600]
-    for _bad in ('PPL@0', 'PPL@1 ', 'PPL@4 ', 'PPL@-512'):
+    for _bad in ('PPL@0', 'PPL@1 ', 'PPL@4 ', 'PPL@-512', '66.0'):
         assert _bad not in txt, (_bad, txt[:600])
     for _bad_val in ('11.0', '22.0', '33.0', '44.0'):
         assert _bad_val not in txt, (_bad_val, txt[:600])
