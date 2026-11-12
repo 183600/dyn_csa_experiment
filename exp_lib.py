@@ -12836,7 +12836,9 @@ def _param_control_detail(recs, a, b):
         return out
 
     def _num(d, key):
-        return _finite_scalar(d.get(key))
+        # Breakdown entries are exact parameter counts; a fractional value is
+        # corrupted provenance, not a measurement to compare with 1%.
+        return _as_seed_int(d.get(key))
     for key, label in (('non_embedding', 'non_embedding'), ('active', 'active')):
         va, vb = _num(ba, key), _num(bb, key)
         if va is None or vb is None:
@@ -12870,10 +12872,12 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
         for (v, _t, _s), r in recs.items():
             if v != arm or not isinstance(r, dict):
                 continue
-            tt, tok = _finite_scalar(r.get('train_time_s')), _finite_scalar(r.get('tokens_seen'))
+            tt, tok = _finite_scalar(r.get('train_time_s')), _as_seed_int(r.get('tokens_seen'))
             if tt is not None and tok is not None and tt > 0 and tok > 0:
                 tpt.append(float(tt) / float(tok))
-            p = _finite_scalar(r.get('params'))
+            # Parameter and token counts are exact integers; bool/fractional
+            # values must not silently become a compute ratio.
+            p = _as_seed_int(r.get('params'))
             if p is not None and p > 0:
                 par.append(float(p))
                 if tok is not None and tok > 0:

@@ -5018,6 +5018,19 @@ def t_param_and_compute_control_detail():
         {('a', 'p', 0): {'params': True, 'train_time_s': True, 'tokens_seen': True},
          ('b', 'p', 0): {'params': True, 'train_time_s': True, 'tokens_seen': True}}, 'a', 'b')
     assert bool_c['compute_matched'] is None and bool_c['time_ratio_a_over_b'] is None, bool_c
+    # Fractional counts are not exact parameter/token identities.
+    frac_c = L._compute_control_detail(
+        {('a', 'p', 0): {'params': 1000.5, 'train_time_s': 10.0, 'tokens_seen': 100.5},
+         ('b', 'p', 0): {'params': 1000, 'train_time_s': 20.0, 'tokens_seen': 100}}, 'a', 'b')
+    assert frac_c['compute_matched'] is None and frac_c['time_ratio_a_over_b'] is None, frac_c
+    frac_p = L._compute_control_detail(
+        {('a', 'p', 0): {'params': 1000.5, 'tokens_seen': 100},
+         ('b', 'p', 0): {'params': 1000, 'tokens_seen': 100}}, 'a', 'b')
+    assert frac_p['compute_matched'] is None and frac_p['proxy_ratio_a_over_b'] is None, frac_p
+    frac_d = L._param_control_detail(
+        {('a', 'p', 0): {'params': 1000, 'param_breakdown': {'total': 1000, 'non_embedding': 800.5, 'active': 700}},
+         ('b', 'p', 0): {'params': 1000, 'param_breakdown': {'total': 1000, 'non_embedding': 800, 'active': 700}}}, 'a', 'b')
+    assert frac_d['non_embedding_rel_diff'] is None and frac_d['non_embedding_controlled'] is None, frac_d
     # A significant contrast whose extra compute favours the winner is
     # system-level, not a verified mechanism.
     entry = {'controlled': True, 'param_controlled': True, 'n': 6, 'significant_global': True,
