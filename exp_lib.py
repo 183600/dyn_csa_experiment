@@ -9689,8 +9689,7 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     if not (math.isfinite(a) and 0.0 < a < 1.0):
         return None
     # The attainable floor decreases monotonically with n, so the smallest
-    # feasible n is the left edge of a suffix.  Binary search keeps this
-    # planning helper O(log n_max) when a scale-up asks for a huge n_max.
+    # feasible n is the left edge of a suffix.
     if holm_min_attainable_p(n_max, m, a) > a + 1e-15:
         return None
     lo, hi = 1, n_max
@@ -9943,8 +9942,7 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
         return m * p <= alpha + 1e-15
 
     # p(k) decreases monotonically as k grows, so "clears the gate" is a
-    # suffix of [0, n].  Binary search finds its left edge in O(log n) calls
-    # instead of the former O(n) scan (which hung for large seed counts).
+    # suffix of [0, n].  Binary search finds its left edge.
     if not _clears(n):
         return None
     lo, hi = 0, n
@@ -9983,9 +9981,9 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
         return 1.0
     if q <= 0.0:
         return 0.0
-    # The incomplete beta loses accuracy (and the log-space fallback becomes
-    # O(n)) once n is very large; a normal tail is stable and more accurate
-    # there.  Small panels keep the exact incomplete-beta path.
+    # The incomplete beta loses accuracy once n is very large; a normal tail
+    # is stable and more accurate there.  Small panels keep the exact
+    # incomplete-beta path.
     if n > _BINOM_EXACT_MAX_N:
         return _binom_sf_normal(n, kmin, q)
     cdf = _betai(n - kmin + 1, kmin, 1.0 - q)
