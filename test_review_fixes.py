@@ -905,6 +905,25 @@ def t_admission_refuses():
         raise AssertionError('a truncated by_len cell must not be admitted')
     except SystemExit as e:
         assert 'truncated' in str(e), e
+    # In-memory manifests must obey the same exact seed/row-count contract as
+    # the loader: bool/fractional ids cannot alias a planned seed.
+    for _bad_seeds in ([True], [1.5], [1, 1.0]):
+        try:
+            V12._admit_confirmation_records(
+                {'a::s1': _rec('a_arm', 1, 'FP')},
+                _manifest_for_admission(seeds=_bad_seeds))
+            raise AssertionError(f'bad in-memory seeds {_bad_seeds!r} must be refused')
+        except SystemExit as e:
+            assert 'seed' in str(e).lower(), e
+    for _bad_nseq in (True, 16.9, 0, 'x'):
+        _mb = _manifest_for_admission()
+        _mb['eval'] = {'n_seqs_clean': _bad_nseq}
+        try:
+            V12._admit_confirmation_records(
+                {'a::s0': _rec('a_arm', 0, 'FP')}, _mb)
+            raise AssertionError(f'bad in-memory n_seqs_clean {_bad_nseq!r} must be refused')
+        except SystemExit as e:
+            assert 'row count' in str(e), e
 
 
 def t_recipe_signature():

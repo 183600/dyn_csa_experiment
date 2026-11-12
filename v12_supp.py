@@ -1218,12 +1218,26 @@ def _admit_confirmation_records(raw, manifest):
     可采纳记录的 data_fp 必须全局唯一（同一冻结 test 切片），否则拒绝。
     返回 (admitted[(variant, seed)] -> record, unified data_fp)。"""
     arms = list(manifest['arms'])
-    seed_whitelist = {int(s) for s in manifest['seeds']}
+    # This gate is also callable with an in-memory manifest (finaltest_stats /
+    # tests).  Apply the loader's exact seed identity here too: int(True)==1
+    # or int(4.9)==4 would admit a record under a different planned seed.
+    _seed_ids = []
+    for _s in manifest['seeds']:
+        _si = L._as_seed_int(_s)
+        if _si is None:
+            raise SystemExit(f'[p5t stats] REFUSE: frozen seed {_s!r} is not an exact integer')
+        _seed_ids.append(_si)
+    if len(set(_seed_ids)) != len(_seed_ids):
+        raise SystemExit(f'[p5t stats] REFUSE: frozen seeds are not unique ({manifest["seeds"]!r})')
+    seed_whitelist = set(_seed_ids)
     exp_code = L.code_stamp()  # eager-only; kernel mode is refused at load
     impl = _frozen_implementation(manifest)
     msha = manifest.get('manifest_sha256')
     want_train_fp = _frozen_train_fp(manifest)
-    _want_nseq = int(((manifest.get('eval') or {}).get('n_seqs_clean')) or 0)
+    _nseq_raw = (manifest.get('eval') or {}).get('n_seqs_clean')
+    _want_nseq = _record_int(_nseq_raw) if _nseq_raw is not None else 0
+    if _nseq_raw is not None and (_want_nseq is None or _want_nseq <= 0):
+        raise SystemExit(f'[p5t stats] REFUSE: eval.n_seqs_clean={_nseq_raw!r} is not a positive integer row count')
     admitted = {}
     excluded = []
     duplicates = []
