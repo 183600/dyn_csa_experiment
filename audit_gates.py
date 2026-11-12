@@ -2275,6 +2275,10 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         _geom_ok = bool(k > 0 and B > 0 and k <= B)
         if not _geom_ok:
             out['problems'].append(f'cell {i}: require 0 < k <= n_blocks (got k={k}, B={B})')
+        _el_ok = bool(_ints['eval_len'] > 0)
+        if not _el_ok:
+            out['problems'].append(
+                f'cell {i}: eval_len must be a positive sequence length (got {_ints["eval_len"]})')
         _nq_ok = bool(nq > 0)
         if not _nq_ok:
             out['problems'].append(f'cell {i}: n_queries must be positive')
@@ -2326,7 +2330,7 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
                              'mass_excess': mass - base, 'recall_excess': rec - base,
                              'n_queries': nq, 'n_seeds': _n_seeds, 'n_seeds_valid': _n_valid,
                              'seed_test': _st,
-                             'claim_allowed': bool(_range_ok and _geom_ok and _nq_ok
+                             'claim_allowed': bool(_range_ok and _geom_ok and _el_ok and _nq_ok
                                                    and mass > base and rec > base
                                                    and _st is not None
                                                    and _st.get('p_exact_signflip', 1.0) < 0.05

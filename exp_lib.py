@@ -8715,7 +8715,7 @@ def pair_reason(ra, rb):
         return 'unverifiable init_core_fp (only one record carries the matched-initialization digest)'
     if _ha and str(_ia) != str(_ib):
         return f'different init_core_fp ({str(_ia)[:12]}… vs {str(_ib)[:12]}…): the two arms did not start from the same shared-trunk initialization despite the paired seed'
-    bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
+    bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None]
     if bad:
         absent = [k for k in bad if ra.get(k) is None and rb.get(k) is None]
         unknown = [k for k in bad if k not in absent and (ra.get(k) is None) != (rb.get(k) is None)]
@@ -8723,7 +8723,20 @@ def pair_reason(ra, rb):
             return f'unverifiable {sorted(unknown)}'
         if absent:
             return f'unverifiable {sorted(absent)}'
-        return f'disagreeing {sorted(bad)}'
+    # A training budget is an exact integer count.  Raw equality would accept
+    # steps=1 vs steps=True (1 == True) and fractional/fractional pairs as a
+    # controlled comparison, and would reject the same integer spelled "1".
+    _disagree = []
+    for k in PAIR_STEP_KEYS:
+        _va = _as_seed_int(ra.get(k))
+        _vb = _as_seed_int(rb.get(k))
+        if _va is None or _vb is None:
+            return (f'unverifiable {k} (not an exact integer training budget: '
+                    f'{ra.get(k)!r} vs {rb.get(k)!r})')
+        if _va != _vb:
+            _disagree.append(k)
+    if _disagree:
+        return f'disagreeing {sorted(_disagree)}'
     return None
 
 def _hyperparam_reason(ra, rb):
@@ -8996,11 +9009,12 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
         n = int(_n_raw)
     elif isinstance(_n_raw, numbers.Real):
         _nf = float(_n_raw)
-        if math.isfinite(_nf) and _nf == math.floor(_nf):
+        if (math.isfinite(_nf) and _nf == math.floor(_nf)
+                and abs(_nf) < 2 ** 53):
             n = int(_nf)
         else:
             n = 0
-            out['reasons'].append(f'n {_n_raw!r} is not an integer seed count')
+            out['reasons'].append(f'n {_n_raw!r} is not an exact integer seed count')
     else:
         # Do not accept a string or other object by truncating/coercing it:
         # a declared seed count must be an exact integer.
@@ -9079,10 +9093,11 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             _fs = int(family_size)
         elif isinstance(family_size, numbers.Real):
             _f = float(family_size)
-            if math.isfinite(_f) and _f == math.floor(_f):
+            if (math.isfinite(_f) and _f == math.floor(_f)
+                    and abs(_f) < 2 ** 53):
                 _fs = int(_f)
             else:
-                out['reasons'].append(f'family_size {family_size!r} is not an integer comparison count')
+                out['reasons'].append(f'family_size {family_size!r} is not an exact integer comparison count')
         else:
             # Strings/other objects are not exact declared family sizes; do not
             # coerce int('4') into a smaller family than the caller stated.
@@ -9113,13 +9128,10 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
 def signflip_p_floor(n):
     """双侧精确符号翻转检验在 n 个种子下的最小可达 p 值（2/2^n）；
     n<=0 返回 NaN。用于报告「未显著是分辨率上限还是数据结论」。"""
-    if isinstance(n, (bool, np.bool_)):
-        return float('nan')
-    try:
-        n = int(n)
-    except (TypeError, ValueError, OverflowError):
-        return float('nan')
-    if n <= 0:
+    # A seed count is an exact integer: int(4.9)=4 and int(True)=1 would
+    # report the resolution floor of a different panel.
+    n = _as_seed_int(n)
+    if n is None or n <= 0:
         return float('nan')
     # same value as 2.0 / 2**n, evaluated in the float exponent range.
     return math.ldexp(2.0, -n)
@@ -10587,7 +10599,8 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             return int(value)
         if isinstance(value, numbers.Real):
             as_float = float(value)
-            if not math.isfinite(as_float) or as_float != math.floor(as_float):
+            if (not math.isfinite(as_float) or as_float != math.floor(as_float)
+                    or abs(as_float) >= 2 ** 53):
                 raise ValueError(f'{label} must be an integer, got {value!r}')
             return int(as_float)
         raise ValueError(f'{label} must be an integer, got {value!r}')
@@ -11430,7 +11443,9 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
     # hyper-parameters only affect the smoothing on top of them.
     _shared_counts = None
     for arm, meta in arms.items():
-        order = int((meta or {}).get('order', 1))
+        order = _as_seed_int((meta or {}).get('order', 1))
+        if order is None or order <= 0:
+            raise ValueError(f'simple baseline {arm}: order must be a positive integer, got {(meta or {}).get("order", 1)!r}')
         grid = grids.get(arm) or {}
         alphas = list(grid.get('alpha') or [0.1])
         interps = list(grid.get('interpolation') or [1.0]) if order == 2 else [0.0]
@@ -11542,9 +11557,8 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         _arm_decl = (_declared.get(arm) if isinstance(_declared, dict) else None)
         _arm_order = None
         if isinstance(_arm_decl, dict) and _arm_decl.get('order') is not None:
-            try:
-                _arm_order = int(_arm_decl['order'])
-            except (TypeError, ValueError, OverflowError):
+            _arm_order = _as_seed_int(_arm_decl['order'])
+            if _arm_order is None:
                 problems.append(f'{arm}: declared order is not an integer ({_arm_decl.get("order")!r})')
         _grids = protocol.get('grids')
         _grid = _grids.get(arm) if isinstance(_grids, dict) else None
@@ -11557,10 +11571,7 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
                     problems.append(f'{arm}: trial {_ti} has no config mapping')
                     continue
                 if _arm_order is not None:
-                    try:
-                        _co = int(_cfg.get('order'))
-                    except (TypeError, ValueError, OverflowError):
-                        _co = None
+                    _co = _as_seed_int(_cfg.get('order'))
                     if _co is None:
                         problems.append(f'{arm}: trial {_ti} has no integer order')
                     elif _co != _arm_order:
@@ -19083,13 +19094,17 @@ def aggregate(summary):
     if _multi:
         print('[aggregate] WARNING: these variants hold MULTIPLE protocol groups and are reported per-group, NOT pooled across groups (pooling would fake extra seeds): ' + ', '.join((f'{v}->{t}' for v, t in sorted(_multi.items()))))
 
+    def _budget_id(rec, key):
+        _v = _as_seed_int(rec.get(key))
+        return _v if _v is not None else ('__invalid__', type(rec.get(key)).__name__, repr(rec.get(key)))
+
     def _cfg_fp(rec):
-        _p = rec.get('params')
-        try:
-            _p = int(_p) if _p is not None and (not isinstance(_p, bool)) else None
-        except (TypeError, ValueError, OverflowError):
-            _p = None
-        return json.dumps([rec.get('run_cfg'), _p, [rec.get(k) for k in PAIR_STEP_KEYS]], sort_keys=True, default=str)
+        # int(1.9)==1 and int(True)==1 would merge two different parameter
+        # counts into one configuration group; use the exact-integer contract.
+        _p = _as_seed_int(rec.get('params'))
+        return json.dumps([rec.get('run_cfg'), _p,
+                           [_budget_id(rec, k) for k in PAIR_STEP_KEYS]],
+                          sort_keys=True, default=str)
 
     def _steps_ok(recs):
         if len(recs) < 2:
@@ -19234,22 +19249,34 @@ def aggregate(summary):
             entry['boundary_excess_dyn'] = float(np.mean(bex))
         hists = [r['ppl_history'] for r in recs if r.get('ppl_history')]
         if hists:
+            def _point(_pt):
+                try:
+                    _s = _as_seed_int(_pt[0])
+                    _v = _finite_scalar(_pt[1])
+                except (TypeError, ValueError, IndexError):
+                    return None
+                if _s is None or _s < 0 or _v is None:
+                    return None
+                return _s, _v
+            def _step_of(_pt):
+                try:
+                    _s = _as_seed_int(_pt[0])
+                except (TypeError, ValueError, IndexError):
+                    return None
+                return _s if _s is not None and _s >= 0 else None
             per_step = {}
             for _h in hists:
                 for _pt in _h:
-                    try:
-                        _s = int(_pt[0])
-                        _v = float(_pt[1])
-                    except (TypeError, ValueError, IndexError):
+                    _p = _point(_pt)
+                    if _p is None:
                         continue
-                    per_step.setdefault(_s, []).append(_v)
+                    per_step.setdefault(_p[0], []).append(_p[1])
             def _grid(_hist):
                 _out = []
                 for _p in _hist:
-                    try:
-                        _out.append(int(_p[0]))
-                    except (TypeError, ValueError, IndexError):
-                        continue
+                    _s = _step_of(_p)
+                    if _s is not None:
+                        _out.append(_s)
                 return _out
             _ref_steps = _grid(hists[0])
             _off_grid = []
@@ -19265,12 +19292,13 @@ def aggregate(summary):
             for _i, _h in enumerate(hists):
                 _own = {}
                 for _pt in _h:
-                    try:
-                        _own[int(_pt[0])] = float(_pt[1])
-                    except (TypeError, ValueError, IndexError):
+                    _p = _point(_pt)
+                    if _p is None:
                         continue
+                    _own[_p[0]] = _p[1]
                 for _s, _v in _own.items():
-                    mat[_i, cols[_s]] = _v
+                    if _s in cols:
+                        mat[_i, cols[_s]] = _v
             good = np.array([[ppl_is_usable(v) for v in row] for row in mat])
             n_good = good.sum(axis=0)
             sums = np.where(good, mat, 0.0).sum(axis=0)
@@ -19300,8 +19328,9 @@ def aggregate(summary):
         # Baseline-matching fingerprint WITHOUT params: a `full` baseline
         # legitimately differs from the sparse arm in parameter count, so a
         # params-including fingerprint could never match it (dead branch).
-        # run_cfg + steps/tokens is exactly the gate `pair_reason` applies.
-        return json.dumps([rec.get('run_cfg'), [rec.get(k) for k in PAIR_STEP_KEYS]], sort_keys=True, default=str)
+        # run_cfg + steps/tokens is exactly the gate `pair_reason` applies,
+        # and the budget fields use the same exact-integer normalisation.
+        return json.dumps([rec.get('run_cfg'), [_budget_id(rec, k) for k in PAIR_STEP_KEYS]], sort_keys=True, default=str)
 
     def _baseline_for(tag, fp_idx, base_groups, recs):
         _want = _cfg_fp_noparam(recs[0]) if recs else None

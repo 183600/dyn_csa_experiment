@@ -216,9 +216,14 @@ def _signflip_saddlepoint_p(values):
 
 
 def signflip_p_floor(n):
-    """Smallest achievable two-sided exact sign-flip p for n nonzero deltas."""
-    n = int(n)
-    return min(1.0, math.ldexp(2.0, -n)) if n > 0 else 1.0
+    """Smallest achievable two-sided exact sign-flip p for n nonzero deltas.
+
+    Mirrors exp_lib.signflip_p_floor: only an exact integer seed count has a
+    resolution floor; booleans/fractional counts return NaN instead of being
+    truncated into a different panel size, and n<=0 has no floor.
+    """
+    n = _int_or(n, None)
+    return min(1.0, math.ldexp(2.0, -n)) if n is not None and n > 0 else float('nan')
 
 
 def exact_signflip(deltas):
@@ -521,16 +526,25 @@ def _pair_reason(ra, rb):
     if _ha and str(_ia) != str(_ib):
         return (f'different init_core_fp ({str(_ia)[:12]}… vs {str(_ib)[:12]}…): '
                 'the two arms did not start from the same shared-trunk initialization despite the paired seed')
-    bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None or ra.get(k) != rb.get(k)]
-    if not bad:
-        return None
-    absent = [k for k in bad if ra.get(k) is None and rb.get(k) is None]
-    unknown = [k for k in bad if k not in absent and (ra.get(k) is None) != (rb.get(k) is None)]
-    if unknown:
-        return f'unverifiable {sorted(unknown)}'
-    if absent:
-        return f'unverifiable {sorted(absent)}'
-    return f'disagreeing {sorted(bad)}'
+    bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None]
+    if bad:
+        absent = [k for k in bad if ra.get(k) is None and rb.get(k) is None]
+        unknown = [k for k in bad if k not in absent and (ra.get(k) is None) != (rb.get(k) is None)]
+        if unknown:
+            return f'unverifiable {sorted(unknown)}'
+        if absent:
+            return f'unverifiable {sorted(absent)}'
+    _disagree = []
+    for k in PAIR_STEP_KEYS:
+        _va, _vb = _int_or(ra.get(k), None), _int_or(rb.get(k), None)
+        if _va is None or _vb is None:
+            return (f'unverifiable {k} (not an exact integer training budget: '
+                    f'{ra.get(k)!r} vs {rb.get(k)!r})')
+        if _va != _vb:
+            _disagree.append(k)
+    if _disagree:
+        return f'disagreeing {sorted(_disagree)}'
+    return None
 
 def paired_row(a_records, b_records):
     common = sorted(set(a_records) & set(b_records))

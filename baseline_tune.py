@@ -277,15 +277,15 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                     _prov_any = records[sorted(records)[0]].get('provenance')
                     _data_version_any = records[sorted(records)[0]].get('data_version')
                 mean, std = _mean_std([records[s]['ppl'] for s in sorted(records)])
-                _steps = {int(records[s]['steps']) for s in records if records[s].get('steps') is not None}
-                _tokens = {int(records[s]['tokens_seen']) for s in records if records[s].get('tokens_seen') is not None}
+                _steps = {L._as_seed_int(records[s].get('steps')) for s in records if records[s].get('steps') is not None}
+                _tokens = {L._as_seed_int(records[s].get('tokens_seen')) for s in records if records[s].get('tokens_seen') is not None}
                 per_arm[arm].append({
                     'config': dict(knobs), 'ppl': mean, 'ppl_std': std,
                     'n_seeds': len(records), 'seeds': sorted(records),
                     'seed_ppls': {str(s): float(records[s]['ppl']) for s in sorted(records)},
                     'params': records[sorted(records)[0]].get('params'),
-                    'steps': (next(iter(_steps)) if len(_steps) == 1 else None),
-                    'tokens_seen': (next(iter(_tokens)) if len(_tokens) == 1 else None),
+                    'steps': (next(iter(_steps)) if len(_steps) == 1 and None not in _steps else None),
+                    'tokens_seen': (next(iter(_tokens)) if len(_tokens) == 1 and None not in _tokens else None),
                     'budget_by_seed': {str(s): [records[s].get('steps'), records[s].get('tokens_seen')]
                                        for s in sorted(records)},
                     'run_cfg': records[sorted(records)[0]].get('run_cfg'), 'outdir': tdir,
@@ -369,7 +369,15 @@ def _relaxed_pair_reason(a, b, tuned_arms):
         _va, _vb = a.get(k), b.get(k)
         if _va is None or _vb is None:
             return f'unverifiable {k} (at least one record omits it)'
-        if _va != _vb:
+        if k in ('steps', 'tokens_seen'):
+            # Budgets are exact integer counts; raw equality would accept
+            # 1 vs True (and compare "1" against 1 as different).
+            _ia, _ib = L._as_seed_int(_va), L._as_seed_int(_vb)
+            if _ia is None or _ib is None:
+                return f'unverifiable {k} (not an exact integer training budget)'
+            if _ia != _ib:
+                return f'{k} differs ({_va!r} vs {_vb!r})'
+        elif _va != _vb:
             return f'{k} differs ({_va!r} vs {_vb!r})'
     # Tuning may change lr/wd/warmup, but it must never silently change the
     # optimizer, betas/eps, LR-schedule shape, grad-clip or augmentation.  The
@@ -399,14 +407,15 @@ def _relaxed_pair_reason(a, b, tuned_arms):
 
 
 def _run_final(base, outdir, protocol, selected):
-    final_seeds = [int(s) for s in protocol.get('final_seeds', [])]
+    # _search_final_seeds applies the exact-integer seed contract; int(True)=1
+    # or int(1.5)=1 must not turn a malformed partition into a real seed.
+    search_seeds, final_seeds, overlap = _search_final_seeds(protocol)
     if not final_seeds:
         # An empty partition would be silently normalised to seed 0 by the
         # runner, reusing a search draw as an "independent" final evaluation.
         raise ValueError(
             'protocol declares no final_seeds — refusing to fall back to seed 0; '
             'declare a disjoint final seed partition before running final records')
-    search_seeds, _, overlap = _search_final_seeds(protocol)
     if final_seeds and overlap:
         raise ValueError(
             'search_seeds and final_seeds overlap on %s — final tuned records '
