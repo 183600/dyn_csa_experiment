@@ -1228,15 +1228,23 @@ def sec_p1l():
         # and int(4.9)==4 would otherwise admit a boolean/fractional key (or a
         # length-0 column) into the table, and a cell measured at 4.9 tokens
         # would be quoted as PPL@4.  Mirror the length audit's contract.
+        # Integers/strings are parsed without a float round-trip so an id above
+        # 2**53 cannot silently map to a neighbouring length.
         if isinstance(Ln, (bool, np.bool_)):
             return None
-        try:
+        if isinstance(Ln, numbers.Integral):
+            v = int(Ln)
+        elif isinstance(Ln, numbers.Real):
             f = float(Ln)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if not math.isfinite(f) or f != math.floor(f) or f <= 0:
-            return None
-        return int(f)
+            if not math.isfinite(f) or f != math.floor(f):
+                return None
+            v = int(f)
+        else:
+            try:
+                v = int(Ln)
+            except (TypeError, ValueError, OverflowError):
+                return None
+        return v if v > 0 else None
 
     def _cell_at(by_len, Ln):
         # by_len keys are normally the integer length or its string spelling,
