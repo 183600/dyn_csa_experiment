@@ -4715,6 +4715,16 @@ def t_boolean_pvalues_are_not_probabilities():
     assert L.reportable_claim({'n': True, 'mean': -1.0, 'std': 0.1,
                                'p_exact_signflip': 0.01, 'p_holm': 0.02},
                               min_n=1)['allowed'] is False
+    # attach_holm's family-resolution diagnostic must read only exact seed
+    # counts; bool/fractional n values cannot lower/raise the family n range.
+    _famc = {'flag': {'n': True, 'mean': -1.0, 'std': 0.1,
+                      'p_exact_signflip': 0.2},
+             'frac': {'n': 6.9, 'mean': -1.0, 'std': 0.1,
+                      'p_exact_signflip': 0.2},
+             'real': {'n': 8, 'mean': -1.0, 'std': 0.1,
+                      'p_exact_signflip': 0.2}}
+    _fam = L.attach_holm(_famc, family='exact n')
+    assert _fam['n_effective_min'] == 8 and _fam['n_effective_max'] == 8, _fam
     # A fractional or string seed count must not be truncated into a smaller
     # n that changes the exact-test p floor.
     for bad_n in (6.9, '6'):

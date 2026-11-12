@@ -8915,11 +8915,11 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     for v in (comparisons or {}).values():
         if not isinstance(v, dict):
             continue
-        try:
-            _n = int(v.get('n'))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if _n > 0:
+        # A boolean/fractional n is not a seed count; int(True)=1 or
+        # int(12.9)=12 would understate n_max and could mislabel the whole
+        # family as resolution-limited.
+        _n = _as_seed_int(v.get('n'))
+        if _n is not None and _n > 0:
             _ns.append(_n)
     _m = int(len(comparisons or {}))
     # The family's smallest attainable raw p is min_i 2/2**n_i, which is set
