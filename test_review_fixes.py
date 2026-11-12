@@ -56,6 +56,24 @@ except Exception as _e:  # pragma: no cover
 _results = []
 
 
+if _HAVE_TORCH:
+    class _WorkerDrawDataset(torch.utils.data.Dataset):
+        """Module-level dataset so DataLoader workers can pickle it.
+
+        Python 3.14 changed the default non-Mac start method to forkserver,
+        which requires the dataset object (including its class) to be
+        picklable.  A function-local class cannot be pickled, so the worker
+        reproducibility test would error before exercising the seed contract.
+        """
+
+        def __len__(self):
+            return 64
+
+        def __getitem__(self, i):
+            return torch.tensor([i, int(random.random() * 1e9),
+                                 int(np.random.random() * 1e9)])
+
+
 class _SkipTest(Exception):
     """A check whose precondition this environment cannot provide (e.g. the
     sandbox forbids POSIX semaphores for DataLoader workers).  Reported as
@@ -2839,14 +2857,10 @@ def t_dataloader_seeding_helpers():
     torch.manual_seed(11)
     L.seed_worker(0)
     assert torch.backends.cudnn.deterministic is True and torch.backends.cudnn.benchmark is False, 'a spawned worker must re-pin deterministic kernels'
-    # The worker hook must also make real worker PROCESSES reproducible.
-    class _DrawDS(torch.utils.data.Dataset):
-        def __len__(self):
-            return 64
-        def __getitem__(self, i):
-            return torch.tensor([i, int(random.random() * 1e9), int(np.random.random() * 1e9)])
+    # The worker hook must also make real worker PROCESSES reproducible
+    # (the dataset is module-level so it survives the forkserver pickle).
     def worker_order(seed):
-        dl = L.deterministic_dataloader(_DrawDS(), batch_size=8, shuffle=True, seed=seed, num_workers=2)
+        dl = L.deterministic_dataloader(_WorkerDrawDataset(), batch_size=8, shuffle=True, seed=seed, num_workers=2)
         return [tuple(int(x) for x in row) for b in dl for row in b]
     try:
         _w4a, _w4b, _w5 = worker_order(4), worker_order(4), worker_order(5)

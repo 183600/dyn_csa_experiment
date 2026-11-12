@@ -1435,8 +1435,13 @@ def v10_analysis(out='analysis_v10/stats.json'):
             return hits[0] if hits else {}
 
         def _pairable(a, b, Ln, rho, tag, mode='uniform'):
-            if str(a.get('val_fp')) != str(b.get('val_fp')):
-                print(f'[v10 stats] L{Ln} r{rho} {mode} {tag}: the two arms were scored on DIFFERENT validation slices (val_fp {str(a.get("val_fp"))[:12]}… vs {str(b.get("val_fp"))[:12]}…) — pairing them would difference two different measurements, so the contrast is omitted')
+            _va = L._content_fp_text(a.get('val_fp'))
+            _vb = L._content_fp_text(b.get('val_fp'))
+            if _va is None or _vb is None:
+                print(f'[v10 stats] L{Ln} r{rho} {mode} {tag}: at least one arm has no valid validation-slice fingerprint (val_fp {a.get("val_fp")!r} vs {b.get("val_fp")!r}) — the slices cannot be shown to match, so the contrast is omitted')
+                return False
+            if _va != _vb:
+                print(f'[v10 stats] L{Ln} r{rho} {mode} {tag}: the two arms were scored on DIFFERENT validation slices (val_fp {_va[:12]}… vs {_vb[:12]}…) — pairing them would difference two different measurements, so the contrast is omitted')
                 return False
             if _fp_norm(a.get('probe_params')) != _fp_norm(b.get('probe_params')):
                 print(f'[v10 stats] L{Ln} r{rho} {mode} {tag}: the two arms were probed under DIFFERENT probe_params — pairing them would difference two different measurements, so the contrast is omitted')
@@ -1697,8 +1702,10 @@ def v10_analysis(out='analysis_v10/stats.json'):
                         other = _ncell('full_rope', 'dense', Ln, cond) if arm == 'dense' else _ncell(tag, arm, Ln, cond)
                         if not learned or not other:
                             continue
-                        if str(learned.get('val_fp')) != str(other.get('val_fp')):
-                            print(f'[v10 stats] NIAH-nat L{Ln} {cond}: {arm} and learned were scored on DIFFERENT validation slices — contrast omitted')
+                        _lv = L._content_fp_text(learned.get('val_fp'))
+                        _ov = L._content_fp_text(other.get('val_fp'))
+                        if _lv is None or _ov is None or _lv != _ov:
+                            print(f'[v10 stats] NIAH-nat L{Ln} {cond}: {arm} and learned were not scored on a verifiably identical validation slice — contrast omitted')
                             continue
                         if (learned.get('_pp'), learned.get('_code'), learned.get('_recipe')) != (other.get('_pp'), other.get('_code'), other.get('_recipe')):
                             print(f'[v10 stats] NIAH-nat L{Ln} {cond}: {arm} and learned were measured under different probe_params/code/recipe — contrast omitted')
@@ -1714,8 +1721,10 @@ def v10_analysis(out='analysis_v10/stats.json'):
                         other = _ncell(ov, 'learned', Ln, cond)
                         if not learned or not other:
                             continue
-                        if str(learned.get('val_fp')) != str(other.get('val_fp')):
-                            print(f'[v10 stats] NIAH-nat L{Ln} {cond}: {tag} and learned were scored on DIFFERENT validation slices — contrast omitted')
+                        _lv = L._content_fp_text(learned.get('val_fp'))
+                        _ov = L._content_fp_text(other.get('val_fp'))
+                        if _lv is None or _ov is None or _lv != _ov:
+                            print(f'[v10 stats] NIAH-nat L{Ln} {cond}: {tag} and learned were not scored on a verifiably identical validation slice — contrast omitted')
                             continue
                         if (learned.get('_pp'), learned.get('_code'), learned.get('_recipe')) != (other.get('_pp'), other.get('_code'), other.get('_recipe')):
                             print(f'[v10 stats] NIAH-nat L{Ln} {cond}: {tag} and learned were measured under different probe_params/code/recipe — contrast omitted')

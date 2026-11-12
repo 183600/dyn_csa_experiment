@@ -164,15 +164,27 @@ def run_training_health(cfg=None):
             _tfp_ok = ((_ck_tfp == _want_tfp) if _want_tfp is not None
                        else ((not _require_tfp)
                              or (isinstance(_ck_tfp, str) and bool(_ck_tfp))))
+            # The recipe is part of the frozen protocol too.  check it here,
+            # before P5T reads and locks the held-out split; otherwise a
+            # healthy/code/train_fp-correct checkpoint trained under another
+            # recipe reaches the one-shot access and is only refused per-cell
+            # afterwards.
+            _sig = _recipe_signature(manifest, v)
+            _ck_recipe = d.get('recipe')
+            _recipe_ok = (_sig is None
+                          or _recipe_matches_signature(_ck_recipe, _sig))
             if not _code_ok:
                 status = 'stale_code'
             elif not _tfp_ok:
                 status = 'stale_train_fp'
+            elif not _recipe_ok:
+                status = 'stale_recipe'
             rows[key] = {'status': status, 'health': h,
                          'best_step': d.get('best_step'),
                          'best_val_ppl': d.get('best_val_ppl'),
                          'final_ppl': d.get('final_ppl'),
                          'code': d.get('code'), 'train_fp': d.get('train_fp'),
+                         'recipe': _ck_recipe, 'recipe_matches': _recipe_ok,
                          'path': ck}
             if status != 'healthy':
                 unhealthy.append(key)
@@ -1560,6 +1572,7 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
     groups = {}
     excluded = []
     _probe_train_fps = set()
+    _ambiguous_idents = set()
     for key, r in raw.items():
         if not isinstance(r, dict):
             excluded.append(f'{key}: not a dict')
@@ -1608,10 +1621,15 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
         grp = groups.setdefault(ident, {})
         if _seed_i in grp:
             excluded.append(f'{key}: duplicate (cell, seed) identity — the pooled mean would be ambiguous')
+            # Do not keep the first-seen value: which one is "first" depends on
+            # JSON object order, so the cell has no unambiguous measurement.
+            _ambiguous_idents.add(ident)
             continue
         grp[_seed_i] = float(r['ppl_mean'])
         if r.get('train_fp'):
             _probe_train_fps.add(str(r['train_fp']))
+    for _ident in _ambiguous_idents:
+        groups.pop(_ident, None)
     if len(_probe_train_fps) > 1:
         # The probe is descriptive, but pooling/contrasting records trained on
         # different corpora would still misattribute the effect to this slice.

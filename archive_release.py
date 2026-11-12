@@ -222,6 +222,15 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
     if _safe_tag(tag) is None:
         print(f'[archive] REFUSE: release tag {tag!r} is not a single safe filename component (path separators / empty / dot segments are not allowed)')
         return 1
+    try:
+        _root = os.path.realpath(REPO)
+        _out = os.path.realpath(os.path.join(REPO, outdir))
+        _out_ok = os.path.commonpath([_root, _out]) == _root
+    except (OSError, ValueError):
+        _out_ok = False
+    if not _out_ok:
+        print(f'[archive] REFUSE: output directory {outdir!r} resolves outside the repository — release artifacts must stay repo-relative')
+        return 1
     _unsafe = [d for d in dirs if not _dir_inside_repo(d) and os.path.isdir(os.path.join(REPO, d))]
     if _unsafe:
         print(f'[archive] REFUSE: result dir(s) {_unsafe} resolve outside the repository — archive members must stay repo-relative')
@@ -254,9 +263,22 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
     if not files:
         print('[archive] REFUSE: nothing to archive — the named result dirs do not exist here; run this on the machine holding the artifacts')
         return 1
+    base_name = f'release_{tag}'
+    man_path_rel = f'{base_name}.MANIFEST.sha256'
+    # The in-archive manifest has a reserved member name.  A collected file
+    # with the same repo-relative path (e.g. `--dirs .` plus a stray root
+    # manifest) would create two members with that name; `make` would succeed
+    # but its own verifier would refuse the archive.  Exclude it up front.
+    _collisions = [p for p in files
+                   if os.path.relpath(p, REPO) == man_path_rel]
+    if _collisions:
+        print(f'[archive] WARNING: excluding collected file(s) whose path collides '
+              f'with the reserved in-archive manifest name {man_path_rel!r}: '
+              f'{[os.path.relpath(p, REPO) for p in _collisions]}')
+        _collset = set(_collisions)
+        files = [p for p in files if p not in _collset]
     os.makedirs(os.path.join(REPO, outdir), exist_ok=True)
     stamp = time.strftime('%Y%m%dT%H%M%S')
-    base_name = f'release_{tag}'
     tar_path = os.path.join(REPO, outdir, f'{base_name}.tar.gz')
     _existing = [p for p in (tar_path, tar_path + '.sha256',
                              os.path.join(REPO, outdir, f'{base_name}.MANIFEST.sha256'),
@@ -274,7 +296,6 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
             rel = os.path.relpath(p, REPO)
             man['files'][rel] = {'sha256': _sha256(p), 'bytes': os.path.getsize(p)}
             tf.add(p, arcname=rel)
-        man_path_rel = f'{base_name}.MANIFEST.sha256'
         man_bytes = json.dumps(man, ensure_ascii=False, indent=2).encode('utf-8')
         import io
         ti = tarfile.TarInfo(man_path_rel)

@@ -1599,8 +1599,13 @@ def _matrix_fingerprint(X):
         # Object-dtype integer tables must keep the same exactness contract:
         # the float64 fallback collapses 2**53 and 2**53+1.
         _vals = arr.reshape(-1).tolist()
+        # Booleans are integral in the row-key contract (0/1), so include them
+        # here too.  Excluding them sent an object table such as
+        # [[True, 2**53]] through the float64 fallback, where 2**53 and
+        # 2**53+1 collide even though the duplicate detector keeps them
+        # distinct.
         _obj_int = all(isinstance(v, numbers.Integral)
-                       and not isinstance(v, (bool, np.bool_))
+                       or isinstance(v, (bool, np.bool_))
                        for v in _vals)
         if _obj_int:
             _obj_fits = all(-(2 ** 63) <= int(v) <= 2 ** 64 - 1 for v in _vals)
@@ -1653,14 +1658,17 @@ def _matrix_fingerprint(X):
                     h.update(np.ascontiguousarray(_blk < 0, dtype=np.uint8).tobytes())
         else:
             block = np.asarray(_blk, dtype=np.float64)
-            # `-0.0 == 0.0` but their byte patterns differ.  The content
-            # fingerprint canonicalises the sign of zero, matching the
-            # duplicate detector, so a cache round-trip through a
-            # representation that normalises signed zero does not make the
-            # same logical table look like a different corpus.
-            if np.any(block == 0.0):
+            # The content fingerprint must use the same logical-equality
+            # rule as the duplicate detector.  `-0.0 == 0.0` but their byte
+            # patterns differ, so canonicalise the sign of zero.  Every NaN
+            # is likewise one missing value to `_row_keys` (it hashes the
+            # non-finite POSITIONS and a NaN/Inf code, not the NaN payload),
+            # so normalise NaN's sign/payload as well instead of letting a
+            # cache round-trip change the corpus fingerprint.
+            if np.any(block == 0.0) or np.any(np.isnan(block)):
                 block = block.copy()
                 block[block == 0.0] = 0.0
+                block[np.isnan(block)] = np.nan
         h.update(np.ascontiguousarray(block).tobytes())
     return h.hexdigest()[:16]
 
@@ -1685,12 +1693,28 @@ def _row_keys(X):
         # Booleans are integral in Python/NumPy's canonical integer path, so
         # include them here as 0/1: an object-dtype bool table must produce the
         # same row keys as its typed bool/int twin.
-        if _flat_obj and all(isinstance(v, numbers.Integral) for v in _flat_obj):
+        if _flat_obj and all(isinstance(v, numbers.Integral)
+                             or isinstance(v, (bool, np.bool_))
+                             for v in _flat_obj):
             _ivs = [int(v) for v in _flat_obj]
             if all(-(2 ** 63) <= v <= 2 ** 63 - 1 for v in _ivs):
                 return _row_keys(np.asarray(_ivs, dtype=np.int64).reshape(src.shape))
             if all(0 <= v <= 2 ** 64 - 1 for v in _ivs):
                 return _row_keys(np.asarray(_ivs, dtype=np.uint64).reshape(src.shape))
+        # A mixed real-number object table is the same logical table as its
+        # float64 twin.  Route it through the typed float path when every
+        # integral value is exactly representable as float64; otherwise keep
+        # the exact per-cell keys below (2**53 and 2**53+1 must stay
+        # distinct).  Without this, an object-serialised cache produces
+        # different duplicate keys from the typed cache with identical rows.
+        if _flat_obj and all(isinstance(v, numbers.Real)
+                             or isinstance(v, (bool, np.bool_))
+                             for v in _flat_obj):
+            _real_exact = all(not isinstance(v, numbers.Integral)
+                              or abs(int(v)) <= 2 ** 53
+                              for v in _flat_obj)
+            if _real_exact:
+                return _row_keys(np.asarray(_flat_obj, dtype=np.float64).reshape(src.shape))
         # Object tables are often mixed/non-contiguous; float64 does not apply
         # to string columns and loses integer precision above 2**53.  Build an
         # exact canonical key per cell instead.

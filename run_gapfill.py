@@ -296,7 +296,13 @@ def merge_long_aggregate(adir, snapshot_agg):
         sm = _seed_map(sentry, tag=str(key))
         fm = _seed_map(fentry, tag=str(key))
         _overlap = set(sm) & set(fm)
-        n_old_all, n_new_only = (len(sm), len(fm) - len(_overlap))
+        n_old_all = len(sm)
+        # A partially overlapping fresh run must contribute only its NEW seeds
+        # to a union mean; the old snapshot contributes only the seeds the
+        # fresh run did not re-measure.  Weighting the old mean by all old
+        # seeds (including the overlap) double-counted those seeds.
+        n_old_only, n_new_only = (n_old_all - len(_overlap),
+                                  len(fm) - len(_overlap))
         sm.update(fm)
         if not sm:
             continue
@@ -319,8 +325,8 @@ def merge_long_aggregate(adir, snapshot_agg):
                     continue
                 if _fresh_covers:
                     sentry[_f] = _vn
-                elif _vo_ok:
-                    w_old = n_old_all / (n_old_all + n_new_only)
+                elif _vo_ok and (n_old_only + n_new_only) > 0:
+                    w_old = n_old_only / (n_old_only + n_new_only)
                     sentry[_f] = _vo * w_old + _vn * (1.0 - w_old)
             _co, _cn = (sentry.get('ppl_curve'), fentry.get('ppl_curve'))
             if _fresh_covers:
@@ -330,7 +336,7 @@ def merge_long_aggregate(adir, snapshot_agg):
                 _cm = {}
                 for _pt in _co:
                     try:
-                        _cm[int(_pt[0])] = [float(_pt[1]) * n_old_all, n_old_all]
+                        _cm[int(_pt[0])] = [float(_pt[1]) * n_old_only, n_old_only]
                     except (TypeError, ValueError, IndexError):
                         continue
                 for _pt in _cn:

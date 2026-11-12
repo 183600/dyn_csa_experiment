@@ -76,8 +76,18 @@ def _hydrate_curve_sidecars(outdir, obj):
         _ref = _r.get('ppl_history_ref')
         if not isinstance(_ref, str) or not _ref or '#' in _ref:
             continue
+        _base = os.path.realpath(os.path.join(REPO, outdir))
+        _path = os.path.realpath(os.path.join(_base, _ref))
         try:
-            with open(os.path.join(REPO, outdir, _ref), encoding='utf-8') as _f:
+            # A sidecar is panel-local.  An absolute ref or ../ escape would
+            # otherwise read an arbitrary JSON file on the machine and inject
+            # its `ppl_history` into the report.
+            if os.path.commonpath([_base, _path]) != _base:
+                continue
+        except ValueError:
+            continue
+        try:
+            with open(_path, encoding='utf-8') as _f:
                 _data = json.load(_f)
         except Exception:
             continue
@@ -326,8 +336,16 @@ def _int_or(v, default):
             return default
         return int(f)
     if isinstance(v, (str, bytes)):
+        # Only a canonical decimal integer spelling is an exact identity;
+        # int() alone would accept " 3 ", "+3", "03" and "1_0".
         try:
-            return int(v)
+            _s = v.decode('ascii') if isinstance(v, bytes) else v
+        except (UnicodeDecodeError, AttributeError):
+            return default
+        if re.fullmatch(r'-?(?:0|[1-9][0-9]*)', _s) is None:
+            return default
+        try:
+            return int(_s)
         except (TypeError, ValueError, OverflowError):
             return default
     # Non-Real number-like objects (e.g. Decimal): int() truncates
@@ -513,6 +531,18 @@ def per_seed_records(outdir):
     _LOADED[_ck] = out
     return out
 
+def _content_fp_text(value):
+    """Canonical non-empty content-identity string, or None (booleans are
+    flags, not fingerprints).  Mirrors exp_lib._content_fp_text."""
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    try:
+        text = str(value)
+    except Exception:
+        return None
+    return text if text else None
+
+
 def _pair_reason(ra, rb):
     if not isinstance(ra, dict) or not isinstance(rb, dict):
         return 'a record is not a dict'
@@ -540,22 +570,20 @@ def _pair_reason(ra, rb):
     # count.  Mirrors exp_lib.pair_reason (a mixed-cap cache rebuild must never
     # be averaged into one paired delta).
     for _k in ('data_fp', 'val_fp', 'eval_fp'):
-        _pa, _pb = ra.get(_k), rb.get(_k)
-        _ha = _pa is not None and str(_pa) != ''
-        _hb = _pb is not None and str(_pb) != ''
-        if _ha != _hb:
+        _pa = _content_fp_text(ra.get(_k))
+        _pb = _content_fp_text(rb.get(_k))
+        if (_pa is None) != (_pb is None):
             return f'unverifiable {_k} (only one record carries the corpus / evaluation-slice fingerprint)'
-        if _ha and str(_pa) != str(_pb):
-            return f'different {_k} ({str(_pa)[:12]}… vs {str(_pb)[:12]}…)'
+        if _pa is not None and _pa != _pb:
+            return f'different {_k} ({_pa[:12]}… vs {_pb[:12]}…)'
     # Matched initialization: equal seeds/geometry do not prove the two arms
     # started from the same shared trunk.  Mirror exp_lib.pair_reason.
-    _ia, _ib = ra.get('init_core_fp'), rb.get('init_core_fp')
-    _ha = _ia is not None and str(_ia) != ''
-    _hb = _ib is not None and str(_ib) != ''
-    if _ha != _hb:
+    _ia = _content_fp_text(ra.get('init_core_fp'))
+    _ib = _content_fp_text(rb.get('init_core_fp'))
+    if (_ia is None) != (_ib is None):
         return 'unverifiable init_core_fp (only one record carries the matched-initialization digest)'
-    if _ha and str(_ia) != str(_ib):
-        return (f'different init_core_fp ({str(_ia)[:12]}… vs {str(_ib)[:12]}…): '
+    if _ia is not None and _ia != _ib:
+        return (f'different init_core_fp ({_ia[:12]}… vs {_ib[:12]}…): '
                 'the two arms did not start from the same shared-trunk initialization despite the paired seed')
     bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None]
     if bad:
@@ -1205,11 +1233,23 @@ def sec_p1t():
         return sum(ppls) / len(ppls) if ppls else _ppl_value(r)
     m1m, t8m, t32m = (_mean(m1), _mean(t8), _mean(t32))
 
+    def _current_per_seed():
+        # The table above admits only current-code records, so the paired
+        # significance claim must use the same rows.  per_seed_records() keeps
+        # every measurable record; a stale run_cfg could otherwise supply the
+        # n/p of a claim that the displayed current rows cannot support.
+        _all = per_seed_records('results_lm_v7_seq2k')
+        if not _CUR_CS:
+            return _all
+        return {_v: {_sk: _r for _sk, _r in _m.items()
+                     if isinstance(_r, dict) and _r.get('_code') == _CUR_CS}
+                for _v, _m in _all.items()}
+
     lines += ['', '**结论（基于已完成的扫描点）**：', '']
     _m1_ok = m1m is not None
     _t_ok = t8m is not None and t32m is not None
     if _m1_ok and _t_ok:
-        _recs3 = per_seed_records('results_lm_v7_seq2k')
+        _recs3 = _current_per_seed()
         _m1_r, _t8_r, _t32_r = (_recs3.get('csa_fix_m1', {}), _recs3.get('csa_fixed_topk8', {}), _recs3.get('csa_fixed_topk32', {}))
         _c3 = []
         _rej3 = 0
@@ -1245,7 +1285,7 @@ def sec_p1t():
         else:
             _dir = f'topk8 {fm(t8m)} > topk32 {fm(t32m)}：选得更少反而更差，整体为单调上升（选择越多越好）'
         _gap = abs(t32m - t8m)
-        _recs = per_seed_records('results_lm_v7_seq2k')
+        _recs = _current_per_seed()
         _pair = paired_row(_recs.get('csa_fixed_topk8', {}), _recs.get('csa_fixed_topk32', {}))
         if _pair is not None:
             _kept, _dl, _st = _pair

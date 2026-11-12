@@ -296,6 +296,27 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     Pass a number to use the fixed-threshold behaviour (tests
     and callers that deliberately use a synthetic noise-free curve do this).
     """
+    # Options are thresholds/counts, not flags: float(True)=1.0 or a NaN
+    # would silently change the health verdict, and int(4.9)=4 would diagnose
+    # a different tail.  Reject malformed values instead of coercing them.
+    _tail_k = _as_seed_int(tail_k)
+    if _tail_k is None or _tail_k < 1:
+        raise ValueError(
+            f'classify_training_health: tail_k must be a positive exact '
+            f'integer, got {tail_k!r}')
+    tail_k = _tail_k
+    for _name, _value in (('slope_tol', slope_tol), ('gap_tol', gap_tol)):
+        if _value is None:
+            continue
+        _f = _finite_scalar(_value)
+        if _f is None or _f < 0.0:
+            raise ValueError(
+                f'classify_training_health: {_name} must be a finite '
+                f'non-negative number, got {_value!r}')
+        if _name == 'slope_tol':
+            slope_tol = _f
+        else:
+            gap_tol = _f
     entries = [h for h in (history if history is not None else []) if isinstance(h, dict)]
     n_bad = 0
     n_train_measured = 0
@@ -5791,7 +5812,10 @@ def _ids_fp(train_ids):
         _part = _arr[_off:_off + _cs]
         if _canon is not None and _part.dtype != _canon:
             _part = _part.astype(_canon, copy=False)
-        elif not _part.flags.c_contiguous:
+        # astype(copy=False) preserves a Fortran layout, and memoryview.cast
+        # only accepts C-contiguous views.  Normalise the layout so the digest
+        # is independent of how the caller stored the same token array.
+        if not _part.flags.c_contiguous:
             _part = np.ascontiguousarray(_part)
         _h.update(memoryview(_part).cast('B'))
     _fp = _h.hexdigest()[:16]
@@ -7955,6 +7979,22 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
     return report
 
 
+def _content_fp_text(value):
+    """Canonical non-empty content-identity string, or None.
+
+    A boolean flag is not a fingerprint: str(True) == 'True' would let a
+    malformed record masquerade as sharing the same corpus/validation slice
+    as a record whose fingerprint is literally the string 'True'.  Treat
+    booleans (and empty values) as absent so pairing fails closed."""
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    try:
+        text = str(value)
+    except Exception:
+        return None
+    return text if text else None
+
+
 def assert_shared_validation_fp(records, *, context='comparison'):
     """Refuse a cross-run comparison whose records were scored on different
     validation slices (e.g. reusing a small cap's validation region under a
@@ -7962,9 +8002,17 @@ def assert_shared_validation_fp(records, *, context='comparison'):
     fps = set()
     for r in records:
         if isinstance(r, dict):
-            _fp = r.get('val_fp') or (r.get('provenance') or {}).get('data', {}).get('val_fp')
-            if _fp:
-                fps.add(str(_fp))
+            _fp = r.get('val_fp')
+            if _fp is None:
+                _fp = (r.get('provenance') or {}).get('data', {}).get('val_fp')
+            if isinstance(_fp, (bool, np.bool_)):
+                raise ValueError(
+                    f'{context}: a record carries a boolean validation '
+                    f'fingerprint ({_fp!r}), which is not a corpus identity; '
+                    'the comparison is unverifiable')
+            _text = _content_fp_text(_fp)
+            if _text is not None:
+                fps.add(_text)
     if len(fps) > 1:
         raise ValueError(f'{context}: records use {len(fps)} different validation '
                          f'slices {sorted(fps)}; their numbers are not comparable')
@@ -8396,7 +8444,10 @@ def _ids_narrow(train_ids):
     return train_ids
 
 def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
-    rng = np.random.default_rng(seed)
+    _rng_seed = _rng_seed_int(seed)
+    if _rng_seed is None:
+        raise ValueError(f'batch_iter: seed must be an exact integer, got {seed!r}')
+    rng = np.random.default_rng(_rng_seed)
     n = len(train_ids) - seq_len - 1
     if n <= 0:
         raise ValueError(f'batch_iter needs len(train_ids) > seq_len+1 to sample causal windows, got len={len(train_ids)} seq_len={seq_len}. Increase n_train_tokens or reduce seq_len.')
@@ -8529,6 +8580,11 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
     This check pulls a few real batches from ``batch_iter`` twice and reports
     the loader-level contract separately.  It consumes no global RNG state and
     is meant to run before a panel starts."""
+    _seed = _as_seed_int(seed)
+    if _seed is None:
+        raise ValueError(
+            f'batch_contract_check: seed must be an exact integer, got {seed!r}')
+    seed = _seed
     seq_len = int(seq_len)
     batch_size = int(batch_size)
     n_batches = max(1, int(n_batches))
@@ -8537,7 +8593,7 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
         'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'seq_len': seq_len,
         'batch_size': batch_size,
-        'seed': int(seed),
+        'seed': seed,
         'vocab_size': (None if vocab is None else int(vocab)),
         'n_batches': n_batches,
         'device': str(device),
@@ -8556,8 +8612,8 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
     }
     _src = np.asarray(train_ids).reshape(-1)
     try:
-        it_a = batch_iter(train_ids, seq_len, batch_size, device, seed=int(seed))
-        it_b = batch_iter(train_ids, seq_len, batch_size, device, seed=int(seed))
+        it_a = batch_iter(train_ids, seq_len, batch_size, device, seed=seed)
+        it_b = batch_iter(train_ids, seq_len, batch_size, device, seed=seed)
         for index in range(n_batches):
             xa, ya = next(it_a)
             xb, yb = next(it_b)
@@ -8832,25 +8888,23 @@ def pair_reason(ra, rb):
     # Both-present equality is required; a one-sided fingerprint is
     # unverifiable, exactly like the optimizer-descriptor gate above.
     for _k in ('data_fp', 'val_fp', 'eval_fp'):
-        _pa, _pb = ra.get(_k), rb.get(_k)
-        _ha = _pa is not None and str(_pa) != ''
-        _hb = _pb is not None and str(_pb) != ''
-        if _ha != _hb:
+        _pa = _content_fp_text(ra.get(_k))
+        _pb = _content_fp_text(rb.get(_k))
+        if (_pa is None) != (_pb is None):
             return f'unverifiable {_k} (only one record carries the corpus / evaluation-slice fingerprint)'
-        if _ha and str(_pa) != str(_pb):
-            return f'different {_k} ({str(_pa)[:12]}… vs {str(_pb)[:12]}…)'
+        if _pa is not None and _pa != _pb:
+            return f'different {_k} ({_pa[:12]}… vs {_pb[:12]}…)'
     # Matched initialization: same seed is not enough (architectures consume
     # different amounts of RNG), so compare the shared-trunk init digest.
     # Both-present equality is required; one-sided is unverifiable.  RNG-state
     # equality is deliberately NOT required: architecture-induced RNG
     # consumption is part of the arm.
-    _ia, _ib = ra.get('init_core_fp'), rb.get('init_core_fp')
-    _ha = _ia is not None and str(_ia) != ''
-    _hb = _ib is not None and str(_ib) != ''
-    if _ha != _hb:
+    _ia = _content_fp_text(ra.get('init_core_fp'))
+    _ib = _content_fp_text(rb.get('init_core_fp'))
+    if (_ia is None) != (_ib is None):
         return 'unverifiable init_core_fp (only one record carries the matched-initialization digest)'
-    if _ha and str(_ia) != str(_ib):
-        return f'different init_core_fp ({str(_ia)[:12]}… vs {str(_ib)[:12]}…): the two arms did not start from the same shared-trunk initialization despite the paired seed'
+    if _ia is not None and _ia != _ib:
+        return f'different init_core_fp ({_ia[:12]}… vs {_ib[:12]}…): the two arms did not start from the same shared-trunk initialization despite the paired seed'
     bad = [k for k in PAIR_STEP_KEYS if ra.get(k) is None or rb.get(k) is None]
     if bad:
         absent = [k for k in bad if ra.get(k) is None and rb.get(k) is None]
@@ -9578,7 +9632,7 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     except (TypeError, ValueError, OverflowError):
         return None
     nb = _valid_bootstrap_count(n_boot, minimum=20)
-    sd = _as_seed_int(seed)
+    sd = _rng_seed_int(seed)
     if nb is None or sd is None or isinstance(conf, (bool, np.bool_)):
         return None
     if not (0.0 < c < 1.0):
@@ -9605,7 +9659,7 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
         return None
     # Draws are generated in chunks.
     nb = _valid_bootstrap_count(n_boot, minimum=2)
-    sd = _as_seed_int(seed)
+    sd = _rng_seed_int(seed)
     if nb is None or sd is None:
         return None
     rng = np.random.default_rng(sd)
@@ -9625,7 +9679,7 @@ def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=2026
     if a.size < 2 or b.size < 2:
         return None
     nb = _valid_bootstrap_count(n_boot, minimum=2)
-    sd = _as_seed_int(seed)
+    sd = _rng_seed_int(seed)
     if nb is None or sd is None:
         return None
     rng = np.random.default_rng(sd)
@@ -9852,8 +9906,10 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
         if m >= denom:
             return 1.0
         return float(m / denom)
-    if m.bit_length() <= e:
-        return 0.0
+    # Do not clamp every small m to zero here: m / 2**e can still be a
+    # representable normal/subnormal binomial-tail floor for e up to ~1074.
+    # The mantissa/exponent projection below yields the correctly rounded
+    # value (and underflows to 0 only when it truly is below float range).
     shift = max(0, m.bit_length() - 53)
     mant = m >> shift
     exp = shift - e
@@ -10533,7 +10589,10 @@ def chi2_sf(x, df):
         try:
             _ratio = x / df
         except (OverflowError, ZeroDivisionError):
-            return 0.0
+            # df is beyond the binary64 range (or zero).  For finite x the
+            # distribution is still centred at df, so x < df has an upper
+            # tail near 1, not 0.
+            return 1.0 if x < df else (0.5 if x == df else 0.0)
         try:
             _inv_df = 1.0 / df
         except (OverflowError, ZeroDivisionError):
@@ -11687,6 +11746,17 @@ def ppl_by_seed(outdir, full=False):
             else:
                 _slot[_s] = r['ppl']
     return out
+
+def _rng_seed_int(value):
+    """Non-negative NumPy RNG seed derived from an exact integer identity.
+
+    Negative panel seeds are valid identities (set_seed folds them into the
+    NumPy domain), but np.random.default_rng rejects them.  Fold with the same
+    64-bit domain for every caller so a negative seed is reproducible instead
+    of raising after validation."""
+    n = _as_seed_int(value)
+    return None if n is None else n % (2 ** 64)
+
 
 def _record_identity(rec, key, legacy_ok):
     seed = _as_seed_int(rec.get('seed'))
@@ -13548,7 +13618,10 @@ def _param_control(recs, a, b):
     pa, pb = _params_of_arm(recs, a), _params_of_arm(recs, b)
     if pa is None or pb is None:
         return (None, None)
-    rel = abs(pa - pb) / float(max(pa, pb, 1))
+    # Exact int/int division keeps the ratio representable even when the
+    # counts themselves exceed the binary64 range; float(max(...)) would
+    # raise OverflowError on a valid (if huge) parameter count.
+    rel = abs(pa - pb) / max(pa, pb, 1)
     return (float(rel), bool(rel <= 0.01))
 
 def _param_breakdown_of_arm(recs, arm):
@@ -13570,7 +13643,7 @@ def _param_control_detail(recs, a, b):
            'unavailable': True}
     pa, pb = _params_of_arm(recs, a), _params_of_arm(recs, b)
     if pa is not None and pb is not None:
-        rel = abs(pa - pb) / float(max(pa, pb, 1))
+        rel = abs(pa - pb) / max(pa, pb, 1)
         out.update({'total_rel_diff': float(rel), 'total_controlled': bool(rel <= 0.01), 'unavailable': False})
     ba, bb = _param_breakdown_of_arm(recs, a), _param_breakdown_of_arm(recs, b)
     if not (isinstance(ba, dict) and isinstance(bb, dict)):
@@ -14911,7 +14984,11 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
     two fresh interpreters with the same seed/PYTHONHASHSEED, which catches a
     child-process seeding mismatch that an in-process check cannot see.
     """
-    seed = int(seed)
+    _seed = _as_seed_int(seed)
+    if _seed is None:
+        raise ValueError(
+            f'seed_contract_check: seed must be an exact integer, got {seed!r}')
+    seed = _seed
     keys = ['python', 'numpy', 'torch', 'dataloader_generator']
     if torch.cuda.is_available():
         keys.append('cuda')
@@ -16985,10 +17062,18 @@ def _write_cell_curve(outdir, key, rec):
 
 def _cell_curve_data(outdir, rec):
     ref = rec.get('curve_ref') if isinstance(rec, dict) else None
-    if not ref:
+    if not ref or not isinstance(ref, str) or '#' in ref:
+        return {}
+    _base = os.path.realpath(outdir)
+    _path = os.path.realpath(os.path.join(_base, ref))
+    try:
+        # Curve sidecars are panel-local; reject absolute paths and ../ escapes.
+        if os.path.commonpath([_base, _path]) != _base:
+            return {}
+    except ValueError:
         return {}
     try:
-        with open(os.path.join(outdir, ref), encoding='utf-8') as f:
+        with open(_path, encoding='utf-8') as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception:
@@ -18520,7 +18605,10 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
                                and torch.equal(y[:, :-1], x[:, 1:]))
         _batch_contract = bool(x.shape[0] == y.shape[0] and y.shape[1] == x.shape[1])
     else:
-        _rng = np.random.default_rng(int(seed))
+        _rng_seed = _rng_seed_int(seed)
+        if _rng_seed is None:
+            raise ValueError(f'overfit probe: seed must be an exact integer, got {seed!r}')
+        _rng = np.random.default_rng(_rng_seed)
         chunk = _rng.integers(0, max(int(vocab), 1), size=(int(batch_size), seq_len + 1), dtype=np.int64)
         _data_fp = _ids_fp(chunk.reshape(-1))
         _data_source = 'synthetic'
@@ -18773,9 +18861,13 @@ def _overfit_probe_config(*, seed, steps, seq_len, batch_size, vocab, target_los
     synthetic pass can still be subsumed by a real-data pass of the same
     model/probe geometry.
     """
+    _seed = _as_seed_int(seed)
+    if _seed is None:
+        raise ValueError(
+            f'_overfit_probe_config: seed must be an exact integer, got {seed!r}')
     cfg = {
         'schema': 2,
-        'seed': int(seed),
+        'seed': _seed,
         'steps': int(steps),
         'seq_len': int(seq_len),
         'batch_size': int(batch_size),
@@ -18973,7 +19065,10 @@ def _repro_batch(seed, *, batch_size, seq_len, vocab, train_ids=None):
     With ``train_ids`` the batch is a deterministic slice of the REAL token
     stream (the same corpus the panel trains on); otherwise it is synthetic.
     The generator is separate from the model's PyTorch RNG stream."""
-    _rng = np.random.default_rng(int(seed) + 7919)
+    _rng_seed = _rng_seed_int(seed)
+    if _rng_seed is None:
+        raise ValueError(f'_repro_batch: seed must be an exact integer, got {seed!r}')
+    _rng = np.random.default_rng(_rng_seed + 7919)
     if train_ids is not None:
         arr = np.asarray(train_ids).reshape(-1)
         need = int(seq_len) + 1
@@ -19021,9 +19116,13 @@ def _repro_tiny_losses(variant, seed, *, steps=3, d=32, n_layers=1, n_heads=4, d
     return losses
 
 def _repro_probe_config(*, seed, steps, tol, arch, seq_len, batch_size, vocab, mlp_ratio, data_fp, train_ids):
+    _seed = _as_seed_int(seed)
+    if _seed is None:
+        raise ValueError(
+            f'_repro_probe_config: seed must be an exact integer, got {seed!r}')
     return {
         'schema': 2,
-        'seed': int(seed),
+        'seed': _seed,
         'steps': int(steps),
         'tol': float(tol),
         'architecture': _repro_probe_arch(arch),
@@ -19148,7 +19247,15 @@ def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False, 
         vocab = (int(np.max(train_ids)) + 1) if train_ids is not None else 64
     if seq_len is None:
         seq_len = 16
-    _seed_list = [int(s) for s in (seeds if seeds is not None else [seed])]
+    # Exact integer seeds only: int(True)=1 and int(1.9)=1 would make one
+    # probe certificate answer for a different declared seed.
+    _seed_list = []
+    for _s in (seeds if seeds is not None else [seed]):
+        _si = _as_seed_int(_s)
+        if _si is None:
+            raise ValueError(
+                f'reproducibility_guard: seed must be an exact integer, got {_s!r}')
+        _seed_list.append(_si)
     _seed_list = list(dict.fromkeys(_seed_list))
     _full_data_fp = None
     if train_ids is not None:
@@ -19656,7 +19763,7 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     wrong unit.
     """
     _n_boot = _valid_bootstrap_count(n_boot, minimum=2)
-    _seed = _as_seed_int(seed)
+    _seed = _rng_seed_int(seed)
     if _n_boot is None or _seed is None:
         return None
     n_boot, seed = _n_boot, _seed
@@ -19738,7 +19845,7 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     _recs = list(recs) if recs is not None else []
     _conf = _valid_alpha01(conf)
     _n_boot = _valid_bootstrap_count(n_boot, minimum=2)
-    _seed = _as_seed_int(seed)
+    _seed = _rng_seed_int(seed)
     _bad_boot = _n_boot is None or _seed is None
     if not _bad_boot:
         n_boot, seed = _n_boot, _seed
@@ -20593,7 +20700,11 @@ def _plan_run(cfg, summary_path, fp):
                 if _drop_is_stale:
                     stale_dropped.append(key)
             cells.append((v, seed))
-    planned = {f'{v}::seed{seed}' for v, seed in cells}
+    # The declared plan is every cfg cell, not only the cells that still need
+    # to run.  Building this set from `cells` classified every already-complete
+    # cell as unplanned and deleted it from summary.json on a normal resume.
+    planned = {f'{v}::seed{seed}'
+               for seed in cfg['seeds'] for v in cfg['variants']}
     unplanned = sorted(k for k in summary if k not in planned)
     if unplanned:
         # A smaller/renamed plan must not keep aggregating records that are not

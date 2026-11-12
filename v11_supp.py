@@ -157,8 +157,13 @@ def v11_analysis(out='analysis_v11/stats.json'):
                     other = cell_mean('full_rope', 'dense', Ln, rho) if arm == 'dense' else cell_mean('csa_fixed_rope', arm, Ln, rho)
                     if not learned or not other:
                         continue
-                    if str(learned.get('val_fp')) != str(other.get('val_fp')):
-                        print(f'[v11 stats] L{Ln} r{rho} {tag}: the two arms were scored on DIFFERENT validation slices (val_fp {str(learned.get("val_fp"))[:12]}… vs {str(other.get("val_fp"))[:12]}…) — pairing them would difference two different measurements, so the contrast is omitted')
+                    _lv = L._content_fp_text(learned.get('val_fp'))
+                    _ov = L._content_fp_text(other.get('val_fp'))
+                    if _lv is None or _ov is None:
+                        print(f'[v11 stats] L{Ln} r{rho} {tag}: at least one arm has no valid validation-slice fingerprint (val_fp {learned.get("val_fp")!r} vs {other.get("val_fp")!r}) — the slices cannot be shown to match, so the contrast is omitted')
+                        continue
+                    if _lv != _ov:
+                        print(f'[v11 stats] L{Ln} r{rho} {tag}: the two arms were scored on DIFFERENT validation slices (val_fp {_lv[:12]}… vs {_ov[:12]}…) — pairing them would difference two different measurements, so the contrast is omitted')
                         continue
                     if V10._fp_norm(learned.get('probe_params')) != V10._fp_norm(other.get('probe_params')):
                         print(f'[v11 stats] L{Ln} r{rho} {tag}: the two arms were probed under DIFFERENT probe_params — pairing them would difference two different measurements, so the contrast is omitted')

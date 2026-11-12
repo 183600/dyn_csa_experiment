@@ -40,6 +40,7 @@ import json
 import math
 import numbers
 import os
+import re
 import sys
 import time
 
@@ -92,11 +93,18 @@ def _exact_int_scalar(value):
             return None
         return int(f)
     if isinstance(value, (str, bytes)):
-        # A JSON spelling is either an exact integer ("3") or not; float()
-        # would accept "3.0"/"1e3" and silently map it to a different
-        # canonical value than the strict manifest/record contracts.
+        # A JSON spelling is either a canonical decimal integer ("3"/"-3") or
+        # not.  int() would also accept whitespace, a leading '+', leading
+        # zeros or underscores ("1_0"), silently mapping malformed provenance
+        # to a different canonical identity than the strict record contract.
         try:
-            return int(value)
+            _s = value.decode('ascii') if isinstance(value, bytes) else value
+        except (UnicodeDecodeError, AttributeError):
+            return None
+        if re.fullmatch(r'-?(?:0|[1-9][0-9]*)', _s) is None:
+            return None
+        try:
+            return int(_s)
         except (TypeError, ValueError, OverflowError):
             return None
     try:
@@ -177,6 +185,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     def _as_int(value):
         return _exact_int_scalar(value)
     _pairs = []
+    _mismatch = []
     for _tp in _tm:
         _tmeta = _load(_tp)
         if not isinstance(_tmeta, dict):
@@ -187,10 +196,14 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             if not isinstance(_mmeta, dict):
                 continue
             _tv, _mv = _as_int(_tmeta.get('vocab')), _as_int(_mmeta.get('vocab'))
+            _diff = []
             if _tv is not None and _mv is not None and _tv != _mv:
-                continue
-            if (_tmeta.get('fit_fp') and _mmeta.get('fit_fp')
-                    and _tmeta['fit_fp'] != _mmeta['fit_fp']):
+                _diff.append(f'vocab {_mv} != {_tv}')
+            _tfit, _mfit = _tmeta.get('fit_fp'), _mmeta.get('fit_fp')
+            if _tfit and _mfit and _tfit != _mfit:
+                _diff.append('fit_fp differs')
+            if _diff:
+                _mismatch.append((os.path.basename(_mp), _ttag, _diff))
                 continue
             _pairs.append((_mp, _mmeta, _tp, _tmeta))
     if preferred_train_seq_len is not None:
@@ -203,6 +216,19 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
         if _pref:
             _pairs = _pref
     if not _pairs:
+        if _mismatch and len(_tm) == 1 and len(_vm) == 1:
+            # A present-but-different tokenizer/vocab identity is a failed
+            # provenance check, not an absent cache.  With exactly one pair of
+            # metadata files there is no stale extra cache to justify a
+            # "not verifiable" reading.
+            out['status'] = 'fail'
+            out['checks']['mismatched_pairs'] = _mismatch
+            out['note'] = ('the only train/test cache pair disagrees on '
+                           'tokenizer/vocab provenance: ' +
+                           '; '.join(f'{a} vs {b}: {", ".join(d)}'
+                                     for a, b, d in _mismatch) +
+                           ' — the audit cannot treat this as an unaudited cache')
+            return out
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no train/test cache pair shares the same vocab/tokenizer-fit provenance; cannot audit tokenizer or split provenance without guessing'
         return out
@@ -854,7 +880,9 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             # a mis-paired test file makes both false positives and false
             # negatives in the overlap audit.
             _cands = []
-            for _tmp in sorted(glob.glob(os.path.join(cd, 'test_meta_*.json'))):
+            _mismatch_seen = []
+            _test_meta_files = sorted(glob.glob(os.path.join(cd, 'test_meta_*.json')))
+            for _tmp in _test_meta_files:
                 _ttag = os.path.basename(_tmp)[len('test_meta_'):-len('.json')]
                 _tm = _load(_tmp)
                 if not isinstance(_tm, dict):
@@ -881,15 +909,23 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                               f'(train={meta.get("vocab")!r}, test={_tm.get("vocab")!r})')
                         continue
                     if _tv != _mv:
+                        _mismatch_seen.append((_ttag, 'vocab', _mv, _tv))
                         continue
                 elif meta.get('vocab') is None or _tm.get('vocab') is None:
                     # A missing vocab cannot prove the two caches share a token
                     # space; keep the candidate (the overlap/sidecar checks are
                     # still useful) but never report the pair as fully verified.
                     _warn(f'{cd}/{tag}: train/test vocab metadata is missing — token-space identity cannot be verified')
-                if meta.get('fit_fp') and _tm.get('fit_fp') and meta['fit_fp'] != _tm['fit_fp']:
+                _mfit = meta.get('fit_fp')
+                _tfit = _tm.get('fit_fp')
+                if _mfit and _tfit and _mfit != _tfit:
+                    _mismatch_seen.append((_ttag, 'fit_fp', _tfit, _mfit))
                     continue
-                if not meta.get('fit_fp') and not _tm.get('fit_fp'):
+                if _mfit and not _tfit:
+                    _warn(f'{cd}/{tag}: test cache has no tokenizer fit-corpus fingerprint (fit_fp) while the train cache has one — fit provenance cannot be verified')
+                elif _tfit and not _mfit:
+                    _warn(f'{cd}/{tag}: train cache has no tokenizer fit-corpus fingerprint (fit_fp) while the test cache has one — fit provenance cannot be verified')
+                elif not _mfit and not _tfit:
                     _warn(f'{cd}/{tag}: train/test tokenizer fit-corpus fingerprint (fit_fp) is missing — fit provenance is not independently verified')
                 _cands.append((_tfp, _ttag, _tm))
             te = None
@@ -931,6 +967,14 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 rec['test_pairing'] = 'ambiguous'
                 rec['test_candidates'] = sorted(os.path.basename(p) for p, _, _ in _cands)
                 _warn(f'{cd}/{tag}: {len(_cands)} test caches match the same protocol; refusing to guess which test split to audit')
+            elif _mismatch_seen and len(_test_meta_files) == 1:
+                # The only held-out cache disagrees with this training cache on
+                # tokenizer/vocab identity.  That is a failed provenance
+                # check, not an absent test cache.
+                rec['test_pairing'] = 'mismatched'
+                rec['status'] = 'fail'
+                _fail(f'{cd}/{tag}: the only test cache does not share the '
+                      f'train tokenizer/vocab provenance ({_mismatch_seen})')
             else:
                 rec['test_pairing'] = 'not_found'
                 # A train/validation-only cache cannot demonstrate test
@@ -1217,7 +1261,24 @@ def audit_attribution(outdirs=None):
                             # absent block-stat measurement look collected.
                             _found = True
                             ent[_dst].append(_xf)
-            if _found or r.get('block_stats') or r.get('by_len_block_stats') or (isinstance(r.get('mech'), dict) and r['mech'].get('cuts')):
+            def _has_blocks(x):
+                # A truthy placeholder (e.g. the string "junk" or a boolean
+                # flag) is not collected evidence; only a finite number or a
+                # non-empty container can stand in for block statistics.
+                if isinstance(x, (bool, np.bool_)):
+                    return False
+                if isinstance(x, (int, float, np.number)):
+                    try:
+                        return bool(math.isfinite(float(x)))
+                    except (TypeError, ValueError, OverflowError):
+                        return False
+                if isinstance(x, (dict, list, tuple, set)):
+                    return bool(x)
+                return False
+            if (_found or _has_blocks(r.get('block_stats'))
+                    or _has_blocks(r.get('by_len_block_stats'))
+                    or (isinstance(r.get('mech'), dict)
+                        and _has_blocks(r['mech'].get('cuts')))):
                 ent['with_block_stats'] += 1
         if panel:
             missing = {v: e for v, e in panel.items() if e['with_block_stats'] == 0}
