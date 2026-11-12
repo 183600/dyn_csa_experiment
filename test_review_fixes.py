@@ -1695,7 +1695,7 @@ def t_shipped_manifest_consistency():
     assert all(abs(float(per[a]['mr']) - 4.0) < 1e-12 for a in v2['arms'] if a != 'full_rope'), per
     # scope block present
     assert v2.get('scope', {}).get('not_covered'), 'scope.not_covered must name the dynamic/HCA claims that are out of scope'
-    # the compute-budget caveat must be explicit, not buried in prose
+    # the compute-allocation caveat must be explicit, not buried in prose
     assert v2.get('compute_budget_disclosure', {}).get('flops'), 'v3 must disclose the dense-arm MLP/FLOPs mismatch'
 
 
@@ -4927,23 +4927,23 @@ def t_scale_ladder_budget_and_transfer_audit():
     assert out['lr_constant'] is True, out
     # A constant LR is disclosed as an unvalidated transfer assumption.
     assert any('transfer' in w for w in out['warnings']), out
-    # A different tokens-per-parameter budget is a visible confound.
+    # A different tokens-per-parameter allocation is a visible confound.
     b2 = tier('S2', 3000, 2000)
     out2 = L.scale_ladder_audit([a, b2])
     assert out2['budget_matched'] is False, out2
     assert any('tokens-per-parameter' in w for w in out2['warnings']), out2
-    # A declared token budget that disagrees with steps*batch*seq is a hard
+    # A declared token allocation that disagrees with steps*batch*seq is a hard
     # fail, not a warning.
     bad = tier('S1', 1000, 1000, tokens=999999)
     out3 = L.scale_ladder_audit([bad, b])
     assert out3['status'] == 'fail', out3
     assert any('n_train_tokens' in p for p in out3['problems']), out3
-    # Missing parameter counts keep the budget claim unverifiable.
+    # Missing parameter counts keep the allocation claim unverifiable.
     out4 = L.scale_ladder_audit([tier('S1', 1000, None), b])
     assert out4['budget_matched'] is None, out4
     assert any('params missing' in w for w in out4['warnings']), out4
     # The deployed plan must carry an explicit transfer policy and expose the
-    # S1/S2 budget ratio rather than silently calling it matched.
+    # S1/S2 allocation ratio rather than silently calling it matched.
     pol = L.SCALE_TRANSFER_POLICY
     assert pol.get('lr_transfer') and pol.get('tokens_per_param_tolerance') is not None, pol
 
@@ -5262,7 +5262,7 @@ def t_efficiency_pairs_audit_and_sweep():
         r3 = A.audit_efficiency_pairs(outdirs=[td])
         rec3 = r3['panels'][td]['a vs b']
         assert rec3['speed_claim_allowed'] is False and 'device or torch' in rec3['reason'], rec3
-        # Boolean latency/token fields are flags, not measurements.
+        # Boolean rate/token fields are flags, not measurements.
         with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
             json.dump({'a::s0': {'variant': 'a', 'efficiency': dict(eff_a, prefill_ms_p50=True)},
                        'b::s0': {'variant': 'b', 'efficiency': dict(eff_b, n_tokens=True)}}, f)

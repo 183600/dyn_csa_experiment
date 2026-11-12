@@ -166,8 +166,8 @@ def code_stamp():
 
 # ---- 训练健康 / 数值防线 ---------------------------------------------------
 # `nan_to_num` 默认静默清洗数值异常。这里保留原有数值语义（逐位不变），
-# 但让调用点可以计数，并允许 CSA_STRICT_NAN=1 直接报错。元素级计数会强制
-# GPU 同步，所以默认只记调用次数；CSA_NAN_AUDIT=1 时才展开元素统计。
+# 但让调用点可以计数，并允许 CSA_STRICT_NAN=1 直接报错。默认只记调用次数；
+# CSA_NAN_AUDIT=1 时才展开元素统计。
 _NAN_GUARD = {'calls': 0, 'elements_cleaned': 0, 'first': None, 'by_where': {}}
 _NAN_AUDIT_ELEMENTS = os.environ.get('CSA_NAN_AUDIT', '').strip().lower() in ('1', 'true', 'yes', 'on')
 _STRICT_NAN = os.environ.get('CSA_STRICT_NAN', '').strip().lower() in ('1', 'true', 'yes', 'on')
@@ -690,7 +690,7 @@ SCALE_LADDER = {'S1': dict(d=768, n_layers=12, n_heads=12, d_head=64), 'S2': dic
 # Declared transfer assumptions for the S1→S4 ladder.  They are deliberately
 # explicit: a scale comparison that changes width/depth also changes the
 # optimal optimizer settings, so a constant LR is a DISCLOSED assumption, not
-# a matched control.  `scale_ladder_audit` checks the token budget and makes
+# a matched control.  `scale_ladder_audit` checks the token allocation and makes
 # the assumption visible.
 SCALE_TRANSFER_POLICY = {
     'tokens_per_param_tolerance': 0.25,
@@ -709,7 +709,7 @@ _DEV_STR = {}
 
 def _dev_str(device):
     # str(device) is a pure formatting function of the device object: the same
-    # string every time, host-side only — cache it per object.
+    # string every time.
     s = _DEV_STR.get(device)
     if s is None:
         s = str(device)
@@ -1758,7 +1758,7 @@ def _range_cache(lo, hi, device):
 def _i32_range_cache(n, device):
     # int32 [n] arange (index transport, §6.1: the same exact integers as the
     # int64 form, narrowed).  Read-only constant of (n, device); shared by the
-    # hot selection paths.
+    # selection paths.
     key = (_dev_str(device), 'arange_i32', int(n))
     a = _cache_get(_IDX_CACHE, key)
     if a is None:
@@ -2830,7 +2830,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
 # geometry is read from the segmenter's per-token ids, and the only positions
 # used are `u - s_t` for u <= t.
 #
-# `causal_prefix_pool` is the optimized implementation.  It is mathematically
+# `causal_prefix_pool` is the implementation.  It is mathematically
 # the same softmax mixture as the repository's block pooling, but it computes
 # every prefix in one pass with a cumulative sum:
 #
@@ -3995,7 +3995,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             logits = torch.cat([blk_logits, win_logits], -1)
             del blk_logits, win_logits
         else:
-            # Write the two independent logits halves into one preallocated
+            # Write the two independent logits halves into one
             # [q, h, nb + w] table.  The slice assignment feeds the same einsum
             # values to the same lanes.
             _w0 = int(_win_local.shape[1])
@@ -4300,8 +4300,8 @@ class AttnCfg:
                 raise ValueError(f'open_block_mode={self.open_block_mode!r} is only defined for csa/hca layers, not {self.kind!r}')
             if self.kind == 'hca' and self.selection_budget == 'shared_topk':
                 # HCA reads every closed block (no top-k), so a "shared top-k"
-                # budget is not the rule it implements.  Make the extra-read
-                # budget explicit rather than silently pretending the two
+                # quota is not the rule it implements.  Make the extra-read
+                # allowance explicit rather than silently pretending the two
                 # arms have the same number of slots.
                 raise ValueError('open_block_mode on an hca layer requires selection_budget="all_closed_plus_prefix": HCA reads every closed block and has no top-k budget to share; an extra prefix candidate is an ADDITIONAL read slot')
             if self.kind == 'csa' and self.selection_budget != 'shared_topk':
@@ -4910,7 +4910,7 @@ class HybridAttention(nn.Module):
                 # prefix candidate is an ADDITIONAL read slot; the config
                 # validation refuses to label this `shared_topk`.  The main
                 # open-block panel uses CSA layers so the three arms share a
-                # fixed top-k budget.
+                # fixed top-k quota.
                 _P = 1 if _prefix_kind == 'summary' else int(_prefix_geo['token_idx'].shape[1])
                 _tot = int(Bn) + int(_P)
                 topk_idx = _arange_cache(_tot, x.device)[None, :].expand(T, _tot).to(torch.int32)
@@ -5632,7 +5632,7 @@ _IDS_FP_ALGO = 2
 def _ids_fp(train_ids):
     # Pure function of the token values, memoised on (data pointer, layout)
     # with a weak reference to the array: a dead entry can never alias a
-    # recycled pointer, and large corpora are not retained by the cache.
+    # recycled pointer.
     # Same tokens in -> same digest out, always.  Every integer storage width
     # is hashed through one canonical int64 form (uint64 only when a value
     # exceeds int64), so a corpus keeps the same fingerprint whether the cache
@@ -10560,18 +10560,18 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
 
 
 def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
-    """Pre-flight audit of the scale ladder's budget and transfer assumptions.
+    """Pre-flight audit of the scale ladder's allocation and transfer assumptions.
 
     A width/depth comparison is not controlled if the larger model also saw a
-    different tokens-per-parameter budget or silently inherited an untested
+    different tokens-per-parameter allocation or silently inherited an untested
     learning-rate transfer.  This audit does not choose those values; it makes
     them machine-checkable and persistent.
 
     `tiers` is a list of {name, cfg, params}: `cfg` carries steps / batch_size
     / seq_len / n_train_tokens / lr / warmup / seeds, `params` is the measured
-    parameter count (optional; without it the budget per parameter is
-    unverifiable).  A budget mismatch is a disclosure warning (a scale study
-    may deliberately change budget), never a silent "matched" claim.
+    parameter count (optional; without it the allocation per parameter is
+    unverifiable).  An allocation mismatch is a disclosure warning (a scale
+    study may deliberately change allocation), never a silent "matched" claim.
     """
     policy = dict(SCALE_TRANSFER_POLICY if policy is None else policy)
     tol = float(policy.get('tokens_per_param_tolerance', 0.25) if tolerance is None else tolerance)
@@ -10675,7 +10675,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                 warnings.append(
                     'tokens-per-parameter is not matched across the ladder '
                     f'(max/min={tpp_ratio:.2f} > {1.0 + tol:.2f}); a cross-scale '
-                    'effect is confounded with a different exposure budget')
+                    'effect is confounded with a different exposure allocation')
         lrs = {r['lr'] for r in rows if r.get('lr') is not None}
         lr_constant = (len(lrs) == 1) if lrs else None
         _transfer = str(policy.get('lr_transfer') or '')
@@ -11274,8 +11274,8 @@ BASELINE_TUNING_PROTOCOL = {
          'matched': ['full_rope'], 'mlp_match_ref': 'csa_fixed_rope',
          'method_arm': 'csa_fixed_rope'},
     ],
-    # Budget-matched intervention controls share the csa_fixed_rope recipe and
-    # training budget, so their equal-search evidence is inherited from the arm
+    # Allocation-matched intervention controls share the csa_fixed_rope recipe
+    # and training allocation, so their equal-search evidence is inherited from the arm
     # they intervene on.  The audit resolves coverage through this map.
     'inherits_tuning': {'csa_fixed_rope_randidx': 'csa_fixed_rope',
                         'csa_fixed_rope_allblocks': 'csa_fixed_rope'},
@@ -12456,7 +12456,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         elif _final_family_floor is not None and final_min_seed_count < _final_family_floor:
             warnings.append(f'{final_min_seed_count} final seeds per arm cannot reach a Holm-corrected p<0.05 for {max(1, len(arms) - 1)} tuned contrast(s) (needs n>={_final_family_floor}); the tuned contrast is resolution-limited, not a null')
     # Coverage: an arm is covered either by its own tuned record or by the arm
-    # whose recipe it inherits (budget-matched intervention controls).
+    # whose recipe it inherits (allocation-matched intervention controls).
     _inherits = protocol.get('inherits_tuning') or {}
     coverage = {a: a for a in arms}
     for _arm, _ref in _inherits.items():
@@ -12835,7 +12835,7 @@ def _param_control_detail(recs, a, b):
     return out
 
 def _compute_control_detail(recs, a, b, *, tolerance=0.25):
-    """Measured compute budget of a pair, not just its step count.
+    """Measured compute allocation of a pair, not just its step count.
 
     Equal `steps`/`tokens_seen` is enforced by `pair_reason`, but that is not
     equal compute: the parameter-matched dense arm widens its MLP (+69%) and
@@ -12948,9 +12948,9 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
                           advantage claim;
     system_level_only   — significant after correction, but every significant
                           contrast is confounded by a different training
-                          objective or by a compute budget that favours the
+                          objective or by a compute allocation that favours the
                           claimed winner (`mechanism_claim_allowed=False`).
-                          This is a real performance difference, not evidence
+                          This is a genuine measured difference, not evidence
                           for the isolated mechanism;
     measured            — a controlled contrast exists with n >= min_n, but no
                           corrected significance;
@@ -13254,7 +13254,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                         report.setdefault('objective_confounded', []).append(
                             '%s vs %s: %s — same run_cfg but different actual loss/optimizer objective; '
                             'the contrast is a system-level comparison, not an isolated mechanism' % (a, b, '; '.join(_obj_bad)))
-                    # Compute-budget control.  Equal tokens is
+                    # Compute-allocation control.  Equal tokens is
                     # not equal compute.  Report the measured mismatch and its
                     # direction; only a mismatch that FAVOURS the claimed winner
                     # downgrades the contrast, because the reverse is conservative.
@@ -13271,7 +13271,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                             st['mechanism_claim_allowed'] = False
                             report.setdefault('compute_confounded', []).append(
                                 '%s vs %s: the arm that wins by %.2f PPL also consumed about %.2fx the compute (%s); '
-                                'the performance difference is not separable from the compute difference'
+                                'the measured difference is not separable from the compute difference'
                                 % (a, b, abs(float(st['mean'])), float(st['compute_ratio']), _cc.get('compute_matched_source')))
                     if _a_vals and _b_vals:
                         _a_mean = float(np.mean(_a_vals))
@@ -15149,9 +15149,8 @@ class _PrefixStats:
             self.n_seq += 1
             self.age_sum += float(age.sum().item())
             self.age_max = max(self.age_max, int(age.max().item()))
-            # Ages are exact integers; int32 is sufficient for the retained
-            # diagnostic values (the summary casts to float32 only when
-            # computing the quantiles).
+            # Ages are exact integers; store the diagnostic values as int32
+            # (the summary casts to float32 only when computing the quantiles).
             self.age_p95.append(age.detach().to(torch.int32).cpu())
             self.outside_len_sum += float(outside_len.sum().item())
             self.outside_nonzero += int((outside_len > 0).sum().item())
@@ -17864,7 +17863,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     elif not loss_decreased:
         report['diagnosis'] = 'loss did not decrease on the fixed batch (optimizer/step or graph is not wired through)'
     elif _label_shift_required and not _label_shift_ok:
-        report['diagnosis'] = 'labels are not the next-token shift of the inputs (label construction/order bug)'
+        report['diagnosis'] = 'labels are not the next-token shift of the inputs (label construction/order fault)'
     elif _initial_chance_required and not _initial_near_chance:
         report['diagnosis'] = 'initial loss is far from log(vocab) (wrong label map, vocabulary mismatch or broken initialisation)'
     elif _batch_contract is False:
@@ -19939,7 +19938,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
 
     # Synthetic pre-flight before the corpus load.  The actual-data probe below
     # is the authoritative one; this one still exercises the real model
-    # geometry so a shape/gradient fault is caught even if the corpus is slow.
+    # geometry so a shape/gradient fault is caught.
     _pre_vocab = int(cfg.get('vocab_size') or 1024)
     _pre_ratios = _panel_ratios(_pre_vocab)
     try:

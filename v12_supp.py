@@ -195,8 +195,7 @@ def run_phase(name, guard, par=None):
         # A direct phase must not start under a plan that the P5T admission
         # gate would reject.  In particular `phase P5T` reads the held-out
         # split, so the zero-GPU plan preflight has to run before that access,
-        # not only for the training phases.  `run_full` runs this once at
-        # startup; the cache avoids repeating it for each phase.
+        # not only for the training phases.  `run_full` runs this once at startup.
         plan_check()
     import par as _par
     _ctx = _par.resolve_ctx(par, label=f'v12 {name}')

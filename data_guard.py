@@ -1639,7 +1639,7 @@ def _row_keys(X):
             arr[arr == 0.0] = 0.0
         finite = np.isfinite(arr)
         if finite.all():
-            # Fast path: every row is finite, so the key is
+            # Every row is finite, so the key is
             # ``row_bytes + b'|' + packbits(all-False)``.
             _tail = np.packbits(np.zeros(int(src.shape[1]), dtype=bool)).tobytes()
             for row_view in arr.view(np.uint8):

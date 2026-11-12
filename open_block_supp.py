@@ -688,7 +688,7 @@ def _render_markdown(stats):
                 _fmt(e.get('peak_mem_allocated_mb'), 1)))
     lines += ['', '## How to read the primary comparisons', '',
               '- `summary - closed @128`: does a causal summary of the open block help under the default cap?',
-              '- `singletons - summary @128`: representation granularity at a fixed top-k budget.',
+              '- `singletons - summary @128`: representation granularity at a fixed top-k quota.',
               '- `interaction`: does removing the cap make the summary benefit larger? A negative value is consistent with a waiting bottleneck, but only alongside block-length, prefix-selection and window-coverage statistics.',
               '- Prefix candidates compete for the same K slots; an empty/rare prefix selection is a selection-path fact, not evidence that prefix information is useless.',
               '- 4 seeds cannot reach p<0.05 (floor 0.125); report the effect and its uncertainty. '

@@ -576,7 +576,7 @@ def paired_row(a_records, b_records):
 def sec_header():
     return ('# CSA / HCA 受控机制研究 — 补充实验报告 (v7)\n\n'
             f'> 生成时间：{time.strftime("%Y-%m-%d %H:%M:%S")}\n'
-            '> 参考论文：arXiv:2606.19348。**范围声明**：本仓库是小规模、从头训练、WikiText-103、固定训练预算下的受控研究，不是 DeepSeek-V4 的全量复现；结论不外推到该模型的规模、语料、长上下文训练或生产系统。\n'
+            '> 参考论文：arXiv:2606.19348。**范围声明**：本仓库是小规模、从头训练、WikiText-103、固定训练量下的受控研究，不是 DeepSeek-V4 的全量复现；结论不外推到该模型的规模、语料、长上下文训练或生产系统。\n'
             '> 定位：**受控机制研究**（controlled mechanism study），非论文全量复现。\n'
             '> **证据等级：探索性（exploratory）**。本报告的面板/种子/比较是在同一 validation split 上选择后观察的；'
             'Holm 校正只限制过度宣称，不能把这些结果变成预注册确认。确认性证据见 `confirmation_frozen.json` / v12。\n'
@@ -1574,7 +1574,7 @@ def sec_flops():
         _ratios = [float(r['csa_over_dense']) for _k, r in sorted(_rows.items())]
         _mono = all((_ratios[i] >= _ratios[i + 1] - 1e-12 for i in range(len(_ratios) - 1)))
         _trend = f'比值单调降到 {min(_ratios):.3f}' if _mono else f'比值总体下行到 {min(_ratios):.3f}（非严格单调，逐点见 flops_analytic.csv）'
-        lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。**按该解析口径**（仅注意力项，不是实测延迟/吞吐/显存），CSA/dense 比随长度下降（{_trend}）；这不等于真实 GPU 加速，实际收益须由 checkpoint 上的测量确认。', '']
+        lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。**按该解析口径**（仅注意力项，不是对延迟、吞吐或设备内存的实测），CSA/dense 比随长度下降（{_trend}）；这不等于真实设备上的收益，实际收益须由 checkpoint 上的测量确认。', '']
     return '\n'.join(lines) + '\n'
 
 def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):
@@ -1766,7 +1766,7 @@ def sec_global_multiplicity():
     if aud['n_bh_rejected'] < aud['n_raw_significant']:
         lines.append('> **读法限制**：存在原始 p<0.05 但全局 BH 不拒绝的比较——跨面板引用它们时必须写成「族内显著、未通过全局校正」，不得写成多个独立发现。')
     if _UNREGISTERED_GATES:
-        lines.append(f'> ⚠ 有 {_UNREGISTERED_GATES} 个 `_sig_gate` 判定未带 label 注册（本节族大小可能偏小）——这是报告构建的缺陷，应修复，而不是忽略。')
+        lines.append(f'> ⚠ 有 {_UNREGISTERED_GATES} 个 `_sig_gate` 判定未带 label 注册（本节族大小可能偏小）——这是报告构建的缺陷，应校正，而不是忽略。')
     lines.append('> 本节是**探索性展示的纪律层**，不是确认性证据：全局校正不把任何探索面板变成预注册结果（见 docs/design_notes.md §17/§20）。')
     lines.append('')
     return '\n'.join(lines) + '\n'

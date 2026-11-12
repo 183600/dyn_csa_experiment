@@ -541,7 +541,7 @@ def _calibrate_panel(run_cfg, guard, panel):
     state = guard._load_state()
     by_class = state.get('sps_by_class') or {}
     total = 0.0
-    print(f'[m0-calib] projected {panel} cost at the measured rates (includes the 1.15 safety factor):')
+    print(f'[m0-calib] projected {panel} duration at the calibrated rates (includes the 1.15 safety factor):')
     for v in variants:
         sps = by_class.get(guard._class_key(run_cfg['d'], run_cfg['n_layers'],
                                             run_cfg['seq_len'], run_cfg['batch_size'], v))

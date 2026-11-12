@@ -2009,12 +2009,12 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
                            else bool(_ba == _bb and len(_ba) == 1))
             # Every record of both arms must share one measured environment.
             # Comparing only the first seed would let a panel that mixes CPU
-            # and GPU (or torch versions / KV semantics) still claim "faster".
+            # and GPU (or torch versions / KV semantics) still be read as comparable.
             same_env = bool(_ea is not None and _ea == _eb
                             and _ea[0] is not None and _ea[1] is not None)
             same_kv = bool(_ka is not None and _kb is not None and _ka == _kb)
-            # Median over seeds, not the first record: a single slow seed must
-            # not decide a "faster" claim.
+            # Median over seeds, not the first record: a single outlier seed
+            # must not decide a comparative claim.
             _ta, _tb = _med(eff[a], 'prefill_ms_p50'), _med(eff[b], 'prefill_ms_p50')
             def _tok_counts(rows):
                 return sorted({int(r['n_tokens']) for r in rows

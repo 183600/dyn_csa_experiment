@@ -1516,8 +1516,7 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
         correct = np.zeros_like(tgt, dtype=bool)
         span = min(seq_len, max_pos) if getattr(model, 'use_abs_pe', True) else seq_len
         tail = 2 * n_pairs
-        # targets uploaded once and the per-chunk comparison done on-device:
-        # only the [n_seq, tail-1] bool strip crosses the bus at the end.
+        # targets are uploaded and the per-chunk comparison is done on-device.
         tgt_dev = L._h2d_async(tgt, torch.int64, device)
         correct_dev = torch.zeros(n_seq, tail - 1, dtype=torch.bool, device=device)
         i = 0
