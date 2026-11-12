@@ -539,7 +539,7 @@ def _content_fp_text(value):
     if isinstance(value, (bytes, bytearray)):
         # Same identity contract as exp_lib._content_fp_text: decode a bytes
         # fingerprint, and treat empty/non-UTF-8 bytes as absent rather than
-        # accepting the truthy repr "b''" as a corpus identity.
+        # accepting the repr "b''" as a corpus identity.
         try:
             text = bytes(value).decode('utf-8')
         except UnicodeDecodeError:

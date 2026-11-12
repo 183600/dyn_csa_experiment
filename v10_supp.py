@@ -401,10 +401,9 @@ def _fp_norm(p):
 def _val_fp_key(value):
     """Hashable grouping key that preserves an invalid val_fp as invalid.
 
-    Probe records are grouped before the pairing gate runs.  Stringifying the
-    value here made a boolean flag indistinguishable from the literal string
-    'True', so a malformed record could enter the same group as a verifiably
-    fingerprinted one and bypass the content-identity check.
+    Probe records are grouped before the pairing gate runs.  An invalid value
+    must stay distinct from the literal string 'True'; the content-identity
+    check depends on that separation.
     """
     text = L._content_fp_text(value)
     if text is not None:

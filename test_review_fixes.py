@@ -7149,16 +7149,15 @@ def t_audit_resume_and_curve_regressions():
 
 def t_content_fingerprint_bytes_and_probe_grouping():
     # A bytes fingerprint is its text twin, while empty/non-UTF-8 bytes are
-    # absent.  str(b'') is "b''" (truthy), which previously masqueraded as a
-    # real corpus identity.
+    # absent: the repr "b''" is not a corpus identity.
     assert L._content_fp_text(b'') is None
     assert BR._content_fp_text(b'') is None
     assert L._content_fp_text(b'abc') == 'abc' == BR._content_fp_text(b'abc')
     assert L._content_fp_text(b'\xff') is None
 
-    # Probe grouping must preserve an invalid val_fp as invalid: stringifying
-    # a boolean made it identical to the literal fingerprint "True", letting
-    # it bypass the later content-fingerprint pairing gate.
+    # Probe grouping must preserve an invalid val_fp as invalid so it cannot
+    # share a group with the literal fingerprint "True" and skip the
+    # content-fingerprint pairing gate.
     _bad = V10._val_fp_key(True)
     assert _bad != V10._val_fp_key('True'), (_bad, V10._val_fp_key('True'))
     assert V10._val_fp_value(_bad) is None

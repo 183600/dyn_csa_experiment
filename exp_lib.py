@@ -7982,17 +7982,16 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
 def _content_fp_text(value):
     """Canonical non-empty content-identity string, or None.
 
-    A boolean flag is not a fingerprint: str(True) == 'True' would let a
-    malformed record masquerade as sharing the same corpus/validation slice
-    as a record whose fingerprint is literally the string 'True'.  Treat
-    booleans (and empty values) as absent so pairing fails closed."""
+    A boolean flag is not a fingerprint: the text 'True' is not a corpus or
+    validation-slice identity.  Booleans (and empty values) are treated as
+    absent so pairing fails closed."""
     if value is None or isinstance(value, (bool, np.bool_)):
         return None
     if isinstance(value, (bytes, bytearray)):
-        # A bytes fingerprint is the same identity as its text twin.  str(b'')
-        # is the truthy 3-character string "b''", which would let an empty
-        # fingerprint masquerade as a real one; decode first and fail closed
-        # on non-UTF-8 bytes rather than inventing a representation.
+        # A bytes fingerprint is the same identity as its text twin.  Empty
+        # bytes are absent (the repr "b''" is not a fingerprint), and
+        # non-UTF-8 bytes are rejected rather than given an invented
+        # representation.
         try:
             text = bytes(value).decode('utf-8')
         except UnicodeDecodeError:

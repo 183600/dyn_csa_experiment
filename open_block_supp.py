@@ -465,8 +465,8 @@ def _controlled_reason(a, b):
             return f'unverifiable {k} (only one record carries it)'
         if va is None:
             continue
-        # A fingerprint is a text identity: str(True) == "True" would let a
-        # malformed boolean pass as a shared corpus/validation slice.
+        # A fingerprint is a text identity: a boolean is not a shared
+        # corpus/validation slice.
         ta, tb = L._content_fp_text(va), L._content_fp_text(vb)
         if ta is None or tb is None:
             # Two explicit absent spellings are the same "both omitted"

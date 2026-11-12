@@ -1569,8 +1569,7 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
     want_train_fp = _frozen_train_fp(manifest)
     _require_train_fp = _train_fp_required(manifest) or any(
         # A malformed truthy/falsey value still declares an intended binding;
-        # use presence, not truthiness, so a boolean cannot be treated as
-        # "no descriptor" and silently admitted.
+        # presence, not truthiness, decides whether a descriptor is required.
         isinstance(_r, dict) and _r.get('train_fp') is not None
         for _r in raw.values())
     groups = {}
@@ -1908,8 +1907,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             _ib = L._content_fp_text(recs_b[_s].get('init_core_fp'))
             if _ia is None or _ib is None:
                 # A boolean/empty/non-text digest is not a shared-trunk
-                # initialization identity; accepting str(True) would let two
-                # malformed records "confirm" a matched init.
+                # initialization identity; both arms must carry a text digest.
                 _init_complete = False
                 continue
             _iv.extend((_ia, _ib))

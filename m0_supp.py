@@ -608,8 +608,7 @@ def _panel_corpus_fp(summary, variant=None):
         if fp is None:
             continue
         # A boolean flag (or an empty/non-UTF-8 bytes value) is not a corpus
-        # identity.  Stringifying it here would turn True into the literal
-        # fingerprint "True" and let unrelated panels look tokenizer-identical.
+        # identity; only a non-empty text fingerprint is accepted.
         text = L._content_fp_text(fp)
         if text is None:
             raise ValueError(f'{variant or "panel"}: records carry a malformed data_version fingerprint {fp!r} (boolean/empty/non-text)')
