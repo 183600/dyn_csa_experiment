@@ -5249,6 +5249,7 @@ def t_sec_p1l_rejects_malformed_length_keys():
         '512': {'ppl': 10.0, 'truncated': False},
         '4096': {'ppl': 20.0, 'truncated': False},
         str(2 ** 53 + 1): {'ppl': 55.0, 'truncated': False},
+        float(2 ** 60): {'ppl': 77.0, 'truncated': False},
     }}}
     # A malformed by_len payload (valid JSON but not an object) must be
     # skipped, not crash the whole length section while a valid record exists.
@@ -5269,6 +5270,8 @@ def t_sec_p1l_rejects_malformed_length_keys():
     # length by a float conversion.
     assert f'PPL@{2 ** 53}' not in txt, txt[:600]
     assert f'PPL@{2 ** 53 + 1}' in txt, txt[:600]
+    # A lossy large float key must not become a valid (huge) length column.
+    assert f'PPL@{2 ** 60}' not in txt and '77.0' not in txt, txt[:600]
 
 
 def t_stale_aggregate_refused():

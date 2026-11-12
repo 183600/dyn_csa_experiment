@@ -1236,7 +1236,10 @@ def sec_p1l():
             v = int(Ln)
         elif isinstance(Ln, numbers.Real):
             f = float(Ln)
-            if not math.isfinite(f) or f != math.floor(f):
+            # Above 2**53 a float cannot represent every integer, so accepting
+            # one would risk quoting a cell under a neighbouring length.
+            if (not math.isfinite(f) or f != math.floor(f)
+                    or abs(f) >= 2 ** 53):
                 return None
             v = int(f)
         else:
