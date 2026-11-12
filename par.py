@@ -721,7 +721,7 @@ def run_child(job_path, result_path):
 
     except SystemExit as exc:
         # A cell-level sys.exit() is a normal experiment failure, not an
-        # infrastructure crash: record it and exit 0 so the dispatcher
+        # infrastructure failure: record it and exit 0 so the dispatcher
         # continues the phase (re-raising here would abort every sibling
         # cell).
         code = exc.code if isinstance(exc.code, int) else 1

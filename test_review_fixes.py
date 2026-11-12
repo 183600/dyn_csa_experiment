@@ -1602,8 +1602,8 @@ def t_seed_plan_exact_counts():
     assert L.methodology_seed_plan('3')['n_seeds'] == 3
     assert L.methodology_seed_plan(3.0)['n_seeds'] == 3
     # The planning significance level is part of the claim contract too: a
-    # boolean/out-of-range/non-numeric alpha must not crash or be echoed as a
-    # usable level.
+    # boolean/out-of-range/non-numeric alpha is refused rather than echoed as
+    # a usable level.
     for _bad_alpha in (True, np.bool_(False), 0, 1, 1.5, float('nan'),
                        float('inf'), 'x', 10 ** 400):
         _p = L.methodology_seed_plan(12, alpha=_bad_alpha)
@@ -2253,7 +2253,7 @@ def t_eval_per_seq():
         geo = math.exp(sum(math.log(p) for p in cell['ppl_per_seq']) / 3.0)
         assert abs(geo - cell['ppl']) / cell['ppl'] < 1e-6, f'pooled ppl must equal the geometric mean of per-seq ppl at L{Ln} (reduction-invariance)'
     # The sampled path must credit per-document stats to the GLOBAL row, not
-    # to a chunk-local row.  With chunk=1 and most targets sampled, a broken
+    # to a chunk-local row.  With chunk=1 and most targets sampled, a wrong
     # offset would pile almost every token onto row 0.
     samp = L.eval_ppl(model, ids, dev, chunk=1, eval_rows=150, eval_seed=5, return_stats=True)
     per_row = samp['n_tokens_per_row']

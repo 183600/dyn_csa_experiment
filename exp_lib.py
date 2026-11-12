@@ -4362,7 +4362,7 @@ class AttnCfg:
         self.n_index_heads = _cfg_int('n_index_heads', self.n_index_heads, 1)
         if self.c_index % self.n_index_heads != 0:
             # The indexer splits c_index evenly across its heads; a truncated
-            # quotient would pass construction and only crash on the first
+            # quotient would pass construction and only fail on the first
             # lightning_indexer call.
             raise ValueError(
                 f'c_index={self.c_index} must be divisible by '
@@ -8097,7 +8097,7 @@ def locked_json_update(path, mutfn, indent=2):
     through this helper, so two children finishing at the same moment can
     never lose each other's records.  mutfn(obj) mutates the loaded object in
     place (or returns a replacement); a missing file starts from {}.  The
-    write itself stays atomic (atomic_write_json), so a crash mid-update
+    write itself stays atomic (atomic_write_json), so an interrupted update
     leaves the previous content intact.
     """
     path = os.fspath(path)
@@ -10145,7 +10145,7 @@ def _binom_cdf_half(n, m):
     representable.  This implementation uses lgamma log-sum-exp for the small
     tail, symmetry for the upper half, and an asymptotic Edgeworth form for
     very large n (where the incomplete-beta continued fraction no longer
-    converges in its bounded iteration budget)."""
+    converges within its bounded iteration limit)."""
     n = int(n)
     m = int(m)
     if n <= 0:
@@ -12941,8 +12941,8 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                          if f is not None]
                 if len(_vals) != len(_ppls):
                     # Dropping a NaN/Inf draw changes which seeds the trial
-                    # was actually selected on; it is a broken measurement,
-                    # not a valid mean over the surviving subset.
+                    # was actually selected on; it is not a valid mean over
+                    # the surviving subset.
                     problems.append(f'{arm}: trial seed_ppls contains non-finite values')
                 if _vals:
                     _m = float(np.mean(_vals))
@@ -13482,8 +13482,8 @@ def controlled_variables_report(recs, arms):
     # Seed/protocol coverage: arm means are only directly comparable when
     # every arm averaged the same seeds under the same measurement protocol.
     # Paired contrasts already use only shared seeds, but an unequal arm still
-    # changes the descriptive mean±std and can hide a lost seed (crash / cap /
-    # error).  Report the exact coverage; None means no arm has a record.
+    # changes the descriptive mean±std and can hide a lost seed.  Report the
+    # exact coverage; None means no arm has a record.
     _seed_sets = {}
     for (v, t, s) in recs:
         if v not in arms:
@@ -14164,7 +14164,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         else:
             report['hypotheses'][comp] = dict(_hyp, kind='baseline')
     # Completeness / metric-alignability of the pre-registered hypotheses.
-    # A missing field or an undeclared metric is a design defect found before
+    # A missing field or an undeclared metric is a design gap found before
     # any number is interpreted; it is reported, not silently defaulted.
     _ha_comp = hypothesis_audit(HYPOTHESIS_DESIGN, 'component', names=list(design))
     _ha_base = hypothesis_audit(BASELINE_HYPOTHESIS_DESIGN, 'baseline', names=list(baselines))
@@ -14746,8 +14746,8 @@ def rng_fingerprint():
             for _st in torch.cuda.get_rng_state_all():
                 h.update(_st.cpu().numpy().tobytes())
         except Exception:
-            # a broken CUDA context is reported elsewhere; the CPU part of
-            # the fingerprint is still a useful diagnostic
+            # an unavailable CUDA context is reported elsewhere; the CPU part
+            # of the fingerprint is still a useful diagnostic
             pass
     return h.hexdigest()[:16]
 
@@ -14804,7 +14804,7 @@ def restore_rng_state(state):
     Restoring is what makes the pre-flight checks side-effect free: the
     training cell that follows sees exactly the RNG state it would have seen
     if the checks had never run, so adding/diagnosing a probe cannot change a
-    recorded loss curve.  A broken CUDA context is reported by the caller's
+    recorded loss curve.  A failed CUDA context is reported by the caller's
     training loop; the CPU streams are still restored here."""
     if not isinstance(state, dict):
         return
@@ -15349,7 +15349,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
     `outdir/data_contract.json` so an auto-preflight is traceable without a
     second manual record.
 
-    `status` / `planned_cells` make the manifest a crash-safe tracking record:
+    `status` / `planned_cells` make the manifest an interruption-safe record:
     `run()` writes it with status='running' before the first cell, so a killed
     process still leaves the code version, config, data version and the list
     of planned cells on disk; the final call marks it complete and lists any
@@ -15418,7 +15418,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         # Custom phases (warmup/NIAH/lenphase) have their own summary keys and
         # metrics (PPL with warm-grid keys, NIAH accuracy, by-length PPL).
         # They build already-normalised cell records and use the same
-        # crash-safe manifest/provenance/integrity machinery as run().
+        # durable manifest/provenance/integrity machinery as run().
         cells = {str(k): dict(v) for k, v in dict(cell_records).items() if isinstance(v, dict)}
     else:
         cells = {}
@@ -18608,7 +18608,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     _initial_near_chance = bool(math.isfinite(initial_loss) and abs(float(initial_loss) - _chance) <= max(0.5 * _chance, 1.0))
     _finite_curve = all(math.isfinite(float(v)) for v in loss_curve)
     # A wrong label shift or an initial loss nowhere near log(vocab) is a data
-    # plumbing fault even if the model can still memorise the fixed batch, so
+    # plumbing problem even if the model can still memorise the fixed batch, so
     # these diagnostics are part of the verdict for the next-token paths (the
     # explicit task-batch path keeps them as diagnostics only).  The batch
     # contract must never be False; None means "not applicable".
@@ -18874,9 +18874,9 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
     task-specific ``(inputs, targets)`` pair (NIAH/masked next-token targets)
     and `ignore_index` carries that loop's label convention; passing either
     `batch` or `train_ids` runs the data-path probe.  `CSA_SKIP_OVERFIT=1` is
-    the explicit escape hatch (e.g. a diagnostic box with a deliberately broken
-    batch); it prints a loud skip line instead.  Passing is necessary, not
-    sufficient."""
+    the explicit escape hatch (e.g. a diagnostic box with a deliberately
+    invalid batch); it prints a loud skip line instead.  Passing is necessary,
+    not sufficient."""
     if os.environ.get('CSA_SKIP_OVERFIT', '').strip().lower() in ('1', 'true', 'yes', 'on'):
         print('[overfit] guard SKIPPED (CSA_SKIP_OVERFIT is set) — this run has no small-batch safety check')
         return []
@@ -19312,9 +19312,9 @@ class TimeGuard:
 
     def reconcile(self):
         """Refund per-token bookings whose recording process is not alive
-        (crash/kill recovery).  State files without a `bookings` map are
-        untouched: their `booked_seconds` is preserved as `booked_untracked`
-        once any tokenised booking coexists."""
+        (interrupted-process recovery).  State files without a `bookings` map
+        are untouched: their `booked_seconds` is preserved as
+        `booked_untracked` once any tokenised booking coexists."""
         try:
             import fcntl
         except ImportError:
@@ -20594,7 +20594,7 @@ def _plan_run(cfg, summary_path, fp):
     unplanned = sorted(k for k in summary if k not in planned)
     if unplanned:
         # A smaller/renamed plan must not keep aggregating records that are not
-        # in this panel's manifest (a shrunk seed list previously left the
+        # in this panel's manifest (a shrunk seed list must not leave the
         # removed seed in the aggregate table).
         print(f'[resume] dropping {len(unplanned)} record(s) outside the current plan: '
               + ', '.join(unplanned[:8]) + (' …' if len(unplanned) > 8 else ''))
@@ -20890,7 +20890,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
 
     # Synthetic pre-flight before the corpus load.  The actual-data probe below
     # is the authoritative one; this one still exercises the real model
-    # geometry so a shape/gradient fault is caught.
+    # geometry so a shape/gradient error is caught.
     _pre_vocab = int(cfg.get('vocab_size') or 1024)
     _pre_ratios = _panel_ratios(_pre_vocab)
     try:
@@ -21004,10 +21004,10 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     def _data_probe_cfg(v):
         return _overfit_probe_config(seed=_first_seed, steps=_probe_steps, seq_len=_probe_seq, batch_size=_probe_batch, vocab=vocab, target_loss=0.05, target_acc=0.99, arch=_arch, mlp_ratio=ratios.get(v), ignore_index=None, source='data', data_fp=_data_fp)
 
-    # The real data-path check: the synthetic pass above cannot catch a broken
-    # real token stream / vocabulary mapping.  It is a superset of the model
-    # plumbing check, so a pass here is the stronger evidence; both reports
-    # are persisted with the panel.
+    # The real data-path check: the synthetic pass above cannot catch an
+    # invalid real token stream / vocabulary mapping.  It is a superset of
+    # the model plumbing check, so a pass here is the stronger evidence;
+    # both reports are persisted with the panel.
     _data_rep = []
     try:
         _data_rep = list(overfit_guard(_variants, seed=_first_seed, steps=_probe_steps, seq_len=_probe_seq, batch_size=_probe_batch, vocab=vocab, train_ids=train_ids, arch=_arch, mlp_ratio=ratios))
@@ -21097,8 +21097,8 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     cells, stale_dropped = _plan_run(cfg, summary_path, fp)
     _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
     _planned_keys = [f'{v}::seed{seed}' for seed in cfg.get('seeds') or [] for v in cfg.get('variants') or []]
-    # Crash-safe tracking: publish the panel's identity (code/data versions,
-    # hyperparameters, planned cells) BEFORE the first cell can be
+    # Interruption-safe tracking: publish the panel's identity (code/data
+    # versions, hyperparameters, planned cells) BEFORE the first cell can be
     # killed.  The final write below flips the status to complete and lists
     # every planned cell that produced no measurement.
     write_run_manifest(outdir, cfg, fp, prov, _read_summary_json(summary_path), sanity=_sanity_doc, reproducibility=_repro_doc, data_contract=_data_contract, seed_contract=_seed_contract, status='running', planned_cells=_planned_keys, started_at=_panel_started)

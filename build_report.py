@@ -671,9 +671,9 @@ def sec_p0r():
         _has_mt = _mtm is not None
         rope_unmatched = unmatched_tag(_cf_r, _fu_r)
         _pgap_r = param_gap(_cf_r, _fu_r)
-        # Only a *known* mismatch counts as a defect: when params are missing
+        # Only a *known* mismatch is flagged: when params are missing
         # (`is_param_matched` returns None) keep the "params 未知" tag but do
-        # not assert the structural-defect block.
+        # not assert the structural-mismatch block.
         rope_is_defect = is_param_matched(_cf_r, _fu_r) is False
         _w_abs = '领先' if g_abs < 0 else '落后'
         _w_absm = '领先' if g_abs_m < 0 else '落后'

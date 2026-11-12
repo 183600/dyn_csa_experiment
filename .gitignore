@@ -47,6 +47,9 @@ results_*/
 t/
 analysis_*/
 REPORT*.md
+autodl_budget*.json
+算力申请.md
+compute_plan.md
 run_time_state*.json
 
 # docs/ 白名单：只保留 design_notes.md

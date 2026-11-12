@@ -1181,7 +1181,7 @@ def _phase_cell_record(v, seed, rec, *, run_cfg, metric='ppl', key=None):
     }
 
 def _write_phase_manifest(outdir, cfg, run_cfg, prov, *, phase, planned_cells, cell_records=None, status='running', started_at=None, data_contract=None):
-    """Write/refresh the same crash-safe run_manifest.json used by run()."""
+    """Write/refresh the same durable run_manifest.json used by run()."""
     try:
         return L.write_run_manifest(
             outdir, cfg, run_cfg, prov, {},
@@ -2623,7 +2623,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
                 _diag_val = np.ascontiguousarray(_va[:min(8, int(_va.shape[0])), :int(train_len)], dtype=np.int64)
         try:
             # The parent ran only the SYNTHETIC pre-flight.  The real token
-            # stream can still be broken (vocabulary mapping, cache mixing,
+            # stream can still be invalid (vocabulary mapping, cache mixing,
             # label shift downstream), so run the same small-batch overfit
             # probe on the actual corpus before starting the cell.  The probe
             # is RNG-preserving, so it cannot perturb this cell.
@@ -3071,7 +3071,7 @@ def run_smoke():
         check = torch.equal(full_ref, ref) and (not torch.allclose(win, ref, atol=1e-06))
         a._dense_warmup = a._dense_max_T = None
         if not check:
-            raise AssertionError(f'dense-warmup truncation broken for {v}')
+            raise AssertionError(f'dense-warmup truncation failed for {v}')
     print('[smoke] 2) dense-warmup toggle + 200-step transfer')
     train_ids, val_batch, vocab, _, vb = L.load_wikitext(512, 1000000)
     for warm in (0, 100):

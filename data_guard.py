@@ -2313,8 +2313,8 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         miss_train = 1.0 - np.mean(np.isfinite(Xt), axis=0)
         miss_hold = 1.0 - np.mean(np.isfinite(Xh), axis=0)
         finite_smd = [abs(v) for v in smd if v is not None]
-        # A zero-column table is a valid (if uninformative) input.  np.max on
-        # the resulting empty vector would raise and abort the whole report.
+        # A zero-column table is a valid (if uninformative) input, so the
+        # empty-vector case is handled explicitly.
         _missing_delta = (float(np.max(np.abs(miss_hold - miss_train)))
                           if miss_train.size else 0.0)
         shift[name] = {

@@ -1636,8 +1636,8 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
                         problems.append(f'{a}: a record whose run_cfg does not equal the {ref_arm} reference (pair_reason would refuse this pairing)')
                         break
         # Seed coverage: arm means are only comparable if they average the
-        # same seeds.  An arm that silently lost a seed (crash / cap / error)
-        # must not be compared against one that kept it.
+        # same seeds.  An arm that silently dropped a seed must not be
+        # compared against one that kept it.
         if all(all(r.get('run_cfg') is not None for r in per_arm[a]) for a in per_arm):
             _cover = {}
             for (v, t, s) in recs_map:
