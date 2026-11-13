@@ -813,7 +813,10 @@ def _frozen_implementation(manifest):
                     f'[v12] REFUSE: implementation binding {_k!r} is declared '
                     f'twice with different values ({_suffix}={_e!r}, {_k}={_b!r}) '
                     '— the frozen run mode is ambiguous')
-        _v = manifest.get(_suffix, _b)
+        # A present-but-null `*_expected` key must not shadow the non-null
+        # alias: ``dict.get(key, default)`` returns the stored None, which
+        # would silently drop a binding the manifest clearly declared.
+        _v = _e if _e is not None else _b
         if _v is not None:
             impl[_k] = _v
     return impl or None
@@ -1430,6 +1433,11 @@ def _by_len_shape_reason(rec, n_seq):
     _nseq_i = _record_int(n_seq)
     if _nseq_i is None or _nseq_i <= 0:
         return f'n_seq={n_seq!r} is not a positive exact integer row count'
+    # The frozen grid names each evaluated length once.  ``512`` and ``"512"``
+    # are two Python keys for ONE length (JSON keeps only strings, an in-memory
+    # record can carry both); taking one of them would silently pick an
+    # endpoint when the two cells disagree.
+    _seen_lens = {}
     for _ln, _c in bl.items():
         if not isinstance(_c, dict):
             return f'by_len[{_ln!r}] is not a cell object'
@@ -1441,6 +1449,11 @@ def _by_len_shape_reason(rec, n_seq):
             return f'by_len key {_ln!r} is not an integer length'
         if _ln_i < 2:
             return f'by_len length {_ln_i} has no next-token prediction (needs Ln>=2); an empty cell is not admissible'
+        if _ln_i in _seen_lens:
+            return (f'by_len declares length {_ln_i} more than once '
+                    f'(keys {_seen_lens[_ln_i]!r} and {_ln!r}) — the frozen '
+                    'endpoint would be ambiguous')
+        _seen_lens[_ln_i] = _ln
         _ntok = _c.get('n_tok')
         _want = _nseq_i * (_ln_i - 1)
         if (isinstance(_ntok, (bool, np.bool_))

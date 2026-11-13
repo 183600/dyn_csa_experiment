@@ -62,6 +62,13 @@ __all__ = [
 
 SPLIT_NAMES = ('train', 'val', 'test')
 _EPS = 1e-12
+# Unique identities for missing values.  Tuple sentinels such as
+# ('__missing__',) / ('__nan__',) could themselves be legitimate categories or
+# group ids, silently merging a real value with "missing" in the shift report
+# or in the whole-group split audit.
+_MISSING_CATEGORY = object()
+_MISSING_GROUP_NAN = object()
+_MISSING_GROUP_NAT = object()
 
 
 # ---------------------------------------------------------------------------
@@ -793,9 +800,9 @@ def _group_key(value):
     if isinstance(value, (float, np.floating)):
         f = float(value)
         if math.isnan(f):
-            return ('__nan__',)
+            return _MISSING_GROUP_NAN
     if isinstance(value, (np.datetime64, np.timedelta64)) and np.isnat(value):
-        return ('__nat__',)
+        return _MISSING_GROUP_NAT
     try:
         hash(value)
     except TypeError:
@@ -2716,7 +2723,7 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
                 'unseen_rate': 0.0}
 
     def _key(value):
-        return ('__missing__',) if _category_is_missing(value) else _hashable_label(value)
+        return _MISSING_CATEGORY if _category_is_missing(value) else _hashable_label(value)
 
     def _sort_key(value):
         return (type(value).__name__, repr(value))

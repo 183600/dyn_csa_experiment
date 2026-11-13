@@ -330,6 +330,11 @@ def t_scale_robustness_edges():
     assert L._safe_path_component('') != L._safe_path_component('_')
     assert L.ckpt_file_name('', 0, 't') != L.ckpt_file_name('_', 0, 't')
     assert '/' not in L.ckpt_file_name('..', 0, '.')
+    # A sanitised spelling must not collide with a caller-supplied safe name
+    # that happens to equal it (the digest suffix is itself a legal filename).
+    _sanitised = L._safe_path_component('a/b')
+    assert L._safe_path_component(_sanitised) != _sanitised
+    assert L.ckpt_file_name('a/b', 0, 't') != L.ckpt_file_name(_sanitised, 0, 't')
 
 
 def t_scale_aggregate_and_claim_edges():
@@ -893,6 +898,11 @@ def t_timeguard_variant_calibration():
     tmp = tempfile.mkdtemp()
     try:
         path = os.path.join(tmp, 'state.json')
+        assert L.TimeGuard._pid_alive(os.getpid()) is True
+        # A malformed/hand-edited pid is not proof of death; reconcile must
+        # keep the conservative "alive" reading instead of raising.
+        assert L.TimeGuard._pid_alive(None) is True
+        assert L.TimeGuard._pid_alive('not-a-pid') is True
         g = L.TimeGuard(dict(total_hours=10, margin=0.9, state_path=path))
         key_a = g._class_key(64, 2, 256, 4, 'csa_fixed')
         key_b = g._class_key(64, 2, 256, 4, 'full_matched')
@@ -1308,6 +1318,12 @@ def t_admission_gate():
     _ok = _rec('a_arm', 0, 'FP', by_len={4096.0: {
         'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False}})
     assert V12._by_len_shape_reason(_ok, 16) is None
+    # Two Python keys for one evaluated length (int and its JSON string twin)
+    # make the frozen endpoint ambiguous; refusing is the only safe read.
+    _dup_ln = _rec('a_arm', 0, 'FP', by_len={
+        4096: {'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False},
+        '4096': {'ppl': 31.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False}})
+    assert V12._by_len_shape_reason(_dup_ln, 16) is not None
     # The cell's own n_seq is part of the frozen estimand; a shape-consistent
     # n_tok with a different row count must not be admitted.
     _nseq_bad = _rec('a_arm', 0, 'FP', by_len={4096: {
@@ -4429,6 +4445,13 @@ def t_leakage_checks_validate_inputs():
         assert 'share group ids' in str(e), e
     else:
         raise AssertionError('a NaN group crossing splits must be rejected')
+    # The missing-group identity must not collide with a literal group id that
+    # happens to spell the internal marker.
+    import data_guard as _DG
+    assert _DG._group_key(float('nan')) == _DG._group_key(float('nan'))
+    assert _DG._group_key(float('nan')) != _DG._group_key(('__nan__',))
+    assert _DG._group_key(('__nan__',)) == ('__nan__',)
+    assert _DG._group_key(np.datetime64('NaT')) != _DG._group_key(('__nat__',))
     # Empty data still splits into three empty parts.
     idx = L.chronological_split_indices(0)
     assert all(len(idx[k]) == 0 for k in ('train', 'val', 'test')), idx
@@ -4445,6 +4468,13 @@ def t_categorical_shift_empty_reference():
         r = L.categorical_shift_report(ref, [('a', 1)])
         assert r['n_reference'] == 2 and r['n_holdout'] == 1, (ref, r)
         assert r['unseen_rate'] == 0.0, (ref, r)
+    # A real category that happens to spell the internal missing marker must
+    # not be conflated with an actual missing value: the holdout missing value
+    # is unseen when the reference only contains that literal category.
+    _coll = L.categorical_shift_report([('__missing__',)], [None])
+    assert _coll['unseen_rate'] == 1.0, _coll
+    _coll2 = L.categorical_shift_report([('__missing__',)], [('__missing__',)])
+    assert _coll2['unseen_rate'] == 0.0 and _coll2['js_divergence'] == 0.0, _coll2
     try:
         L.categorical_shift_report([1, 2], [1, 2], max_categories=0)
     except ValueError:
@@ -5474,6 +5504,16 @@ def t_by_len_cells_requires_exact_length():
             raise AssertionError(f'by_len_cells must refuse the length {bad!r}')
     # A genuine length-one panel has no next-token target and yields no cells.
     assert L.by_len_cells([base], 1) == []
+    # An in-memory record can carry both the integer and string spelling of
+    # one length.  Two cells for one endpoint are ambiguous, not two samples.
+    _dup = {'variant': 'a', 'val_fp': 'v', 'by_len': {
+        4: {'ppl': 10.0}, '4': {'ppl': 99.0}}}
+    try:
+        L.by_len_cells([_dup], 4)
+    except ValueError as _e:
+        assert 'ambiguous' in str(_e).lower(), str(_e)
+    else:
+        raise AssertionError('duplicate int/str by_len keys must be refused')
 
 
 def t_audit_length_exact_integer_fields():
@@ -8031,6 +8071,14 @@ def t_identity_fingerprint_and_pairing_regressions():
             assert 'implementation binding' in str(_e).lower(), str(_e)[:200]
         else:
             raise AssertionError('conflicting amp_dtype aliases were accepted')
+    # A present-but-null `*_expected` key declares no override; it must not
+    # shadow the non-null alias that DOES declare the frozen mode.
+    assert V12._frozen_implementation(
+        {'amp_dtype': 'bf16', 'amp_dtype_expected': None}) == {'amp_dtype': 'bf16'}
+    assert V12._frozen_implementation(
+        {'eager_batch': True, 'eager_batch_expected': None,
+         'amp_grad_scaler': False}) == {'eager_batch': True,
+                                        'amp_grad_scaler': False}
 
 
 def t_malformed_panel_and_niah_records_are_excluded():

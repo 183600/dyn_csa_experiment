@@ -9240,11 +9240,18 @@ def by_len_cells(rows, Ln, variant=None):
         bl = r.get('by_len')
         if not isinstance(bl, dict):
             continue
-        cell = None
-        for k in keys:
-            if k in bl:
-                cell = bl[k]
-                break
+        # ``4`` and ``"4"`` are two Python spellings of ONE length.  A JSON
+        # record only carries strings, but an in-memory/hand-edited record can
+        # carry both; silently taking the first would pick an endpoint when the
+        # two cells disagree.
+        _matches = [k for k in keys if k in bl]
+        if len(_matches) > 1:
+            raise ValueError(
+                f'by_len_cells: record declares length {Ln_i} more than once '
+                f'({_matches!r}) — the per-length cell is ambiguous')
+        if not _matches:
+            continue
+        cell = bl[_matches[0]]
         if not isinstance(cell, dict):
             continue
         if ppl_is_usable(cell.get('ppl')):
@@ -17656,12 +17663,19 @@ def _safe_path_component(value):
     """
     raw = str(value)
     s = ''.join(ch if (ch.isalnum() or ch in '._-') else '_' for ch in raw)
+    _digest = hashlib.sha1(raw.encode('utf-8', 'replace')).hexdigest()[:12]
     # Dot segments are path syntax even though every character is allowed;
     # treat them like any other sanitised value so the component can never be
     # '.', '..' or an empty segment on its own.  The empty spelling also needs
     # the digest so that distinct raw values keep distinct checkpoint paths.
     if s != raw or s in ('.', '..') or not s:
-        s = f'{s}-{hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:12]}'
+        s = f'{s}-{_digest}'
+    elif re.fullmatch(r'.*-[0-9a-f]{12}', s):
+        # A SANITIZED name has exactly this shape.  If a caller uses the
+        # sanitised spelling itself as a variant (e.g. a generated name), the
+        # two would otherwise share one checkpoint path; qualify the safe
+        # spelling too.  Ordinary safe names never match this suffix.
+        s = f'{s}-{_digest}'
     return s or '_'
 
 
@@ -19765,7 +19779,10 @@ class TimeGuard:
             return False
         except PermissionError:
             return True
-        except (OSError, AttributeError):
+        except (OSError, AttributeError, ValueError, TypeError):
+            # A malformed pid ("", None, a non-numeric string) is not proof
+            # that the owner died; keep the conservative "alive" reading so a
+            # hand-edited state file cannot make reconcile refund live work.
             return True  # 无法判定（非 posix 等）时按存活处理，绝不误退
 
     def reconcile(self):
