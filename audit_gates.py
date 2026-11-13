@@ -2489,13 +2489,37 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
             out['problems'].append(
                 f'cell {i} ({c.get("arm")}): per_seed is empty — no seed-level evidence')
             continue
-        _n_seeds = len(_seeds)
+        if not isinstance(_seeds, dict):
+            out['problems'].append(
+                f'cell {i} ({c.get("arm")}): per_seed is {type(_seeds).__name__}, not an object — no seed-level evidence')
+            continue
+        # Seed keys are identities, not arbitrary labels: "0", "0." and "0.0"
+        # are the same seed.  Counting each spelling separately would let one
+        # measurement fabricate an n>=6 panel and a significant sign-flip test.
+        _seed_ids = {}
+        _dup_ids = set()
+        for _sk in _seeds:
+            _sid = _exact_int_scalar(_sk)
+            if _sid is None:
+                continue
+            if _sid in _seed_ids:
+                _dup_ids.add(_sid)
+            else:
+                _seed_ids[_sid] = str(_sk)
+        _n_seeds = len(_seed_ids)
+        if _dup_ids:
+            out['problems'].append(
+                f'cell {i} ({c.get("arm")}): duplicate seed identities {sorted(_dup_ids)[:5]} — seed keys must name each measurement once')
         _st = None
         # Only complete seed rows enter the paired test.  A malformed row must
         # not inflate the reported seed count or the claim gate: the exact test
         # is run on the valid deltas and its own n is what the n>=6 floor uses.
         _d, _bad_seed = [], []
         for _sk, v in _seeds.items():
+            _sid = _exact_int_scalar(_sk)
+            if _sid is None or _sid in _dup_ids:
+                _bad_seed.append(str(_sk))
+                continue
             if not isinstance(v, dict) or v.get('mass_covered') is None or v.get('random_baseline') is None:
                 _bad_seed.append(str(_sk))
                 continue

@@ -475,7 +475,9 @@ def _run_final(base, outdir, protocol, selected):
         # pre-registered final seed set.
         _allowed = set(final_seeds)
         _extra = []
-        for rec in s.values():
+        _seen_final = set()
+        _ambiguous = set()
+        for _key, rec in s.items():
             if not (isinstance(rec, dict) and L.ppl_is_usable(rec.get('ppl'))
                     and not rec.get('synthesized')):
                 continue
@@ -485,7 +487,18 @@ def _run_final(base, outdir, protocol, selected):
             if _sid is None or _sid not in _allowed:
                 _extra.append(rec.get('seed'))
                 continue
+            if _sid in _seen_final:
+                # Two measurable records for one (arm, seed) are ambiguous.
+                # Keeping whichever the JSON happens to list last would make
+                # the tuned contrast order-dependent, so drop the whole cell.
+                _ambiguous.add(_sid)
+                continue
+            _seen_final.add(_sid)
             merged[f'{arm}::seed{_sid}'] = rec
+        for _sid in _ambiguous:
+            merged.pop(f'{arm}::seed{_sid}', None)
+        if _ambiguous:
+            print(f'[tune] {arm}: excluded ambiguous final record(s) for seed(s) {sorted(_ambiguous)} — duplicate (arm, seed) identities')
         if _extra:
             print(f'[tune] {arm}: ignored stale summary record(s) with seed(s) {_extra} outside the declared final seeds {final_seeds}')
     L.atomic_write_json(os.path.join(final_dir, 'summary.json'), merged)

@@ -262,7 +262,10 @@ class PoolGeometry:
             end_prev_full = np.concatenate([np.full((R, 1), -1, dtype=np.int64), ends_full[:, :-1]], axis=1)
             starts_prev_full = np.concatenate([np.zeros((R, 1), dtype=np.int64), starts_full[:, :-1]], axis=1)
             ov_start_full = np.maximum(end_prev_full - int(overlap), starts_prev_full)
-            ov_len_full = end_prev_full - ov_start_full
+            # Block 0 has no previous block; its raw length is negative.
+            # Eager pooling clamps the B-lane length to zero, so the exposed
+            # geometry must do the same (the forward mask already excludes it).
+            ov_len_full = np.maximum(end_prev_full - ov_start_full, 0)
             starts_prev_np = np.where(colmask, starts_prev_full, 0)
             ov_start_np = np.where(colmask, ov_start_full, 0)
             ov_len_np = np.where(colmask, ov_len_full, 0)
@@ -833,7 +836,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk, need_soft=True):
     qIf = qI if qI.dtype == acc else qI.to(acc)
     kIf = kI if kI.dtype == acc else kI.to(acc)
     wf = w_idx if w_idx.dtype == acc else w_idx.to(acc)
-    k_out = min(int(topk), Bm)
+    k_out = max(0, min(int(topk), Bm))
     idx = torch.empty((R, T, k_out), device=dev, dtype=torch.int32)
     valid = torch.empty((R, T, k_out), device=dev, dtype=torch.bool)
     # Soft is a training-only prior (the straight-through S path is dead
@@ -2383,7 +2386,7 @@ def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=True):
     # 打分泳道宽补到 >= 16 的 2 幂（零填充泳道对点积恰好贡献 +0.0，分数
     # 逐位不变）；hd 无需是 2 的幂或 >= 16。
     HDP = max(_next_pow2(hd), 16)
-    k_out = min(int(topk), Bm)
+    k_out = max(0, min(int(topk), Bm))
     BB2 = _next_pow2(Bm)
     idx = torch.empty((R, T, k_out), device=qI.device, dtype=torch.int32)
     valid_i8 = torch.empty((R, T, k_out), device=qI.device, dtype=torch.int8)

@@ -95,7 +95,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
         if not isinstance(raw, dict):
             print(f'[v11 stats] WARNING: {sp} is valid JSON but not an object ({type(raw).__name__}) — the probe panel is EXCLUDED')
             raw = {}
-        cells, _dup_cells, _bad_cells = ({}, [], [])
+        cells, _dup_cells, _bad_cells, _dup_keys = ({}, [], [], set())
         for _k, r in raw.items():
             if not isinstance(r, dict):
                 _bad_cells.append((_k, 'not a dict'))
@@ -120,12 +120,15 @@ def v11_analysis(out='analysis_v11/stats.json'):
             grp = cells.setdefault(pk, {})
             if _seed in grp:
                 _dup_cells.append((_k, pk[:4], _seed))
+                _dup_keys.add(pk)
                 continue
             grp[_seed] = dict(r, seed=_seed)
+        for _dk in _dup_keys:
+            cells.pop(_dk, None)
         if _bad_cells:
             print(f'[v11 stats] {len(_bad_cells)} record(s) in {sp} carry no variant/seed/ppl_mean and are skipped (they are error or truncation stubs, not measurements): ' + ', '.join((f'{k}({why})' for k, why in _bad_cells[:4])))
         if _dup_cells:
-            print(f'[v11 stats] {len(_dup_cells)} probe record(s) share a (cell, probe_params, seed) identity — their PPL is ambiguous and they are dropped from the pooling: ' + ', '.join((f'{k}' for k, _c, _s in _dup_cells[:4])))
+            print(f'[v11 stats] {len(_dup_cells)} probe record(s) share a (cell, probe_params, seed) identity — the whole ambiguous cell is dropped from the pooling: ' + ', '.join((f'{k}' for k, _c, _s in _dup_cells[:4])))
         probe_cells = []
         for (v, arm, Ln, rho, mode, _pp, _cd, _recipe, _vfp), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}

@@ -170,6 +170,15 @@ def _is_current(rec, fp):
         return False
     if rec.get('run_fingerprint') != fp:
         return False
+    # The record's own identity must agree with its summary key.  A merged or
+    # hand-edited summary can otherwise hide a record from another cell under
+    # the key the resume path is about to skip.
+    _key = rec.get('key')
+    _variant = rec.get('variant')
+    _seed = L._as_seed_int(rec.get('seed'))
+    if _key is not None and _variant is not None and _seed is not None:
+        if str(_key) != f'{_variant}::seed{_seed}':
+            return False
     if rec.get('code') != L.code_stamp():
         return False
     if rec.get('synthesized'):
@@ -200,9 +209,13 @@ def _run_one(cfg, *, variant, seed, train_ids, val_batch, vocab, val_bnd,
              outdir, fp, device, max_hours=None):
     key = f'{variant}::seed{int(seed)}'
     summary = _load_summary(outdir)
-    if _is_current(summary.get(key), fp):
+    _stored = summary.get(key)
+    if (_is_current(_stored, fp)
+            and isinstance(_stored, dict)
+            and str(_stored.get('variant')) == str(variant)
+            and L._as_seed_int(_stored.get('seed')) == int(seed)):
         print(f'[open-block] skip {key} (current record)')
-        return summary[key]
+        return _stored
     if max_hours is not None and max_hours <= 0:
         print(f'[open-block] stopping before {key}: --max-hours exhausted')
         return None
@@ -504,12 +517,12 @@ def _controlled_reason(a, b):
     ob = b.get('open_block_config')
     if not oa or not ob:
         return 'unverifiable open_block_config (empty descriptor)'
-    if oa.get('fingerprint') is not None and oa.get('fingerprint') == ob.get('fingerprint'):
-        return None
     # The only allowed layer-level differences are max_block/open mode/scope.
-    la, lb = oa.get('layers') or [], ob.get('layers') or []
+    la, lb = oa.get('layers'), ob.get('layers')
     if not isinstance(la, (list, tuple)) or not isinstance(lb, (list, tuple)):
         return 'unverifiable open_block_config.layers (not a list)'
+    if not la or not lb:
+        return 'unverifiable open_block_config (empty layer list)'
     if len(la) != len(lb):
         return 'different layer counts'
     # max_block_tokens is the same factor under its public alias.
@@ -522,15 +535,35 @@ def _controlled_reason(a, b):
                 continue
             if x.get(k) != y.get(k):
                 return f'layer {i} differs in undeclared field {k}'
+    # The fingerprint is an equality shortcut only after the structure above
+    # has been checked; an equal/missing fingerprint must not hide a layer
+    # descriptor that differs in an undeclared field.
+    if oa.get('fingerprint') is not None and oa.get('fingerprint') == ob.get('fingerprint'):
+        return None
     return None
 
 
 def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     summary = _load_summary(outdir)
-    _fps = {rec.get('run_fingerprint') for rec in summary.values()
-            if isinstance(rec, dict) and not rec.get('synthesized')
-            and L.ppl_is_usable(rec.get('ppl'))}
-    _fps.discard(None)
+    _fps = set()
+    for _rec in summary.values():
+        if not (isinstance(_rec, dict) and not _rec.get('synthesized')
+                and L.ppl_is_usable(_rec.get('ppl'))):
+            continue
+        _raw_fp = _rec.get('run_fingerprint')
+        if _raw_fp is None:
+            continue
+        if not isinstance(_raw_fp, (str, bytes, bytearray)):
+            raise SystemExit(
+                f'{outdir}/summary.json contains a record whose run_fingerprint '
+                f'is {type(_raw_fp).__name__}, not a text identity; refusing to '
+                'pool corrupt evidence')
+        _fp_text = L._content_fp_text(_raw_fp)
+        if _fp_text is None:
+            raise SystemExit(
+                f'{outdir}/summary.json contains an empty run_fingerprint; '
+                'refusing to pool corrupt evidence')
+        _fps.add(_fp_text)
     if len(_fps) > 1:
         raise SystemExit(
             f'{outdir}/summary.json mixes {len(_fps)} run fingerprints (e.g. a '

@@ -414,10 +414,13 @@ def _load_manifest(path):
     if _tokb and str(_tokb.get('fit', '')).lower() and 'train' not in str(_tokb.get('fit', '')).lower():
         raise SystemExit(f'[v12] REFUSE: binding.tokenizer.fit={_tokb.get("fit")!r} is not the train-only fit required by the freeze')
     _test = str(_stat.get('test', 'exact two-sided sign-flip over paired per-seed deltas')).lower()
-    if 'sign-flip' not in _test and 'sign flip' not in _test:
+    if ('sign-flip' not in _test and 'sign flip' not in _test) or 'two-sided' not in _test:
         raise SystemExit(f'[v12] REFUSE: freeze manifest pre-registers test {_stat.get("test")!r}, but this analyzer only implements the exact two-sided sign-flip test — update the code or re-freeze')
     _corr = str(_stat.get('correction', 'holm step-down')).lower()
-    if 'holm' not in _corr:
+    _neg_holm = any(_neg in _corr for _neg in (
+        'no holm', 'no-holm', 'not holm', 'not-holm', 'non-holm',
+        'without holm', 'without-holm'))
+    if 'holm' not in _corr or _neg_holm:
         raise SystemExit(f'[v12] REFUSE: freeze manifest pre-registers correction {_stat.get("correction")!r}, but this analyzer only implements Holm step-down — update the code or re-freeze')
     for comp in m['primary_comparisons']:
         if not isinstance(comp, dict):
@@ -1743,6 +1746,19 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             raise SystemExit(
                 '[p5t stats] REFUSE: every manifest.primary_comparisons entry '
                 'must be an object')
+        _comp_names = []
+        for _c in _comps:
+            _name = _c.get('name')
+            if not isinstance(_name, str) or not _name:
+                raise SystemExit(
+                    '[p5t stats] REFUSE: every manifest.primary_comparisons '
+                    'entry must carry a non-empty string name')
+            _comp_names.append(_name)
+        if len(set(_comp_names)) != len(_comp_names):
+            raise SystemExit(
+                '[p5t stats] REFUSE: duplicate primary-comparison names would '
+                'collapse the Holm family — every declared contrast needs a '
+                'unique name')
     bylen_path = bylen_path or os.path.join(TEST_OUTDIR, 'bylen.json')
     probe_path = probe_path or os.path.join(TEST_OUTDIR, 'distractor.json')
     raw = {}

@@ -1565,6 +1565,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             print(f'[v10 stats] {len(_bad_cells)} record(s) in {sp} carry no variant/seed/ppl_mean and are skipped (they are error or truncation stubs, not measurements): ' + ', '.join((f'{k}({why})' for k, why in _bad_cells[:4])))
         _n_bad_pre = len(_bad_cells)
         cells, _dup_cells = ({}, [])
+        _dup_keys = set()
         for k, r in _usable.items():
             if r.get('probe_params') is None:
                 _bad_cells.append((k, 'no probe_params'))
@@ -1577,10 +1578,13 @@ def v10_analysis(out='analysis_v10/stats.json'):
             grp = cells.setdefault(key, {})
             if r['seed'] in grp:
                 _dup_cells.append((k, key[:5], r['seed']))
+                _dup_keys.add(key)
                 continue
             grp[r['seed']] = r
+        for _dk in _dup_keys:
+            cells.pop(_dk, None)
         if _dup_cells:
-            print(f'[v10 stats] {len(_dup_cells)} probe record(s) share a (cell, seed) identity — their PPL is ambiguous and they are dropped from the pooling: ' + ', '.join((f'{k}' for k, _c, _s in _dup_cells[:4])))
+            print(f'[v10 stats] {len(_dup_cells)} probe record(s) share a (cell, seed) identity — the whole ambiguous cell is dropped from the pooling: ' + ', '.join((f'{k}' for k, _c, _s in _dup_cells[:4])))
         _new_bad = _bad_cells[_n_bad_pre:]
         if _new_bad:
             print(f'[v10 stats] {len(_new_bad)} record(s) in {sp} lack `probe_params` and are dropped from every mean/paired statistic: ' + ', '.join((f'{k}({why})' for k, why in _new_bad[:4])))

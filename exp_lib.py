@@ -4381,6 +4381,7 @@ class AttnCfg:
         self.c_kv = _cfg_int('c_kv', self.c_kv, 0)
         self.c_index = _cfg_int('c_index', self.c_index, 0)
         self.n_index_heads = _cfg_int('n_index_heads', self.n_index_heads, 1)
+        self.fuse_kernel = _cfg_int('fuse_kernel', self.fuse_kernel, 1)
         if self.c_index % self.n_index_heads != 0:
             # The indexer splits c_index evenly across its heads; a truncated
             # quotient would pass construction and only fail on the first
@@ -5750,6 +5751,11 @@ def _ids_fp(train_ids):
     try:
         _key = (train_ids.__array_interface__['data'][0], train_ids.shape, train_ids.strides, train_ids.dtype.str)
     except (AttributeError, TypeError):
+        _key = None
+    # A writeable array can change under the same pointer/layout; memoising
+    # its digest would then return a stale corpus identity.  Only immutable
+    # arrays are safe to key by storage address.
+    if _key is not None and getattr(getattr(train_ids, 'flags', None), 'writeable', False):
         _key = None
     if _key is not None:
         _hit = _IDS_FP_MEMO.get(_key)
@@ -14733,7 +14739,9 @@ def normalize_seed_list(seeds, *, default=(0,)):
     elif isinstance(seeds, np.ndarray) and seeds.ndim == 0:
         seeds = [seeds.item()]
     elif isinstance(seeds, (str, bytes)):
-        seeds = seeds.decode().split() if isinstance(seeds, bytes) else seeds.replace(',', ' ').split()
+        if isinstance(seeds, bytes):
+            seeds = seeds.decode()
+        seeds = seeds.replace(',', ' ').split()
     else:
         # A scalar number-like object is a seed identity when it satisfies the
         # shared exact-integer contract.
@@ -14745,7 +14753,8 @@ def normalize_seed_list(seeds, *, default=(0,)):
             seeds = [seeds]
     out = []
     seen = set()
-    for raw in seeds:
+
+    def _add(raw):
         if isinstance(raw, (bool, np.bool_)):
             raise ValueError(f'seed must be an integer, got boolean {raw!r}')
         if isinstance(raw, (float, np.floating)):
@@ -14764,11 +14773,17 @@ def normalize_seed_list(seeds, *, default=(0,)):
             raise ValueError(f'seed must be an integer, got {raw!r}')
         if s in seen:
             print(f'[seeds] WARNING: duplicate seed {s} removed from the panel plan (it would otherwise be trained twice under the same key)')
-            continue
+            return
         seen.add(s)
         out.append(s)
+
+    for raw in seeds:
+        _add(raw)
     if not out:
-        out = list(dict.fromkeys(int(x) for x in default))
+        # The fallback default is a seed axis too: it must obey the same
+        # exact-integer contract instead of int()-truncating booleans/floats.
+        for raw in default:
+            _add(raw)
     return out
 
 

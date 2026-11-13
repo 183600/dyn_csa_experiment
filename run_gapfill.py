@@ -159,6 +159,9 @@ def synthesize_long_summary():
         _proto = e.get('protocol') if isinstance(e, dict) else None
         return (real_v, str(_proto) if _proto else None)
     for v, e in agg.items():
+        if not isinstance(e, dict):
+            print(f'[synth] SKIP: aggregate entry `{v}` is {type(e).__name__}, not an object — it cannot describe a variant')
+            continue
         _ppls = e.get('ppls') or []
         _seeds = e.get('seeds')
         if not _ppls:
@@ -264,11 +267,17 @@ def synthesize_long_summary():
 def merge_long_aggregate(adir, snapshot_agg):
     if not snapshot_agg:
         return
+    if not isinstance(snapshot_agg, dict):
+        print(f'[v6-merge] WARNING: the snapshot aggregate is {type(snapshot_agg).__name__}, not an object — nothing is merged')
+        return
     agg_path = os.path.join(adir, 'aggregate.json')
     try:
         fresh = json.load(open(agg_path, encoding='utf-8'))
     except Exception as _e:
         print(f'[v6-merge] WARNING: cannot read the freshly written {agg_path} ({type(_e).__name__}: {_e}) — the snapshot is left unmerged; re-run `_finish_panel` on the panel to rebuild it')
+        return
+    if not isinstance(fresh, dict):
+        print(f'[v6-merge] WARNING: {agg_path} is valid JSON but not an object ({type(fresh).__name__}) — the snapshot is left unmerged; re-run `_finish_panel` on the panel to rebuild it')
         return
     merged = copy.deepcopy(snapshot_agg)
 
