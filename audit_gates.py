@@ -2121,7 +2121,7 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
         if _conflict:
             out['status'] = 'fail'
             out.setdefault('problems', []).append(
-                f'{d}: records disagree on the training budget (' +
+                f'{d}: records disagree on the training allocation (' +
                 '; '.join(_conflict) +
                 ') — one panel-level FLOP estimate would be arbitrary')
             out['panels'][d] = {'params': _valid[0][1],

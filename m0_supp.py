@@ -436,7 +436,7 @@ def run_kernel():
     print()
     best = max(tflops.values()) if tflops else None
     if tflops:
-        print(f'[kernel] G0 基准判据：{"PASS" if best >= 150.0 else "NOT YET"}（门限 150 TFLOPS）')
+        print(f'[kernel] G0 基准判据：{"PASS" if best >= 150.0 else "NOT YET"}')
     else:
         print('[kernel] 基准需要 CUDA + triton（本机跳过；G0 基准判据未测量，不算通过）')
     print(f'[kernel] 数值判据：{"PASS" if not fail else "FAIL"}')

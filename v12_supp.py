@@ -832,7 +832,7 @@ def _frozen_seeds():
     truth is the manifest; hard-coded phase lists must not disagree with it.
 
     Run the FULL `_load_manifest` validation here, not just a JSON
-    seed parse.  Training refuses before the first GPU-second if the manifest
+    seed parse.  Training refuses before it starts if the manifest
     would be rejected at P5T load time (stamp mismatch, unresolvable power
     gate, binding inconsistency).
     """
