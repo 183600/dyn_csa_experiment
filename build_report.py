@@ -1461,9 +1461,7 @@ def sec_p1l():
         # Resolve them so a cell is never silently shown as "—", while a
         # malformed key (including the dict-equality alias True == 1) never
         # supplies a cell for a different real length.  Two keys that name the
-        # same length (e.g. 512 and "512") are ambiguous even when their
-        # values happen to agree: choosing one would quote an endpoint the
-        # record does not uniquely define.
+        # same length (e.g. 512 and "512") are ambiguous.
         if not isinstance(by_len, dict):
             return None
         _hits = []

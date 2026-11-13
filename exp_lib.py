@@ -3437,11 +3437,7 @@ def _rank_blocks(masked, B, ties, k=None):
     sel = gt | (eq & (eq_cum <= need[:, None]))
     del eq_cum, gt, eq, need
     rank = torch.cumsum(sel, dim=1, dtype=torch.int32)
-    # NaN has no ordering under `>`/`==`.  A NaN in a row can either leave
-    # fewer than kk selections or (when enough finite entries exist) return a
-    # finite top-k that omits the NaN the stable descending sort puts first.
-    # The helper's contract is the first k columns of that stable sort, so any
-    # NaN row takes the full-sort path (whose NaN ordering is defined).
+    # NaN rows use the full stable sort, whose NaN ordering is defined.
     _needs_sort = rank[:, -1] != kk
     if src.dtype.is_floating_point:
         _needs_sort.logical_or_(torch.isnan(src).any(dim=1))
@@ -8818,11 +8814,10 @@ _WINDOW_SCAN_CHUNK = 1 << 20
 def _window_follow_tokens(src, row, chunk=_WINDOW_SCAN_CHUNK):
     """All tokens that immediately follow an occurrence of ``row`` in ``src``.
 
-    Scans the start positions in fixed-size chunks instead of materialising a
-    full-corpus boolean mask per sampled row.  The returned set is exactly the
-    set of ``src[p + len(row)]`` values over every valid start ``p``; a window
-    with no following token (``p + len(row) == len(src)``) cannot be a training
-    target and is not returned.
+    The returned set is exactly the set of ``src[p + len(row)]`` values over
+    every valid start ``p``; a window with no following token
+    (``p + len(row) == len(src)``) cannot be a training target and is not
+    returned.
     """
     src = np.asarray(src).reshape(-1)
     row = np.asarray(row).reshape(-1)
@@ -8913,9 +8908,6 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
                 for _bi in range(_xn.shape[0]):
                     _row = _xn[_bi]
                     _last = int(_yn[_bi, -1])
-                    # Chunked start-position scan: an exact synonym of the
-                    # full boolean-mask form without allocating a corpus-sized
-                    # mask per sampled row.
                     _nexts = _window_follow_tokens(_src, _row)
                     # A repeated input window with different continuations
                     # makes the final target unverifiable from x/y alone:
@@ -18262,11 +18254,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                                         'lr': base})
                     print(f'  [nan] non-finite gradient norm at step {step + 1}; zeroing grads and skipping the update')
                     opt.zero_grad(set_to_none=True)
-                    # `unscale_` marked the gradients non-finite, so the
-                    # scaler must still update: skipping it would leave an
-                    # overflowing fp16 scale unchanged and every later step
-                    # could overflow the same way.  `update()` without `step()`
-                    # is the supported recovery path after `unscale_`.
+                    # `update()` without `step()` is the supported recovery
+                    # path after `unscale_` reports non-finite gradients.
                     _scaler.update()
                 else:
                     _gn_post = min(_gn_pre, float(GRAD_CLIP_NORM))
@@ -18608,9 +18597,7 @@ def _lm_batch_metrics(model, x, y, vocab, chunk=64, ignore_index=None):
                     correct += (lg.argmax(-1)[valid] == tg[valid]).sum()
                     n += int(valid.sum())
         if n <= 0:
-            # Every target was ignored (or the batch had no scoreable
-            # columns).  `0/1` would claim a perfectly measured zero loss and
-            # zero accuracy; the point is unmeasured, so report NaN.
+            # No scoreable target: the point is unmeasured.
             return float('nan'), float('nan')
         return (float(total.item()) / n), (float(correct.item()) / n)
     finally:
@@ -20149,10 +20136,8 @@ def _group_params(recs):
 def _common_nonempty_dict(recs, key):
     """The one non-empty dict under ``key`` shared by every record.
 
-    A single seed's value must not stand in for the arm: a partially recorded
-    panel would then publish a capacity/KV decomposition that the other seeds
-    never measured.  Any missing or mismatched value makes the arm's detail
-    unverifiable, so nothing is reported.
+    A missing or mismatched value makes the arm's detail unverifiable, so
+    nothing is reported.
     """
     vals = []
     for r in recs:

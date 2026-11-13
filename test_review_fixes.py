@@ -2578,8 +2578,7 @@ def t_aggregate_common_dict_fields():
     assert entry['param_breakdown'] == bd, entry
     assert entry['kv_cache_elements_per_token'] == kv, entry
     # One seed without the detail makes the whole arm's decomposition
-    # unverifiable: using the remaining seed would publish a capacity/KV
-    # table the other seed never measured.
+    # unverifiable.
     partial = {k: dict(v) for k, v in both.items()}
     partial['a::s1'].pop('param_breakdown')
     partial['a::s1'].pop('kv_cache_elements_per_token')
@@ -5108,8 +5107,8 @@ def t_audit_budget_integer_runs():
             assert r['status'] == 'fail' and r.get('problems'), (bad, r)
             _panel = r['panels'][td]
             assert not isinstance(_panel, dict) or _panel.get('estimate') is None, (bad, r)
-        # Two model widths under one variant make the panel-level FLOP
-        # estimate arbitrary (the old code silently used the first record).
+        # Two model widths under one variant make a panel-level estimate
+        # arbitrary.
         with open(sp, 'w', encoding='utf-8') as f:
             json.dump({'v::s0': {'variant': 'v', 'params': 1000, 'steps': 3,
                                  'batch_size': 2, 'seq_len': 8},

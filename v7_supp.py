@@ -2552,8 +2552,7 @@ def _merge_prior_by_len(prev_by_len, new_cells, need_lens, *, label=''):
 
     Only exact integer length keys survive.  A length that is being
     re-evaluated is replaced by the new measurement, and two spellings of one
-    length (e.g. 512 and "512") are ambiguous, so neither stale value is
-    kept instead of silently choosing one.
+    length (e.g. 512 and "512") are ambiguous, so neither is kept.
     """
     merged = {}
     seen = set()
@@ -2767,9 +2766,8 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         try:
             _cells = L.by_len_cells([_rec], _ln)
         except ValueError:
-            # An ambiguous integer/string twin (or another malformed length
-            # declaration) is not a complete measurement; re-evaluate it
-            # instead of aborting the whole resume path.
+            # An ambiguous or malformed length declaration is not a complete
+            # measurement; re-evaluate it.
             return False
         if not _cells:
             return False

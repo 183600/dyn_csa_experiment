@@ -2153,10 +2153,6 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
                     and _qi is not None and _qi > 0):
                 _tok_vals_set.add(_si * _bi * _qi)
         _tok_vals = sorted(_tok_vals_set)
-        # The parameter count is as much a panel-level allocation input as the
-        # step/token counts: taking `_valid[0]` would make the FLOP estimate
-        # depend on JSON insertion order when a mixed/resumed panel holds two
-        # model widths under one variant.
         _param_vals = sorted({_p for _r, _p in _valid})
         _conflict = []
         if _tok_bad:

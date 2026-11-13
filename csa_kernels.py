@@ -788,11 +788,7 @@ def _stable_topk_desc(x, k):
     sel = gt | (eq & (eq_cum <= need[:, None]))
     del eq_cum
     rank = torch.cumsum(sel, dim=1, dtype=torch.int32)
-    # NaN has no ordering under `>`/`==`.  A NaN in a row can either leave
-    # fewer than kk selections or (when enough finite entries exist) return a
-    # finite top-k that omits the NaN the stable descending sort puts first.
-    # The helper's contract is the first k columns of that stable sort, so any
-    # NaN row takes the full-sort path (whose NaN ordering is defined).
+    # NaN rows use the full stable sort, whose NaN ordering is defined.
     _needs_sort = rank[:, -1] != kk
     if flat.dtype.is_floating_point:
         _needs_sort.logical_or_(torch.isnan(flat).any(dim=1))
