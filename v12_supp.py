@@ -460,10 +460,16 @@ def _load_manifest(path):
         raise SystemExit(f'[v12] REFUSE: binding.tokenizer must be an object ({_tokb!r})')
     if _tokb and str(_tokb.get('fit', '')).lower() and 'train' not in str(_tokb.get('fit', '')).lower():
         raise SystemExit(f'[v12] REFUSE: binding.tokenizer.fit={_tokb.get("fit")!r} is not the train-only fit required by the freeze')
-    _test = str(_stat.get('test', 'exact two-sided sign-flip over paired per-seed deltas')).lower()
+    _test_raw = _stat.get('test', 'exact two-sided sign-flip over paired per-seed deltas')
+    if not isinstance(_test_raw, str) or not _test_raw.strip():
+        raise SystemExit(f'[v12] REFUSE: statistics.test={_test_raw!r} is not a non-empty text test identity')
+    _test = _test_raw.lower()
     if ('sign-flip' not in _test and 'sign flip' not in _test) or 'two-sided' not in _test:
         raise SystemExit(f'[v12] REFUSE: freeze manifest pre-registers test {_stat.get("test")!r}, but this analyzer only implements the exact two-sided sign-flip test — update the code or re-freeze')
-    _corr = str(_stat.get('correction', 'holm step-down')).lower()
+    _corr_raw = _stat.get('correction', 'holm step-down')
+    if not isinstance(_corr_raw, str) or not _corr_raw.strip():
+        raise SystemExit(f'[v12] REFUSE: statistics.correction={_corr_raw!r} is not a non-empty text correction identity')
+    _corr = _corr_raw.lower()
     _neg_holm = any(_neg in _corr for _neg in (
         'no holm', 'no-holm', 'not holm', 'not-holm', 'non-holm',
         'without holm', 'without-holm'))

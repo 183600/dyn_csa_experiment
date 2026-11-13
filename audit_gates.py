@@ -2104,6 +2104,31 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
         if not _valid:
             out['panels'][d] = 'no usable param records'
             continue
+        # A panel-level FLOP estimate needs ONE training budget.  Silently
+        # taking _valid[0] makes the reported tokens depend on JSON insertion
+        # order when seeds disagree.
+        _step_vals = sorted({
+            _si for _r, _p in _valid
+            if (_si := _exact_int_scalar(_r.get('steps'))) is not None})
+        _tok_vals = sorted({
+            _ti for _r, _p in _valid
+            if (_ti := _exact_int_scalar(_r.get('tokens_seen'))) is not None})
+        _conflict = []
+        if steps is None and len(_step_vals) > 1:
+            _conflict.append(f'steps {_step_vals}')
+        if len(_tok_vals) > 1:
+            _conflict.append(f'tokens_seen {_tok_vals}')
+        if _conflict:
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: records disagree on the training budget (' +
+                '; '.join(_conflict) +
+                ') — one panel-level FLOP estimate would be arbitrary')
+            out['panels'][d] = {'params': _valid[0][1],
+                                'steps': _step_vals or None,
+                                'tokens': _tok_vals or None,
+                                'estimate': None}
+            continue
         r0, p0 = _valid[0]
         _steps = steps if steps is not None else r0.get('steps')
         _steps_i = _exact_int_scalar(_steps)

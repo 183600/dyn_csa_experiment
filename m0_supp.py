@@ -604,7 +604,9 @@ def _panel_corpus_fp(summary, variant=None):
             continue
         fp = rec.get('data_version')
         if fp is None and isinstance(rec.get('provenance'), dict):
-            fp = ((rec['provenance'].get('data') or {}).get('data_version'))
+            _prov_data = rec['provenance'].get('data')
+            if isinstance(_prov_data, dict):
+                fp = _prov_data.get('data_version')
         if fp is None:
             continue
         # A boolean flag (or an empty/non-UTF-8 bytes value) is not a corpus
@@ -719,12 +721,22 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
             if len(common) < 2:
                 continue
             lr = L.paired_log_ratio([pa[s] for s in common], [pb[s] for s in common], seeds=common)
-            raw[label] = lr
             try:
                 _cfp = _panel_corpus_fp(summary, a)
+                _cfp_b = _panel_corpus_fp(summary, b)
             except ValueError as e:
                 print(f'[m0-analysis] {name}/{label}: {e}')
                 continue
+            # A log-ratio contrast is only defined when BOTH arms of the same
+            # panel were scored on the same tokenisation/corpus.  Checking only
+            # arm `a` would pool a mixed panel whose numerator and denominator
+            # use different corpora.
+            if _cfp is not None and _cfp_b is not None and _cfp != _cfp_b:
+                print(f'[m0-analysis] {name}/{label}: arms `{a}` and `{b}` carry '
+                      f'different corpus fingerprints ({_cfp} vs {_cfp_b}) — '
+                      'the paired log ratio is refused')
+                continue
+            raw[label] = lr
             _e = (report['panels'].get(label) or {}).get('arms', {}).get(a) or {}
             points.append({'label': label, 'scale': _e.get('params'),
                            'effects': lr['effects'], 'seeds': lr['seeds'],

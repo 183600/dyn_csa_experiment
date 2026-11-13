@@ -823,7 +823,10 @@ def cosine_similarity_consecutive(H, eps=1e-08):
     # time axis in chunks changes no value; the unchunked form is used when
     # the whole sequence fits in one chunk.
     if H.dim() < 2:
-        h = F.normalize(H, dim=-1, eps=eps)
+        # A 1-D tensor is a sequence of scalar features.  Normalising the
+        # whole vector (dim=-1 is the time axis here) is not a per-position
+        # cosine; unsqueeze makes each scalar its own feature row.
+        h = F.normalize(H.unsqueeze(-1), dim=-1, eps=eps).squeeze(-1)
         return (h[1:] * h[:-1]).sum(dim=-1)
     T = int(H.shape[-2])
     if T <= 1:
@@ -5303,6 +5306,8 @@ class HybridAttention(nn.Module):
         # value-identical to the stack form (transport only, design notes §6.1).
         outs = torch.empty(B, T, d, device=x.device, dtype=x.dtype)
         gates = []
+        _blp_rows = []
+        _bdec_rows = 0
         _prev_batch = _CPU_ACTIVE_BATCH[0]
         _CPU_ACTIVE_BATCH[0] = int(B)
         try:
@@ -5312,8 +5317,21 @@ class HybridAttention(nn.Module):
                 outs[b] = o
                 if g is not None:
                     gates.append(g)
+                _lp = getattr(self, 'last_boundary_logp', None)
+                if _lp is not None:
+                    _blp_rows.append(_lp)
+                    _bdec_rows += int(getattr(self, 'last_boundary_decisions', 0) or 0)
         finally:
             _CPU_ACTIVE_BATCH[0] = _prev_batch
+        if _blp_rows:
+            _lp_tot = _blp_rows[0]
+            for _lp in _blp_rows[1:]:
+                _lp_tot = _lp_tot + _lp
+            self.last_boundary_logp = _lp_tot
+            self.last_boundary_decisions = int(_bdec_rows)
+        else:
+            self.last_boundary_logp = None
+            self.last_boundary_decisions = 0
         if not gates:
             self.last_gate_mean = None
         else:
@@ -6424,11 +6442,18 @@ _WT103_TEST_MEMO = {}
 _WT103_TEST_MEMO_CAP = 2
 
 def _text_fp(rows):
-    """sha256 of a list of text rows (fit-corpus provenance for the test cache)."""
+    """sha256 of a list of text rows (fit-corpus provenance for the test cache).
+
+    Each row is length-prefixed before its bytes, so a newline inside a row
+    cannot be confused with the boundary between two rows.  The tokenised
+    stream appends an EOS per row, so `["a\\nb"]` and `["a", "b"]` are
+    different fit corpora and must never share a cache identity.
+    """
     h = hashlib.sha256()
     for r in rows:
-        h.update(r.encode('utf-8', errors='replace'))
-        h.update(b'\n')
+        b = r.encode('utf-8', errors='replace')
+        h.update(len(b).to_bytes(8, 'little'))
+        h.update(b)
     return h.hexdigest()[:16]
 
 def _tokenise_row_chunks(row_chunks, cap_tokens, label, tok, eos_id,
@@ -20129,7 +20154,8 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     seed_logppl = None
     if rows is not None:
         per_tok = nll_mat.sum(axis=1) / np.maximum(ntok_mat.sum(axis=1), 1e-30)
-        ok = np.isfinite(per_tok) & (per_tok > 0)
+        # CE == 0 (PPL == 1) is a valid measurement, not a missing one.
+        ok = np.isfinite(per_tok) & (per_tok >= 0)
         if ok.sum() == S and S >= 2:
             lp = per_tok
             seed_logppl = lp
@@ -20158,7 +20184,8 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
             with np.errstate(divide='ignore', invalid='ignore'):
                 # log(PPL) = pooled CE = NLL/tokens.
                 lp_draw = np.where(nt > 0, nn / np.maximum(nt, 1e-30), np.nan)
-                lp_draw = np.where(np.isfinite(lp_draw) & (lp_draw > 0), lp_draw, np.nan)
+                # log(PPL) == 0 is finite; only negative/non-finite CE is invalid.
+                lp_draw = np.where(np.isfinite(lp_draw) & (lp_draw >= 0), lp_draw, np.nan)
             draws[_b:_b + _nb] = lp_draw
             _b += _nb
         draws = draws[np.isfinite(draws)]

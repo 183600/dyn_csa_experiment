@@ -2465,10 +2465,18 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         raise RuntimeError('CSA_KERNEL 只支持 learned indexer（indexer_mode != "learned" 的臂请回退 eager）')
     if cfg.chunking == 'cosine_learnable':
         if pre_blocks is None or gate_sigs is None:
-            raise RuntimeError('cosine_learnable 层需要 forward 预计算的门控信号与块几何')
-        bids = [pb[0] for pb in pre_blocks]
-        nblks = [pb[1] for pb in pre_blocks]
-        hons = [pb[2] for pb in pre_blocks]
+            if T != 1:
+                raise RuntimeError('cosine_learnable 层需要 forward 预计算的门控信号与块几何')
+            # A length-1 sequence has no gate/cut row; eager `_single` treats
+            # it as one block, so the batched/kernel path must do the same
+            # instead of crashing on the missing gate tensors.
+            bids = [_exp_blocks_fixed(T, cfg.block_size, dev) for _ in range(B)]
+            nblks = [1] * B
+            hons = None
+        else:
+            bids = [pb[0] for pb in pre_blocks]
+            nblks = [pb[1] for pb in pre_blocks]
+            hons = [pb[2] for pb in pre_blocks]
         # Write the rows directly into the int32 device table.
         bid_full = torch.empty((B, T), dtype=torch.int32, device=dev)
         for _b, _bd in enumerate(bids):
@@ -2513,6 +2521,10 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         # 没有它内核模式的记录会丢掉全部块长/边界诊断。
         for _b in range(B):
             attn._stats.append(torch.bincount(bid_full[_b]))
+            if cfg.chunking == 'cosine_learnable' and gate_sigs is not None:
+                _gs = gate_sigs[_b]
+                _gcuts = _gs[1] if _gs is not None and len(_gs) > 1 else None
+                attn._stats.add_segmentation(bid_full[_b], _gcuts, cfg.max_block)
         if attn._cuts is not None:
             for _b in range(B):
                 attn._cuts.append((bid_full[_b, 1:] != bid_full[_b, :-1]).nonzero(as_tuple=True)[0] + 1)
@@ -2567,6 +2579,22 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
                                     soft=soft, sink_logits=sink, sel_valid=valid, impl=impl_attn)
     outs = attn.W_o(out.reshape(B, T, attn.nh * attn.hd))
     attn.last_gate_mean = _gate_mean_batched(attn, cfg, T, B, gate_sigs, hons, nblks)
+    # Match eager `_single`: a REINFORCE gate returns the sampled cut
+    # log-probability and decision count instead of silently dropping the
+    # policy-gradient term in the batched/kernel path.
+    _blps = [gs[2] for gs in (gate_sigs or [])
+             if gs is not None and len(gs) > 2]
+    if _blps:
+        _lp = _blps[0]
+        for _next in _blps[1:]:
+            _lp = _lp + _next
+        attn.last_boundary_logp = _lp
+        attn.last_boundary_decisions = int(sum(
+            int(gs[0].numel()) for gs in gate_sigs
+            if gs is not None and len(gs) > 2))
+    else:
+        attn.last_boundary_logp = None
+        attn.last_boundary_decisions = 0
     return outs
 
 

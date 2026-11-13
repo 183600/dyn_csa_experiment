@@ -70,8 +70,9 @@ _EPS = 1e-12
 
 def _check_fraction(name, value):
     # Booleans are not fractions: float(True) == 1.0 would silently turn a
-    # mistaken flag into a 100% split.  Same contract as _check_count.
-    if isinstance(value, (bool, np.bool_)):
+    # mistaken flag into a 100% split.  Temporal values are not fractions
+    # either.  Same contract as _check_count.
+    if isinstance(value, (bool, np.bool_, np.datetime64, np.timedelta64)):
         raise ValueError(f'{name} must be a number in [0, 1], got {value!r}')
     try:
         value = float(value)
@@ -84,7 +85,7 @@ def _check_fraction(name, value):
 
 def _check_count(name, value, *, positive=False):
     """Validate an integer count without silently coercing/truncating it."""
-    if isinstance(value, (bool, np.bool_)):
+    if isinstance(value, (bool, np.bool_, np.datetime64, np.timedelta64)):
         raise ValueError(f'{name} must be an integer, got {value!r}')
     if isinstance(value, numbers.Integral):
         value = int(value)
@@ -276,6 +277,10 @@ def _validated_index(values, *, name='index'):
             if isinstance(v, (bool, np.bool_)):
                 raise ValueError(
                     f'{name} must contain integer row indices, not booleans')
+            if isinstance(v, (np.datetime64, np.timedelta64)):
+                raise ValueError(
+                    f'{name} must contain integer row indices, not temporal '
+                    f'values ({type(v).__name__})')
             if isinstance(v, numbers.Integral):
                 v = int(v)
             elif isinstance(v, numbers.Real):
@@ -334,7 +339,7 @@ def _check_purge(purge):
     coerced, which would silently change the embargo size while looking like a
     valid request.
     """
-    if isinstance(purge, (bool, np.bool_)):
+    if isinstance(purge, (bool, np.bool_, np.datetime64, np.timedelta64)):
         raise ValueError(f'purge must be a non-negative integer, got {purge!r}')
     if isinstance(purge, numbers.Integral):
         purge = int(purge)
@@ -1596,6 +1601,27 @@ def _canonical_complex_cell(v):
     return ('cplx', _part(z.real), _part(z.imag))
 
 
+def _temporal_identity(v):
+    """Unit-independent identity for a datetime64/timedelta64 value.
+
+    NumPy compares the same instant in different units as equal, so the
+    duplicate/fingerprint contracts must do the same.  Normalise to
+    microseconds (the finest unit that covers ordinary dates without
+    overflowing); fall back to the textual spelling only when that conversion
+    is out of range.
+    """
+    if np.isnat(v):
+        return ('nat', type(v).__name__)
+    try:
+        u = (v.astype('datetime64[us]') if isinstance(v, np.datetime64)
+             else v.astype('timedelta64[us]'))
+        if not np.isnat(u):
+            return ('dt', type(v).__name__, int(u.astype(np.int64)))
+    except (OverflowError, ValueError, TypeError):
+        pass
+    return ('dt', type(v).__name__, str(v))
+
+
 def _canonical_object_cell(v):
     if v is None:
         # None is the object spelling of a missing numeric cell, the same
@@ -1616,9 +1642,7 @@ def _canonical_object_cell(v):
     if isinstance(v, (np.datetime64, np.timedelta64)):
         # Checked before the integer branches: np.timedelta64 is registered as
         # np.integer, but int() on a unit-bearing value is not an integer.
-        if np.isnat(v):
-            return ('nat', type(v).__name__)
-        return ('dt', type(v).__name__, str(v))
+        return _temporal_identity(v)
     if isinstance(v, (bool, np.bool_)):
         return ('num', int(v))
     if isinstance(v, (int, np.integer)):
@@ -1829,10 +1853,16 @@ def _row_keys(X):
         # A pure string object table is the logical twin of a fixed-width
         # Unicode/bytes table; route it through that path so a cache that
         # serialised strings as object dtype still matches its typed copy.
-        if _flat_obj and all(isinstance(v, (str, np.str_)) for v in _flat_obj):
+        if (_flat_obj and all(isinstance(v, (str, np.str_)) for v in _flat_obj)
+                and all('\x00' not in str(v) for v in _flat_obj)):
+            # Fixed-width NumPy strings cannot preserve embedded NULs (they
+            # truncate at the first NUL).  Keep NUL-bearing object strings on
+            # the exact per-cell path below so they cannot collide with a
+            # shorter string.
             return _row_keys(np.asarray(_flat_obj, dtype=str).reshape(src.shape))
-        if _flat_obj and all(isinstance(v, (bytes, bytearray, np.bytes_))
-                             for v in _flat_obj):
+        if (_flat_obj and all(isinstance(v, (bytes, bytearray, np.bytes_))
+                              for v in _flat_obj)
+                and all(b'\x00' not in bytes(v) for v in _flat_obj)):
             # Convert each cell explicitly: np.asarray([b'a', bytearray(b'b')],
             # dtype=bytes) treats the bytearray as a sequence and refuses the
             # inhomogeneous table.  The byte content is the same identity.
@@ -1856,9 +1886,7 @@ def _row_keys(X):
             if isinstance(v, (np.datetime64, np.timedelta64)):
                 # np.timedelta64 is np.integer, but int() on a unit-bearing
                 # value is not an integer; handle temporal identity first.
-                if np.isnat(v):
-                    return ('nat', type(v).__name__)
-                return ('dt', type(v).__name__, str(v))
+                return _temporal_identity(v)
             if isinstance(v, (bool, np.bool_)):
                 # Match the typed integral path, which hashes bool as 0/1.
                 return ('num', int(v))
@@ -1905,7 +1933,8 @@ def _row_keys(X):
                 h = hashlib.blake2b(digest_size=8)
                 h.update(_tag)
                 for cell in row:
-                    _b = cell.encode('utf-8') if isinstance(cell, str) else bytes(cell)
+                    _b = (cell.encode('utf-8', errors='backslashreplace')
+                          if isinstance(cell, str) else bytes(cell))
                     h.update(len(_b).to_bytes(8, 'little'))
                     h.update(_b)
                 keys.append(h.digest())

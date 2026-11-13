@@ -410,6 +410,15 @@ def _relaxed_pair_reason(a, b, tuned_arms):
                 return f'{k} is not a text fingerprint ({_va!r} vs {_vb!r})'
             if _ta != _tb:
                 return f'{k} differs ({_ta[:12]!r} vs {_tb[:12]!r})'
+    # The evaluation slice is part of the measurement identity even when the
+    # training corpus matches.  Older records may omit it on both sides, but a
+    # one-sided or differing eval_fp must not be paired.
+    _ea = L._content_fp_text(a.get('eval_fp'))
+    _eb = L._content_fp_text(b.get('eval_fp'))
+    if (_ea is None) != (_eb is None):
+        return 'unverifiable eval_fp (only one record carries the evaluation-slice fingerprint)'
+    if _ea is not None and _ea != _eb:
+        return f'eval_fp differs ({_ea[:12]!r} vs {_eb[:12]!r})'
     # Tuning may change lr/wd/warmup, but it must never silently change the
     # optimizer, betas/eps, LR-schedule shape, grad-clip or augmentation.  The
     # strict `pair_reason` already enforces this for architecture contrasts;

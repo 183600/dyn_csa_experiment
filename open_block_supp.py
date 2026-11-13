@@ -113,7 +113,7 @@ def _recipe(cfg, *, matrix, outdir):
     return d
 
 
-def _run_fingerprint(cfg, *, matrix, outdir):
+def _run_fingerprint(cfg, *, matrix, outdir, synthetic=None, data_fp=None):
     r = _recipe(cfg, matrix=matrix, outdir=outdir)
     # The fingerprint identifies the training recipe, not which cells of the
     # matrix happen to be scheduled in this invocation: adding a seed or an
@@ -121,6 +121,12 @@ def _run_fingerprint(cfg, *, matrix, outdir):
     r.pop('seeds', None)
     r.pop('outdir', None)
     r.pop('matrix', None)
+    # The data mode and scored corpus are part of the measurement identity:
+    # a synthetic smoke panel must never be resumed as WikiText evidence.
+    if synthetic is not None:
+        r['synthetic'] = bool(synthetic)
+    if data_fp is not None:
+        r['data_fp'] = str(data_fp)
     return json.dumps(r, sort_keys=True, separators=(',', ':'))
 
 
@@ -260,12 +266,16 @@ def _run_one(cfg, *, variant, seed, train_ids, val_batch, vocab, val_bnd,
 def run_panel(cfg, matrix, *, device, synthetic=False, max_hours=None, label='main'):
     outdir = cfg['outdir']
     os.makedirs(outdir, exist_ok=True)
-    fp = _run_fingerprint(cfg, matrix=matrix, outdir=outdir)
     if synthetic:
         train, val, vocab = _synthetic_data(cfg)
         val_bnd = None
     else:
         train, val, vocab, val_bnd = _wikitext_data(cfg)
+    _data_fp = L._ids_fp(train)
+    _val_fp = L._ids_fp(np.ascontiguousarray(val).reshape(-1))
+    fp = _run_fingerprint(cfg, matrix=matrix, outdir=outdir,
+                          synthetic=bool(synthetic),
+                          data_fp=f'{_data_fp}|{_val_fp}')
     manifest = {
         'kind': 'open_block_panel', 'label': label,
         'code': L.code_stamp(), 'semantics': L.CODE_SEMANTICS,

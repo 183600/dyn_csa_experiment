@@ -116,7 +116,22 @@ def _fold_backup_into_aggregate(adir):
         lentry['ppls'] = vals
         lentry['n_seeds'] = len(vals)
         lentry['ppl_mean'] = sum(vals) / len(vals)
+        lentry['ppl_mean_arithmetic'] = lentry['ppl_mean']
         lentry['ppl_std'] = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        # The recovered union has no exact per-seed NLL denominator, so any
+        # pooled/primary field left over from the smaller live seed set would
+        # describe different data than seeds/ppls now do.  Reports prefer
+        # ppl_primary, so invalidate it explicitly and disclose the fallback.
+        lentry['nll_sum'] = None
+        lentry['n_tokens'] = None
+        lentry['ppl_pooled'] = None
+        lentry['ppl_primary'] = float(lentry['ppl_mean'])
+        lentry['ppl_aggregation'] = ('arithmetic_seed_mean_fallback '
+                                     '(recovered seed coverage has no exact '
+                                     'per-seed NLL denominator)')
+        for _f in ('ppl_median', 'ppl_iqr', 'ppl_ci95_seed_t',
+                   'ppl_ci95_doc_bootstrap', 'ppl_ci_seed_doc_combined'):
+            lentry[_f] = None
         recovered[key] = sorted(missing)
     if recovered:
         L.atomic_write_json(agg_path, merged, indent=2)

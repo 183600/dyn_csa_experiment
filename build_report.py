@@ -462,21 +462,21 @@ def _tag_of(r, key=None, legacy_ok=None):
                 return f'w{m.group(1)}'
     return ''
 
-def _prefer_one_cfg(items, cfg_of, who=''):
-    def _keyable(value):
-        # Keep the (label, run_cfg) tuple shape with every part hashable, so
-        # metadata values can be used as grouping keys.
-        if isinstance(value, tuple):
-            return tuple(_keyable(v) for v in value)
-        try:
-            hash(value)
-            return value
-        except TypeError:
-            return ('__unhashable__', type(value).__name__, repr(value))
+def _keyable_value(value):
+    """Hashable identity for a metadata value used as a grouping key."""
+    if isinstance(value, tuple):
+        return tuple(_keyable_value(v) for v in value)
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return ('__unhashable__', type(value).__name__, repr(value))
 
+
+def _prefer_one_cfg(items, cfg_of, who=''):
     by = collections.defaultdict(list)
     for it in items:
-        by[_keyable(cfg_of(it))].append(it)
+        by[_keyable_value(cfg_of(it))].append(it)
     per = collections.defaultdict(list)
     for _key, lst in by.items():
         if isinstance(_key, tuple) and len(_key) == 2:
@@ -669,7 +669,8 @@ def paired_row(a_records, b_records):
     # sign-flip test and fabricate n.
     _cfg_groups = collections.defaultdict(list)
     for _tk in common:
-        _cfg_groups[(a_records[_tk].get('run_cfg'), b_records[_tk].get('run_cfg'))].append(_tk)
+        _cfg_groups[(_keyable_value(a_records[_tk].get('run_cfg')),
+                     _keyable_value(b_records[_tk].get('run_cfg')))].append(_tk)
     if len(_cfg_groups) > 1:
         _ranked = sorted(_cfg_groups.items(),
                          key=lambda kv: (not (isinstance(kv[0][0], str) and _CUR_CS and kv[0][0].endswith(f'_cs{_CUR_CS}')), -len(kv[1]), str(kv[0])))
@@ -830,7 +831,12 @@ def sec_p0w():
         if _w < 0 and _measurable({'ppl': r.get('ppl'), 'synthesized': r.get('synthesized', False)}):
             print(f"[report] sec_p0w: record {k!r} carries no parseable warmup tag — it is skipped, not counted")
             continue
-        rows.append((r.get('variant', '?'), _w, _sd, r.get('ppl'), r.get('ppl_at_switch'), r.get('synthesized', False), k))
+        _v = _record_variant(r, k)
+        if _v is None:
+            if _measurable({'ppl': r.get('ppl'), 'synthesized': r.get('synthesized', False)}):
+                print(f"[report] sec_p0w: record {k!r} carries a non-text variant ({r.get('variant')!r}) — it is skipped, not counted")
+            continue
+        rows.append((_v, _w, _sd, r.get('ppl'), r.get('ppl_at_switch'), r.get('synthesized', False), k))
     rows.sort(key=lambda x: (x[0], x[1], x[2]))
     rows = [row for row in rows if _measurable({'ppl': row[3], 'synthesized': row[5]})]
     rows = _prefer_one_cfg(rows, lambda row: ((row[0], row[1]), (s.get(row[-1]) or {}).get('run_cfg')), who='sec_p0w')
@@ -848,9 +854,12 @@ def sec_p0w():
         if _w is None:
             _t = _tag_of(_r, _k, _legacy_ok)
             _w = int(_t[1:]) if _t.startswith('w') and _t[1:].isdigit() else -1
-        _slot = rec_by_s[_r.get('variant', '?'), _w]
+        _rv = _record_variant(_r, _k)
+        if _rv is None:
+            continue
+        _slot = rec_by_s[_rv, _w]
         if _sd in _slot:
-            print(f"[report] sec_p0w: ambiguous (variant, warm_steps, seed) = ({_r.get('variant', '?')!r}, {_w}, {_sd}): two measurable records found; keeping the FIRST (key {_k!r} ignored)")
+            print(f"[report] sec_p0w: ambiguous (variant, warm_steps, seed) = ({_rv!r}, {_w}, {_sd}): two measurable records found; keeping the FIRST (key {_k!r} ignored)")
             continue
         _slot[_sd] = _r
     grp = collections.defaultdict(list)
@@ -1230,13 +1239,16 @@ def sec_p1t():
         if not isinstance(r, dict):
             continue
         if r.get('error'):
-            v = r.get('variant', rid.split('::')[0])
-            failed.setdefault(v, []).append(r.get('seed'))
+            v = _record_variant(r, rid)
+            if v is not None:
+                failed.setdefault(v, []).append(r.get('seed'))
         elif _measurable(r) and (not _CUR_CS or r.get('_code') == _CUR_CS):
             # A stale record must not mask a missing current sweep point: the
             # table and _nblocks_measured/_agg_entry only quote current-stamp
             # rows.
-            _measured.add(r.get('variant', rid.split('::')[0]))
+            v = _record_variant(r, rid)
+            if v is not None:
+                _measured.add(v)
     _grid = ['csa_fix_m1', 'csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512']
     missing = [v for v in _grid if v not in _measured and v not in failed]
     for v in missing:

@@ -70,7 +70,10 @@ def _sha256(path, chunk=1 << 20):
 def _git_state():
     def _run(*args):
         try:
-            return subprocess.run(['git', *args], cwd=REPO, capture_output=True, text=True, timeout=30).stdout.strip()
+            _cp = subprocess.run(['git', *args], cwd=REPO, capture_output=True, text=True, timeout=30)
+            if _cp.returncode != 0:
+                return None
+            return _cp.stdout.strip()
         except Exception:
             return None
     head = _run('rev-parse', 'HEAD')
@@ -110,6 +113,17 @@ def _dir_inside_repo(d):
         return False
 
 
+def _file_inside_repo(p):
+    """True only when `p` is a regular file whose real path stays in REPO."""
+    try:
+        root = os.path.realpath(REPO)
+        real = os.path.realpath(p)
+        return (os.path.isfile(p) and not os.path.islink(p)
+                and os.path.commonpath([root, real]) == root)
+    except (OSError, ValueError):
+        return False
+
+
 def _collect(dirs, include_ckpt=False):
     """Files that would enter the archive, with sizes and hashes (lazily)."""
     files = []
@@ -134,8 +148,10 @@ def _collect(dirs, include_ckpt=False):
                 files.append(p)
     for f in ENV_FILES:
         p = os.path.join(REPO, f)
-        if os.path.exists(p) and not os.path.islink(p) and os.path.isfile(p):
+        if _file_inside_repo(p):
             files.append(p)
+        elif os.path.lexists(p):
+            print(f'[archive] WARNING: skipping non-regular or out-of-repo provenance file {f} — archive members must stay repo-relative')
     # The loaders write tag-suffixed metadata/tokenizer files (e.g.
     # meta_v5_sl512_....json), not the fixed names above.  Pack those
     # small provenance files too; otherwise a release silently omits the cache
@@ -145,11 +161,13 @@ def _collect(dirs, include_ckpt=False):
                  'wt103_cache/tok_v5_*.json', 'wt103_cache/test_tok_v2_*.json',
                  'fineweb_cache/meta_v2_*.json'):
         for _p in sorted(_glob.glob(os.path.join(REPO, _pat))):
-            if os.path.isfile(_p) and not os.path.islink(_p):
+            if _file_inside_repo(_p):
                 files.append(_p)
+            elif os.path.lexists(_p):
+                print(f'[archive] WARNING: skipping non-regular or out-of-repo provenance file {os.path.relpath(_p, REPO)} — archive members must stay repo-relative')
     for f in ('results_lm_test/.freeze_lock.json',):
         p = os.path.join(REPO, f)
-        if os.path.exists(p) and not os.path.islink(p) and os.path.isfile(p):
+        if _file_inside_repo(p):
             files.append(p)
     # Training logs (gitignored, so they only exist on the experiment machine).
     # Pack every per-seed log in the evidence release; pack every
@@ -158,10 +176,10 @@ def _collect(dirs, include_ckpt=False):
         for n in sorted(os.listdir(REPO)):
             if n.startswith('run_') and n.endswith('.log'):
                 _p = os.path.join(REPO, n)
-                if os.path.isfile(_p) and not os.path.islink(_p):
+                if _file_inside_repo(_p):
                     files.append(_p)
                 else:
-                    print(f'[archive] WARNING: skipping non-regular root log {n} — only regular files are content-attested')
+                    print(f'[archive] WARNING: skipping non-regular or out-of-repo root log {n} — only regular files are content-attested')
     except OSError:
         pass
     # The freeze lock can already be reached by the directory walk above;
@@ -279,13 +297,27 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
               f'{[os.path.relpath(p, REPO) for p in _collisions]}')
         _collset = set(_collisions)
         files = [p for p in files if p not in _collset]
-    os.makedirs(os.path.join(REPO, outdir), exist_ok=True)
-    stamp = time.strftime('%Y%m%dT%H%M%S')
-    tar_path = os.path.join(REPO, outdir, f'{base_name}.tar.gz')
+    _outdir_abs = os.path.join(REPO, outdir)
+    try:
+        _root_real = os.path.realpath(REPO)
+        _out_real = os.path.realpath(_outdir_abs)
+        if os.path.commonpath([_root_real, _out_real]) != _root_real:
+            print(f'[archive] REFUSE: output directory {outdir!r} resolves outside '
+                  'the repository — release artifacts must stay repo-relative')
+            return 1
+    except (OSError, ValueError):
+        print(f'[archive] REFUSE: output directory {outdir!r} is not resolvable '
+              'inside the repository')
+        return 1
+    os.makedirs(_outdir_abs, exist_ok=True)
+    tar_path = os.path.join(_outdir_abs, f'{base_name}.tar.gz')
+    # `exists` is false for a dangling symlink; `lexists` is what makes a
+    # pre-planted link refuse instead of being followed outside the repo by
+    # the tar/open() calls below.
     _existing = [p for p in (tar_path, tar_path + '.sha256',
-                             os.path.join(REPO, outdir, f'{base_name}.MANIFEST.sha256'),
-                             os.path.join(REPO, outdir, f'{base_name}.release_record.json'))
-                 if os.path.exists(p)]
+                             os.path.join(_outdir_abs, f'{base_name}.MANIFEST.sha256'),
+                             os.path.join(_outdir_abs, f'{base_name}.release_record.json'))
+                 if os.path.lexists(p)]
     if _existing:
         print('[archive] REFUSE: release artifacts already exist for tag '
               f'{tag!r} ({[os.path.basename(p) for p in _existing]}) — an '
@@ -305,17 +337,17 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
         ti.mtime = int(time.time())
         tf.addfile(ti, io.BytesIO(man_bytes))
     # external copy of the manifest + the archive's own hash
-    man_ext = os.path.join(REPO, outdir, man_path_rel)
+    man_ext = os.path.join(_outdir_abs, man_path_rel)
     with open(man_ext, 'wb') as f:
         f.write(man_bytes)
     tar_sha = _sha256(tar_path)
-    with open(os.path.join(REPO, outdir, f'{base_name}.tar.gz.sha256'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(_outdir_abs, f'{base_name}.tar.gz.sha256'), 'w', encoding='utf-8') as f:
         f.write(f'{tar_sha}  {os.path.basename(tar_path)}\n')
     print(f'[archive] wrote {os.path.relpath(tar_path, REPO)} ({os.path.getsize(tar_path):,d} B)')
     print(f'[archive] wrote {man_path_rel} ({len(man["files"])} files, {len(man["checkpoint_hashes"])} ckpt hashes)')
     print(f'[archive] archive sha256: {tar_sha}')
     print('[archive] publish the tar.gz + MANIFEST + .sha256 to a read-only location (release attachment / object store); the git repo itself stays source-only (design_notes §8)')
-    with open(os.path.join(REPO, outdir, f'{base_name}.release_record.json'), 'w', encoding='utf-8') as f:
+    with open(os.path.join(_outdir_abs, f'{base_name}.release_record.json'), 'w', encoding='utf-8') as f:
         json.dump({'release': base_name, 'tag': tag, 'created_at': man['created_at'], 'tar_sha256': tar_sha, 'n_files': len(man['files']), 'n_ckpt_hashes': len(man['checkpoint_hashes']), 'git_head': (man['git'] or {}).get('git_head')}, f, ensure_ascii=False, indent=2)
     return 0
 
@@ -371,9 +403,10 @@ def cmd_verify(tar_path):
         _unsafe_members = []
         for _name in names:
             _parts = _name.replace('\\', '/').split('/')
+            _drive_rel = (len(_parts[0]) >= 2 and _parts[0][1] == ':'
+                          and _parts[0][0].isalpha())
             if (not _name or _name.startswith('/') or
-                    any(_p in ('', '..') for _p in _parts) or
-                    (len(_parts[0]) == 2 and _parts[0][1] == ':')):
+                    any(_p in ('', '..') for _p in _parts) or _drive_rel):
                 _unsafe_members.append(_name)
         if _unsafe_members:
             print(f'[archive] REFUSE: archive contains unsafe member path(s) '
