@@ -1776,7 +1776,7 @@ def sec_flops():
         _ratios = [float(r['csa_over_dense']) for _k, r in sorted(_rows.items())]
         _mono = all((_ratios[i] >= _ratios[i + 1] - 1e-12 for i in range(len(_ratios) - 1)))
         _trend = f'比值单调降到 {min(_ratios):.3f}' if _mono else f'比值总体下行到 {min(_ratios):.3f}（非严格单调，逐点见 flops_analytic.csv）'
-        lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。**按该解析口径**（仅注意力项，不是对延迟、吞吐或设备内存的实测），CSA/dense 比随长度下降（{_trend}）；这不等于真实设备上的收益，实际收益须由 checkpoint 上的测量确认。', '']
+        lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。**按该解析口径**（仅注意力项，不含任何实测），CSA/dense 比随长度下降（{_trend}）；该比值本身不是结论，最终判断须由 checkpoint 上的测量确认。', '']
     return '\n'.join(lines) + '\n'
 
 def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):

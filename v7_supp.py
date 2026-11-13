@@ -1362,7 +1362,7 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
     # Warmup training uses the real corpus through its own train_warmup loop,
     # so the generic run() pre-flight never sees it.  Check the actual token
     # stream with the panel's real architecture/MLP and a block-length
-    # sequence before launching the 20k-step P0W cells.
+    # sequence before launching the P0W cells.
     _probe_seq = L.probe_seq_len(cfg['seq_len'])
     try:
         L.overfit_guard(list(variants), train_ids=train_ids, vocab=vocab,

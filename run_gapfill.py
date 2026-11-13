@@ -565,7 +565,7 @@ def run_full():
         _synth_summary, _long_snapshot = {}, None
         push_ok = True
     # Phase order: the statistically foundational panels first (core table ->
-    # its leave-one-out ablations -> scale probe), the 20k-step long runs
+    # its leave-one-out ablations -> scale probe), the long runs
     # LAST.  The n>=3 core/ablation/scale tables are secured before the long
     # runs; on a box that already holds the panels every phase just resumes
     # and the order adds nothing.

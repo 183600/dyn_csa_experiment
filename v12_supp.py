@@ -2331,7 +2331,7 @@ def schedule_shutdown(delay_s=120):
     print(f'[v12] instance shuts down in {delay_s}s.')
 
 def run_full():
-    # Fail before the first GPU-second / before P5T can touch test.  This is
+    # Fail before any training starts and before P5T can touch test.  This is
     # the same zero-GPU plan check CI runs; on a real box it also verifies that
     # the frozen manifest and this code agree.
     plan_check()

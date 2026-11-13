@@ -3677,7 +3677,7 @@ def t_baseline_tuning_audit():
                                'csa_fixed', 0) is None
     assert BT._one_seed_record({'csa_fixed::seed0': dict(_ok, seed=1)},
                                'csa_fixed', 0) is None
-    # A legacy record may omit the redundant fields; the key then supplies
+    # A record may omit the redundant fields; the key then supplies
     # the identity.
     _legacy = {'ppl': 9.0}
     assert BT._one_seed_record({'csa_fixed::seed0': _legacy}, 'csa_fixed', 0) is _legacy

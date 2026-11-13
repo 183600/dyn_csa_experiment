@@ -13445,7 +13445,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 if _miss:
                     problems.append(f'{arm}: final records miss declared seeds {_miss}')
                 # Extra records are just as damaging as missing ones: a
-                # resumed/merged panel could carry an older seed that is not
+                # resumed/merged panel could carry an extra seed that is not
                 # in the declared final partition, inflating n while the
                 # artifact still claims the pre-registered seed set.  Without
                 # this check the coverage sets can agree on the extra seed and
@@ -18039,7 +18039,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             if _dist and _world > 1:
                 # Every rank must take the same branch: skipping backward on
                 # one rank while another enters DDP's gradient collective
-                # deadlocks the job.
+                # stalls the job.
                 _ok_t = torch.tensor([1 if math.isfinite(_loss_item) else 0], dtype=torch.int32, device=device)
                 torch.distributed.all_reduce(_ok_t, op=torch.distributed.ReduceOp.MIN)
                 _step_ok = bool(int(_ok_t.item()))

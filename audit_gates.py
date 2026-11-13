@@ -2104,7 +2104,7 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
         if not _valid:
             out['panels'][d] = 'no usable param records'
             continue
-        # A panel-level FLOP estimate needs ONE training budget.  Taking
+        # A panel-level FLOP estimate needs ONE training length.  Taking
         # _valid[0] makes the reported tokens depend on JSON insertion order
         # when seeds disagree.
         _step_vals = sorted({
