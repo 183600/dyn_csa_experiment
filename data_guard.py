@@ -1604,21 +1604,37 @@ def _temporal_identity(v):
     """Unit-independent identity for a datetime64/timedelta64 value.
 
     NumPy compares the same instant in different units as equal, so the
-    duplicate/fingerprint contracts must do the same.  Normalise to
-    microseconds (the finest unit that covers ordinary dates without
-    overflowing); fall back to the textual spelling only when that conversion
-    is out of range.
+    duplicate/fingerprint contracts must do the same.  Microseconds are tried
+    first (the historical canonical unit for ordinary timestamps), then finer
+    units so sub-microsecond precision is preserved, then coarser units so an
+    instant outside the microsecond int64 range still has a stable identity.
+
+    A coarse -> fine conversion can silently WRAP instead of raising (e.g.
+    ``datetime64[Y]`` -> ``datetime64[us]`` for year 300000), so every
+    candidate is accepted only when converting it back reproduces the original
+    value exactly.  Without that check two different instants can share the
+    wrapped integer, or the same instant in different units gets different
+    keys.
     """
     if np.isnat(v):
         return ('nat', type(v).__name__)
-    try:
-        u = (v.astype('datetime64[us]') if isinstance(v, np.datetime64)
-             else v.astype('timedelta64[us]'))
-        if not np.isnat(u):
-            return ('dt', type(v).__name__, int(u.astype(np.int64)))
-    except (OverflowError, ValueError, TypeError):
-        pass
-    return ('dt', type(v).__name__, str(v))
+    typ = 'datetime64' if isinstance(v, np.datetime64) else 'timedelta64'
+
+    def _exact(unit):
+        try:
+            u = v.astype(f'{typ}[{unit}]')
+            if np.isnat(u) or u.astype(v.dtype) != v:
+                return None
+            return int(u.astype(np.int64))
+        except (OverflowError, ValueError, TypeError):
+            return None
+
+    for _unit in ('us', 'ns', 'ps', 'fs', 'as',
+                  'ms', 's', 'm', 'h', 'D', 'W', 'M', 'Y'):
+        _n = _exact(_unit)
+        if _n is not None:
+            return ('dt', typ, _n)
+    return ('dt', typ, str(v))
 
 
 def _canonical_object_cell(v):

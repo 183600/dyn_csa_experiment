@@ -20525,7 +20525,11 @@ def aggregate(summary, *, outdir=None):
                 for _s, _v in _own.items():
                     if _s in cols:
                         mat[_i, cols[_s]] = _v
-            good = np.array([[ppl_is_usable(v) for v in row] for row in mat])
+            # dtype=bool is required even when every row is empty (a malformed
+            # curve leaves no usable step): np.array([[]]) is a FLOAT array and
+            # `~good` then raises instead of treating the curve as absent.
+            good = np.array([[ppl_is_usable(v) for v in row] for row in mat],
+                            dtype=bool)
             n_good = good.sum(axis=0)
             sums = np.where(good, mat, 0.0).sum(axis=0)
             mean_ppl = np.where(n_good > 0, sums / np.maximum(n_good, 1), np.nan)

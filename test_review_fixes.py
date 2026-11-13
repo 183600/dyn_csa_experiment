@@ -1591,6 +1591,12 @@ def t_aggregate_rejects_malformed_seed_ids():
     agg = L.aggregate(raw)['a']
     assert agg['n_seeds'] == 1 and agg['seeds'] == [2], agg
     assert agg['ppl_mean'] == 20.0, agg
+    # A malformed PPL-curve payload leaves no usable step.  That is an absent
+    # curve, not a crash: np.array([[]]) is a FLOAT array, so the "usable"
+    # mask needs an explicit bool dtype before its bitwise negation.
+    malformed = {'a::seed0': dict(base, seed=0, ppl_history=[1, [2], None])}
+    agg2 = L.aggregate(malformed)['a']
+    assert agg2['n_seeds'] == 1 and agg2.get('ppl_curve') == [], agg2
 
 
 def t_audit_resolution_classification():
@@ -4650,6 +4656,20 @@ def t_object_byte_tables():
             assert DG._matrix_fingerprint(_typed) == DG._matrix_fingerprint(_obj), (
                 _unit, _is_dt, 'fingerprint')
             assert DG.duplicate_mask(_typed).tolist() == [False, False, False], (_unit, _is_dt)
+    # The canonical temporal identity must stay unit-independent even when a
+    # coarse->fine conversion would silently WRAP (year 300000 does not fit in
+    # int64 microseconds).  Same instant -> same key; distinct instants differ.
+    for _s in ('100000-01-01', '300000-01-01', '-100000-01-01'):
+        _ids = {DG._temporal_identity(
+                    np.datetime64(_s).astype(f'datetime64[{_u}]'))
+                for _u in ('Y', 'D', 'h', 'm', 's', 'ms')}
+        assert len(_ids) == 1, (_s, _ids)
+    assert DG._temporal_identity(np.datetime64('300000')) != \
+        DG._temporal_identity(np.datetime64('300001'))
+    # A truncating unit conversion (weeks) is a different instant and must not
+    # share the key with the day-precision value.
+    assert DG._temporal_identity(np.datetime64('2020-01-01', 'D')) != \
+        DG._temporal_identity(np.datetime64('2020-01-01', 'D').astype('datetime64[W]'))
     # A complex value is a (real, imaginary) pair, and the object/fixed-width
     # twins must share one fingerprint.
     _z = np.array([[1 + 2j], [1 + 3j]], dtype='complex128')
@@ -6712,6 +6732,53 @@ def t_scale_edge_case_regressions():
         assert any('eval_span' in x for x in rep['problems']), rep
 
 
+def t_report_health_malformed_history():
+    # A malformed curve_health/history payload is an absent curve.  A truthy
+    # scalar `health_history` (1.5) or a list of non-objects must not crash the
+    # report reader.
+    import shutil
+    _saved_repo = BR.REPO
+    _saved_loaded = dict(BR._LOADED)
+    d = tempfile.mkdtemp()
+    try:
+        for panel in ('results_lm_v7_seq2k',):
+            os.makedirs(os.path.join(d, panel), exist_ok=True)
+            summary = {
+                'a::seed0': {'variant': 'a', 'seed': 0, 'ppl': 10.0,
+                             'curve_health': {}, 'health_history': 1.5},
+                'a::seed1': {'variant': 'a', 'seed': 1, 'ppl': 11.0,
+                             'curve_health': {}, 'health_history': [1, 'x']},
+            }
+            with open(os.path.join(d, panel, 'summary.json'), 'w',
+                      encoding='utf-8') as f:
+                json.dump(summary, f)
+        os.makedirs(os.path.join(d, 'analysis_v7'), exist_ok=True)
+        with open(os.path.join(d, 'analysis_v7', 'stats.json'), 'w',
+                  encoding='utf-8') as f:
+            json.dump({'comparisons': -1, 'rows': [-1]}, f)
+        with open(os.path.join(d, 'analysis_v7', 'flops_analytic.json'), 'w',
+                  encoding='utf-8') as f:
+            json.dump({'rows': -1, 'config': True,
+                       'crossover_seq_len_csa_beats_dense': [1]}, f)
+        _saved_comps = list(BR._REPORTED_COMPARISONS)
+        _saved_calls = BR._GATE_CALLS
+        _saved_unreg = BR._UNREGISTERED_GATES
+        BR.REPO = d
+        BR._LOADED.clear()
+        text = BR.sec_training_health()
+        assert isinstance(text, str)
+        assert isinstance(BR.sec_stats(), str)
+        assert isinstance(BR.sec_flops(), str)
+    finally:
+        BR.REPO = _saved_repo
+        BR._LOADED.clear()
+        BR._LOADED.update(_saved_loaded)
+        BR._REPORTED_COMPARISONS[:] = _saved_comps
+        BR._GATE_CALLS = _saved_calls
+        BR._UNREGISTERED_GATES = _saved_unreg
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def t_global_multiplicity_audit_basic():
     # Known BH case: p=[0.01, 0.02, 0.5] at m=3 -> q=[0.03, 0.03, 0.5].
     r = L.global_multiplicity_audit([('a', 0.01), ('b', 0.02), ('c', 0.5)])
@@ -8073,6 +8140,7 @@ def main():
     _check('L10c3 length audit parses keys and counts exactly', t_audit_length_exact_integer_fields)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
     _check('L12 length audit fails closed on missing n_seq', t_audit_length_missing_n_seq_flag)
+    _check('L12b report health reader tolerates malformed histories', t_report_health_malformed_history)
     _check('L13 global cross-panel multiplicity audit (exp_lib)', t_global_multiplicity_audit_basic)
     _check('L13b global audit fail-closed rules', t_global_multiplicity_audit_fail_closed)
     _check('L13c build_report twin matches exp_lib audit', t_global_multiplicity_twin_consistency)

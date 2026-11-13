@@ -1719,16 +1719,27 @@ def sec_flops():
         return '## 解析 FLOPs / KV-cache — （无结果）\n\n'
     cfg = d.get('config', {})
     rows = d.get('rows', [])
+    if not isinstance(rows, (list, tuple)):
+        # A scalar/object `rows` is an ABSENT table, not an iterable.
+        print(f'[report] sec_flops: analysis rows is {type(rows).__name__}, not a list — section omitted')
+        rows = []
     pick = {512, 2048, 8192, 65536, 1048576}
     _xo = d.get('crossover_seq_len_csa_beats_dense')
-    _xo_txt = f'**seq = {_xo}**' if _xo is not None else '**不存在**（所测长度内 CSA 均不低于 dense）'
+    if (isinstance(_xo, (bool, np.bool_))
+            or not isinstance(_xo, (int, float, np.integer, np.floating))
+            or not math.isfinite(float(_xo))):
+        _xo = None
+    _xo_txt = f'**seq = {_xo:g}**' if _xo is not None else '**不存在**（所测长度内 CSA 均不低于 dense）'
     lines = ['## 解析 FLOPs / KV-cache 与交叉点', '', f'**配置**：{cfg}。**方法**：论文只给相对百分比、无闭式，故采用与硬件无关的解析 FLOPs / KV-cache 进行对比。**这些是结构性估算**；任何「效率优势」主张必须用 `audit_gates.measure_prefill_decode` 在真实 checkpoint 上测量后另行报告。', '', f'**交叉点**：CSA 的每 token 注意力 FLOPs 在 {_xo_txt} 处开始低于 dense。', '', '| seq | 选择率 | CSA/dense FLOPs | hybrid/dense | CSA KV/dense |', '|---|---|---|---|---|']
     for r in rows:
-        if not isinstance(r, dict) or r.get('seq_len') not in pick:
+        if not isinstance(r, dict):
             continue
         try:
+            _sv = float(r.get('seq_len'))
+            if not math.isfinite(_sv) or _sv not in pick:
+                continue
             lines.append(f'| {r['seq_len']} | {r['sel_ratio']:.2%} | {r['csa_over_dense']:.3f} | {r['hybrid_over_dense']:.3f} | {r['csa_kv_over_dense']:.3f} |')
-        except (KeyError, TypeError, ValueError) as _e:
+        except (KeyError, TypeError, ValueError, OverflowError) as _e:
             print(f'[report] sec_flops: a malformed row was skipped ({type(_e).__name__}: {_e})')
     _need = ('seq_len', 'sel_ratio', 'csa_over_dense', 'hybrid_over_dense',
              'csa_kv_over_dense')
@@ -1746,12 +1757,14 @@ def sec_flops():
                 continue
         except (TypeError, ValueError, OverflowError):
             continue
-        _clean.append(r)
-    _clean.sort(key=lambda r: float(r['seq_len']))
+        _clean.append((_sv, r))
+    _clean.sort(key=lambda _sr: _sr[0])
     _rows = {}
-    for r in _clean:
-        _rows.setdefault(r['seq_len'], r)
-    _x = d.get('crossover_seq_len_csa_beats_dense')
+    for _sv, r in _clean:
+        # Normalise the key so an integral float (512.0) and an int (512) are
+        # one sequence length instead of two mixed-type sort keys.
+        _rows.setdefault(int(_sv) if _sv.is_integer() else _sv, r)
+    _x = _xo
     _r512 = _rows.get(512)
     if _r512 is not None and _x is not None:
         _ratio = float(_r512['csa_over_dense'])
@@ -2038,8 +2051,15 @@ def sec_training_health():
              '> Diagnostic only. `best_val_ppl` / `best_step` are reported alongside the final number; they do not replace the pre-registered final-step endpoint.', '',
              '| panel | cell | status | best PPL @ step | final PPL | final−best | tail train slope | tail val slope | gap | curve rows | last curve 95% CI |', '|---|---|---|---|---|---|---|---|---|---|---|']
     for name, key, rec, h in rows[:200]:
-        _hist = rec.get('health_history') or []
+        # A malformed history is an ABSENT curve, not a crash: a truthy scalar
+        # (1.5) or a list whose last element is not an object must not reach
+        # the subscript/`.get` below.
+        _hist = rec.get('health_history')
+        if not isinstance(_hist, (list, tuple)):
+            _hist = []
         _last = _hist[-1] if _hist else {}
+        if not isinstance(_last, dict):
+            _last = {}
         _ci = ('[%s, %s]' % (fm(_last.get('val_ci95_low')), fm(_last.get('val_ci95_high')))) if _last else 'n/a'
         lines.append('| %s | `%s` | %s | %s @ %s | %s | %s | %s | %s | %s | %s | %s |' % (
             name, key, h.get('status'), fm(h.get('best_val_ppl')), h.get('best_step'),
@@ -2102,6 +2122,11 @@ def sec_stats():
         return ''
     lines = ['## 配对符号翻转检验（sign-flip permutation）', '', '符号翻转检验：n≤20 枚举全部 2^n 种符号组合得精确双侧 p 值；20<n≤40 用 meet-in-the-middle 精确计数；n>40 用确定性的 Lugannani-Rice 鞍点尾近似（不是随机 Monte-Carlo）。n 很小时 p 的分辨率下限为 2/2^n，报告 Δ、方向同向性与该下限。', '', '> **证据等级：探索性（v7 面板）**。Holm 列在本报告展示的对比族内做 step-down 校正，防止把多格 p<0.05 读成多个发现；它不是预注册确认，也不能把 v7–v11 已看过的数据变成确认性证据（见 docs/design_notes.md §17）。', '', '| 比较 | Δ(mean) | p | p_Holm |', '|---|---|---|---|']
     items = d.get('comparisons', {}) if isinstance(d, dict) else {}
+    if not isinstance(items, dict):
+        # A malformed analysis file must not crash the report; an unreadable
+        # comparison table is an ABSENT table, never a scalar/list to iterate.
+        print(f'[report] sec_stats: analysis comparisons is {type(items).__name__}, not an object — section omitted')
+        items = {}
     if not items and isinstance(d, dict):
         items = {k: v for k, v in d.items() if isinstance(v, dict) and (v.get('mean') is not None or v.get('delta') is not None)}
     _pairs = []
