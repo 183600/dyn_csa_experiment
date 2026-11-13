@@ -8214,12 +8214,37 @@ def load_run_corpus(cfg):
         return load_fineweb_edu(cfg['seq_len'], cfg['n_train_tokens'], vocab_size=cfg.get('vocab_size', B_VOCAB), val_seqs=cfg.get('val_seqs', 512), cache_dir=cfg.get('cache_dir', './fineweb_cache'), source=cfg.get('fw_source', 'sample-10BT'), fit_docs=cfg.get('fw_fit_docs', 20000))
     raise ValueError(f"load_run_corpus: unknown dataset {name!r} (expected 'wikitext' or 'fineweb')")
 
+def _json_key_text(key, used):
+    """A JSON object key that cannot silently collide with another key.
+
+    JSON keys are strings, but dict keys are not: ``1`` and ``"1"`` are two
+    distinct Python keys whose str() spelling is identical.  A plain
+    ``str(k)`` comprehension would keep only the last value (silent data
+    loss).  Keep the ordinary spelling whenever it is unique and type-qualify
+    only the colliding keys.
+    """
+    text = str(key)
+    if text not in used:
+        used[text] = key
+        return text
+    base = f'{type(key).__name__}:{key!r}'
+    candidate = base
+    suffix = 1
+    while candidate in used:
+        suffix += 1
+        candidate = f'{base}#{suffix}'
+    used[candidate] = key
+    return candidate
+
+
 def _json_clean(obj):
     """Recursively replace non-finite floats with null and make NumPy values
     JSON-safe.  Standard JSON has no NaN/Infinity tokens; writing them makes a
     damaged curve indistinguishable from a real value on strict parsers."""
     if isinstance(obj, dict):
-        return {str(k): _json_clean(v) for k, v in obj.items()}
+        _used = {}
+        return {_json_key_text(k, _used): _json_clean(v)
+                for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_json_clean(v) for v in obj]
     if isinstance(obj, np.ndarray):
@@ -13272,8 +13297,19 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 _ss = tuple(sorted(set(_norm_seeds)))
                 if len(_ss) != len(_raw_seeds):
                     problems.append(f'{arm}: trial lists duplicate seeds')
-                if _ppls is not None and set(str(s) for s in _ss) != set(_ppls):
-                    problems.append(f'{arm}: trial seeds and seed_ppls keys disagree')
+                if _ppls is not None:
+                    # Compare the SEED IDENTITY, not its JSON spelling: an
+                    # in-memory artifact may key seed_ppls by int 0 while the
+                    # trial's seed list carries 0 (or by "0" after a JSON
+                    # round-trip).  Both describe the same draw set, so a
+                    # plain string comparison would fabricate a disagreement.
+                    _norm_keys = [_as_seed_int(k) for k in _ppls]
+                    if any(k is None for k in _norm_keys):
+                        problems.append(f'{arm}: seed_ppls keys are not integer seeds ({list(_ppls)[:3]!r})')
+                    elif len(set(_norm_keys)) != len(_norm_keys):
+                        problems.append(f'{arm}: seed_ppls lists duplicate seeds')
+                    elif set(_norm_keys) != set(_ss):
+                        problems.append(f'{arm}: trial seeds and seed_ppls keys disagree')
                 _set.add(_ss)
             elif _ppls is not None:
                 _norm_keys = [_as_seed_int(k) for k in _ppls]
@@ -15475,7 +15511,8 @@ def _jsonable(v):
     """Recursively convert a config/provenance value to JSON-safe data.
     Sets are sorted so two equal configs always serialise identically."""
     if isinstance(v, dict):
-        return {str(k): _jsonable(x) for k, x in v.items()}
+        _used = {}
+        return {_json_key_text(k, _used): _jsonable(x) for k, x in v.items()}
     if isinstance(v, (set, frozenset)):
         return sorted((_jsonable(x) for x in v), key=str)
     if isinstance(v, (list, tuple)):

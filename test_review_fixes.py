@@ -1419,6 +1419,19 @@ def t_recipe_signature():
         v2 = json.load(f)
     shipped = v2['binding']['training_recipe_signature']
     assert V12._recipe_matches_signature(recipe, shipped) is True, 'the shipped v2 signature must accept the canonical P3MT recipe string'
+    # The alias spellings name ONE frozen recipe; conflicting values must be
+    # refused rather than silently taking the first.
+    try:
+        V12._recipe_signature({'binding': {
+            'training_recipe_signature': {'steps': 3000},
+            'training_recipe': {'steps': 40}}})
+    except SystemExit as e:
+        assert 'ambiguous' in str(e).lower(), e
+    else:
+        raise AssertionError('conflicting training_recipe aliases must be refused')
+    assert V12._recipe_signature({'binding': {
+        'training_recipe_signature': {'steps': 3000},
+        'training_recipe': {'steps': 3000}}}) == {'steps': 3000}
     # A boolean/non-finite signature value must be refused at load time: the
     # synthetic plan recipe could otherwise "match" by string equality while
     # every real checkpoint (numeric steps) is rejected after test access.
@@ -2874,6 +2887,10 @@ def t_parallel_child_env_seed():
                         'y': np.array([np.longdouble(2.5)]),
                         'z': np.float32(3.5), 'b': np.bool_(True)})
     assert normed == {'x': 1.5, 'y': [2.5], 'z': 3.5, 'b': True}, normed
+    # Distinct keys with one str() spelling must survive the job round-trip.
+    _coll = par._norm({1: 'int', '1': 'text', None: 'none', 'None': 'text2'})
+    assert len(_coll) == 4 and set(_coll.values()) == {'int', 'text', 'none', 'text2'}, _coll
+    assert len(par._denorm(_coll)) == 4, _coll
     env = par._child_env('0', 17)
     assert env['PYTHONHASHSEED'] == '17' and env['CUDA_VISIBLE_DEVICES'] == '0', {k: env.get(k) for k in ('PYTHONHASHSEED', 'CUDA_VISIBLE_DEVICES')}
     env2 = par._child_env('0')
@@ -5686,6 +5703,23 @@ def t_baseline_audit_malformed_seed_keys():
     assert any('ppl_std is not numeric' in p for p in out['problems']), out
     assert any('is not numeric' in p for p in out['problems']), out
 
+    # In-memory artifacts may key seed_ppls by int even though JSON uses
+    # strings; the same seed identity must not be reported as a mismatch.
+    _int_art = {
+        'arms': {'a': {'selected': {'lr': 1e-3}, 'selected_metric_value': 1.5,
+                       'trials': [{'config': {'lr': 1e-3}, 'ppl': 1.5,
+                                   'seeds': [0, 1], 'seed_ppls': {0: 1.0, 1: 2.0},
+                                   'ppl_std': 0.7071067811865476,
+                                   'steps': 10, 'tokens_seen': 100}]}},
+        'selection_metric': 'ppl', 'selection_split': 'validation',
+        'direction': 'lower_is_better', 'search_seeds': [0, 1],
+        'protocol': {'selection_metric': 'ppl', 'selection_split': 'validation',
+                     'direction': 'lower_is_better', 'trials': [{'lr': 1e-3}],
+                     'arms': ['a'], 'search_seeds': [0, 1]},
+    }
+    _out = L.baseline_tuning_audit(_int_art)
+    assert not any('keys disagree' in p for p in _out['problems']), _out
+
 
 def t_simple_baseline_audit_malformed_records():
     art = {
@@ -7105,6 +7139,15 @@ def t_locked_json_and_csv_generator():
         with open(c, encoding='utf-8') as f:
             lines = f.read().splitlines()
         assert lines == ['a,b', '0,0', '1,2', '2,4'], lines
+        # Distinct dict keys with one str() spelling must not overwrite each
+        # other in a JSON artifact/config.
+        _coll = L._json_clean({1: 'int', '1': 'text'})
+        assert len(_coll) == 2 and 'int' in _coll.values() and 'text' in _coll.values(), _coll
+        _coll2 = L._jsonable({1: 'int', '1': 'text'})
+        assert len(_coll2) == 2 and 'int' in _coll2.values() and 'text' in _coll2.values(), _coll2
+        _coll3 = L._json_clean({None: 'none', 'None': 'text'})
+        assert len(_coll3) == 2 and 'none' in _coll3.values() and 'text' in _coll3.values(), _coll3
+        assert L._json_clean({1: 'a'}) == {'1': 'a'}
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

@@ -656,9 +656,26 @@ def _recipe_signature(manifest, arm=None):
     _bind = manifest.get('binding') or {}
     if not isinstance(_bind, dict):
         return None
-    sig = _bind.get('training_recipe_signature')
+    # The new and legacy spellings are aliases for ONE frozen recipe.  If both
+    # are present with different content, returning the first would silently
+    # pick one frozen protocol; refuse the ambiguous binding instead.
+    _sig_new = _bind.get('training_recipe_signature')
+    _sig_old = _bind.get('training_recipe')
+    if (isinstance(_sig_new, dict) and _sig_new
+            and isinstance(_sig_old, dict) and _sig_old):
+        try:
+            _same_sig = (json.dumps(_sig_new, sort_keys=True, default=str)
+                         == json.dumps(_sig_old, sort_keys=True, default=str))
+        except Exception:
+            _same_sig = False
+        if not _same_sig:
+            raise SystemExit(
+                '[v12] REFUSE: binding.training_recipe_signature and '
+                'binding.training_recipe declare DIFFERENT frozen recipes — '
+                'the training recipe is ambiguous')
+    sig = _sig_new
     if sig is None:
-        sig = _bind.get('training_recipe')
+        sig = _sig_old
     if not isinstance(sig, dict) or not sig:
         sig = None
     if arm is not None:

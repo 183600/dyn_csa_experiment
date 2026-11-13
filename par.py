@@ -182,10 +182,34 @@ def ctx_active(ctx, n_cells=1):
     )
 
 
+def _json_key_text(key, used):
+    """A JSON key whose ordinary str() spelling is unique in this mapping.
+
+    Distinct Python keys can share one str() spelling (1 vs "1", None vs
+    "None"); a plain str() comprehension would silently keep only the last
+    value.  Preserve the normal spelling when it is unique and qualify only
+    the colliding keys.
+    """
+    text = str(key)
+    if text not in used:
+        used[text] = key
+        return text
+    base = f'{type(key).__name__}:{key!r}'
+    candidate = base
+    suffix = 1
+    while candidate in used:
+        suffix += 1
+        candidate = f'{base}#{suffix}'
+    used[candidate] = key
+    return candidate
+
+
 def _norm(obj):
     """Convert driver payloads to JSON-compatible values."""
     if isinstance(obj, dict):
-        return {str(key): _norm(value) for key, value in obj.items()}
+        _used = {}
+        return {_json_key_text(key, _used): _norm(value)
+                for key, value in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_norm(value) for value in obj]
     if isinstance(obj, (set, frozenset)):
@@ -220,7 +244,9 @@ def _norm(obj):
 
 def _denorm(obj):
     if isinstance(obj, dict):
-        return {str(key): _denorm(value) for key, value in obj.items()}
+        _used = {}
+        return {_json_key_text(key, _used): _denorm(value)
+                for key, value in obj.items()}
     if isinstance(obj, list):
         return [_denorm(value) for value in obj]
     return obj
