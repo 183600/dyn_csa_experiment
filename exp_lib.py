@@ -14735,10 +14735,8 @@ def normalize_seed_list(seeds, *, default=(0,)):
     elif isinstance(seeds, (str, bytes)):
         seeds = seeds.decode().split() if isinstance(seeds, bytes) else seeds.replace(',', ' ').split()
     else:
-        # A scalar number-like object (e.g. Decimal) is an exact seed identity
-        # when the shared contract accepts it; otherwise it is not iterable,
-        # and iterating would raise a confusing TypeError instead of rejecting
-        # the malformed seed.
+        # A scalar number-like object is a seed identity when it satisfies the
+        # shared exact-integer contract.
         try:
             iter(seeds)
         except TypeError:

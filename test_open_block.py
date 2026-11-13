@@ -145,8 +145,7 @@ def t_config_and_segmenter():
     _rfp_a = dict(_cfg(8), run_fingerprint=True)
     _rfp_b = dict(_cfg(None), run_fingerprint=True)
     assert 'run_fingerprint' in O._controlled_reason(_rfp_a, _rfp_b)
-    # Structural counts and the parameter total are exact integers: a boolean
-    # True must not pass as 1 (int(True)==1) on both arms.
+    # Structural counts and the parameter total are exact integers.
     _cnt_a = dict(_cfg(8), hyperparams={'steps': True}, params=1000)
     _cnt_b = dict(_cfg(8), hyperparams={'steps': 1}, params=1000)
     assert 'steps' in O._controlled_reason(_cnt_a, _cnt_b)

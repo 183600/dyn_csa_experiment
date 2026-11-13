@@ -201,9 +201,8 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
     既有实现逐字节一致（同一 RNG 播种、同一调用顺序——见 _distractor_ppls
     的行缓存键）。三种新模式（span/doc/topical）同样只
     依赖 (eval_len, jj, rho, mode, span_len)，保证臂间严格配对。"""
-    # The row geometry is exact-integer state.  int(True)==1 / int(1.5)==1
-    # would silently corrupt a different span (or crash in a slice), so refuse
-    # malformed lengths before any mode branch.
+    # The row geometry is exact-integer state; malformed lengths are refused
+    # before any mode branch.
     _ints = {}
     for _name, _value in (('eval_len', eval_len), ('target', target),
                           ('jj', jj), ('span_len', span_len)):
@@ -582,9 +581,8 @@ def _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed, 
     Returns (ids[n_seq, eval_len+1], q_cols, q_vals, stats)：q_cols 为
     **目标尾区内相对的 logits 列号**（预测 answer 的那一列），q_vals 为正确
     答案 token。"""
-    # Geometry is declared with exact integers: a boolean/string/fractional
-    # value would either crash deep in the construction or silently build a
-    # different task (e.g. int(True)==1 couple).  Refuse it up front.
+    # Geometry is declared with exact integers; malformed values are refused
+    # up front.
     _ints = {}
     for _name, _value in (('eval_len', eval_len), ('target', target),
                           ('n_pairs', n_pairs), ('vocab', vocab),

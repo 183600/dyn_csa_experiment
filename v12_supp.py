@@ -1725,9 +1725,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     （歧义/混切片）。by_length 汇总同样只由可采纳记录构成。"""
     if manifest is None:
         manifest = _load_manifest(FREEZE_MANIFEST)
-    # finaltest_stats is also callable with an in-memory manifest.  Validate
-    # the nested plan objects here so a malformed shape fails closed with a
-    # named refusal instead of an AttributeError/TypeError mid-analysis.
+    # finaltest_stats is also callable with an in-memory manifest; the nested
+    # plan objects are validated here.
     for _key in ('statistics', 'eval', 'binding'):
         _obj = manifest.get(_key)
         if _obj is not None and not isinstance(_obj, dict):

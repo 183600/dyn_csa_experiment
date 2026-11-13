@@ -1094,8 +1094,7 @@ def t_mode_validation():
         raise AssertionError('uniform corruption with vocab=1 must be rejected (no alternative token)')
     except ValueError:
         pass
-    # Row/length geometry is exact too: a boolean or fractional length must
-    # not corrupt a different span (or fail later in a slice/index).
+    # Row/length geometry is exact-integer state.
     for _kw in ({'eval_len': True}, {'eval_len': 1.5}, {'eval_len': -1},
                 {'target': True}, {'target': -1}, {'target': 128},
                 {'jj': True}, {'jj': 1.5}, {'jj': 99},
@@ -1109,9 +1108,7 @@ def t_mode_validation():
             pass
         else:
             raise AssertionError(f'_corrupt_row accepted malformed geometry {_kw!r}')
-    # Probe/fingerprint grids follow the same exact-integer geometry contract;
-    # a boolean length or a fractional density must not fingerprint a
-    # different cell.
+    # Probe/fingerprint grids share the exact-integer geometry contract.
     for _bad in ({'eval_lens': [True]}, {'eval_lens': [1.5]},
                  {'eval_lens': []}, {'modes': {'uniform': [True]}},
                  {'modes': {'uniform': [1.5]}}, {'modes': 'uniform'}):
@@ -2363,9 +2360,7 @@ def t_eval_per_seq():
                 pass
             else:
                 raise AssertionError(f'eval_ppl accepted malformed sampling control {_kw!r}')
-    # A non-positive row cap is not "the full set"; the alternative is an
-    # explicit None, so 0/-1 must not silently score every row while recording
-    # a different eval_rows value.
+    # A row cap is either None (the full set) or a positive exact integer.
     for _bad_rows in (0, -1, -150):
         try:
             L.eval_ppl(model, ids, dev, chunk=1, eval_rows=_bad_rows,
@@ -2602,9 +2597,7 @@ def t_seed_axis_normalization():
             raise AssertionError(f'normalize_seed_list must reject {bad!r}')
     # Exact Python integers above 2**53 are preserved (only lossy floats fail).
     assert L.normalize_seed_list(['9007199254740993']) == [9007199254740993]
-    # A scalar number-like object follows the same exact-integer contract as
-    # the rest of the seed readers (Decimal('4') is seed 4; Decimal('4.9') is
-    # not silently truncated to 4).
+    # Scalar number-like objects follow the exact-integer seed contract.
     from decimal import Decimal
     assert L.normalize_seed_list(Decimal('4')) == [4]
     for _bad_scalar in (Decimal('4.9'), object()):
@@ -3849,8 +3842,7 @@ def t_baseline_driver_refuses_overlapping_final_seeds():
         assert 'overlap' in str(e), e
     else:
         raise AssertionError('overlapping search/final seeds were not refused')
-    # Driver options are exact integers too: int(True)==1 / int(1.5)==1 must
-    # not silently turn a malformed limit into a one-trial/one-step run.
+    # Driver options are exact integers.
     for _kw in ({'trial_limit': 0}, {'trial_limit': True},
                 {'search_steps': True}, {'search_steps': 1.5}):
         try:
@@ -6489,8 +6481,7 @@ def t_scale_edge_case_regressions():
             pass
         else:
             raise AssertionError(f'ngram_lm_score accepted {_bad_kw!r}')
-    # A malformed scale tier is a named audit failure, not an AttributeError
-    # that aborts the report build; a non-list tier container is also refused.
+    # A malformed scale tier is a named audit failure.
     for _bad_tiers in ([{'name': 'x', 'cfg': [1]}], 3, 'not-a-ladder'):
         _aud = L.scale_ladder_audit(_bad_tiers)
         assert _aud['status'] == 'fail' and _aud['problems'], _aud
@@ -7121,9 +7112,7 @@ def t_targeted_contract_edges():
     _ids, _tgt, _dist, _kdist = V7.build_niah_batch(2, 16, 4, 64, seed=0)
     assert _ids.shape == (2, 16) and _tgt.shape == (2, 15), (_ids.shape, _tgt.shape)
     assert (_tgt >= -100).all() and _dist.shape == _tgt.shape, (_tgt, _dist)
-    # The natural-text NIAH builder follows the same exact-geometry contract:
-    # a zero/boolean pair count or a fractional row count must not reach a
-    # ZeroDivisionError / TypeError deep in the construction.
+    # The natural-text NIAH builder follows the same exact-geometry contract.
     _val = np.asarray(np.random.default_rng(0).integers(0, 128, (4, 65)), dtype=np.int64)
     for _kw in ({'n_pairs': 0}, {'n_pairs': True}, {'n_seq': 1.5},
                 {'n_seq': 5}, {'eval_len': 70}, {'vocab': 8},
@@ -7221,9 +7210,7 @@ def t_statistical_and_config_regressions():
         pass
     else:
         raise AssertionError('a string frozen-arm container was accepted')
-    # Nested plan objects are validated for in-memory manifests too: a string
-    # eval/statistics/comparison container must be a named refusal, not an
-    # AttributeError/TypeError halfway through the statistics.
+    # Nested plan objects are validated for in-memory manifests too.
     _m3 = {'arms': ['a'], 'seeds': [0], 'manifest_sha256': 'x',
            'code_semantics_expected': L.CODE_SEMANTICS,
            'primary_comparisons': [], 'statistics': {'descriptive_only': True},

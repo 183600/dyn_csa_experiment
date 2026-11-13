@@ -431,8 +431,7 @@ def _controlled_reason(a, b):
             'd', 'n_layers', 'n_heads', 'd_head', 'mlp_ratio', 'vocab_size',
             'dataset', 'data_version', 'val_seqs', 'eval_every', 'eval_subset',
             'code', 'amp_dtype', 'eager_batch')
-    # Structural counts are exact integers.  A boolean True would otherwise
-    # compare equal to 1 and silently pass as a shared training control.
+    # Structural counts are exact-integer training controls.
     count_keys = {'steps', 'tokens_seen', 'n_train_tokens', 'seq_len',
                   'batch_size', 'warmup', 'd', 'n_layers', 'n_heads',
                   'd_head', 'vocab_size', 'val_seqs', 'eval_every',
@@ -444,8 +443,8 @@ def _controlled_reason(a, b):
                 continue
             return f'unverifiable {k} (only one record carries it)'
         if k in count_keys:
-            # Exact counts: 1000 and "1000" are the same measurement, while a
-            # boolean True must not pass as 1.
+            # Exact counts compare as integers: 1000 and "1000" are the same
+            # measurement.
             ia, ib = L._as_seed_int(va), L._as_seed_int(vb)
             if ia is None or ib is None:
                 return f'{k} is not an exact integer count ({va!r} != {vb!r})'
@@ -460,8 +459,7 @@ def _controlled_reason(a, b):
     if (a.get('params') is None) != (b.get('params') is None):
         return 'unverifiable parameter count (only one record carries it)'
     if a.get('params') is not None:
-        # A parameter count is an exact positive integer; a boolean/string
-        # marker or a fractional value is not a shared architecture control.
+        # A parameter count is an exact positive-integer architecture control.
         _pa = L._as_seed_int(a.get('params'))
         _pb = L._as_seed_int(b.get('params'))
         if _pa is None or _pb is None or _pa <= 0 or _pb <= 0:
