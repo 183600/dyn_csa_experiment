@@ -451,7 +451,15 @@ def _safe_exp_ppl(x):
         return None
     try:
         x = float(x)
-    except (TypeError, ValueError, OverflowError):
+    except OverflowError:
+        # A finite Python integer/Decimal outside the binary64 range still has
+        # a well-defined exp limit: +inf (or underflow to 0 for a huge negative
+        # exponent), not "no value".
+        try:
+            return float('inf') if x > 0 else 0.0
+        except Exception:
+            return None
+    except (TypeError, ValueError):
         return None
     if math.isnan(x):
         return float('nan')
@@ -833,10 +841,16 @@ def cosine_similarity_consecutive(H, eps=1e-08):
     # time axis in chunks changes no value; the unchunked form is used when
     # the whole sequence fits in one chunk.
     if H.dim() < 2:
+        if H.dim() == 0:
+            # A scalar is not a sequence; return the same empty result the
+            # length-0/1 sequence branches produce rather than indexing 0-D.
+            return H.new_empty((0,))
         # A 1-D tensor is a sequence of scalar features; each scalar is its
-        # own feature row, so unsqueeze before normalising.
+        # own feature row, so unsqueeze before normalising.  The consecutive
+        # similarities are the elementwise products: reducing over the time
+        # axis here would return one scalar instead of T-1 values.
         h = F.normalize(H.unsqueeze(-1), dim=-1, eps=eps).squeeze(-1)
-        return (h[1:] * h[:-1]).sum(dim=-1)
+        return h[1:] * h[:-1]
     T = int(H.shape[-2])
     if T <= 1:
         return H.new_empty(H.shape[:-2] + (0,))
@@ -17609,8 +17623,10 @@ def _safe_path_component(value):
     s = ''.join(ch if (ch.isalnum() or ch in '._-') else '_' for ch in raw)
     # Dot segments are path syntax even though every character is allowed;
     # treat them like any other sanitised value so the component can never be
-    # '.', '..' or an empty segment on its own.
-    if s != raw or s in ('.', '..'):
+    # '.', '..' or an empty segment on its own.  The empty spelling also needs
+    # the digest: otherwise '' (returned as '_') would collide with the
+    # ordinary value '_' and two variants would share one checkpoint path.
+    if s != raw or s in ('.', '..') or not s:
         s = f'{s}-{hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:12]}'
     return s or '_'
 

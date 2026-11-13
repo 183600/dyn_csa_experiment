@@ -326,6 +326,9 @@ def t_scale_robustness_edges():
     # Dot segments are path syntax, not ordinary filename components.
     assert L._safe_path_component('..') not in ('.', '..')
     assert L._safe_path_component('.') not in ('.', '..')
+    assert L._safe_path_component('') not in ('', '.', '..')
+    assert L._safe_path_component('') != L._safe_path_component('_')
+    assert L.ckpt_file_name('', 0, 't') != L.ckpt_file_name('_', 0, 't')
     assert '/' not in L.ckpt_file_name('..', 0, '.')
 
 
@@ -440,6 +443,8 @@ def t_safe_exp_and_doc_ci():
     # yields inf.
     assert math.isfinite(L._safe_exp_ppl(705.0))
     assert L._safe_exp_ppl(1000.0) == float('inf')
+    assert L._safe_exp_ppl(10 ** 400) == float('inf')
+    assert L._safe_exp_ppl(-(10 ** 400)) == 0.0
     assert L._safe_exp_ppl(float('nan')) != L._safe_exp_ppl(float('nan'))  # NaN stays NaN
     assert L._safe_exp_ppl(True) is None and L._safe_exp_ppl(np.bool_(False)) is None
     # Token-pooled CE and its interval must target the same estimand even when
@@ -7915,6 +7920,15 @@ def t_identity_fingerprint_and_pairing_regressions():
               'gap': 0.1 * i} for i in range(6)]
     assert L.classify_training_health(_hist)['status'] == 'underfitting_or_stalled'
     assert L.classify_training_health(_hist, gap_tol=0.2)['status'] == 'overfitting'
+    # Consecutive cosine similarity over a 1-D (scalar-feature) sequence keeps
+    # the time axis: T-1 values, not one scalar.  Short/scalar inputs are
+    # empty rather than an indexing error.
+    _c1 = L.cosine_similarity_consecutive(torch.tensor([1.0, -2.0, 3.0]))
+    assert _c1.shape == (2,) and torch.equal(_c1, torch.tensor([-1.0, -1.0])), _c1
+    assert L.cosine_similarity_consecutive(torch.tensor([2.0])).shape == (0,)
+    assert L.cosine_similarity_consecutive(torch.tensor(2.0)).shape == (0,)
+    _c2 = L.cosine_similarity_consecutive(torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]]))
+    assert _c2.shape == (2,) and torch.equal(_c2, torch.tensor([0.0, 0.0])), _c2
     # A malformed frozen training-corpus binding must be refused at load time,
     # not treated as "no literal value".
     with tempfile.TemporaryDirectory() as _td:
@@ -7929,6 +7943,52 @@ def t_identity_fingerprint_and_pairing_regressions():
             assert 'training' in str(_e).lower(), str(_e)[:200]
         else:
             raise AssertionError('a boolean training_data_fingerprint was accepted')
+    # Conflicting aliases cannot both bind the corpus; a malformed geometry
+    # field must be refused even when a literal fingerprint is present.
+    with tempfile.TemporaryDirectory() as _td:
+        for _bad_binding, _top in (
+                ({'training_data_fingerprint': {'canonical_train_fp': 'A', 'train_fp': 'B'}}, None),
+                ({'training_data_fingerprint': {'canonical_train_fp': 'A'}}, 'B')):
+            _p = os.path.join(_td, 'manifest_conflict.json')
+            _m = _write_manifest(_p, list(range(12)))
+            _m['binding'] = _bad_binding
+            if _top is not None:
+                _m['canonical_train_fp'] = _top
+            with open(_p, 'w', encoding='utf-8') as _f:
+                json.dump(_m, _f)
+            try:
+                V12._load_manifest(_p)
+            except SystemExit as _e:
+                assert 'conflict' in str(_e).lower(), str(_e)[:200]
+            else:
+                raise AssertionError(f'conflicting training fingerprints were accepted: {_bad_binding!r}')
+        _p = os.path.join(_td, 'manifest_geometry.json')
+        _m = _write_manifest(_p, list(range(12)))
+        _m['binding'] = {'training_data_fingerprint': {
+            'canonical_train_fp': 'A', 'seq_len': 1.5}}
+        with open(_p, 'w', encoding='utf-8') as _f:
+            json.dump(_m, _f)
+        try:
+            V12._load_manifest(_p)
+        except SystemExit as _e:
+            assert 'seq_len' in str(_e), str(_e)[:200]
+        else:
+            raise AssertionError('a malformed binding geometry field was accepted alongside a literal fingerprint')
+    # Implementation-mode aliases with different values make the frozen run
+    # mode ambiguous and must be refused before admission.
+    with tempfile.TemporaryDirectory() as _td:
+        _p = os.path.join(_td, 'manifest_impl.json')
+        _m = _write_manifest(_p, list(range(12)))
+        _m['amp_dtype'] = 'fp32'
+        _m['amp_dtype_expected'] = 'bf16'
+        with open(_p, 'w', encoding='utf-8') as _f:
+            json.dump(_m, _f)
+        try:
+            V12._load_manifest(_p)
+        except SystemExit as _e:
+            assert 'implementation binding' in str(_e).lower(), str(_e)[:200]
+        else:
+            raise AssertionError('conflicting amp_dtype aliases were accepted')
 
 
 def t_malformed_panel_and_niah_records_are_excluded():

@@ -596,6 +596,9 @@ def _load_manifest(path):
     # malformed declaration must fail before any held-out access instead of
     # being treated as "no literal value" and paired with a derivable train_fp.
     _frozen_train_fp(m)
+    # An implementation-mode binding declared under both its alias spellings
+    # must name the same mode before any record is admitted.
+    _frozen_implementation(m)
     m['manifest_sha256'] = _file_sha256(path)
     return m
 
@@ -714,6 +717,10 @@ def _frozen_train_fp(manifest):
                     f'[v12] REFUSE: {label} is an empty training-corpus '
                     'fingerprint — an empty/absent identity cannot bind a corpus')
             return value
+        # Collect EVERY declared literal first: two different non-null aliases
+        # in one object cannot both bind the corpus, so returning the first
+        # one would silently pick a frozen identity.
+        _found = []
         for _sub in ('canonical_train_fp', 'train_fp', 'value'):
             if _sub not in value:
                 continue
@@ -725,9 +732,16 @@ def _frozen_train_fp(manifest):
                 raise SystemExit(
                     f'[v12] REFUSE: {label}.{_sub}={_sv!r} is not a '
                     'non-empty text fingerprint')
-            return _sv
+            _found.append((f'{label}.{_sub}', _sv))
+        if len({_v for _n, _v in _found}) > 1:
+            raise SystemExit(
+                f'[v12] REFUSE: {label} declares conflicting training-corpus '
+                f'fingerprints ({", ".join(f"{_n}={_v!r}" for _n, _v in _found)}) '
+                '— an ambiguous binding cannot identify the frozen corpus')
         # Declared geometry fields are part of the binding, so validate them
-        # here rather than at P5T.
+        # here rather than at P5T.  This check must run even when a literal
+        # fingerprint is present, otherwise a malformed seq_len/token count
+        # would be silently ignored.
         for _cnt, _minimum in (('seq_len', 2), ('n_train_tokens', 1)):
             if _cnt not in value or value[_cnt] is None:
                 continue
@@ -736,8 +750,9 @@ def _frozen_train_fp(manifest):
                 raise SystemExit(
                     f'[v12] REFUSE: {label}.{_cnt}={value[_cnt]!r} is not an '
                     f'exact integer >= {_minimum}')
-        return None
+        return _found[0][1] if _found else None
 
+    _found = []
     for _obj_name, _obj in (('binding', manifest.get('binding') or {}),
                             ('manifest', manifest)):
         if not isinstance(_obj, dict):
@@ -747,8 +762,14 @@ def _frozen_train_fp(manifest):
                 continue
             _v = _take(f'{_obj_name}.{_k}', _obj.get(_k))
             if _v is not None:
-                return _v
-    return None
+                _found.append((f'{_obj_name}.{_k}', _v))
+    if len({_v for _n, _v in _found}) > 1:
+        raise SystemExit(
+            '[v12] REFUSE: the frozen plan declares conflicting '
+            'training-corpus fingerprints across aliases '
+            f'({", ".join(f"{_n}={_v!r}" for _n, _v in _found)}) — '
+            'the corpus identity is ambiguous')
+    return _found[0][1] if _found else None
 
 
 def _frozen_implementation(manifest):
@@ -764,7 +785,20 @@ def _frozen_implementation(manifest):
     """
     impl = {}
     for _k in ('eager_batch', 'amp_dtype', 'amp_grad_scaler'):
-        _v = manifest.get(_k + '_expected', manifest.get(_k))
+        _suffix = _k + '_expected'
+        _e = manifest.get(_suffix)
+        _b = manifest.get(_k)
+        if _e is not None and _b is not None:
+            try:
+                _same = bool(_e == _b)
+            except Exception:
+                _same = False
+            if not _same:
+                raise SystemExit(
+                    f'[v12] REFUSE: implementation binding {_k!r} is declared '
+                    f'twice with different values ({_suffix}={_e!r}, {_k}={_b!r}) '
+                    '— the frozen run mode is ambiguous')
+        _v = manifest.get(_suffix, _b)
         if _v is not None:
             impl[_k] = _v
     return impl or None
