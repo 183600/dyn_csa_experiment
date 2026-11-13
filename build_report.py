@@ -401,11 +401,11 @@ def _finite_ppls(r):
     return [f for f in (_as_finite(x) for x in ppls) if f is not None and f > 0.0]
 
 def _record_variant(rec, key):
-    """Canonical arm name for a stored record (None = malformed/unhashable).
+    """Canonical arm name for a stored record (None = no usable arm name).
 
     A missing `variant` falls back to the summary-key prefix, matching the
-    historical reader contract.  A list/dict variant cannot name an arm; the
-    reader excludes it instead of crashing when building a dict key."""
+    historical reader contract.  A list/dict variant cannot name an arm, so
+    the reader excludes it when building a dict key."""
     if not isinstance(rec, dict):
         return None
     v = rec.get('variant')
@@ -464,9 +464,8 @@ def _tag_of(r, key=None, legacy_ok=None):
 
 def _prefer_one_cfg(items, cfg_of, who=''):
     def _keyable(value):
-        # cfg_of returns (label, run_cfg); a hand-edited record can put a
-        # list/dict in run_cfg.  Keep the tuple shape while making every part
-        # hashable so one malformed record cannot abort the whole report.
+        # Keep the (label, run_cfg) tuple shape with every part hashable, so
+        # metadata values can be used as grouping keys.
         if isinstance(value, tuple):
             return tuple(_keyable(v) for v in value)
         try:

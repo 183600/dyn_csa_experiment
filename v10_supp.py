@@ -509,10 +509,10 @@ def _probe_record_problem(rec):
 def _niah_record_problem(rec):
     """Why a stored NIAH-natural record is not a usable measurement (None = ok).
 
-    The reader builds grouping keys from variant/arm/eval_len/condition, so an
-    unhashable or wrongly-typed field would abort the whole analysis instead
-    of excluding one bad record.  Geometry follows the same exact-integer
-    contract as the corruption probe: a length-1 cell has no scored target.
+    The reader builds grouping keys from variant/arm/eval_len/condition, so
+    those fields must be hashable text/exact integers.  Geometry follows the
+    same contract as the corruption probe: a length-1 cell has no scored
+    target.
     """
     if not isinstance(rec, dict):
         return 'not a dict'

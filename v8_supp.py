@@ -58,9 +58,8 @@ def _paired_records(outdir):
 def _cfg_key(value):
     """Hashable identity for a run_cfg metadata value.
 
-    Valid records carry a string, but a hand-edited/merged JSON file can hold
-    a list/dict.  Grouping keys must never raise on that input: canonicalise
-    the unhashable spelling instead of aborting the whole analysis."""
+    Valid records carry a string; list/dict metadata is canonicalised into a
+    hashable spelling."""
     try:
         hash(value)
         return value

@@ -4409,9 +4409,9 @@ class AttnCfg:
     boundary_policy: str = 'threshold'
 
     def __post_init__(self):
-        # Dispatch strings select different forward paths; an unknown value
-        # must fail at construction instead of silently falling through to a
-        # different mechanism (or a later assert after data/model setup).
+        # Dispatch strings select different forward paths; reject unknown
+        # values at construction rather than falling through to another
+        # mechanism.
         if self.kind not in ('full', 'csa', 'hca'):
             raise ValueError(f'unknown attention kind {self.kind!r}; expected full/csa/hca')
         if self.chunking not in ('fixed', 'cosine_learnable', 'cosine_abs', 'cosine_adaptive'):
@@ -8177,8 +8177,7 @@ def _json_clean(obj):
 
 def _prov_data_version(prov):
     """`provenance.data.data_version` when the provenance is a well-formed
-    object, else None.  A malformed provenance must not turn manifest writing
-    into an AttributeError after the cell has already run."""
+    object, else None."""
     if not isinstance(prov, dict):
         return None
     data = prov.get('data')
@@ -11854,12 +11853,11 @@ def run_cfg_knobs(fp):
     return m.groupdict() if m else {}
 
 def _record_variant_name(rec, key):
-    """Canonical arm name for a stored panel record (None = malformed).
+    """Canonical arm name for a stored panel record (None = no usable name).
 
     A record without a `variant` field falls back to the summary-key prefix,
     matching the historical reader contract.  A non-text variant (list/dict)
-    cannot name an arm; returning None lets readers exclude it rather than
-    crash on an unhashable dict/set key."""
+    cannot name an arm, so the caller excludes it."""
     if not isinstance(rec, dict):
         return None
     v = rec.get('variant')
@@ -21168,9 +21166,8 @@ def preflight_fingerprint(cfg, *, stage, vocab=None, data_fp=None, probe_cfg=Non
 def _as_bool_flag(value):
     """Boolean flag value, or None when the value is not a boolean/0/1.
 
-    ``bool("false")`` is True, so a JSON/config string must never be accepted
-    as an explicit flag: malformed values fall back to the geometry default
-    instead of silently enabling a different run mode."""
+    A JSON/config string is never accepted as an explicit flag; non-boolean
+    values fall back to the geometry default."""
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
     if isinstance(value, numbers.Integral):

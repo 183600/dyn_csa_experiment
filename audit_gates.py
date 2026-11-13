@@ -1562,9 +1562,8 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                 try:
                     e[field].add(value)
                 except TypeError:
-                    # A list/dict is not a measurement; keep the audit running
-                    # and record the malformed cell instead of aborting with
-                    # an unhashable-type error.
+                    # A list/dict is not a measurement; record the malformed
+                    # cell with a stable repr.
                     e[field].add(repr(value))
                     problems.append(f'{key}: L{Ln} {field} is not a scalar value ({type(value).__name__})')
 

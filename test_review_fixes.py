@@ -5368,7 +5368,7 @@ def t_audit_length_requires_eval_span():
         assert out['by_length']['512']['same_scored_targets_across_records'] is False, out
 
 
-def t_audit_length_malformed_cells_do_not_crash():
+def t_audit_length_malformed_cells_are_rejected():
     td = tempfile.mkdtemp(prefix='len_', dir=REPO)
     try:
         p = os.path.join(td, 'bylen.json')
@@ -7772,10 +7772,9 @@ def t_probe_reader_geometry_and_manifest_fail_closed():
                 raise AssertionError(f'endpoint {_bad_ep!r} was accepted')
 
 
-def t_malformed_panel_and_niah_records_do_not_crash():
+def t_malformed_panel_and_niah_records_are_excluded():
     # Panel readers build dict/set keys from a record's variant.  A JSON
-    # list/dict variant cannot name an arm, so it must be excluded rather than
-    # raising an unhashable-key TypeError during a report build.
+    # list/dict variant cannot name an arm, so the readers exclude it.
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
             json.dump({'good::seed0': {'variant': 'good', 'seed': 0, 'ppl': 10.0},
@@ -7792,7 +7791,7 @@ def t_malformed_panel_and_niah_records_do_not_crash():
         assert set(_agg) == {'good'}, _agg
         assert BR._prefer_one_cfg([1, 2], lambda _x: ('a', ['bad'])) == [1, 2]
         # The zero-GPU audits build the same dict keys; a malformed variant is
-        # excluded instead of aborting the audit with an unhashable key.
+        # excluded.
         for _fn in (A.audit_attribution, A.audit_failures,
                     A.audit_efficiency_pairs):
             try:
@@ -7806,8 +7805,7 @@ def t_malformed_panel_and_niah_records_do_not_crash():
             'eval_len': 4096, 'condition': 'clean',
             'probe_params': {'n_seq': 16, 'target': 512}}
     assert V10._niah_record_problem(good) is None
-    # Dispatch strings are exact enums: an unknown value must not survive to a
-    # later forward-path fallthrough.
+    # Dispatch strings are exact enums.
     for _kw in ({'kind': 'bogus'}, {'chunking': 'bogus'},
                 {'indexer_mode': 'bogus'}, {'content_mode': 'bogus'},
                 {'fuse_mode': 'bogus'}, {'boundary_policy': 'bogus'}):
@@ -7817,7 +7815,7 @@ def t_malformed_panel_and_niah_records_do_not_crash():
             pass
         else:
             raise AssertionError(f'AttnCfg accepted {_kw!r}')
-    # Boolean config flags are not truthiness tests: bool("false") is True.
+    # Boolean config flags are parsed as exact booleans.
     assert L._is_confirmatory_cfg({'confirm': True}) is True
     assert L._is_confirmatory_cfg({'confirm': False}) is False
     assert L._is_confirmatory_cfg({'d': 512, 'seeds': [0, 1]}) is True
@@ -7828,8 +7826,7 @@ def t_malformed_panel_and_niah_records_do_not_crash():
                 dict(good, seed=1.5), dict(good, probe_params=None)):
         assert V10._niah_record_problem(bad) is not None, bad
 
-    # A malformed provenance object must not turn manifest writing into an
-    # AttributeError after a cell has already run.
+    # Manifest writing accepts a malformed provenance object.
     assert L._prov_data_version({'data': []}) is None
     assert L._prov_data_version({'data': {'data_version': 'dv'}}) == 'dv'
     with tempfile.TemporaryDirectory() as d:
@@ -8071,7 +8068,7 @@ def main():
     _check('L10c corpus-audit memo keys the validation row shape', t_corpus_audit_memo_keys_validation_shape)
     _check('L10c2 corpus-audit document-overlap count is exact', t_corpus_audit_overlap_metadata_exact)
     _check('L10d report command aggregates sub-audit status', t_report_aggregate_status_fails_closed)
-    _check('L10c length audit rejects malformed cell objects', t_audit_length_malformed_cells_do_not_crash)
+    _check('L10c length audit rejects malformed cell objects', t_audit_length_malformed_cells_are_rejected)
     _check('L10c2 by-length reader requires an exact integer length', t_by_len_cells_requires_exact_length)
     _check('L10c3 length audit parses keys and counts exactly', t_audit_length_exact_integer_fields)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
@@ -8091,7 +8088,7 @@ def main():
     _check('L19 probe geometry requires exact integers', t_probe_geometry_exact_integers)
     _check('L20 shared validation fingerprint tolerates malformed provenance', t_shared_validation_fp_refuses_malformed_provenance)
     _check('L21 probe readers/manifest reject impossible geometry', t_probe_reader_geometry_and_manifest_fail_closed)
-    _check('L22 malformed panel/NIAH records are excluded without crashing', t_malformed_panel_and_niah_records_do_not_crash)
+    _check('L22 malformed panel/NIAH records are excluded', t_malformed_panel_and_niah_records_are_excluded)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

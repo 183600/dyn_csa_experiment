@@ -1815,8 +1815,7 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
     per_variant = {}
 
     def _cfg_key(value):
-        # A hand-edited record can carry a list/dict run_cfg; grouping it must
-        # exclude nothing and must not raise an unhashable-key TypeError.
+        # Group records by a hashable form of run_cfg metadata.
         try:
             hash(value)
             return value
