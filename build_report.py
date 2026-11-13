@@ -1720,7 +1720,7 @@ def sec_flops():
     cfg = d.get('config', {})
     rows = d.get('rows', [])
     if not isinstance(rows, (list, tuple)):
-        # A scalar/object `rows` is an ABSENT table, not an iterable.
+        # Only a list/tuple is a table; any other payload is an absent table.
         print(f'[report] sec_flops: analysis rows is {type(rows).__name__}, not a list — section omitted')
         rows = []
     pick = {512, 2048, 8192, 65536, 1048576}
