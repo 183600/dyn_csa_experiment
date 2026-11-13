@@ -2493,9 +2493,8 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
             out['problems'].append(
                 f'cell {i} ({c.get("arm")}): per_seed is {type(_seeds).__name__}, not an object — no seed-level evidence')
             continue
-        # Seed keys are identities, not arbitrary labels: "0", "0." and "0.0"
-        # are the same seed.  Counting each spelling separately would let one
-        # measurement fabricate an n>=6 panel and a significant sign-flip test.
+        # Seed keys are identities: "0", "0." and "0.0" name the same seed,
+        # and each seed is counted once.
         _seed_ids = {}
         _dup_ids = set()
         for _sk in _seeds:

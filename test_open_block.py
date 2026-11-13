@@ -124,8 +124,8 @@ def t_config_and_segmenter():
     # all() would be vacuously true).
     _empty_model = type('_M', (), {'blocks': []})()
     assert L.open_block_config(_empty_model)['all_closed_default'] is False
-    # Variant names carry the cap as an exact integer identity: a fractional
-    # or boolean value must not be truncated into a different matrix cell.
+    # Variant names carry the cap as an exact integer identity; only 32/64/128
+    # are valid matrix cells.
     assert L.open_block_variant_name(32.0, 'closed') == 'csa_dynamic_mb32_closed'
     for _bad_mb in (32.9, True, 33, '32.9', object()):
         try:
@@ -207,8 +207,8 @@ def t_prefix_pool_reference():
         for a, b in zip(go, gr):
             assert torch.allclose(a, b, atol=2e-3, rtol=2e-3), (
                 scope, window, float((a - b).detach().abs().max()))
-    # `overlap=None` is the public no-lane spelling; it must behave exactly
-    # like overlap=0 instead of crashing in int(None).
+    # `overlap=None` is the public no-lane spelling and behaves exactly like
+    # overlap=0.
     for scope, window in (('full_prefix', 6), ('outside_window', 3)):
         _none = L.causal_prefix_pool(Xa, Xb, Za, Zb, bid, Ba, Bb, None,
                                      n_blocks=nb, scope=scope, window=window)
@@ -586,7 +586,7 @@ def t_record_identity_and_completeness():
     assert cells == {}, cells
     assert OB._rec_by_cell({'A::seed0': base}, fp)
     # Two usable records for one (variant, seed) are ambiguous even when the
-    # key spellings differ; neither may silently win by dict order.
+    # key spellings differ.
     _dup = {'A::seed0': base,
             'A::seed 0': dict(base, nll_sum=11.0)}
     assert OB._rec_by_cell(_dup, fp) == {}, OB._rec_by_cell(_dup, fp)

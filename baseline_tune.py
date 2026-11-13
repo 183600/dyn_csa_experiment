@@ -488,9 +488,8 @@ def _run_final(base, outdir, protocol, selected):
                 _extra.append(rec.get('seed'))
                 continue
             if _sid in _seen_final:
-                # Two measurable records for one (arm, seed) are ambiguous.
-                # Keeping whichever the JSON happens to list last would make
-                # the tuned contrast order-dependent, so drop the whole cell.
+                # Two measurable records for one (arm, seed) are ambiguous,
+                # so the whole cell is dropped.
                 _ambiguous.add(_sid)
                 continue
             _seen_final.add(_sid)

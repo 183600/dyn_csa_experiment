@@ -2157,8 +2157,8 @@ def t_adaptive_threshold_guard():
     for shape in ((0,), (0, 5), (3, 0), (0, 0)):
         got = L.causal_adaptive_threshold(torch.empty(shape), 16)
         assert tuple(got.shape) == shape, (shape, got.shape)
-    # The target block size is an exact structural count: booleans/fractions
-    # must not silently select a different quantile (even for empty input).
+    # The target block size is an exact structural count, including for empty
+    # input.
     for _bad_target in (True, False, 0, -1, 1.5, '16.0'):
         try:
             L.causal_adaptive_threshold(torch.empty((0, 5)), _bad_target)
@@ -2227,9 +2227,8 @@ def t_empty_pool_geometry():
     comp, last_tok, B = L.pool_blocks_single(torch.empty(0, 4), torch.empty(0, 4),
                                              torch.empty(4, 4), ids)
     assert comp.shape == (0, 4) and last_tok.shape == (0,) and B == 0
-    # `overlap=None` means "no previous-block lane" and must be accepted on the
-    # same path as overlap=0 instead of crashing in the 8-tuple geometry
-    # unpack (the None form of _pool_parts is a 4-tuple).
+    # `overlap=None` means "no previous-block lane" and follows the same path
+    # as overlap=0 through the 8-tuple geometry.
     n, c = 8, 3
     bids = L.blocks_from_cuts(n, [True, False, False, True, False, False, False],
                               1, 3, dev)
@@ -2250,8 +2249,7 @@ def t_segment_empty():
     for n in (0, -1):
         base = L.blocks_from_cuts(n, [], 2, 8, torch.device('cpu'))
         assert base.numel() == 0, (n, base)
-    # Structural geometry is exact: booleans/fractions are not silently
-    # truncated, and a zero/oversized-fixed block size fails closed.
+    # Structural geometry is exact; malformed block sizes fail closed.
     for _bad in ((True, 1, 2), (1.5, 1, 2), (5, True, 2), (5, 0, 2),
                  (5, 1, 1.5), (5, 2, 1)):
         try:

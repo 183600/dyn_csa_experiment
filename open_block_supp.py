@@ -343,11 +343,8 @@ def _rec_by_cell(summary, run_fingerprint=None):
             continue
         cell = (v, seed)
         if cell in out:
-            # Two usable records for one (variant, seed) are ambiguous: the
-            # summary key spelling ("0", " 0", "0_0") is not the identity.
-            # Keeping whichever the JSON happens to list last would make the
-            # paired statistic depend on dict insertion order, so the whole
-            # cell is excluded instead.
+            # Two usable records for one (variant, seed) are ambiguous even
+            # under different key spellings, so the whole cell is excluded.
             ambiguous.add(cell)
             continue
         out[cell] = {'record': rec, 'nll': nll, 'ppl': float(rec['ppl'])}

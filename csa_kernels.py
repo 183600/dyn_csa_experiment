@@ -262,9 +262,7 @@ class PoolGeometry:
             end_prev_full = np.concatenate([np.full((R, 1), -1, dtype=np.int64), ends_full[:, :-1]], axis=1)
             starts_prev_full = np.concatenate([np.zeros((R, 1), dtype=np.int64), starts_full[:, :-1]], axis=1)
             ov_start_full = np.maximum(end_prev_full - int(overlap), starts_prev_full)
-            # Block 0 has no previous block; its raw length is negative.
-            # Eager pooling clamps the B-lane length to zero, so the exposed
-            # geometry must do the same (the forward mask already excludes it).
+            # Block 0 has no previous block, so its B-lane length is zero.
             ov_len_full = np.maximum(end_prev_full - ov_start_full, 0)
             starts_prev_np = np.where(colmask, starts_prev_full, 0)
             ov_start_np = np.where(colmask, ov_start_full, 0)

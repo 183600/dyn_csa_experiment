@@ -903,9 +903,8 @@ def _successor_starts(n, nxt):
     return np.asarray(starts, dtype=np.int64)
 
 def _segment(n, want_cut_list, min_block, max_block):
-    # Segmentation geometry is exact-integer state: int(True)==1 / int(4.9)==4
-    # would silently build a different block table (and cache it under the
-    # wrong key).  Negative lengths remain the documented empty case.
+    # Segmentation geometry is exact-integer state; malformed values are
+    # refused.  Negative lengths remain the documented empty case.
     _n = _as_seed_int(n)
     _mb = _as_seed_int(min_block)
     if _n is None or _mb is None or _mb < 1:
@@ -1240,8 +1239,8 @@ def _d2h_stage(shape, dtype, device):
         return (None, None)
 
 def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_count=False, return_honoured=False):
-    # Validate the exact structural geometry even on the n<=0 / n==1 shortcuts,
-    # which bypass _segment's own entry checks.
+    # Validate the exact structural geometry on every path, including the
+    # n<=0 / n==1 shortcuts.
     _n = _as_seed_int(n)
     _mb = _as_seed_int(min_block)
     if _n is None or _mb is None or _mb < 1:
@@ -1616,8 +1615,8 @@ def _adaptive_exact_limit():
 
 
 def causal_adaptive_threshold(sim, target_block_tokens):
-    # The target block size is an exact structural count, even for an empty
-    # input (the empty shortcut must not accept a different configured cell).
+    # The target block size is an exact structural count, including for an
+    # empty input.
     _target = _as_seed_int(target_block_tokens)
     if _target is None or _target < 1:
         raise ValueError(
@@ -1684,9 +1683,8 @@ def causal_adaptive_threshold(sim, target_block_tokens):
 
 
 def blocks_fixed(n, block_size, device):
-    # Exact structural integers: a fractional/boolean block size must not be
-    # truncated into a different table, and bs=0 must not reach the division
-    # below as a ZeroDivisionError.
+    # Exact structural integers: n and block_size are validated before the
+    # cache key and the division below.
     n_i = _as_seed_int(n)
     bs = _as_seed_int(block_size)
     if n_i is None or bs is None or bs < 1:
@@ -5526,8 +5524,8 @@ def open_block_variant_name(max_block, mode, scope='full_prefix'):
     if max_block is None:
         mb = 'none'
     else:
-        # The cap is an exact structural integer: int(32.9)==32 or int(True)==1
-        # would silently name a different cell of the matrix.
+        # The cap is an exact structural integer; only 32/64/128 are valid
+        # matrix cells.
         _mb = _as_seed_int(max_block)
         if _mb is None or _mb not in (32, 64, 128):
             raise ValueError(f'unsupported max_block {max_block!r} for the open-block variant names')
@@ -5829,9 +5827,8 @@ def _ids_fp(train_ids):
         _key = (train_ids.__array_interface__['data'][0], train_ids.shape, train_ids.strides, train_ids.dtype.str)
     except (AttributeError, TypeError):
         _key = None
-    # A writeable array can change under the same pointer/layout; memoising
-    # its digest would then return a stale corpus identity.  Only immutable
-    # arrays are safe to key by storage address.
+    # Only immutable arrays are keyed by storage address; a writeable array
+    # is re-hashed because its contents can change under the same pointer.
     if _key is not None and getattr(getattr(train_ids, 'flags', None), 'writeable', False):
         _key = None
     if _key is not None:
@@ -11467,8 +11464,8 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         if len(warm) == len(rows) and warm and min(warm) > 0:
             warm_ratio = max(warm) / min(warm)
         if len(warm) == len(rows) and min(warm) == 0.0 and max(warm) > 0.0:
-            # A zero-warmup tier against a non-zero one is an infinite ratio;
-            # the old min>0 guard silently skipped the disclosure.
+            # A zero-warmup tier against a non-zero one is an infinite ratio
+            # and is disclosed explicitly.
             warnings.append(
                 'warmup fraction includes 0 on at least one tier but not on '
                 'all of them — the warmup schedule is not matched across scales')
@@ -14868,8 +14865,7 @@ def normalize_seed_list(seeds, *, default=(0,)):
     for raw in seeds:
         _add(raw)
     if not out:
-        # The fallback default is a seed axis too: it must obey the same
-        # exact-integer contract instead of int()-truncating booleans/floats.
+        # The fallback default follows the same exact-integer seed contract.
         for raw in default:
             _add(raw)
     return out
