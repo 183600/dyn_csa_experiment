@@ -299,9 +299,17 @@ def _load_manifest(path):
             # A manifest integer spelling must be an actual integer.  The
             # float path below would accept "512.0"/"1e3" and hand the raw
             # string to downstream int() calls after a test access.  Reject
-            # non-canonical spellings at load time.
+            # non-canonical spellings (whitespace, leading '+', leading zeros,
+            # underscores) at load time too: int() would silently accept them
+            # as a different textual identity than the canonical JSON form.
             try:
-                _iv = int(value)
+                _text = value.decode('ascii') if isinstance(value, bytes) else value
+            except (UnicodeDecodeError, AttributeError):
+                raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an integer')
+            if re.fullmatch(r'-?(?:0|[1-9][0-9]*)', _text) is None:
+                raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an integer')
+            try:
+                _iv = int(_text)
             except (TypeError, ValueError, OverflowError):
                 raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an integer')
             if abs(_iv) >= 2 ** 53:
@@ -395,19 +403,28 @@ def _load_manifest(path):
         # The probe runs on the SAME frozen test slice as the by-length panel.
         # If it asks for a longer sequence or more rows, run_finaltest sizes
         # the slice from by_length_ppl/n_seqs_clean and the probe indexes out
-        # of bounds.
+        # of bounds AFTER the one-shot test access.  Validate the effective
+        # defaults too, not only the fields the manifest happens to spell out.
         _plens = [int(float(_x)) for _x in (_probe.get('eval_lens') or [])]
-        if _plens:
-            if _bl_ints and max(_plens) > max(_bl_ints):
-                raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.eval_lens={_plens} extends beyond the frozen test slice width max(by_length_ppl)={max(_bl_ints)} — enlarge by_length_ppl (and re-freeze) or shrink the probe')
-            if _eval.get('n_seqs_clean') is not None:
-                _nseq_frozen = _int_field(_eval.get('n_seqs_clean'), 'eval.n_seqs_clean')
-                if 'n_seq' in _probe and _int_field(_probe.get('n_seq'), 'eval.distractor_probe.n_seq') > _nseq_frozen:
-                    raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.n_seq={_probe.get("n_seq")} exceeds the frozen test row count n_seqs_clean={_nseq_frozen}')
-            if 'target' in _probe:
-                _ptarget = _int_field(_probe.get('target'), 'eval.distractor_probe.target')
-                if min(_plens) <= _ptarget:
-                    raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.target={_ptarget} must be smaller than every probe eval_len {sorted(_plens)} (the far context would be empty/negative)')
+        _eff_plens = _plens or [2048, 4096]
+        if _bl_ints and max(_eff_plens) > max(_bl_ints):
+            raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.eval_lens={_eff_plens} extends beyond the frozen test slice width max(by_length_ppl)={max(_bl_ints)} — enlarge by_length_ppl (and re-freeze) or shrink the probe')
+        _nseq_frozen = None
+        if _eval.get('n_seqs_clean') is not None:
+            _nseq_frozen = _int_field(_eval.get('n_seqs_clean'), 'eval.n_seqs_clean')
+            _eff_nseq = (_int_field(_probe.get('n_seq'), 'eval.distractor_probe.n_seq')
+                         if 'n_seq' in _probe else _nseq_frozen)
+            if _eff_nseq > _nseq_frozen:
+                raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.n_seq={_eff_nseq} exceeds the frozen test row count n_seqs_clean={_nseq_frozen}')
+        if 'target' in _probe:
+            _ptarget = _int_field(_probe.get('target'), 'eval.distractor_probe.target')
+            if min(_eff_plens) <= _ptarget:
+                raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.target={_ptarget} must be smaller than every probe eval_len {sorted(_eff_plens)} (the far context would be empty/negative)')
+    if _probe is None and _bl_ints and max([2048, 4096]) > max(_bl_ints):
+        # No probe block at all: run_finaltest still uses its fixed default
+        # probe lengths, so the default grid must fit the frozen slice before
+        # the one-shot test access.
+        raise SystemExit(f'[v12] REFUSE: the default distractor probe eval_lens=[2048, 4096] extends beyond the frozen test slice width max(by_length_ppl)={max(_bl_ints)} — declare a shorter eval.distractor_probe.eval_lens or enlarge by_length_ppl (and re-freeze)')
     _tokb = (_bind.get('tokenizer') or {}) if isinstance(_bind, dict) else {}
     if _tokb and not isinstance(_tokb, dict):
         raise SystemExit(f'[v12] REFUSE: binding.tokenizer must be an object ({_tokb!r})')
@@ -1230,7 +1247,10 @@ def run_finaltest(cfg=None, guard=None):
     _probe_rhos = [float(x) for x in (_probe_eval.get('rhos') or V10.PROBE_MODES[_probe_mode])]
     if _probe_mode in ('mask', 'delete', 'doc') and any(abs(x - 1.0) > 1e-9 for x in _probe_rhos):
         raise SystemExit(f"[v12] REFUSE: eval.distractor_probe.mode={_probe_mode!r} is all-or-nothing and only admits rho=1.0 (got {_probe_rhos})")
-    pcfg = dict(V10.PROBE, outdir=outdir, ckpt_dir=cfg['ckpt_dir'], summary=cfg['probe_summary'], variants=list(manifest['arms']), seeds=[int(s) for s in manifest['seeds']], eval_lens=[int(x) for x in (_probe_eval.get('eval_lens') or [2048, 4096])], rhos=_probe_rhos, modes={_probe_mode: _probe_rhos}, niah=None, arm_overrides={v: ['learned'] for v in V10.SCRATCH_CONTROLS}, target=int(_probe_eval.get('target', cfg.get('target', 512))), n_seq=int(_probe_eval.get('n_seq', cfg.get('n_seq', 16))), chunk=int(cfg.get('chunk', 4)))
+    # The probe is measured on the SAME frozen rows as the by-length panel, so
+    # an omitted probe n_seq must default to that frozen row count — not to a
+    # runtime config value that could exceed it.
+    pcfg = dict(V10.PROBE, outdir=outdir, ckpt_dir=cfg['ckpt_dir'], summary=cfg['probe_summary'], variants=list(manifest['arms']), seeds=[int(s) for s in manifest['seeds']], eval_lens=[int(x) for x in (_probe_eval.get('eval_lens') or [2048, 4096])], rhos=_probe_rhos, modes={_probe_mode: _probe_rhos}, niah=None, arm_overrides={v: ['learned'] for v in V10.SCRATCH_CONTROLS}, target=int(_probe_eval.get('target', cfg.get('target', 512))), n_seq=int(_probe_eval.get('n_seq', _nseq_clean)), chunk=int(cfg.get('chunk', 4)))
     mech_summ = {}
     if os.path.exists(cfg['mech_summary']):
         mech_summ = json.load(open(cfg['mech_summary'], encoding='utf-8'))
@@ -2373,7 +2393,11 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
         errs.append(f'eval.distractor_probe.mode={_probe_mode!r} is all-or-nothing and only admits rho=1.0 (got {_probe_rhos})')
     _probe_lens = [int(x) for x in (_probe_plan.get('eval_lens') or [2048, 4096])]
     _probe_target = int(_probe_plan.get('target', FINALTEST_CFG.get('target', 512)))
-    _probe_nseq = int(_probe_plan.get('n_seq', FINALTEST_CFG.get('n_seq', 16)))
+    # run_finaltest now defaults an omitted probe n_seq to the FROZEN row
+    # count (the probe must score the same rows as the primary panel); the
+    # pre-flight must validate that same effective value.
+    _probe_nseq = int(_probe_plan.get(
+        'n_seq', _nseq if _nseq > 0 else FINALTEST_CFG.get('n_seq', 16)))
     if _probe_nseq <= 0:
         errs.append(f'distractor probe n_seq={_probe_nseq} must be positive')
     elif _nseq > 0 and _probe_nseq > _nseq:

@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import platform
+import posixpath
 import subprocess
 import sys
 import tarfile
@@ -378,6 +379,24 @@ def cmd_verify(tar_path):
             print(f'[archive] REFUSE: archive contains unsafe member path(s) '
                   f'{_unsafe_members[:5]} — absolute or parent-traversing '
                   'members cannot be extracted safely')
+            return 1
+        # Two spellings that resolve to the same extraction path (e.g. `a`
+        # and `./a`, or `dir/a` and `dir/./a`) are ambiguous even though the
+        # raw member names differ.  The exact-name Counter above cannot see
+        # that collision, so normalise the archive paths as well before
+        # attesting a unique release tree.
+        _norm_map = {}
+        for _name in names:
+            _norm = posixpath.normpath(_name.replace('\\', '/'))
+            if _norm in ('.', ''):
+                _norm = ''
+            _norm_map.setdefault(_norm, []).append(_name)
+        _dup_norm = [sorted(_raw) for _raw in _norm_map.values() if len(_raw) > 1]
+        if _dup_norm:
+            print(f'[archive] REFUSE: archive contains member paths that '
+                  f'normalise to the same extraction path {_dup_norm[:5]} — '
+                  'extraction would be ambiguous, so the content hashes '
+                  'cannot identify one unique release tree')
             return 1
         # The manifest written by `make` is named after the archive itself.
         # Picking the first `*.MANIFEST.sha256` member would let an ordinary

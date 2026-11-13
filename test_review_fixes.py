@@ -530,6 +530,14 @@ def t_training_health_classifier():
              'val_ppl': 55.0 - 0.5 * i} for i in range(6)]
     h = L.classify_training_health(hist)
     assert h['status'] == 'healthy', h
+    # Training CE flat/rising while validation CE falls is a validation-only
+    # improvement, not `validation_degrading` (whose reason would contradict
+    # the observed negative validation slope).
+    hist = [{'step': i * 100, 'train_ce': 4.0 + 0.001 * i,
+             'val_ce': 4.0 - 0.05 * i, 'val_ppl': 55.0 - 0.5 * i}
+            for i in range(6)]
+    h = L.classify_training_health(hist)
+    assert h['status'] == 'healthy' and 'validation-only' in h['reason'], h
     # A MEASURED non-finite point must be flagged...
     hist = [{'step': i * 100, 'train_ce': 6.0 - 0.30 * i, 'val_ce': 4.0 - 0.02 * i,
              'val_ppl': 55.0 - 0.5 * i} for i in range(6)]
@@ -1111,7 +1119,8 @@ def t_mode_validation():
     # Probe/fingerprint grids share the exact-integer geometry contract.
     for _bad in ({'eval_lens': [True]}, {'eval_lens': [1.5]},
                  {'eval_lens': []}, {'modes': {'uniform': [True]}},
-                 {'modes': {'uniform': [1.5]}}, {'modes': 'uniform'}):
+                 {'modes': {'uniform': [1.5]}}, {'modes': 'uniform'},
+                 {'modes': {'bogus_mode': [0.5]}}):
         _pcfg = dict(V10.PROBE)
         _pcfg.update(_bad)
         try:
@@ -1190,7 +1199,9 @@ def t_power_gate():
                 raise AssertionError(f'by_length_ppl={_bad_lens!r} must be refused')
         pok = os.path.join(td, 'ok_lens.json')
         mo = _write_manifest(pok, list(range(12)))
-        mo['eval'] = {'n_seqs_clean': 16, 'by_length_ppl': [512, '1024', 2048.0]}
+        mo['eval'] = {'n_seqs_clean': 16, 'by_length_ppl': [512, '1024', 2048.0],
+                      'distractor_probe': {'eval_lens': [1024, 2048],
+                                           'target': 512, 'n_seq': 16}}
         with open(pok, 'w', encoding='utf-8') as f:
             json.dump(mo, f)
         V12._load_manifest(pok)
@@ -1206,6 +1217,46 @@ def t_power_gate():
                 assert 'integer' in str(e), str(e)[:200]
             else:
                 raise AssertionError(f'eval.n_seqs_clean={_bad_nseq!r} must be refused')
+        # Non-canonical integer spellings are not a second identity for a
+        # frozen length/count (int(' 512 ') / int('+512') / int('05') would
+        # otherwise be silently accepted).
+        for _bad_spelling in (' 512', '+512', '0512', '5_12', '512 '):
+            pbad = os.path.join(td, 'bad_spelling.json')
+            mb = _write_manifest(pbad, list(range(12)))
+            mb['eval'] = {'n_seqs_clean': 16, 'by_length_ppl': [_bad_spelling]}
+            with open(pbad, 'w', encoding='utf-8') as f:
+                json.dump(mb, f)
+            try:
+                V12._load_manifest(pbad)
+            except SystemExit as e:
+                assert 'by_length_ppl' in str(e), str(e)[:200]
+            else:
+                raise AssertionError(f'by_length_ppl={_bad_spelling!r} must be refused')
+        # The probe runs on the same frozen slice and its omitted fields take
+        # fixed defaults; those defaults must also fit before any test access.
+        pbad = os.path.join(td, 'probe_too_wide.json')
+        mb = _write_manifest(pbad, list(range(12)))
+        mb['eval'] = {'n_seqs_clean': 16, 'by_length_ppl': [512]}
+        with open(pbad, 'w', encoding='utf-8') as f:
+            json.dump(mb, f)
+        try:
+            V12._load_manifest(pbad)
+        except SystemExit as e:
+            assert 'distractor_probe' in str(e), str(e)[:200]
+        else:
+            raise AssertionError('default probe eval_lens beyond the frozen width must be refused')
+        pbad = os.path.join(td, 'probe_target.json')
+        mb = _write_manifest(pbad, list(range(12)))
+        mb['eval'] = {'n_seqs_clean': 16, 'by_length_ppl': [4096],
+                      'distractor_probe': {'target': 2048}}
+        with open(pbad, 'w', encoding='utf-8') as f:
+            json.dump(mb, f)
+        try:
+            V12._load_manifest(pbad)
+        except SystemExit as e:
+            assert 'target' in str(e), str(e)[:200]
+        else:
+            raise AssertionError('probe target >= the default eval_len must be refused')
         # A non-object eval block must be refused explicitly.
         for _bad_eval in ([], [4096], 'x'):
             pbad = os.path.join(td, 'bad_eval.json')
@@ -2702,6 +2753,12 @@ def t_seed_contract_check():
     assert r['checks']['worker_seed_reproducible'] is True
     assert r['checks']['cuda_seeded'] is (True if torch.cuda.is_available() else None)
     assert L.rng_fingerprint() == fp0, 'the seed contract probe must not advance the process RNG streams'
+    # The planner accepts exact integer seeds outside torch's 64-bit domain
+    # and folds them the same way in every consumer; the worker probe must not
+    # be the one path that raises instead.
+    for _big in (2 ** 64 + 7, -(2 ** 63) - 5):
+        r = L.seed_contract_check(seed=_big)
+        assert r['passed'] is True and r['checks']['worker_seed_reproducible'] is True, r
 
 
 def t_batch_iter_reproducible():
@@ -6831,6 +6888,11 @@ def t_scale_corpus_binding_refuses_mixed_tokenizers():
     m = L.meta_analyze_effects([{'label': 'S1', 'scale': 1, 'effects': [0.1, 0.2, 0.3], 'seeds': [0, 1, 2]},
                                 {'label': 'S2', 'scale': 2, 'effects': [0.15, 0.25, 0.35], 'seeds': [0, 1, 2]}])
     assert m['corpus_binding']['corpus_binding'] == 'unverifiable', m
+    # One point cannot attest a cross-scale binding even when it carries a
+    # fingerprint (there is no second point to agree with).
+    one = L._scale_points([{'label': 'S1', 'scale': 1, 'effects': [0.1],
+                            'seeds': [0], 'corpus_fp': 'fpA', 'vocab': 8192}])
+    assert L._scale_corpus_binding(one)['corpus_binding'] == 'unverifiable'
     assert m['status'] == 'ok', 'points without fingerprints stay analysable, just unattested'
     # The ladder audit fails CLOSED on a corpus/tokenizer mismatch.
     def _tier(name, corpus_fp=None, vocab=None):
@@ -7519,6 +7581,70 @@ def t_archive_verify_rejects_ambiguous_member_paths():
         _release(os.path.join(d, 'release_escape.tar.gz'),
                  [('../escape.txt', b'hello')])
         assert AR.cmd_verify(os.path.join(d, 'release_escape.tar.gz')) == 1
+        # Distinct spellings that normalise to one extraction path are just as
+        # ambiguous as an exact duplicate name.
+        _release(os.path.join(d, 'release_normdup.tar.gz'),
+                 [('payload.txt', b'hello'), ('./payload.txt', b'hello')])
+        assert AR.cmd_verify(os.path.join(d, 'release_normdup.tar.gz')) == 1
+
+
+def t_probe_geometry_exact_integers():
+    base = dict(V10.PROBE)
+    for _bad in ({'eval_lens': [True]}, {'eval_lens': [1.5]},
+                 {'eval_lens': []}, {'target': True}, {'target': 1.5},
+                 {'n_seq': True}, {'n_seq': 1.5}, {'vocab': True},
+                 {'vocab': 1.5}, {'train_len': True}):
+        cfg = dict(base)
+        cfg.update(_bad)
+        try:
+            V10._probe_fingerprint(cfg)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'_probe_fingerprint accepted {_bad!r}')
+    good = dict(base, eval_lens=[2048.0, '4096'], target='512',
+                vocab=8192.0, n_seq='16', train_len=512.0)
+    fp = V10._probe_fingerprint(good)
+    assert fp == {'n_seq': 16, 'target': 512, 'vocab': 8192,
+                  'val_seq_len': 4097, 'stat': 'ppl_pooled_nll_v5'}, fp
+    # `span_len` changes the corruption geometry, so it must be exact and
+    # must never be silently replaced/truncated before it enters the key.
+    for _bad in (True, 1.5, 0, -1, 'x'):
+        cfg = dict(base, span_len=_bad)
+        try:
+            V10._probe_fp_for_mode(V10._probe_fingerprint(cfg), cfg, 'span')
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'span_len={_bad!r} must be refused')
+    assert V10._probe_span_len(dict(base)) == V10.PROBE_SPAN_LEN
+    assert V10._probe_span_len(dict(base, span_len='8')) == 8
+    assert V10._probe_fp_for_mode(V10._probe_fingerprint(base), base, 'span')['span_len'] == V10.PROBE_SPAN_LEN
+    try:
+        V10._probe_fp_for_mode(V10._probe_fingerprint(base), base, 'bogus_mode')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('unknown probe mode must be refused')
+
+
+def t_shared_validation_fp_refuses_malformed_provenance():
+    good = [{'val_fp': 'F'}, {'provenance': {'data': {'val_fp': 'F'}}}]
+    assert L.assert_shared_validation_fp(good) == 'F'
+    # Malformed provenance is unverifiable, not an AttributeError that crashes
+    # a report build.
+    for _bad in ({'provenance': 'not-an-object'},
+                 {'provenance': {'data': []}},
+                 {'provenance': {'data': {'val_fp': True}}}):
+        try:
+            got = L.assert_shared_validation_fp([_bad])
+        except ValueError:
+            pass
+        except Exception as _e:
+            raise AssertionError(f'malformed provenance raised {type(_e).__name__}: {_e}')
+        else:
+            assert got is None, got
+
 
 def main():
     if not _HAVE_TORCH:
@@ -7769,6 +7895,8 @@ def main():
     _check('L16 targeted contract edges', t_targeted_contract_edges)
     _check('L17 content fingerprints canonicalise bytes; probe grouping preserves invalid val_fp', t_content_fingerprint_bytes_and_probe_grouping)
     _check('L18 archive verify rejects duplicate/traversing member paths', t_archive_verify_rejects_ambiguous_member_paths)
+    _check('L19 probe geometry requires exact integers', t_probe_geometry_exact_integers)
+    _check('L20 shared validation fingerprint tolerates malformed provenance', t_shared_validation_fp_refuses_malformed_provenance)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -352,7 +352,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, 
         raise ValueError(f'_distractor_ppls: unknown corruption mode {mode!r} (expected one of {_CORRUPT_MODES})')
     if mode in ('mask', 'delete', 'doc') and abs(float(rho) - 1.0) > 1e-9:
         raise ValueError(f"mode {mode!r} is an all-or-nothing condition and only admits rho=1.0 (got {rho!r}); partial masking is a different question and is not this probe")
-    _span_len = int(cfg.get('span_len') or PROBE_SPAN_LEN)
+    _span_len = _probe_span_len(cfg)
     i = 0
     while i < n_seq:
         j = min(i + n_ch, n_seq)
@@ -410,12 +410,53 @@ def _cell_ppl(nll_sum, n_tok):
         return float('inf')
     return math.exp(ce)
 
+def _probe_span_len(cfg):
+    """Exact positive span geometry for the `span` corruption mode.
+
+    A missing key keeps the shipped default.  An explicit value must be an
+    exact integer >= 1: bare int(True)/int(4.9) would silently corrupt a
+    different span than the one named in the record fingerprint."""
+    raw = cfg.get('span_len') if isinstance(cfg, dict) else None
+    if raw is None:
+        return int(PROBE_SPAN_LEN)
+    iv = L._as_seed_int(raw)
+    if iv is None or iv < 1:
+        raise ValueError(
+            f'probe span_len={raw!r} must be a positive exact integer')
+    return iv
+
+
 def _probe_fingerprint(cfg):
-    _need = max((int(_x) for _x in cfg['eval_lens'])) + 1
-    _tl = int(cfg.get('train_len') or P3MT_PAYLOAD['train_len'])
-    return {'n_seq': int(cfg['n_seq']), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'val_seq_len': max(_tl, _need), 'stat': 'ppl_pooled_nll_v5'}
+    if not isinstance(cfg, dict):
+        raise ValueError(f'_probe_fingerprint: cfg is {type(cfg).__name__}, not an object')
+    _lens = cfg.get('eval_lens')
+    if not isinstance(_lens, (list, tuple)) or not _lens:
+        raise ValueError('_probe_fingerprint: eval_lens must be a non-empty list')
+    _need = 0
+    for _x in _lens:
+        _xi = L._as_seed_int(_x)
+        if _xi is None or _xi < 2:
+            raise ValueError(
+                f'_probe_fingerprint: eval_len={_x!r} must be an exact integer >= 2')
+        _need = max(_need, _xi)
+    _need += 1
+    _tl = L._as_seed_int(cfg.get('train_len') or P3MT_PAYLOAD['train_len'])
+    _target = L._as_seed_int(cfg.get('target'))
+    _vocab = L._as_seed_int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])
+    _n_seq = L._as_seed_int(cfg.get('n_seq'))
+    for _name, _iv in (('train_len', _tl), ('target', _target),
+                       ('vocab', _vocab), ('n_seq', _n_seq)):
+        if _iv is None or _iv < 1:
+            raise ValueError(
+                f'_probe_fingerprint: {_name}={_iv!r} must be a positive exact integer')
+    return {'n_seq': int(_n_seq), 'target': int(_target), 'vocab': int(_vocab),
+            'val_seq_len': max(_tl, _need), 'stat': 'ppl_pooled_nll_v5'}
 
 def _probe_fp_for_mode(fp, cfg, mode):
+    if mode not in _CORRUPT_MODES:
+        raise ValueError(
+            f'_probe_fp_for_mode: unknown corruption mode {mode!r} '
+            f'(expected one of {_CORRUPT_MODES})')
     """Add the parameters a corruption mode actually consumes.
 
     `span` corruption changes with `span_len`; the existing probe_params for
@@ -423,7 +464,7 @@ def _probe_fp_for_mode(fp, cfg, mode):
     Without this, changing span_len would silently reuse measurements made
     with a different span geometry."""
     if mode == 'span':
-        return dict(fp, span_len=int(cfg.get('span_len') or PROBE_SPAN_LEN))
+        return dict(fp, span_len=_probe_span_len(cfg))
     return fp
 
 def _fp_norm(p):
@@ -499,6 +540,10 @@ def _probe_defs(cfg):
     for _mode, _rhos in _modes.items():
         if not isinstance(_mode, str) or not _mode:
             raise ValueError(f'_probe_defs: mode {_mode!r} must be a non-empty text name')
+        if _mode not in _CORRUPT_MODES:
+            raise ValueError(
+                f'_probe_defs: unknown corruption mode {_mode!r} '
+                f'(expected one of {_CORRUPT_MODES})')
         if not isinstance(_rhos, (list, tuple)):
             raise ValueError(f'_probe_defs: rhos for mode {_mode!r} must be a list')
         _rhos_f = []

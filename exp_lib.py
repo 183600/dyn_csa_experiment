@@ -399,6 +399,15 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     elif train_s < -train_tol and val_s <= val_tol:
         status = 'healthy'
         reason = 'training CE is falling and validation CE is not rising'
+    elif val_s < -val_tol:
+        # Training CE is not decreasing (flat or rising) while validation CE
+        # is still falling.  This is not `validation_degrading` — the old
+        # final else mislabelled it and printed a reason that contradicted the
+        # sign of the validation slope.  Validation improving is not an
+        # overfitting/staleness signal; classify it by what the curves show.
+        status = 'healthy'
+        reason = ('validation CE is falling in the tail while training CE is '
+                  'flat or rising (validation-only improvement)')
     else:
         status = 'validation_degrading'
         reason = 'validation CE is rising in the tail'
@@ -8093,7 +8102,9 @@ def assert_shared_validation_fp(records, *, context='comparison'):
         if isinstance(r, dict):
             _fp = r.get('val_fp')
             if _fp is None:
-                _fp = (r.get('provenance') or {}).get('data', {}).get('val_fp')
+                _prov = r.get('provenance')
+                _data = _prov.get('data') if isinstance(_prov, dict) else None
+                _fp = _data.get('val_fp') if isinstance(_data, dict) else None
             if isinstance(_fp, (bool, np.bool_)):
                 raise ValueError(
                     f'{context}: a record carries a boolean validation '
@@ -10865,7 +10876,10 @@ def _scale_corpus_binding(pts):
             f'({len(set(fps))} distinct); a paired log PPL ratio is only '
             'defined within one tokenisation, so cross-scale pooling is '
             'refused (report the scales separately)')
-    elif len(fps) == len(pts) and len(pts) > 0 and len(set(fps)) == 1:
+    elif len(fps) == len(pts) and len(pts) >= 2 and len(set(fps)) == 1:
+        # "Shared" attests a cross-point identity.  One point cannot attest a
+        # cross-scale binding, so it stays explicitly unverifiable rather than
+        # being promoted to `shared` by a vacuous equality.
         out['corpus_binding'] = 'shared'
     else:
         out['corpus_binding'] = 'unverifiable'
@@ -15163,8 +15177,12 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
 
     def _worker_draws(s):
         # Reproduce torch's worker base seed explicitly, then let the hook
-        # derive the worker's Python/NumPy/Torch streams from it.
-        torch.manual_seed(s)
+        # derive the worker's Python/NumPy/Torch streams from it.  Use the
+        # same 64-bit folding as set_seed/dataloader_generator: planned seed
+        # ids may be any exact Python integer, and torch.manual_seed raises
+        # outside its signed/unsigned 64-bit domain.
+        _ts = s if -(2 ** 63) <= s < 2 ** 64 else s % (2 ** 64)
+        torch.manual_seed(_ts)
         seed_worker(0)
         g = dataloader_generator(s)
         return {

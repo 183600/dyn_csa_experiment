@@ -1171,7 +1171,10 @@ def _phase_cell_record(v, seed, rec, *, run_cfg, metric='ppl', key=None):
         'rng_fp': rec.get('rng_fp'),
         'data_fp': rec.get('data_fp'),
         'val_fp': rec.get('val_fp'),
-        'data_version': rec.get('data_version') or (rec.get('provenance') or {}).get('data', {}).get('data_version'),
+        'data_version': rec.get('data_version') or (
+            (rec.get('provenance').get('data') or {}).get('data_version')
+            if isinstance(rec.get('provenance'), dict)
+            and isinstance(rec.get('provenance').get('data'), dict) else None),
         'code_stamp': rec.get('_code') or CKPT_CODE,
         'run_cfg': rec.get('run_cfg') or run_cfg,
         'hyperparams': rec.get('hyperparams'),
