@@ -2468,8 +2468,7 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
             if T != 1:
                 raise RuntimeError('cosine_learnable 层需要 forward 预计算的门控信号与块几何')
             # A length-1 sequence has no gate/cut row; eager `_single` treats
-            # it as one block, so the batched/kernel path must do the same
-            # instead of crashing on the missing gate tensors.
+            # it as one block, and the batched/kernel path does the same.
             bids = [_exp_blocks_fixed(T, cfg.block_size, dev) for _ in range(B)]
             nblks = [1] * B
             hons = None
@@ -2580,8 +2579,7 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     outs = attn.W_o(out.reshape(B, T, attn.nh * attn.hd))
     attn.last_gate_mean = _gate_mean_batched(attn, cfg, T, B, gate_sigs, hons, nblks)
     # Match eager `_single`: a REINFORCE gate returns the sampled cut
-    # log-probability and decision count instead of silently dropping the
-    # policy-gradient term in the batched/kernel path.
+    # log-probability and decision count for the batched/kernel path.
     _blps = [gs[2] for gs in (gate_sigs or [])
              if gs is not None and len(gs) > 2]
     if _blps:
