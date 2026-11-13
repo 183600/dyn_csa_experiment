@@ -7842,7 +7842,7 @@ def t_probe_reader_geometry_and_manifest_fail_closed():
 def t_identity_fingerprint_and_pairing_regressions():
     import data_guard as DG
     # Different instants stored in different units must not share a temporal
-    # identity (a coarse->fine fallback previously dropped the unit).
+    # identity.
     assert DG._temporal_identity(np.datetime64(1, 'ns')) != \
         DG._temporal_identity(np.datetime64(1, 'us'))
     for _s in ('2020-01-01', '100000-01-01', '300000-01-01'):
@@ -7916,7 +7916,7 @@ def t_identity_fingerprint_and_pairing_regressions():
     assert L.classify_training_health(_hist)['status'] == 'underfitting_or_stalled'
     assert L.classify_training_health(_hist, gap_tol=0.2)['status'] == 'overfitting'
     # A malformed frozen training-corpus binding must be refused at load time,
-    # not silently treated as "no literal value".
+    # not treated as "no literal value".
     with tempfile.TemporaryDirectory() as _td:
         _p = os.path.join(_td, 'manifest.json')
         _m = _write_manifest(_p, list(range(12)))

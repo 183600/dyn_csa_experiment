@@ -593,9 +593,8 @@ def _load_manifest(path):
                     if not math.isfinite(_mr) or _mr <= 1.0:
                         raise SystemExit(f'[v12] REFUSE: per-arm mr for {_arm!r} must be finite and > 1 ({_mr!r})')
     # Validate the training-corpus binding shape at load time too: a
-    # malformed declaration must fail before any held-out access, not be
-    # silently treated as "no literal value" and then paired with an
-    # arbitrary derivable train_fp later.
+    # malformed declaration must fail before any held-out access instead of
+    # being treated as "no literal value" and paired with a derivable train_fp.
     _frozen_train_fp(m)
     m['manifest_sha256'] = _file_sha256(path)
     return m
@@ -728,7 +727,7 @@ def _frozen_train_fp(manifest):
                     'non-empty text fingerprint')
             return _sv
         # Declared geometry fields are part of the binding, so validate them
-        # here instead of silently ignoring a malformed value until P5T.
+        # here rather than at P5T.
         for _cnt, _minimum in (('seq_len', 2), ('n_train_tokens', 1)):
             if _cnt not in value or value[_cnt] is None:
                 continue

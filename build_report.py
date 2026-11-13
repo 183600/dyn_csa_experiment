@@ -654,11 +654,10 @@ def _pair_reason(ra, rb):
 def _pair_condition_tail(r):
     """Everything `_pair_reason` requires to agree, except run_cfg itself.
 
-    Grouping seeds only by run_cfg still let seed 0 use optimizer A and seed 1
-    optimizer B (or different corpus/eval fingerprints) and pooled both into
-    one sign-flip test: each seed pair can be internally consistent while the
-    paired observations come from different recipes.  Include the remaining
-    controlled fields so one test never fabricates n across conditions.
+    These are the remaining controlled fields, so seeds that differ in
+    optimizer, corpus/eval fingerprints, init or step count are never pooled
+    into one sign-flip test: each seed pair can be internally consistent while
+    the paired observations come from different recipes.
     """
     return (
         _keyable_value(r.get('train_knobs')),

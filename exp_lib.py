@@ -5865,11 +5865,11 @@ _IDS_FP_ALGO = 2
 def _ids_fp_memo_safe(arr):
     """True only when an address-keyed fingerprint memo cannot go stale.
 
-    A read-only view can still share its storage with a writeable base (or be
-    a read-only memmap another process can rewrite), so ``writeable=False``
+    A read-only view can share its storage with a writeable base (or be a
+    read-only memmap another process can rewrite), so ``writeable=False``
     alone is not an immutability proof: mutating the base leaves the view's
-    pointer/shape/strides unchanged and the memo would return the old digest.
-    Memoise only an own-data, non-mapped array with no base.
+    pointer/shape/strides unchanged, so an address-keyed memo could return a
+    stale digest.  Memoise only an own-data, non-mapped array with no base.
     """
     flags = getattr(arr, 'flags', None)
     if flags is None or bool(getattr(flags, 'writeable', True)):
@@ -12849,9 +12849,9 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         raise ValueError(f'labels contains duplicate class identifiers: {labels.tolist()}')
     # The returned mapping is JSON-keyed.  Distinct label identities can share
     # one str() spelling (1 vs "1", or two different objects with the same
-    # repr); a plain str key would then silently overwrite one class and make
-    # f1_positive/prevalence read the wrong record.  Keep the historical
-    # spelling whenever it is unique, and type-qualify only collisions.
+    # repr); a plain str key would merge two classes and make f1_positive /
+    # prevalence read the wrong record.  Keep the usual spelling when it is
+    # unique, and type-qualify only collisions.
     _class_keys = [str(x) for x in labels.tolist()]
     if len(set(_class_keys)) != len(_class_keys):
         _class_keys = []

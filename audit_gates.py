@@ -2126,10 +2126,8 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
             _si for _r, _p in _valid
             if (_si := _exact_int_scalar(_r.get('steps'))) is not None})
         # Each record must contribute the SAME token allocation, whether it
-        # spells out tokens_seen or only carries steps/batch/seq.  Comparing
-        # only the explicitly present tokens_seen values lets a record with
-        # no field be derived to a different total while the panel still
-        # looks unanimous.
+        # spells out tokens_seen or only carries steps/batch/seq, so one
+        # panel-level total is derived from every record the same way.
         _tok_vals_set = set()
         _tok_bad = []
         for _r, _p in _valid:
