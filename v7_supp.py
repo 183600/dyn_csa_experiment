@@ -1217,7 +1217,7 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
                     and L._as_seed_int(_cur.get('seed')) == L._as_seed_int(seed)
                     and L._as_seed_int(_cur.get('warm_steps')) == L._as_seed_int(warm))
     if isinstance(_cur, dict) and ((_cur.get('synthesized')) or (not _identity_ok) or not L.result_is_current(_cur, CKPT_CODE, 'ppl')):
-        _drop_msg = f'[resume] {key} holds a record that is not current under this code semantics or does not name this (variant, warm, seed) cell (stale code stamp, missing ppl, synthesized, or mislabelled) — DROPPING it before retraining, so a failed or truncated attempt cannot leave the old reading in place looking like a fresh result'
+        _drop_msg = f'[resume] {key} holds a record that is not current under this code semantics or does not name this (variant, warm, seed) cell (stale code stamp, missing ppl, synthesized, or identity mismatch) — DROPPING it before retraining, so an interrupted or truncated attempt cannot leave a stale reading in place looking like a fresh result'
         _cur = None
     if L.result_is_current(_cur, CKPT_CODE, 'ppl'):
         if _cur.get('run_cfg') == fp:
@@ -3161,7 +3161,7 @@ if __name__ == '__main__':
     except Exception:
         traceback.print_exc()
         try:
-            git_push('v7: PARTIAL — crashed, see log (re-run resumes)')
+            git_push('v7: PARTIAL — interrupted, see log (re-run resumes)')
         except Exception:
             traceback.print_exc()
         if mode == 'full':

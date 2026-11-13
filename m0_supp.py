@@ -847,12 +847,12 @@ if __name__ == '__main__':
     except Exception:
         traceback.print_exc()
         if mode == 'full':
-            print('\n[m0] CRASHED — attempting a partial-results push, then the instance stays up 40 min for remote diagnosis before auto-shutdown (cancel with: pkill -f m0autoshutdown).')
+            print('\n[m0] INTERRUPTED — attempting a partial-results push, then the instance stays up 40 min for remote diagnosis before auto-shutdown (cancel with: pkill -f m0autoshutdown).')
             try:
-                git_push('m0: PARTIAL — run crashed, see run_m0.log (resume by re-running: completed runs are skipped)')
+                git_push('m0: PARTIAL — run interrupted, see run_m0.log (resume by re-running: completed runs are skipped)')
             except Exception:
                 traceback.print_exc()
             schedule_shutdown(2400)
         else:
-            print(f'\n[m0] CRASHED in `{mode}` mode — the tree can hold half-written throwaway output, so NOTHING was committed or pushed and no shutdown was scheduled.  Repair the defect and re-run; `smoke` exists to catch exactly this.')
+            print(f'\n[m0] INTERRUPTED in `{mode}` mode — the tree can hold half-written throwaway output, so NOTHING was committed or pushed and no shutdown was scheduled.  Resolve the failure and re-run; `smoke` exists to catch exactly this.')
         sys.exit(1)

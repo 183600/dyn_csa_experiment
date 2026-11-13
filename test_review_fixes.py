@@ -2458,7 +2458,7 @@ def t_eval_per_seq():
             pass
         else:
             raise AssertionError(f'eval_ppl accepted non-positive eval_rows={_bad_rows!r}')
-    # Negative/huge exact seeds are reproducible identities, not crashes.
+    # Negative/huge exact seeds are reproducible identities.
     _neg = L.eval_ppl(model, ids, dev, chunk=1, eval_rows=150, eval_seed=-1,
                       return_stats=True)
     _neg2 = L.eval_ppl(model, ids, dev, chunk=1, eval_rows=150, eval_seed=-1,
@@ -4624,7 +4624,7 @@ def t_object_byte_tables():
             _dt, 'fingerprint')
     # np.timedelta64 is numbers.Integral/np.integer but int() on a unit-bearing
     # value is not an integer; it must take the temporal identity path instead
-    # of crashing duplicate/corpus checks.
+    # of invalid duplicate/corpus checks.
     for _vals in ([np.datetime64('2020-01-01'), np.datetime64('2020-01-01')],
                   [np.timedelta64(1, 'D'), np.timedelta64(1, 'D')],
                   [np.timedelta64('NaT'), np.timedelta64('NaT')]):
@@ -7630,7 +7630,7 @@ def t_probe_geometry_exact_integers():
 def t_shared_validation_fp_refuses_malformed_provenance():
     good = [{'val_fp': 'F'}, {'provenance': {'data': {'val_fp': 'F'}}}]
     assert L.assert_shared_validation_fp(good) == 'F'
-    # Malformed provenance is unverifiable, not an AttributeError that crashes
+    # Malformed provenance is unverifiable, not an AttributeError.
     # a report build.
     for _bad in ({'provenance': 'not-an-object'},
                  {'provenance': {'data': []}},
@@ -7646,9 +7646,9 @@ def t_shared_validation_fp_refuses_malformed_provenance():
 
 
 def t_probe_reader_geometry_and_manifest_fail_closed():
-    # Stored probe records must not be able to crash a report by putting an
-    # unhashable JSON value into a grouping key, nor describe geometry the
-    # probe cannot produce (length-1 cells, unknown modes, partial masking).
+    # Stored probe records are checked before they enter a grouping key, and
+    # must not describe geometry the probe cannot produce (length-1 cells,
+    # unknown modes, partial masking).
     _good = {'variant': 'csa_fixed', 'arm': 'learned', 'seed': 0,
              'eval_len': 4096, 'rho': 0.5, 'mode': 'uniform',
              'probe_params': {'n_seq': 16}}
@@ -7878,13 +7878,13 @@ def main():
     _check('E4b panel tracking events', t_panel_tracking_events)
     _check('E5 DataLoader/worker seeding', t_dataloader_seeding_helpers)
     _check('E6 end-to-end training reproducibility', t_train_variant_reproducible)
-    _check('E7 overfit check detects broken optimizer', t_overfit_detects_broken_optimizer)
+    _check('E7 overfit check detects a non-updating optimizer', t_overfit_detects_broken_optimizer)
     _check('E8 append-only experiment ledger + manifest', t_experiment_ledger)
     _check('E4b manifest seed integrity is exact', t_manifest_seed_integrity_is_exact)
     _check('E9a int32 cache narrowing rejects corrupt ids', t_npy_serve_int32_rejects_invalid_and_out_of_range)
     _check('E9b id fingerprint is storage-width invariant', t_ids_fp_is_storage_width_invariant)
     _check('E9 data_version identity', t_data_version_identity)
-    _check('E10 crash-safe manifest status/planned cells', t_manifest_running_then_complete)
+    _check('E10 durable manifest status/planned cells', t_manifest_running_then_complete)
     _check('E11 failed overfit guard is retried', t_failed_guard_is_retried)
     _check('E12 locked JSON nested path + CSV generator rows', t_locked_json_and_csv_generator)
     _check('F1 indexer column-narrowing exactness', t_indexer_column_narrowing_exact)
@@ -7946,10 +7946,10 @@ def main():
     _check('I15d split audit fails closed on unreadable metadata', t_split_audit_fails_on_unreadable_meta)
     _check('I15e valid-JSON non-object summaries are refused', t_valid_json_non_object_summaries_are_refused)
     _check('I15f metrics audit distinguishes absent from malformed summaries', t_audit_metrics_missing_or_malformed_summary)
-    _check('I16 fairness audit ignores a NaN seed instead of crashing', t_audit_fairness_nan_seed_does_not_crash)
+    _check('I16 fairness audit ignores a NaN seed without an exception', t_audit_fairness_nan_seed_does_not_crash)
     _check('I17 an empty split cache is not reported as verified', t_audit_split_empty_cache_is_not_ok)
-    _check('I18 tuning audit reports malformed seed keys instead of crashing', t_baseline_audit_malformed_seed_keys)
-    _check('I19 simple-baseline audit reports malformed records instead of crashing', t_simple_baseline_audit_malformed_records)
+    _check('I18 tuning audit reports malformed seed keys without an exception', t_baseline_audit_malformed_seed_keys)
+    _check('I19 simple-baseline audit reports malformed records without an exception', t_simple_baseline_audit_malformed_records)
     _check('I20 index aliasing, non-finite labels, signed-zero duplicates, undefined SMD, NaT groups', t_data_guard_index_label_and_shift_edges)
     _check('I21 split-and-prepare fits preprocessing on train only', t_split_and_prepare_fits_train_only)
     _check('I21a data-quality temporal split audit', t_data_quality_temporal_audit)

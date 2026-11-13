@@ -335,7 +335,7 @@ def _load_manifest(path):
         raise SystemExit(f'[v12] REFUSE: freeze manifest expects code semantics {_exp!r} but the current code is {L.CODE_SEMANTICS!r} — the code changed after freezing; re-freeze consciously (update {path} with a dated note) instead of silently testing new code under the old pre-registration')
     # The statistics block is a pre-registration contract: the analyzer must
     # implement exactly the frozen test/correction, so a mismatch is refused
-    # rather than silently computed and mislabelled in the report.
+    # rather than silently computed under a different contract.
     _stat = m.get('statistics') or {}
     _do = _stat.get('descriptive_only')
     if _do is not None and not isinstance(_do, (bool, np.bool_)):
@@ -1071,8 +1071,8 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         if not isinstance(rec, dict):
             return True
         # The record's own identity must agree with the summary key used to
-        # fetch it; otherwise a mislabelled/merged record could make this cell
-        # look complete without ever measuring the requested (variant, seed).
+        # fetch it; otherwise a mismatched or merged record could make this
+        # cell look complete without ever measuring the requested (variant, seed).
         if (rec.get('variant') != v
                 or L._as_seed_int(rec.get('seed')) != int(seed)):
             return True
@@ -1686,7 +1686,7 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             why = 'synthesized reconstruction — not an independent probe measurement'
         elif _geom_why is not None:
             # Text names/geometry are checked before any set/dict key is built:
-            # an unhashable variant/arm must be a named exclusion, not a crash.
+            # an unhashable variant/arm becomes a named exclusion.
             why = _geom_why
         elif r.get('variant') not in arms:
             why = f"variant {r.get('variant')!r} is not one of the frozen arms"
@@ -2676,7 +2676,7 @@ if __name__ == '__main__':
     except Exception:
         traceback.print_exc()
         try:
-            git_push('v12: PARTIAL — crashed, see log (re-run resumes)')
+            git_push('v12: PARTIAL — interrupted, see log (re-run resumes)')
         except Exception:
             traceback.print_exc()
         if mode == 'full':

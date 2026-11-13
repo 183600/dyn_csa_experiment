@@ -266,7 +266,7 @@ if __name__ == '__main__':
     except Exception:
         traceback.print_exc()
         try:
-            git_push('v8: PARTIAL — crashed, see log (re-run resumes)')
+            git_push('v8: PARTIAL — interrupted, see log (re-run resumes)')
         except Exception:
             traceback.print_exc()
         if mode == 'full':

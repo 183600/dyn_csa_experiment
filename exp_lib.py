@@ -9259,8 +9259,8 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         if not isinstance(v, dict):
             continue
         # A boolean/fractional n is not a seed count; int(True)=1 or
-        # int(12.9)=12 would understate n_max and could mislabel the whole
-        # family as resolution-limited.
+        # int(12.9)=12 would understate n_max and could make the whole family
+        # look resolution-limited.
         _n = _as_seed_int(v.get('n'))
         if _n is not None and _n > 0:
             _ns.append(_n)
@@ -14193,7 +14193,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         # dense arm was actually scheduled.  A pure ablation panel without
         # full_matched/full_sw128_matched is not testing the baseline claim,
         # so including its (missing) slots would only inflate the correction
-        # family and mislabel an untested comparison as "unverified".
+        # family and mark an untested comparison as "unverified".
         _base_arms = {x for _cs in BASELINE_DESIGN.values() for _a, _b, _n in _cs for x in (_a, _b)}
         baselines = BASELINE_DESIGN if (default_design and (_base_arms & set(present))) else {}
     try:

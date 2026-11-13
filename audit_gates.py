@@ -967,7 +967,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 if not os.path.exists(_tfp):
                     # An existing test metadata record without its ids array
                     # is an incomplete cache, not an absent one.  Skipping it
-                    # would downgrade a broken held-out split to "no test
+                    # would downgrade an incomplete held-out split to "no test
                     # cache matches" and let the audit pass with a warning.
                     rec['status'] = 'fail'
                     _fail(f'{cd}/{tag}: test cache metadata {_ttag} exists but its '
@@ -1526,7 +1526,7 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
     for key, r in raw.items():
         if not isinstance(r, dict):
             # A malformed top-level record must not make the whole audit look
-            # merely "not run"; it is a broken length panel.
+            # merely "not run"; it is an invalid length panel.
             problems.append(f'{key}: record is {type(r).__name__}, not an object — the per-length cells cannot be audited')
             continue
         _cells = r.get('by_len')

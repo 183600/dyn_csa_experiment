@@ -178,7 +178,7 @@ def synthesize_long_summary():
         _exp_tok = _LONG_STEPS * int(L.RUN_LONG['batch_size']) * int(L.RUN_LONG['seq_len'])
         _ts = _num_or_none(e.get('tokens_seen'))
         if _ts is not None and _ts != _exp_tok:
-            print(f"[synth] REFUSING to synthesize `{v}`: the aggregate's tokens_seen={_ts} does not match the current long recipe ({_LONG_STEPS} steps x {int(L.RUN_LONG['batch_size'])} x {int(L.RUN_LONG['seq_len'])} = {_exp_tok} tokens) — the snapshot was produced under a different configuration and reconstructing under the current step count would mislabel it.  Re-run the panel; only this variant is skipped.")
+            print(f"[synth] REFUSING to synthesize `{v}`: the aggregate's tokens_seen={_ts} does not match the current long recipe ({_LONG_STEPS} steps x {int(L.RUN_LONG['batch_size'])} x {int(L.RUN_LONG['seq_len'])} = {_exp_tok} tokens) — the snapshot was produced under a different configuration and reconstructing under the current step count would misattribute it.  Re-run the panel; only this variant is skipped.")
             _cfg_refused.append(v)
             continue
         if _seeds is None or len(_seeds) != len(_ppls):
@@ -660,12 +660,12 @@ if __name__ == '__main__':
     except Exception:
         traceback.print_exc()
         if mode in ('full', 'topup'):
-            print('\n[v6] CRASHED — attempting a partial-results push, then the instance stays up 40 min for remote diagnosis before auto-shutdown (cancel with: pkill -f v6autoshutdown).')
+            print('\n[v6] INTERRUPTED — attempting a partial-results push, then the instance stays up 40 min for remote diagnosis before auto-shutdown (cancel with: pkill -f v6autoshutdown).')
             try:
-                git_push('v6: PARTIAL — run_gapfill crashed, see run_v6.log (resume by re-running: completed runs are skipped)')
+                git_push('v6: PARTIAL — run_gapfill interrupted, see run_v6.log (resume by re-running: completed runs are skipped)')
             except Exception:
                 traceback.print_exc()
             schedule_shutdown(2400)
         else:
-            print(f'\n[v6] CRASHED in `{mode}` mode — the tree can hold half-written throwaway output, so NOTHING was committed or pushed and no shutdown was scheduled.  Repair the defect and re-run; `smoke` exists to catch exactly this.')
+            print(f'\n[v6] INTERRUPTED in `{mode}` mode — the tree can hold half-written throwaway output, so NOTHING was committed or pushed and no shutdown was scheduled.  Resolve the failure and re-run; `smoke` exists to catch exactly this.')
         sys.exit(1)

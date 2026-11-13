@@ -1634,7 +1634,7 @@ def _equal_token_slices():
                 # equal label.
                 _tok_tol = 0.5 * max(abs(float(_tps_s)), abs(float(_tps_l)))
                 if abs(tokens_large - target_tokens) > _tok_tol:
-                    print(f'[stats] equal-token slice {name} @ {target_tokens / 1000000.0:.2f}M: the nearest large-arm step {step_l} has {tokens_large / 1000000.0:.2f}M tokens (difference exceeds half a step) — slice OMITTED rather than mislabelled')
+                    print(f'[stats] equal-token slice {name} @ {target_tokens / 1000000.0:.2f}M: the nearest large-arm step {step_l} has {tokens_large / 1000000.0:.2f}M tokens (difference exceeds half a step) — slice OMITTED rather than misattributed')
                     continue
                 _g_s = _gap_at('P3SS', step)
                 _g_l = _gap_at(name, step_l)
@@ -2695,7 +2695,7 @@ if __name__ == '__main__':
     except Exception:
         traceback.print_exc()
         try:
-            git_push('v10: PARTIAL — crashed, see log (re-run resumes)')
+            git_push('v10: PARTIAL — interrupted, see log (re-run resumes)')
         except Exception:
             traceback.print_exc()
         if mode == 'full':
