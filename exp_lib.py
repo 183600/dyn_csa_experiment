@@ -3437,12 +3437,10 @@ def _rank_blocks(masked, B, ties, k=None):
     sel = gt | (eq & (eq_cum <= need[:, None]))
     del eq_cum, gt, eq, need
     rank = torch.cumsum(sel, dim=1, dtype=torch.int32)
-    # NaN has no ordering under `>`/`==` (PyTorch sorts it first in descending
-    # order), so a row containing NaN can select fewer than kk columns and
-    # leave the sentinel buffer uninitialised.  The indexer masks non-finite
-    # scores upstream, but this helper's contract is "the first k columns of
-    # the stable descending sort"; use that full sort (whose NaN ordering is
-    # defined) instead of returning garbage.  Finite inputs keep the hot path.
+    # NaN has no ordering under `>`/`==`, so a row containing NaN can yield
+    # fewer than kk selections.  The helper's contract is the first k columns
+    # of the stable descending sort; use that full sort, whose NaN ordering is
+    # defined, in that case.
     if bool((rank[:, -1] != kk).any()):
         order = torch.argsort(src, dim=1, stable=True, descending=True)[:, :kk]
         return order if ties == 'earliest' else torch.sub(B - 1, order)
@@ -8228,13 +8226,11 @@ def load_run_corpus(cfg):
     raise ValueError(f"load_run_corpus: unknown dataset {name!r} (expected 'wikitext' or 'fineweb')")
 
 def _json_key_text(key, used):
-    """A JSON object key that cannot silently collide with another key.
+    """A JSON object key that stays distinct from every other key.
 
     JSON keys are strings, but dict keys are not: ``1`` and ``"1"`` are two
-    distinct Python keys whose str() spelling is identical.  A plain
-    ``str(k)`` comprehension would keep only the last value (silent data
-    loss).  Keep the ordinary spelling whenever it is unique and type-qualify
-    only the colliding keys.
+    distinct Python keys whose str() spelling is identical.  Keep the ordinary
+    spelling when it is unique and type-qualify only the colliding keys.
     """
     text = str(key)
     if text not in used:
@@ -9253,10 +9249,9 @@ def by_len_cells(rows, Ln, variant=None):
         bl = r.get('by_len')
         if not isinstance(bl, dict):
             continue
-        # ``4`` and ``"4"`` are two Python spellings of ONE length.  A JSON
-        # record only carries strings, but an in-memory/hand-edited record can
-        # carry both; silently taking the first would pick an endpoint when the
-        # two cells disagree.
+        # ``4`` and ``"4"`` are two Python spellings of ONE length.  An
+        # in-memory record can carry both; two cells for one length are
+        # ambiguous.
         _matches = [k for k in keys if k in bl]
         if len(_matches) > 1:
             raise ValueError(
@@ -13322,8 +13317,8 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                     # Compare the SEED IDENTITY, not its JSON spelling: an
                     # in-memory artifact may key seed_ppls by int 0 while the
                     # trial's seed list carries 0 (or by "0" after a JSON
-                    # round-trip).  Both describe the same draw set, so a
-                    # plain string comparison would fabricate a disagreement.
+                    # round-trip).  Both describe the same draw set, so compare
+                    # seed identity rather than string spelling.
                     _norm_keys = [_as_seed_int(k) for k in _ppls]
                     if any(k is None for k in _norm_keys):
                         problems.append(f'{arm}: seed_ppls keys are not integer seeds ({list(_ppls)[:3]!r})')
@@ -13929,11 +13924,8 @@ def controlled_variables_report(recs, arms):
 def _params_of_arm(recs, arm):
     """The one exact parameter count shared by every record of ``arm``.
 
-    A single record's count must not stand in for the arm: if any seed omits
-    ``params`` (or carries a malformed/different count), the arm's parameter
-    size is unverifiable, not matched.  Returning the first available value
-    would let one missing seed disappear and turn a parameter-confounded
-    contrast into a "controlled" one.
+    If any seed omits ``params`` (or carries a malformed/different count), the
+    arm's parameter size is unverifiable, not matched.
     """
     vals = []
     for (v, _t, _s), r in recs.items():
@@ -13974,10 +13966,8 @@ def _param_control(recs, a, b):
 def _param_breakdown_of_arm(recs, arm):
     """The one non-empty breakdown shared by every record of ``arm``.
 
-    A single record's breakdown cannot stand in for the arm: if one seed omits
-    it (or carries a different breakdown), the active/non-embedding capacity
-    is unverifiable.  Returning the first available dict would let the missing
-    seed disappear and label a partially recorded arm as controlled.
+    If one seed omits it (or carries a different breakdown), the
+    active/non-embedding capacity is unverifiable.
     """
     vals = []
     for (v, _t, _s), r in recs.items():
@@ -17716,10 +17706,10 @@ def _safe_path_component(value):
     if s != raw or s in ('.', '..') or not s:
         s = f'{s}-{_digest}'
     elif re.fullmatch(r'.*-[0-9a-f]{12}', s):
-        # A SANITIZED name has exactly this shape.  If a caller uses the
-        # sanitised spelling itself as a variant (e.g. a generated name), the
-        # two would otherwise share one checkpoint path; qualify the safe
-        # spelling too.  Ordinary safe names never match this suffix.
+        # A sanitized name has exactly this shape.  A caller may use the
+        # sanitised spelling itself as a variant (e.g. a generated name), so
+        # qualify the safe spelling too.  Ordinary safe names never match this
+        # suffix.
         s = f'{s}-{_digest}'
     return s or '_'
 
@@ -19826,8 +19816,7 @@ class TimeGuard:
             return True
         except (OSError, AttributeError, ValueError, TypeError):
             # A malformed pid ("", None, a non-numeric string) is not proof
-            # that the owner died; keep the conservative "alive" reading so a
-            # hand-edited state file cannot make reconcile refund live work.
+            # that the owner died; keep the conservative "alive" reading.
             return True  # 无法判定（非 posix 等）时按存活处理，绝不误退
 
     def reconcile(self):

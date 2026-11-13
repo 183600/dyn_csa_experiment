@@ -187,8 +187,7 @@ def _json_key_text(key, used):
     """A JSON key whose ordinary str() spelling is unique in this mapping.
 
     Distinct Python keys can share one str() spelling (1 vs "1", None vs
-    "None"); a plain str() comprehension would silently keep only the last
-    value.  Preserve the normal spelling when it is unique and qualify only
+    "None").  Preserve the normal spelling when it is unique and qualify only
     the colliding keys.
     """
     text = str(key)

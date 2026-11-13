@@ -1815,9 +1815,8 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
     per_variant = {}
 
     def _cfg_key(value):
-        # Group records by a hashable form of run_cfg metadata.  A tuple
-        # sentinel would collide with a real tuple carrying that spelling; the
-        # private key type keeps distinct metadata values distinct.
+        # Group records by a hashable form of run_cfg metadata.  The private
+        # key type keeps distinct metadata values distinct.
         try:
             hash(value)
             return value

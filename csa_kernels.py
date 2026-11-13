@@ -788,13 +788,9 @@ def _stable_topk_desc(x, k):
     sel = gt | (eq & (eq_cum <= need[:, None]))
     del eq_cum
     rank = torch.cumsum(sel, dim=1, dtype=torch.int32)
-    # NaN has no ordering under `>`/`==` (PyTorch sorts it first in descending
-    # order), so a row containing NaN can select fewer than kk columns and
-    # leave the sentinel buffer uninitialised.  The indexer masks non-finite
-    # scores upstream, but this helper is also a standalone stable-top-k
-    # primitive; fall back to the full stable sort (whose NaN ordering is
-    # defined) rather than returning garbage.  Finite inputs keep the hot
-    # path unchanged.
+    # NaN has no ordering under `>`/`==`, so a row containing NaN can yield
+    # fewer than kk selections.  Fall back to the full stable sort, whose NaN
+    # ordering is defined, in that case.
     if bool((rank[:, -1] != kk).any()):
         val, idx = torch.sort(x, dim=-1, descending=True, stable=True)
         return val[..., :kk], idx[..., :kk]

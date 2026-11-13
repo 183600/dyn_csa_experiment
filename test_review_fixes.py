@@ -899,8 +899,8 @@ def t_timeguard_variant_calibration():
     try:
         path = os.path.join(tmp, 'state.json')
         assert L.TimeGuard._pid_alive(os.getpid()) is True
-        # A malformed/hand-edited pid is not proof of death; reconcile must
-        # keep the conservative "alive" reading instead of raising.
+        # A malformed/hand-edited pid is not proof of death; keep the
+        # conservative "alive" reading.
         assert L.TimeGuard._pid_alive(None) is True
         assert L.TimeGuard._pid_alive('not-a-pid') is True
         g = L.TimeGuard(dict(total_hours=10, margin=0.9, state_path=path))
@@ -6117,8 +6117,7 @@ def t_param_and_compute_control_detail():
     assert _partial_detail['total_controlled'] is True, _partial_detail
     assert _partial_detail['active_controlled'] is None, _partial_detail
     assert _partial_detail['non_embedding_controlled'] is None, _partial_detail
-    # One seed without a parameter count makes the whole arm unverifiable:
-    # using the remaining seeds would let a missing measurement look matched.
+    # One seed without a parameter count makes the whole arm unverifiable.
     _partial = {('a', 'p', 0): {'params': 1000},
                 ('a', 'p', 1): {},
                 ('b', 'p', 0): {'params': 1000},
@@ -8245,8 +8244,7 @@ def t_key_identity_and_sequence_edges():
 
 def t_topk_nan_matches_stable_sort():
     import csa_kernels as K
-    # A NaN k-th value used to leave the candidate buffer uninitialised (the
-    # uninitialised sentinel column became an out-of-range gather index).
+    # A NaN k-th value must follow the full stable sort.
     cases = [
         [[float('inf'), 1.0, float('nan'), float('-inf'), 2.0]],
         [[float('nan'), float('nan'), 1.0]],

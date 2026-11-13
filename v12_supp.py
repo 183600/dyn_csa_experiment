@@ -657,8 +657,8 @@ def _recipe_signature(manifest, arm=None):
     if not isinstance(_bind, dict):
         return None
     # The new and legacy spellings are aliases for ONE frozen recipe.  If both
-    # are present with different content, returning the first would silently
-    # pick one frozen protocol; refuse the ambiguous binding instead.
+    # are present with different content, the training recipe is ambiguous;
+    # refuse the binding.
     _sig_new = _bind.get('training_recipe_signature')
     _sig_old = _bind.get('training_recipe')
     if (isinstance(_sig_new, dict) and _sig_new
@@ -813,9 +813,8 @@ def _frozen_implementation(manifest):
                     f'[v12] REFUSE: implementation binding {_k!r} is declared '
                     f'twice with different values ({_suffix}={_e!r}, {_k}={_b!r}) '
                     '— the frozen run mode is ambiguous')
-        # A present-but-null `*_expected` key must not shadow the non-null
-        # alias: ``dict.get(key, default)`` returns the stored None, which
-        # would silently drop a binding the manifest clearly declared.
+        # A present-but-null `*_expected` key carries no override; use the
+        # non-null alias when present.
         _v = _e if _e is not None else _b
         if _v is not None:
             impl[_k] = _v
@@ -1434,9 +1433,7 @@ def _by_len_shape_reason(rec, n_seq):
     if _nseq_i is None or _nseq_i <= 0:
         return f'n_seq={n_seq!r} is not a positive exact integer row count'
     # The frozen grid names each evaluated length once.  ``512`` and ``"512"``
-    # are two Python keys for ONE length (JSON keeps only strings, an in-memory
-    # record can carry both); taking one of them would silently pick an
-    # endpoint when the two cells disagree.
+    # are two Python keys for ONE length; a record carrying both is ambiguous.
     _seen_lens = {}
     for _ln, _c in bl.items():
         if not isinstance(_c, dict):
@@ -1673,9 +1670,9 @@ def _by_len_cell(rec, Ln):
     """The one cell for a frozen length, or None when it is ambiguous.
 
     JSON records carry string keys while an in-memory record may carry the
-    integer spelling too.  If both spellings are present, choosing one would
-    silently pick an endpoint when the two cells disagree; report no cell so
-    every consumer treats the record as unverifiable at that length.
+    integer spelling too.  If both spellings are present the endpoint is
+    ambiguous; report no cell so every consumer treats the record as
+    unverifiable at that length.
     """
     if not isinstance(rec, dict):
         return None
@@ -2134,10 +2131,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             res['power_first_holm_gate_effective'] = {f'q={q:.2f}': L.signflip_power(_n_eff_nonzero, len(manifest['primary_comparisons']), q, _alpha) for q in (0.8, 0.85, 0.9, 0.95)}
         # Parameter counts are exact positive integers; bool/fractional or
         # lossy large values are malformed provenance, not a matched arm.
-        # Every usable PAIR must expose BOTH counts: averaging over only the
-        # records that happen to carry `params` would let one missing seed
-        # disappear while the remaining records still look matched, turning
-        # an unverifiable comparison into a confirmed parameter-matched one.
+        # Every usable PAIR must expose BOTH counts so the parameter
+        # comparison is verifiable.
         _params_a = [L._as_seed_int(recs_a[s].get('params')) for s in usable]
         _params_b = [L._as_seed_int(recs_b[s].get('params')) for s in usable]
         _param_complete = bool(usable) and all(

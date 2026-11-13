@@ -63,10 +63,9 @@ __all__ = [
 
 SPLIT_NAMES = ('train', 'val', 'test')
 _EPS = 1e-12
-# Unique identities for missing values.  Tuple sentinels such as
-# ('__missing__',) / ('__nan__',) could themselves be legitimate categories or
-# group ids, silently merging a real value with "missing" in the shift report
-# or in the whole-group split audit.
+# Unique identities for missing values.  Private objects keep a real category
+# or group id that happens to spell an internal marker distinct from an actual
+# missing value in the shift report and the whole-group split audit.
 _MISSING_CATEGORY = object()
 _MISSING_GROUP_NAN = object()
 _MISSING_GROUP_NAT = object()
@@ -75,10 +74,10 @@ _MISSING_GROUP_NAT = object()
 class _BoolKey:
     """Type-qualified identity for a boolean label/category.
 
-    ``True == 1`` and they share a hash, so a plain dict/set key silently
-    merges a boolean category with the integer category 1.  Booleans are flags,
-    not integer measurements elsewhere in this module, so label identities keep
-    them separate while both bool spellings (bool / np.bool_) share one key.
+    ``True == 1`` and they share a hash, so identity keys distinguish booleans
+    from integers.  Booleans are flags, not integer measurements elsewhere in
+    this module, so label identities keep them separate while both bool
+    spellings (bool / np.bool_) share one key.
     """
     __slots__ = ('value',)
 
@@ -98,11 +97,8 @@ class _BoolKey:
 class _UnhashableKey:
     """Type-qualified, stable identity for an unhashable label/group value.
 
-    A plain tuple sentinel such as ``('__unhashable__', type, repr)`` is itself
-    a legitimate hashable value: a real tuple with that exact spelling would
-    compare equal to the sentinel and silently merge two categories/groups.
-    Using a private class instance makes such a collision impossible while
-    keeping the key hashable and its repr deterministic.
+    A private class instance keeps distinct categories/groups distinct while
+    remaining hashable with a deterministic repr.
     """
     __slots__ = ('type_name', 'text')
 
@@ -388,8 +384,7 @@ def _take(data, idx):
         return data[idx]
     except (TypeError, IndexError):
         # str/bytes reject NumPy array indexing with IndexError rather than
-        # TypeError; handling only TypeError made the documented
-        # "string is indexable" sequence case impossible.
+        # TypeError, so both are handled here.
         if isinstance(data, str):
             return ''.join(data[int(i)] for i in idx)
         if isinstance(data, (bytes, bytearray)):
@@ -1969,10 +1964,7 @@ def _row_keys(X):
         # serialised strings as object dtype still matches its typed copy.
         # Embedded NULs need no special case: NumPy preserves them in the
         # fixed-width buffer and the row key is length-prefixed, so 'a\x00b'
-        # stays distinct from 'ab' (and from 'a') on both paths.  Keeping
-        # NUL-bearing object cells on the per-cell path made the same logical
-        # row hash differently depending on how a cache stored it, which hid
-        # exact duplicates from the leakage audit.
+        # stays distinct from 'ab' (and from 'a') on both paths.
         if _flat_obj and all(isinstance(v, (str, np.str_)) for v in _flat_obj):
             return _row_keys(np.asarray(_flat_obj, dtype=str).reshape(src.shape))
         if _flat_obj and all(isinstance(v, (bytes, bytearray, np.bytes_))
@@ -2079,8 +2071,8 @@ def _row_keys(X):
         if not _wide:
             # Match the corpus fingerprint's canonical numeric form: an
             # in-range integer table is the exact same logical table as its
-            # float64 twin, so `0` and `0.0` (or `-0.0`) must produce the same
-            # duplicate key instead of one being invisible to the other.
+            # float64 twin, so `0` and `0.0` (or `-0.0`) produce the same
+            # duplicate key.
             return _row_keys(np.asarray(src, dtype=np.float64))
     if _integral or (src.dtype != object and not np.issubdtype(src.dtype, np.floating)):
         _step = _hash_row_block(int(src.shape[1]), 1 << 16)
