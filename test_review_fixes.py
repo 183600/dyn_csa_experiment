@@ -1946,6 +1946,19 @@ def t_tuned_pairing_keeps_optimizer_gate():
     _why = BT._relaxed_pair_reason(dict(a, init_core_fp=True),
                                    dict(b, init_core_fp=True), {'a': 3, 'b': 3})
     assert _why and 'text fingerprint' in _why, _why
+    # Exact parameter counts far outside the binary64 range must compare
+    # without an int->float overflow.
+    _huge = 10 ** 400
+    assert BT._relaxed_pair_reason(dict(a, params=_huge), dict(b, params=_huge),
+                                   {'a': 3, 'b': 3}) is None
+    assert BT._relaxed_pair_reason(dict(a, params=_huge),
+                                   dict(b, params=2 * _huge),
+                                   {'a': 3, 'b': 3}) is not None
+    # The report's parameter gap follows the same exact-integer contract.
+    assert BR.param_gap({'params': _huge}, {'params': _huge}) == 0.0
+    assert BR.param_gap({'params': 1000.0}, {'params': 1000}) == 0.0
+    assert BR.param_gap({'params': 1.5}, {'params': 1}) is None
+    assert BR.param_gap({'params': True}, {'params': 1}) is None
 
 
 def t_arm_mean_std_and_relative_effect():
@@ -2296,6 +2309,23 @@ def t_eval_per_seq():
     assert sum(per_row) == int(samp['n_tokens']) == 150, (sum(per_row), samp['n_tokens'])
     assert max(per_row) <= ids.shape[1] - 1, f'per-document token counts must stay within one row: {per_row}'
     assert abs(sum(samp['nll_per_row']) - samp['nll_sum']) < 1e-9, 'per-document NLL must sum to the pooled NLL'
+    # Sampling controls follow the exact-integer contract: a boolean/fractional
+    # seed or row cap must not silently select a different subset.
+    for _bad in (True, 1.5, 'x'):
+        for _kw in ({'eval_seed': _bad}, {'eval_rows': _bad}):
+            try:
+                L.eval_ppl(model, ids, dev, chunk=1, return_stats=True,
+                           **({'eval_rows': 150} | _kw))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'eval_ppl accepted malformed sampling control {_kw!r}')
+    # Negative/huge exact seeds are reproducible identities, not crashes.
+    _neg = L.eval_ppl(model, ids, dev, chunk=1, eval_rows=150, eval_seed=-1,
+                      return_stats=True)
+    _neg2 = L.eval_ppl(model, ids, dev, chunk=1, eval_rows=150, eval_seed=-1,
+                       return_stats=True)
+    assert _neg['eval_seed'] == -1 and _neg['n_tokens'] == _neg2['n_tokens']
 
 
 # ---------------------------------------------------------------------------
@@ -6602,6 +6632,14 @@ def t_scale_corpus_binding_refuses_mixed_tokenizers():
     assert c['status'] == 'fail' and any('vocab size' in x for x in c['problems']), c
     d = L.scale_ladder_audit([_tier('S1'), _tier('S2')])
     assert d['status'] != 'fail' and d['corpus_binding']['corpus_fp'] == 'unverifiable', d
+    # Fingerprint identity is canonical: a bytes fingerprint is its text twin,
+    # while an empty marker is absent (not a shared corpus).
+    e = L.scale_ladder_audit([_tier('S1', b'fpA', 8000), _tier('S2', 'fpA', 8000)])
+    assert e['status'] != 'fail' and e['corpus_binding']['corpus_fp'] == 'shared', e
+    f = L.scale_ladder_audit([_tier('S1', '', 8000), _tier('S2', '', 8000)])
+    assert f['corpus_binding']['corpus_fp'] == 'unverifiable', f
+    g = L.scale_ladder_audit([_tier('S1', b'\xff', 8000), _tier('S2', 'fpA', 8000)])
+    assert g['status'] == 'fail', g
 
 
 def t_scale_point_provenance_roundtrip():

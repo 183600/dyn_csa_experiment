@@ -1552,6 +1552,15 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
            'note': 'test-split descriptive secondary evidence; not part of the frozen primary family or the Holm correction'}
     if not slice_fp or not probe_path or not os.path.exists(probe_path):
         return out
+    # Canonicalise the frozen slice identity with the same rule the rest of
+    # the probe gate uses; comparing raw values would split a bytes fingerprint
+    # from its text twin and let a boolean/empty value look like a slice.
+    _slice_text = L._content_fp_text(slice_fp)
+    if _slice_text is None:
+        out['error'] = f'slice_fp {slice_fp!r} is not a non-empty text fingerprint'
+        return out
+    slice_fp = _slice_text
+    out['slice_fp'] = _slice_text
     try:
         raw = json.load(open(probe_path, encoding='utf-8'))
     except Exception as e:
@@ -1589,7 +1598,7 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             why = f"variant {r.get('variant')!r} is not one of the frozen arms"
         elif _seed_i is None or _seed_i not in seeds:
             why = f"seed {r.get('seed')!r} is outside the frozen whitelist"
-        elif r.get('val_fp') != slice_fp:
+        elif L._content_fp_text(r.get('val_fp')) != slice_fp:
             why = f"val_fp {str(r.get('val_fp'))[:12]}… does not match the frozen test slice {str(slice_fp)[:12]}…"
         elif exp_code is not None and r.get('_code') != exp_code:
             why = f"_code {r.get('_code')!r} does not match the frozen code semantics {exp_code!r}"

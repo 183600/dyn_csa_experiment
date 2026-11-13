@@ -457,8 +457,16 @@ def _controlled_reason(a, b):
         return f"parameter count differs ({a.get('params')!r} != {b.get('params')!r})"
     if (a.get('run_fingerprint') is None) != (b.get('run_fingerprint') is None):
         return 'unverifiable run_fingerprint (only one record carries it)'
-    if a.get('run_fingerprint') is not None and a.get('run_fingerprint') != b.get('run_fingerprint'):
-        return 'run_fingerprint differs (recipe/backend/matrix changed)'
+    if a.get('run_fingerprint') is not None:
+        # The run fingerprint is a text recipe/backend identity.  A boolean or
+        # empty marker must not compare equal on both arms and silently pass.
+        _rfa = L._content_fp_text(a.get('run_fingerprint'))
+        _rfb = L._content_fp_text(b.get('run_fingerprint'))
+        if _rfa is None or _rfb is None:
+            return 'run_fingerprint is not a text fingerprint (%r vs %r)' % (
+                a.get('run_fingerprint'), b.get('run_fingerprint'))
+        if _rfa != _rfb:
+            return 'run_fingerprint differs (recipe/backend/matrix changed)'
     for k in ('data_fp', 'val_fp', 'eval_fp', 'eval_subset_fp', 'rng_fp'):
         va, vb = a.get(k), b.get(k)
         if (va is None) != (vb is None):

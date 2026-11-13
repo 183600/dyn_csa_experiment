@@ -472,8 +472,11 @@ PARAM_MATCH_ARCH = 0.06
 def param_gap(a, b, tol=PARAM_MATCH_TOL):
     if not isinstance(a, dict) or not isinstance(b, dict):
         return None
-    pa = _as_finite(a.get('params'))
-    pb = _as_finite(b.get('params'))
+    # Parameter counts are exact positive integers, matching the exp_lib
+    # contract: a boolean/fractional count is not a measurement, and huge
+    # counts must not go through a lossy/overflowing float conversion.
+    pa = _int_or(a.get('params'), None)
+    pb = _int_or(b.get('params'), None)
     if pa is None or pb is None:
         return None
     if pa <= 0 or pb <= 0:

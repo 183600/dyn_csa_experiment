@@ -11256,11 +11256,22 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                 if _v <= 0:
                     problems.append(f'{name}: vocab={_v!r} must be positive')
                     continue
-            elif isinstance(_v, (bool, np.bool_)):
-                # A boolean is a flag, not a corpus/tokenizer fingerprint;
-                # otherwise two unrelated tiers would look "shared".
-                problems.append(f'{name}: {_fpk}={_v!r} is a boolean, not a fingerprint')
-                continue
+            else:
+                # Canonicalise the fingerprint once, with the same rule the
+                # rest of the scale machinery uses.  Comparing raw values with
+                # str() splits a bytes fingerprint from its text twin and
+                # treats an empty string as a shared identity.
+                if isinstance(_v, (bool, np.bool_)):
+                    problems.append(f'{name}: {_fpk}={_v!r} is a boolean, not a fingerprint')
+                    continue
+                if isinstance(_v, (str, bytes, bytearray)) and not _v:
+                    # An empty marker is the explicit "not recorded" state.
+                    continue
+                _text = _content_fp_text(_v)
+                if _text is None:
+                    problems.append(f'{name}: {_fpk}={_v!r} is not a non-empty text fingerprint')
+                    continue
+                _v = _text
             row[_fpk] = _v
         try:
             steps = _as_int(cfg['steps'], 'steps')
@@ -15789,6 +15800,19 @@ def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
 @torch.inference_mode()
 def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, return_stats=False,
              collect_block_stats=False, val_bnd=None, bnd_tol=1):
+    # Sampling controls are exact integers, not bool/float coercion targets:
+    # int(True)=1 and int(1.5)=1 would silently sample a different subset
+    # (and a huge/negative seed must still produce a reproducible stream).
+    _seed = _as_seed_int(eval_seed)
+    if _seed is None:
+        raise ValueError(f'eval_ppl: eval_seed must be an exact integer, got {eval_seed!r}')
+    _gen_seed = _rng_seed_int(_seed)
+    eval_seed = _seed
+    if eval_rows is not None:
+        _rows = _as_seed_int(eval_rows)
+        if _rows is None:
+            raise ValueError(f'eval_ppl: eval_rows must be an exact integer, got {eval_rows!r}')
+        eval_rows = _rows
     # `collect_block_stats=True` enables the compression-report hooks for this
     # same forward pass, so block-length/boundary diagnostics come from it too.
     # A chunk is a set of independent sequences (no cross-row op in the
@@ -15821,14 +15845,14 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
             _flat = _n_rows * _n_tgt
             _k = min(int(eval_rows), _flat)
             if _k < _flat:
-                _g = torch.Generator().manual_seed(int(eval_seed))
+                _g = torch.Generator().manual_seed(_gen_seed)
                 _sel = torch.randperm(_flat, generator=_g)[:_k]
                 # Sort the selected rows for integer range queries; this selects
                 # the same slice as the boolean-mask form (host-side integer
                 # equivalence, design notes §6.2).
                 _sel_host = torch.sort(_sel).values
                 _sel_sorted = _sel_host.to(device)
-                print(f'[eval_ppl] scoring a uniform sample of {_k}/{_flat} target rows (eval_rows={int(eval_rows)}, eval_seed={int(eval_seed)}) — this is a SAMPLED estimate, not the full-set PPL')
+                print(f'[eval_ppl] scoring a uniform sample of {_k}/{_flat} target rows (eval_rows={int(eval_rows)}, eval_seed={eval_seed}) — this is a SAMPLED estimate, not the full-set PPL')
             else:
                 print(f'[eval_ppl] eval_rows={int(eval_rows)} covers the whole {_flat}-row target space; scoring the FULL set (this is the population statistic, not a sample)')
         _vhost = None

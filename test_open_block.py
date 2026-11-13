@@ -141,6 +141,11 @@ def t_config_and_segmenter():
     _efp_a = dict(_cfg(8), run_fingerprint='x', data_fp='')
     _efp_b = dict(_cfg(None), run_fingerprint='x', data_fp='')
     assert O._controlled_reason(_efp_a, _efp_b) is None
+    # The run/recipe fingerprint is a text identity too: two malformed arms
+    # must not look like the same recipe.
+    _rfp_a = dict(_cfg(8), run_fingerprint=True)
+    _rfp_b = dict(_cfg(None), run_fingerprint=True)
+    assert 'run_fingerprint' in O._controlled_reason(_rfp_a, _rfp_b)
 
 
 # ---------------------------------------------------------------------------
