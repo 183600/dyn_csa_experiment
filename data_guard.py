@@ -1582,6 +1582,24 @@ def _canonical_object_cell(v):
         # None is the object spelling of a missing numeric cell, the same
         # value the numeric paths materialise as NaN.
         return ('nan',)
+    if isinstance(v, (bytes, bytearray, np.bytes_)):
+        # A bytearray is the mutable spelling of the same byte string, and an
+        # object-serialised np.bytes_ must match its Python-bytes twin; use the
+        # bytes content so an object table and a fixed-width bytes table share
+        # one identity.  (np.asarray(list_of_bytearray, dtype=bytes) cannot
+        # convert a MIXED bytes/bytearray column at all.)
+        v = bytes(v)
+    elif isinstance(v, str):
+        # np.str_ is a str subclass whose type name differs; normalise to the
+        # plain str spelling so an object table and its fixed-width Unicode
+        # twin share one canonical identity (and fingerprint).
+        v = str(v)
+    if isinstance(v, (np.datetime64, np.timedelta64)):
+        # Checked before the integer branches: np.timedelta64 is registered as
+        # np.integer, but int() on a unit-bearing value is not an integer.
+        if np.isnat(v):
+            return ('nat', type(v).__name__)
+        return ('dt', type(v).__name__, str(v))
     if isinstance(v, (bool, np.bool_)):
         return ('num', int(v))
     if isinstance(v, (int, np.integer)):
@@ -1593,10 +1611,6 @@ def _canonical_object_cell(v):
         if math.isinf(f):
             return ('inf', 1 if f > 0 else -1)
         return ('num', 0.0 if f == 0.0 else f)
-    if isinstance(v, (np.datetime64, np.timedelta64)):
-        if np.isnat(v):
-            return ('nat', type(v).__name__)
-        return ('dt', type(v).__name__, str(v))
     try:
         hash(v)
     except TypeError:
@@ -1622,18 +1636,27 @@ def _matrix_fingerprint(X):
     _obj_int = False
     _obj_fits = True
     _obj_big = False
-    _obj_canon = arr.dtype.kind in ('U', 'S')
+    # Fixed-width Unicode/bytes and complex tables use the canonical per-cell
+    # identity: float64 conversion would discard a complex imaginary part.
+    _obj_canon = arr.dtype.kind in ('U', 'S', 'c')
     if arr.dtype == object and arr.size:
         # Object-dtype integer tables must keep the same exactness contract:
         # the float64 fallback collapses 2**53 and 2**53+1.
         _vals = arr.reshape(-1).tolist()
+        # np.timedelta64 is registered as numbers.Integral, but int() on a
+        # unit-bearing value returns datetime.timedelta (or raises), so it is
+        # a temporal value, not an integer cell.  Route every datetime-like
+        # object cell through the canonical temporal identity.
+        _obj_dt = any(isinstance(v, (np.datetime64, np.timedelta64))
+                      for v in _vals)
         # Booleans are integral in the row-key contract (0/1), so include them
         # here too: an object table such as [[True, 2**53]] stays on the exact
         # integer path, where 2**53 and 2**53+1 remain distinct as the
         # duplicate detector requires.
-        _obj_int = all(isinstance(v, numbers.Integral)
-                       or isinstance(v, (bool, np.bool_))
-                       for v in _vals)
+        _obj_int = (not _obj_dt) and all(
+            isinstance(v, numbers.Integral)
+            or isinstance(v, (bool, np.bool_))
+            for v in _vals)
         if _obj_int:
             _obj_fits = all(-(2 ** 63) <= int(v) <= 2 ** 64 - 1 for v in _vals)
             if not _obj_fits:
@@ -1646,8 +1669,10 @@ def _matrix_fingerprint(X):
     if arr.dtype == object and arr.size and not _obj_int and not _obj_big:
         _vals = arr.reshape(-1).tolist()
         # None is a missing numeric cell (the numeric paths turn it into NaN),
-        # so it shares the float64 fingerprint path with real values.
-        if not all(isinstance(v, numbers.Real) or v is None for v in _vals):
+        # so it shares the float64 fingerprint path with real values.  A
+        # datetime/timedelta object cell is temporal metadata, never a float.
+        if (_obj_dt
+                or not all(isinstance(v, numbers.Real) or v is None for v in _vals)):
             _obj_canon = True
         elif any(isinstance(v, numbers.Integral) and abs(int(v)) > 2 ** 53
                  for v in _vals):
@@ -1733,12 +1758,18 @@ def _row_keys(X):
         # as object, int64 or uint64, keeping cross-dtype duplicates visible
         # to the duplicate audit.
         _flat_obj = src.reshape(-1).tolist()
+        # np.timedelta64 is numbers.Integral but int() on a unit-bearing value
+        # is not an integer; keep every datetime-like cell on the temporal
+        # canonical path below.
+        _flat_dt = any(isinstance(v, (np.datetime64, np.timedelta64))
+                       for v in _flat_obj)
         # Booleans are integral in Python/NumPy's canonical integer path, so
         # include them here as 0/1: an object-dtype bool table must produce the
         # same row keys as its typed bool/int twin.
-        if _flat_obj and all(isinstance(v, numbers.Integral)
-                             or isinstance(v, (bool, np.bool_))
-                             for v in _flat_obj):
+        if _flat_obj and not _flat_dt and all(
+                isinstance(v, numbers.Integral)
+                or isinstance(v, (bool, np.bool_))
+                for v in _flat_obj):
             _ivs = [int(v) for v in _flat_obj]
             if all(-(2 ** 63) <= v <= 2 ** 63 - 1 for v in _ivs):
                 return _row_keys(np.asarray(_ivs, dtype=np.int64).reshape(src.shape))
@@ -1752,10 +1783,11 @@ def _row_keys(X):
         # different duplicate keys from the typed cache with identical rows.
         # None is a missing numeric cell, the same value as NaN, so it shares
         # this path instead of becoming a distinct NoneType object key.
-        if _flat_obj and all(isinstance(v, numbers.Real)
-                             or isinstance(v, (bool, np.bool_))
-                             or v is None
-                             for v in _flat_obj):
+        if _flat_obj and not _flat_dt and all(
+                isinstance(v, numbers.Real)
+                or isinstance(v, (bool, np.bool_))
+                or v is None
+                for v in _flat_obj):
             _real_exact = all(v is None or not isinstance(v, numbers.Integral)
                               or abs(int(v)) <= 2 ** 53
                               for v in _flat_obj)
@@ -1768,7 +1800,11 @@ def _row_keys(X):
             return _row_keys(np.asarray(_flat_obj, dtype=str).reshape(src.shape))
         if _flat_obj and all(isinstance(v, (bytes, bytearray, np.bytes_))
                              for v in _flat_obj):
-            return _row_keys(np.asarray(_flat_obj, dtype=bytes).reshape(src.shape))
+            # Convert each cell explicitly: np.asarray([b'a', bytearray(b'b')],
+            # dtype=bytes) treats the bytearray as a sequence and refuses the
+            # inhomogeneous table.  The byte content is the same identity.
+            return _row_keys(np.asarray([bytes(v) for v in _flat_obj],
+                                        dtype=bytes).reshape(src.shape))
         # Object tables are often mixed/non-contiguous; float64 does not apply
         # to string columns and loses integer precision above 2**53.  Build an
         # exact canonical key per cell instead.
@@ -1776,6 +1812,20 @@ def _row_keys(X):
             if v is None:
                 # Same missing-cell identity as the numeric float path.
                 return ('nan',)
+            if isinstance(v, (bytes, bytearray, np.bytes_)):
+                # Match the fixed-width bytes path (and the canonical object
+                # fingerprint): the byte content, not the mutable container.
+                v = bytes(v)
+            elif isinstance(v, str):
+                # np.str_ is a str subclass with a different type name; use
+                # the plain-str spelling for the same canonical identity.
+                v = str(v)
+            if isinstance(v, (np.datetime64, np.timedelta64)):
+                # np.timedelta64 is np.integer, but int() on a unit-bearing
+                # value is not an integer; handle temporal identity first.
+                if np.isnat(v):
+                    return ('nat', type(v).__name__)
+                return ('dt', type(v).__name__, str(v))
             if isinstance(v, (bool, np.bool_)):
                 # Match the typed integral path, which hashes bool as 0/1.
                 return ('num', int(v))
@@ -1788,10 +1838,6 @@ def _row_keys(X):
                 if math.isinf(f):
                     return ('inf', 1 if f > 0 else -1)
                 return ('num', 0.0 if f == 0.0 else f)
-            if isinstance(v, (np.datetime64, np.timedelta64)):
-                if np.isnat(v):
-                    return ('nat', type(v).__name__)
-                return ('dt', type(v).__name__, str(v))
             try:
                 hash(v)
             except TypeError:
@@ -1800,6 +1846,11 @@ def _row_keys(X):
 
         return [tuple(_cell_key(v) for v in row) for row in src]
     keys = []
+    if src.dtype.kind == 'c':
+        # A complex cell is a pair (real, imaginary); the raw-byte path below
+        # is width-dependent and the float path discards the imaginary part.
+        # Reuse the exact canonical per-cell identity of an object table.
+        return _row_keys(src.astype(object))
     if src.dtype.kind in ('U', 'S'):
         _tag = b'U' if src.dtype.kind == 'U' else b'S'
         _step = _hash_row_block(int(src.shape[1]), 1 << 16)

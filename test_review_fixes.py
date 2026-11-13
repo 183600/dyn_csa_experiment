@@ -4520,6 +4520,55 @@ def t_categorical_and_cache_guards():
         raise AssertionError('fractional vocab size was accepted by the token-id range check')
 
 
+def t_object_byte_tables():
+    # Object columns can mix Python bytes, bytearray and np.bytes_.  The
+    # fixed-width fast path must normalise each cell's byte CONTENT: a bare
+    # np.asarray(list_of_bytearray, dtype=bytes) treats the mutable container
+    # as a sequence and raises on the mixed table, taking duplicate detection
+    # and the corpus fingerprint down with it.
+    import data_guard as DG
+    vals = [b'a', bytearray(b'b'), np.bytes_(b'c')]
+    arr = np.empty((len(vals), 1), dtype=object)
+    arr[:, 0] = vals
+    typed = np.array([bytes(v) for v in vals], dtype='S').reshape(-1, 1)
+    assert DG._row_keys(arr) == DG._row_keys(typed), 'byte content must identify the row'
+    assert DG._matrix_fingerprint(arr) == DG._matrix_fingerprint(typed), (
+        'object byte tables must share the fixed-width bytes fingerprint')
+    mask = DG.duplicate_mask(np.array([[b'a'], [bytearray(b'a')]], dtype=object))
+    assert mask.tolist() == [False, True], mask
+    # np.str_/np.bytes_ are subclasses whose TYPE NAME differs from the plain
+    # builtin; the fingerprint must still match the fixed-width table.
+    for _vals, _dt in (([np.str_('a'), np.str_('b')], 'U'),
+                       ([np.bytes_(b'a'), np.bytes_(b'b')], 'S')):
+        _obj = np.empty((len(_vals), 1), dtype=object)
+        _obj[:, 0] = _vals
+        _typed = np.array([_dt == 'U' and str(v) or bytes(v) for v in _vals],
+                          dtype=_dt).reshape(-1, 1)
+        assert DG._row_keys(_obj) == DG._row_keys(_typed), (_dt, 'row keys')
+        assert DG._matrix_fingerprint(_obj) == DG._matrix_fingerprint(_typed), (
+            _dt, 'fingerprint')
+    # np.timedelta64 is numbers.Integral/np.integer but int() on a unit-bearing
+    # value is not an integer; it must take the temporal identity path instead
+    # of crashing duplicate/corpus checks.
+    for _vals in ([np.datetime64('2020-01-01'), np.datetime64('2020-01-01')],
+                  [np.timedelta64(1, 'D'), np.timedelta64(1, 'D')],
+                  [np.timedelta64('NaT'), np.timedelta64('NaT')]):
+        _obj = np.empty((2, 1), dtype=object)
+        _obj[:, 0] = _vals
+        assert DG.duplicate_mask(_obj).tolist() == [False, True], _vals
+        assert len(DG._row_keys(_obj)) == 2 and DG._matrix_fingerprint(_obj), _vals
+    # A complex value is a (real, imaginary) pair.  The float64 fallback used
+    # to discard the imaginary part, so 1+2j and 1+3j shared one fingerprint;
+    # the object/fixed-width twins must also agree.
+    _z = np.array([[1 + 2j], [1 + 3j]], dtype='complex128')
+    assert DG._matrix_fingerprint(_z[:1]) != DG._matrix_fingerprint(_z[1:])
+    assert DG.duplicate_mask(_z).tolist() == [False, False]
+    _zo = np.empty((2, 1), dtype=object)
+    _zo[:, 0] = [1 + 2j, 1 + 3j]
+    assert DG._row_keys(_z) == DG._row_keys(_zo)
+    assert DG._matrix_fingerprint(_z) == DG._matrix_fingerprint(_zo)
+
+
 def t_public_exports_resolve():
     # __all__ is an API contract: every advertised name must exist, and a
     # star-import must not fail.  A stale entry (a name added to __all__ but
@@ -7573,6 +7622,7 @@ def main():
     _check('I4b data-quality report checks split index disjointness', t_data_quality_report_index_disjointness)
     _check('I5a categorical shift handles an empty reference', t_categorical_shift_empty_reference)
     _check('I5 categorical shift + cache guards', t_categorical_and_cache_guards)
+    _check('I5b object byte tables normalise byte content', t_object_byte_tables)
     _check('I6 explicit split sizes stay non-negative', t_split_sizes_explicit_never_negative)
     _check('I7 split audit finds sequence-level row overlap', t_audit_split_sequence_overlap)
     _check('I8 public exports resolve (star-import safe)', t_public_exports_resolve)
