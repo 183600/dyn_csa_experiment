@@ -1946,8 +1946,7 @@ def t_tuned_pairing_keeps_optimizer_gate():
     _why = BT._relaxed_pair_reason(dict(a, init_core_fp=True),
                                    dict(b, init_core_fp=True), {'a': 3, 'b': 3})
     assert _why and 'text fingerprint' in _why, _why
-    # Exact parameter counts far outside the binary64 range must compare
-    # without an int->float overflow.
+    # Exact parameter counts compare beyond the binary64 range.
     _huge = 10 ** 400
     assert BT._relaxed_pair_reason(dict(a, params=_huge), dict(b, params=_huge),
                                    {'a': 3, 'b': 3}) is None
@@ -2309,8 +2308,7 @@ def t_eval_per_seq():
     assert sum(per_row) == int(samp['n_tokens']) == 150, (sum(per_row), samp['n_tokens'])
     assert max(per_row) <= ids.shape[1] - 1, f'per-document token counts must stay within one row: {per_row}'
     assert abs(sum(samp['nll_per_row']) - samp['nll_sum']) < 1e-9, 'per-document NLL must sum to the pooled NLL'
-    # Sampling controls follow the exact-integer contract: a boolean/fractional
-    # seed or row cap must not silently select a different subset.
+    # Sampling controls follow the exact-integer contract.
     for _bad in (True, 1.5, 'x'):
         for _kw in ({'eval_seed': _bad}, {'eval_rows': _bad}):
             try:

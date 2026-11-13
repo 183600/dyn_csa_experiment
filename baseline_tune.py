@@ -409,9 +409,8 @@ def _relaxed_pair_reason(a, b, tuned_arms):
     pa, pb = L._as_seed_int(a.get('params')), L._as_seed_int(b.get('params'))
     if pa is None or pb is None or pa <= 0 or pb <= 0:
         return 'unverifiable params (missing, boolean, fractional or non-positive count)'
-    # Exact int/int division keeps the ratio representable even when the
-    # counts themselves exceed the binary64 range; float(max(...)) would
-    # raise OverflowError on a valid (if huge) parameter count.
+    # Compare exact integer counts; their ratio stays representable even
+    # beyond the binary64 range.
     if abs(pa - pb) / max(pa, pb, 1) > 0.01:
         return f'parameter mismatch ({pa} vs {pb})'
     if tuned_arms.get(a.get('variant')) != tuned_arms.get(b.get('variant')):

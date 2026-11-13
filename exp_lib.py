@@ -11258,9 +11258,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                     continue
             else:
                 # Canonicalise the fingerprint once, with the same rule the
-                # rest of the scale machinery uses.  Comparing raw values with
-                # str() splits a bytes fingerprint from its text twin and
-                # treats an empty string as a shared identity.
+                # rest of the scale machinery uses.
                 if isinstance(_v, (bool, np.bool_)):
                     problems.append(f'{name}: {_fpk}={_v!r} is a boolean, not a fingerprint')
                     continue
@@ -15800,9 +15798,8 @@ def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
 @torch.inference_mode()
 def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, return_stats=False,
              collect_block_stats=False, val_bnd=None, bnd_tol=1):
-    # Sampling controls are exact integers, not bool/float coercion targets:
-    # int(True)=1 and int(1.5)=1 would silently sample a different subset
-    # (and a huge/negative seed must still produce a reproducible stream).
+    # Sampling controls are exact integers; a bool or fractional value is
+    # rejected.  A negative or huge seed still produces a reproducible stream.
     _seed = _as_seed_int(eval_seed)
     if _seed is None:
         raise ValueError(f'eval_ppl: eval_seed must be an exact integer, got {eval_seed!r}')

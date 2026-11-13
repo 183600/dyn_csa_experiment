@@ -1553,8 +1553,7 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
     if not slice_fp or not probe_path or not os.path.exists(probe_path):
         return out
     # Canonicalise the frozen slice identity with the same rule the rest of
-    # the probe gate uses; comparing raw values would split a bytes fingerprint
-    # from its text twin and let a boolean/empty value look like a slice.
+    # the probe gate uses.
     _slice_text = L._content_fp_text(slice_fp)
     if _slice_text is None:
         out['error'] = f'slice_fp {slice_fp!r} is not a non-empty text fingerprint'

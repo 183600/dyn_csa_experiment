@@ -444,8 +444,8 @@ def run_kernel():
     if fail:
         sys.exit(1)
     # The training-level layer is the one that can certify a whole panel; run
-    # it only on a machine that actually has the Triton backend, and never
-    # advertise a pass when the benchmark itself did not reach the gate.
+    # it only on a machine that actually has the Triton backend, and require
+    # the benchmark itself to reach the gate.
     benchmark_pass = bool(best is not None and best >= 150.0)
     if 'triton' in backends:
         print('[kernel] G0 layer 3: training-level kernel/eager TOST')

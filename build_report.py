@@ -473,8 +473,7 @@ def param_gap(a, b, tol=PARAM_MATCH_TOL):
     if not isinstance(a, dict) or not isinstance(b, dict):
         return None
     # Parameter counts are exact positive integers, matching the exp_lib
-    # contract: a boolean/fractional count is not a measurement, and huge
-    # counts must not go through a lossy/overflowing float conversion.
+    # contract: a boolean/fractional count is not a measurement.
     pa = _int_or(a.get('params'), None)
     pb = _int_or(b.get('params'), None)
     if pa is None or pb is None:
