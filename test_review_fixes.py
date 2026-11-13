@@ -7645,6 +7645,133 @@ def t_shared_validation_fp_refuses_malformed_provenance():
             assert got is None, got
 
 
+def t_probe_reader_geometry_and_manifest_fail_closed():
+    # Stored probe records must not be able to crash a report by putting an
+    # unhashable JSON value into a grouping key, nor describe geometry the
+    # probe cannot produce (length-1 cells, unknown modes, partial masking).
+    _good = {'variant': 'csa_fixed', 'arm': 'learned', 'seed': 0,
+             'eval_len': 4096, 'rho': 0.5, 'mode': 'uniform',
+             'probe_params': {'n_seq': 16}}
+    assert V10._probe_record_problem(_good) is None
+    for _bad in (
+            dict(_good, variant=['csa_fixed']),
+            dict(_good, arm={'learned': 1}),
+            dict(_good, seed=True),
+            dict(_good, seed=1.5),
+            dict(_good, eval_len=1),
+            dict(_good, eval_len=True),
+            dict(_good, eval_len=4096.5),
+            dict(_good, rho=True),
+            dict(_good, rho=-0.1),
+            dict(_good, rho=1.1),
+            dict(_good, rho=float('nan')),
+            dict(_good, mode='bogus'),
+            dict(_good, mode=None),
+            dict(_good, mode='mask', rho=0.5),
+            dict(_good, probe_params={}),
+            dict(_good, probe_params=None)):
+        assert V10._probe_record_problem(_bad) is not None, _bad
+
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, 'probe.json')
+        raw = {}
+        for s in (0, 1):
+            for arm, ppl in (('learned', 10.0), ('dense', 11.0)):
+                raw[f'{arm}{s}'] = dict(_good, seed=s, arm=arm, ppl_mean=ppl,
+                                        val_fp='F', _code=L.code_stamp())
+        raw['bad_variant'] = dict(_good, variant=['x'], seed=0,
+                                  ppl_mean=1.0, val_fp='F',
+                                  _code=L.code_stamp())
+        raw['bad_arm'] = dict(_good, arm=['learned'], seed=0, ppl_mean=1.0,
+                              val_fp='F', _code=L.code_stamp())
+        raw['bad_len'] = dict(_good, eval_len=1, seed=0, ppl_mean=1.0,
+                              val_fp='F', _code=L.code_stamp())
+        raw['bad_mode'] = dict(_good, mode='bogus', seed=0, ppl_mean=1.0,
+                               val_fp='F', _code=L.code_stamp())
+        raw['bad_mask'] = dict(_good, mode='mask', rho=0.5, seed=0,
+                               ppl_mean=1.0, val_fp='F',
+                               _code=L.code_stamp())
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
+        out = V12._test_probe_stats(p, {'arms': ['csa_fixed'], 'seeds': [0, 1]}, 'F')
+        assert out['n_admitted'] == 4, out
+        assert out['n_excluded'] == 5, out
+        assert out['contrasts'], out
+
+    with tempfile.TemporaryDirectory() as td:
+        def _load(extra_stat=None, eval_block=None, **top):
+            p = os.path.join(td, 'manifest.json')
+            m = _write_manifest(p, list(range(12)), extra_stat=extra_stat)
+            if eval_block is not None:
+                m['eval'] = eval_block
+            m.update(top)
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(m, f)
+            return V12._load_manifest(p)
+
+        for _bad_do in ('false', '1', 1):
+            try:
+                _load(extra_stat={'descriptive_only': _bad_do})
+            except SystemExit as e:
+                assert 'descriptive_only' in str(e), str(e)[:200]
+            else:
+                raise AssertionError(f'descriptive_only={_bad_do!r} bypassed the power gate')
+        _base_eval = {'n_seqs_clean': 16, 'by_length_ppl': [4096]}
+        for _probe, _needle in (
+                ({'mode': 'bogus'}, 'corruption modes'),
+                ({'mode': 'mask', 'rhos': [0.5]}, 'all-or-nothing'),
+                ({'eval_lens': [1]}, 'eval_lens')):
+            try:
+                _load(eval_block=dict(_base_eval, distractor_probe=_probe))
+            except SystemExit as e:
+                assert _needle in str(e), (e, str(e)[:300])
+            else:
+                raise AssertionError(f'distractor_probe={_probe!r} was accepted')
+        for _bad_impl in ({'eager_batch_expected': 'false'},
+                          {'amp_grad_scaler_expected': 1},
+                          {'amp_dtype_expected': True}):
+            try:
+                _load(**_bad_impl)
+            except SystemExit as e:
+                assert 'implementation' in str(e) or 'dtype' in str(e), str(e)[:200]
+            else:
+                raise AssertionError(f'implementation binding {_bad_impl!r} was accepted')
+        # In-memory manifests bypass _load_manifest, so the implementation
+        # gate itself must reject non-boolean flags rather than bool("false").
+        assert V12._implementation_reason(
+            {'train_knobs': {'eager_batch': True}},
+            {'eager_batch': 'false'}) is not None
+        assert V12._implementation_reason(
+            {'train_knobs': {'amp_grad_scaler': True}},
+            {'amp_grad_scaler': 1}) is not None
+        assert V12._implementation_reason(
+            {'train_knobs': {'amp_dtype': 'bf16'}},
+            {'amp_dtype': True}) is not None
+        assert V12._implementation_reason(
+            {'train_knobs': {'eager_batch': False, 'amp_dtype': 'bf16',
+                             'amp_grad_scaler': False}},
+            {'eager_batch': False, 'amp_dtype': 'bf16',
+             'amp_grad_scaler': False}) is None
+        # The endpoint length is part of the frozen identity: whitespace,
+        # leading zeros and non-ASCII digits are not canonical spellings.
+        _p = os.path.join(td, 'endpoint.json')
+        _m = _write_manifest(_p, list(range(12)))
+        for _bad_ep in ('by_len.ppl@04096', 'by_len.ppl@4096 ',
+                        'by_len.ppl@٤٠٩٦', 'by_len.ppl@1',
+                        'ppl@4096', 'accuracy@4096',
+                        'by_len.ppl@4096@2048'):
+            _mm = json.loads(json.dumps(_m))
+            _mm['primary_comparisons'][0]['endpoint'] = _bad_ep
+            with open(_p, 'w', encoding='utf-8') as f:
+                json.dump(_mm, f)
+            try:
+                V12._load_manifest(_p)
+            except SystemExit as e:
+                assert 'endpoint' in str(e), (e, str(e)[:200])
+            else:
+                raise AssertionError(f'endpoint {_bad_ep!r} was accepted')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -7896,6 +8023,7 @@ def main():
     _check('L18 archive verify rejects duplicate/traversing member paths', t_archive_verify_rejects_ambiguous_member_paths)
     _check('L19 probe geometry requires exact integers', t_probe_geometry_exact_integers)
     _check('L20 shared validation fingerprint tolerates malformed provenance', t_shared_validation_fp_refuses_malformed_provenance)
+    _check('L21 probe readers/manifest reject impossible geometry', t_probe_reader_geometry_and_manifest_fail_closed)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

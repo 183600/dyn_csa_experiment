@@ -337,6 +337,23 @@ def _load_manifest(path):
     # implement exactly the frozen test/correction, so a mismatch is refused
     # rather than silently computed and mislabelled in the report.
     _stat = m.get('statistics') or {}
+    _do = _stat.get('descriptive_only')
+    if _do is not None and not isinstance(_do, (bool, np.bool_)):
+        raise SystemExit(
+            f'[v12] REFUSE: statistics.descriptive_only={_do!r} is not a '
+            'boolean — a truthy string/number must not disable the power gate')
+    for _flag in ('eager_batch', 'eager_batch_expected',
+                  'amp_grad_scaler', 'amp_grad_scaler_expected'):
+        _fv = m.get(_flag)
+        if _fv is not None and not isinstance(_fv, (bool, np.bool_)):
+            raise SystemExit(
+                f'[v12] REFUSE: {_flag}={_fv!r} is not a boolean implementation '
+                'flag')
+    for _dtype_key in ('amp_dtype', 'amp_dtype_expected'):
+        _dv = m.get(_dtype_key)
+        if _dv is not None and (not isinstance(_dv, str) or not _dv):
+            raise SystemExit(
+                f'[v12] REFUSE: {_dtype_key}={_dv!r} is not a non-empty dtype name')
     _ns = _stat.get('n_seeds')
     if _ns is not None and _int_field(_ns, 'statistics.n_seeds') != len(m['seeds']):
         raise SystemExit(f'[v12] REFUSE: freeze manifest declares n_seeds={_ns} but lists {len(m["seeds"])} seeds — the pre-registered resolution and the seed list disagree')
@@ -373,8 +390,13 @@ def _load_manifest(path):
     if _probe is not None:
         if not isinstance(_probe, dict):
             raise SystemExit(f'[v12] REFUSE: eval.distractor_probe must be an object ({_probe!r})')
-        if _probe.get('mode') is not None and not isinstance(_probe.get('mode'), str):
-            raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.mode must be a string ({_probe.get("mode")!r})')
+        _pmode = _probe.get('mode')
+        if _pmode is None:
+            _pmode = 'uniform'
+        if not isinstance(_pmode, str) or _pmode not in V10.PROBE_MODES:
+            raise SystemExit(
+                f'[v12] REFUSE: eval.distractor_probe.mode={_pmode!r} is not one '
+                f'of the implemented corruption modes {sorted(V10.PROBE_MODES)}')
         for _pk in ('rhos', 'eval_lens'):
             if _pk not in _probe:
                 continue
@@ -393,8 +415,15 @@ def _load_manifest(path):
                 if _pk == 'rhos' and not (0.0 <= _xf <= 1.0):
                     raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.rhos value {_xf!r} is outside [0,1]')
                 if _pk == 'eval_lens':
-                    if _int_field(_x, 'eval.distractor_probe.eval_lens entry') <= 0:
-                        raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.eval_lens value {_x!r} is not a positive integer')
+                    if _int_field(_x, 'eval.distractor_probe.eval_lens entry') < 2:
+                        raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.eval_lens value {_x!r} has no next-token prediction (needs an integer length >= 2)')
+        _eff_rhos = [float(x) for x in
+                     (_probe.get('rhos') or V10.PROBE_MODES[_pmode])]
+        if (_pmode in ('mask', 'delete', 'doc')
+                and any(abs(x - 1.0) > 1e-9 for x in _eff_rhos)):
+            raise SystemExit(
+                f'[v12] REFUSE: eval.distractor_probe.mode={_pmode!r} is '
+                f'all-or-nothing and only admits rho=1.0 (got {_eff_rhos})')
         for _pk in ('target', 'n_seq'):
             if _pk in _probe:
                 _iv = _int_field(_probe.get(_pk), f'eval.distractor_probe.{_pk}')
@@ -405,7 +434,8 @@ def _load_manifest(path):
         # the slice from by_length_ppl/n_seqs_clean and the probe indexes out
         # of bounds AFTER the one-shot test access.  Validate the effective
         # defaults too, not only the fields the manifest happens to spell out.
-        _plens = [int(float(_x)) for _x in (_probe.get('eval_lens') or [])]
+        _plens = [_int_field(_x, 'eval.distractor_probe.eval_lens entry')
+                  for _x in (_probe.get('eval_lens') or [])]
         _eff_plens = _plens or [2048, 4096]
         if _bl_ints and max(_eff_plens) > max(_bl_ints):
             raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.eval_lens={_eff_plens} extends beyond the frozen test slice width max(by_length_ppl)={max(_bl_ints)} — enlarge by_length_ppl (and re-freeze) or shrink the probe')
@@ -454,9 +484,24 @@ def _load_manifest(path):
         if _ep is not None:
             if not isinstance(_ep, str) or '@' not in _ep:
                 raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} endpoint {_ep!r} is not a by-length endpoint (e.g. by_len.ppl@4096)')
-            _tail = _ep.rsplit('@', 1)[-1].strip()
-            if not _tail.isdigit() or int(_tail) <= 0:
-                raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} endpoint {_ep!r} does not end in a positive integer length')
+            _ep_head, _, _tail = _ep.rpartition('@')
+            # The analyzer implements exactly one endpoint family; accepting
+            # another prefix would compute by_len.ppl numbers under a
+            # different pre-registered label.
+            if _ep_head != 'by_len.ppl':
+                raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} endpoint {_ep!r} is not a by_len.ppl endpoint (only by_len.ppl@<length> is implemented)')
+            # Canonical decimal spelling only: `isdigit()` also accepts
+            # non-ASCII digits, and int('04096') would silently alias the
+            # canonical length 4096.  The endpoint length is part of the
+            # pre-registered identity, not a loose numeric hint.
+            if re.fullmatch(r'[1-9][0-9]*', _tail) is None:
+                raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} endpoint {_ep!r} does not end in a canonical positive integer length')
+            try:
+                _tail_i = _int_field(_tail, f'comparison {comp.get("name")!r} endpoint length')
+            except SystemExit:
+                raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} endpoint {_ep!r} does not end in a canonical positive integer length') from None
+            if _tail_i < 2:
+                raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} endpoint {_ep!r} has no next-token prediction (needs an integer length >= 2)')
         _es = comp.get('expected_sign')
         if _es is not None and str(_es).lower() not in ('positive', 'negative'):
             raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} has expected_sign={_es!r} (expected "positive", "negative", or null)')
@@ -686,16 +731,27 @@ def _implementation_reason(rec, impl):
         if _k not in tk:
             return f"train_knobs lacks {_k!r} required by the frozen implementation binding"
         _got = tk.get(_k)
-        if _k == 'eager_batch':
-            if bool(_got) != bool(_want):
-                return f"train_knobs.eager_batch={_got!r} does not match the frozen {bool(_want)!r}"
-        elif _k == 'amp_dtype':
-            _g = _got or 'fp32'
-            _w = _want or 'fp32'
-            if str(_g).lower() != str(_w).lower():
+        if _k == 'amp_dtype':
+            if _got is None:
+                _got = 'fp32'
+            if _want is None:
+                _want = 'fp32'
+            if (not isinstance(_got, str) or not _got
+                    or not isinstance(_want, str) or not _want):
+                return (f"train_knobs.amp_dtype={tk.get(_k)!r} / frozen "
+                        f"{impl.get(_k)!r} is not a text dtype name")
+            if _got.lower() != _want.lower():
                 return f"train_knobs.amp_dtype={_got!r} does not match the frozen {_want!r}"
-        elif bool(_got) != bool(_want):
-            return f"train_knobs.{_k}={_got!r} does not match the frozen {bool(_want)!r}"
+        else:
+            # A truthy string/int is not a boolean declaration; bool('false')
+            # would otherwise match a frozen True and admit the wrong run mode.
+            if (isinstance(_got, (bool, np.bool_))
+                    and isinstance(_want, (bool, np.bool_))):
+                if bool(_got) != bool(_want):
+                    return f"train_knobs.{_k}={_got!r} does not match the frozen {_want!r}"
+            else:
+                return (f"train_knobs.{_k}={_got!r} / frozen {_want!r} "
+                        'is not a boolean implementation flag')
     return None
 
 
@@ -1625,8 +1681,13 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
         why = None
         _seed_i = _record_int(r.get('seed'))
         _tfp_text = L._content_fp_text(r.get('train_fp'))
+        _geom_why = V10._probe_record_problem(r)
         if r.get('synthesized'):
             why = 'synthesized reconstruction — not an independent probe measurement'
+        elif _geom_why is not None:
+            # Text names/geometry are checked before any set/dict key is built:
+            # an unhashable variant/arm must be a named exclusion, not a crash.
+            why = _geom_why
         elif r.get('variant') not in arms:
             why = f"variant {r.get('variant')!r} is not one of the frozen arms"
         elif _seed_i is None or _seed_i not in seeds:
@@ -1649,22 +1710,10 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             why = _implementation_reason(r, impl)
         elif not L.ppl_is_usable(r.get('ppl_mean')):
             why = 'ppl_mean is not a usable measurement'
-        elif r.get('arm') is None or r.get('eval_len') is None or r.get('rho') is None:
-            why = 'missing arm/eval_len/rho'
-        elif _record_int(r.get('eval_len')) is None or _record_int(r.get('eval_len')) <= 0:
-            why = f"eval_len {r.get('eval_len')!r} is not a positive integer"
-        else:
-            _rho_i = None if isinstance(r.get('rho'), (bool, np.bool_)) else L._finite_scalar(r.get('rho'))
-            if _rho_i is None:
-                why = f"rho {r.get('rho')!r} is not a finite numeric measurement"
-            elif not (0.0 <= _rho_i <= 1.0):
-                why = f"rho {_rho_i!r} is outside the corruption-fraction range [0,1]"
-            elif not isinstance(r.get('probe_params'), dict) or not r.get('probe_params'):
-                why = 'missing probe_params geometry (a probe measured under unknown parameters cannot be paired)'
         if why:
             excluded.append(f'{key}: {why}')
             continue
-        mode = str(r.get('mode', 'uniform'))
+        mode = r.get('mode', 'uniform')
         ident = (r['variant'], r['arm'], _record_int(r['eval_len']), float(r['rho']), mode,
                  json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True),
                  str(r.get('recipe')), str(r.get('_code')))

@@ -453,19 +453,58 @@ def _probe_fingerprint(cfg):
             'val_seq_len': max(_tl, _need), 'stat': 'ppl_pooled_nll_v5'}
 
 def _probe_fp_for_mode(fp, cfg, mode):
-    if mode not in _CORRUPT_MODES:
-        raise ValueError(
-            f'_probe_fp_for_mode: unknown corruption mode {mode!r} '
-            f'(expected one of {_CORRUPT_MODES})')
     """Add the parameters a corruption mode actually consumes.
 
     `span` corruption changes with `span_len`; the existing probe_params for
     every other mode are kept byte-identical so their resume stays valid.
     Without this, changing span_len would silently reuse measurements made
     with a different span geometry."""
+    if mode not in _CORRUPT_MODES:
+        raise ValueError(
+            f'_probe_fp_for_mode: unknown corruption mode {mode!r} '
+            f'(expected one of {_CORRUPT_MODES})')
     if mode == 'span':
         return dict(fp, span_len=_probe_span_len(cfg))
     return fp
+
+def _probe_record_problem(rec):
+    """Why a stored probe record is not a usable measurement (None = usable).
+
+    Grouping keys must never contain unhashable JSON values and must never
+    describe a geometry the probe cannot produce: variant/arm are text names,
+    seed and eval_len are exact integers (eval_len >= 2), rho is a finite
+    fraction, mode is implemented, and all-or-nothing modes use rho=1.  The
+    record-specific `ppl_mean`/fingerprint checks stay with each reader."""
+    if not isinstance(rec, dict):
+        return 'not a dict'
+    _v = rec.get('variant')
+    if not isinstance(_v, str) or not _v:
+        return f'variant {_v!r} is not a non-empty text name'
+    _arm = rec.get('arm')
+    if not isinstance(_arm, str) or not _arm:
+        return f'arm {_arm!r} is not a non-empty text name'
+    if L._as_seed_int(rec.get('seed')) is None:
+        return f'seed {rec.get("seed")!r} is not an exact integer'
+    _ln = L._as_seed_int(rec.get('eval_len'))
+    if _ln is None or _ln < 2:
+        return (f'eval_len {rec.get("eval_len")!r} is not an exact integer '
+                '>= 2 (a length-1 cell has no next-token target)')
+    _rho_raw = rec.get('rho')
+    if isinstance(_rho_raw, (bool, np.bool_)):
+        return f'rho {_rho_raw!r} is a boolean flag, not a corruption fraction'
+    _rho = L._finite_scalar(_rho_raw)
+    if _rho is None or not (0.0 <= _rho <= 1.0):
+        return f'rho {_rho_raw!r} is not a finite fraction in [0,1]'
+    _mode = rec.get('mode', 'uniform')
+    if not isinstance(_mode, str) or _mode not in _CORRUPT_MODES:
+        return (f'mode {_mode!r} is not one of {_CORRUPT_MODES}')
+    if _mode in ('mask', 'delete', 'doc') and abs(_rho - 1.0) > 1e-9:
+        return (f'mode {_mode!r} is all-or-nothing and requires rho=1.0 '
+                f'(got {_rho_raw!r})')
+    _pp = rec.get('probe_params')
+    if not isinstance(_pp, dict) or not _pp:
+        return 'missing probe_params geometry (the measurement cannot be paired)'
+    return None
 
 def _fp_norm(p):
     if not isinstance(p, dict):
@@ -1629,17 +1668,18 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if r.get('synthesized'):
                 _bad_cells.append((_k, 'synthesized reconstruction'))
                 continue
-            _seed = L._as_seed_int(r.get('seed'))
-            if r.get('variant') is None or _seed is None:
-                _bad_cells.append((_k, 'no variant/integer seed'))
+            _why = _probe_record_problem(r)
+            if _why is not None:
+                _bad_cells.append((_k, _why))
                 continue
             if not L.ppl_is_usable(r.get('ppl_mean')):
                 _bad_cells.append((_k, 'ppl_mean is not a usable measurement'))
                 continue
-            if r.get('arm') is None or r.get('eval_len') is None or r.get('rho') is None:
-                _bad_cells.append((_k, 'no arm/eval_len/rho'))
-                continue
-            _usable[_k] = dict(r, seed=_seed)
+            _usable[_k] = dict(
+                r, seed=L._as_seed_int(r.get('seed')),
+                eval_len=L._as_seed_int(r.get('eval_len')),
+                rho=L._finite_scalar(r.get('rho')),
+                mode=r.get('mode', 'uniform'))
         if _bad_cells:
             print(f'[v10 stats] {len(_bad_cells)} record(s) in {sp} carry no variant/seed/ppl_mean and are skipped (they are error or truncation stubs, not measurements): ' + ', '.join((f'{k}({why})' for k, why in _bad_cells[:4])))
         _n_bad_pre = len(_bad_cells)
@@ -1649,7 +1689,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if r.get('probe_params') is None:
                 _bad_cells.append((k, 'no probe_params'))
                 continue
-            _mode = str(r.get('mode', 'uniform'))
+            _mode = r['mode']
             # the grouping key carries the mode EXPLICITLY (probe_params' mode
             # field is normalised out by _fp_norm): uniform and natural cells
             # at the same rho must never merge into one pooled cell.

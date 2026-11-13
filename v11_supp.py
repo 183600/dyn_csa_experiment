@@ -103,26 +103,30 @@ def v11_analysis(out='analysis_v11/stats.json'):
             if r.get('synthesized'):
                 _bad_cells.append((_k, 'synthesized reconstruction'))
                 continue
-            _seed = L._as_seed_int(r.get('seed'))
-            if r.get('variant') is None or _seed is None:
-                _bad_cells.append((_k, 'no variant/integer seed'))
+            _why = V10._probe_record_problem(r)
+            if _why is not None:
+                _bad_cells.append((_k, _why))
                 continue
+            _seed = L._as_seed_int(r.get('seed'))
             if not L.ppl_is_usable(r.get('ppl_mean')):
                 _bad_cells.append((_k, 'ppl_mean is not a usable measurement'))
                 continue
-            if r.get('arm') is None or r.get('eval_len') is None or r.get('rho') is None:
-                _bad_cells.append((_k, 'no arm/eval_len/rho'))
-                continue
-            if r.get('probe_params') is None:
-                _bad_cells.append((_k, 'no probe_params'))
-                continue
-            pk = (r['variant'], r.get('arm'), r.get('eval_len'), r.get('rho'), str(r.get('mode', 'uniform')), json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')), V10._val_fp_key(r.get('val_fp')))
+            _r_norm = dict(
+                r, seed=_seed,
+                eval_len=L._as_seed_int(r.get('eval_len')),
+                rho=L._finite_scalar(r.get('rho')),
+                mode=r.get('mode', 'uniform'))
+            pk = (_r_norm['variant'], _r_norm['arm'], _r_norm['eval_len'],
+                  _r_norm['rho'], _r_norm['mode'],
+                  json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True),
+                  str(r.get('_code')), str(r.get('recipe')),
+                  V10._val_fp_key(r.get('val_fp')))
             grp = cells.setdefault(pk, {})
             if _seed in grp:
                 _dup_cells.append((_k, pk[:4], _seed))
                 _dup_keys.add(pk)
                 continue
-            grp[_seed] = dict(r, seed=_seed)
+            grp[_seed] = _r_norm
         for _dk in _dup_keys:
             cells.pop(_dk, None)
         if _bad_cells:
