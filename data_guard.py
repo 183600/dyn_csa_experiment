@@ -1577,6 +1577,29 @@ def _hash_row_block(width, cap):
     return max(1, min(int(cap), _HASH_BLOCK_BYTES // max(1, 8 * int(width))))
 
 
+def _canonical_object_cell(v):
+    if isinstance(v, (bool, np.bool_)):
+        return ('num', int(v))
+    if isinstance(v, (int, np.integer)):
+        return ('num', int(v))
+    if isinstance(v, (float, np.floating)):
+        f = float(v)
+        if math.isnan(f):
+            return ('nan',)
+        if math.isinf(f):
+            return ('inf', 1 if f > 0 else -1)
+        return ('num', 0.0 if f == 0.0 else f)
+    if isinstance(v, (np.datetime64, np.timedelta64)):
+        if np.isnat(v):
+            return ('nat', type(v).__name__)
+        return ('dt', type(v).__name__, str(v))
+    try:
+        hash(v)
+    except TypeError:
+        return ('unhashable', type(v).__name__, repr(v))
+    return ('obj', type(v).__name__, v)
+
+
 def _matrix_fingerprint(X):
     arr = np.asarray(X)
     h = hashlib.sha256()
@@ -1595,6 +1618,7 @@ def _matrix_fingerprint(X):
     _obj_int = False
     _obj_fits = True
     _obj_big = False
+    _obj_canon = arr.dtype.kind in ('U', 'S')
     if arr.dtype == object and arr.size:
         # Object-dtype integer tables must keep the same exactness contract:
         # the float64 fallback collapses 2**53 and 2**53+1.
@@ -1615,6 +1639,13 @@ def _matrix_fingerprint(X):
                 # distinct.
                 _obj_int = False
                 _obj_big = True
+    if arr.dtype == object and arr.size and not _obj_int and not _obj_big:
+        _vals = arr.reshape(-1).tolist()
+        if not all(isinstance(v, numbers.Real) for v in _vals):
+            _obj_canon = True
+        elif any(isinstance(v, numbers.Integral) and abs(int(v)) > 2 ** 53
+                 for v in _vals):
+            _obj_canon = True
     _integral = _integral or _obj_int
     _wide_int = False
     _wide_neg = False
@@ -1638,6 +1669,13 @@ def _matrix_fingerprint(X):
             h.update(b'OBJ_BIG')
             for v in _blk.reshape(-1).tolist():
                 _s = str(int(v)).encode('ascii')
+                h.update(len(_s).to_bytes(8, 'little'))
+                h.update(_s)
+            continue
+        if _obj_canon:
+            h.update(b'OBJ_CANON')
+            for v in _blk.reshape(-1).tolist():
+                _s = repr(_canonical_object_cell(v)).encode('utf-8', 'backslashreplace')
                 h.update(len(_s).to_bytes(8, 'little'))
                 h.update(_s)
             continue
@@ -1742,6 +1780,19 @@ def _row_keys(X):
 
         return [tuple(_cell_key(v) for v in row) for row in src]
     keys = []
+    if src.dtype.kind in ('U', 'S'):
+        _tag = b'U' if src.dtype.kind == 'U' else b'S'
+        _step = _hash_row_block(int(src.shape[1]), 1 << 16)
+        for start in range(0, src.shape[0], _step):
+            for row in src[start:start + _step].tolist():
+                h = hashlib.blake2b(digest_size=8)
+                h.update(_tag)
+                for cell in row:
+                    _b = cell.encode('utf-8') if isinstance(cell, str) else bytes(cell)
+                    h.update(len(_b).to_bytes(8, 'little'))
+                    h.update(_b)
+                keys.append(h.digest())
+        return keys
     # Integer/bool/datetime/string columns have an exact fixed-width byte
     # representation.  Converting them through float64 loses integers above
     # 2**53 (2**53 and 2**53+1 would hash as the same row and one would be

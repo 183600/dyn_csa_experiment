@@ -358,7 +358,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, 
         j = min(i + n_ch, n_seq)
         rows = []
         for jj in range(i, j):
-            _rk = (eval_len, jj, float(rho), vocab, int(cfg['target']), mode)
+            _rk = (eval_len, jj, float(rho), vocab, int(cfg['target']), mode, _span_len)
             _row = row_cache.get(_rk) if row_cache is not None else None
             if _row is None:
                 _row = _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=_span_len)

@@ -116,6 +116,22 @@ def _exact_int_scalar(value):
     return int(f)
 
 
+def _seed_identity_scalar(value):
+    sid = _exact_int_scalar(value)
+    if sid is not None:
+        return sid
+    if not isinstance(value, (str, bytes)):
+        return None
+    try:
+        text = value.decode('ascii') if isinstance(value, bytes) else value
+        number = float(text)
+    except (UnicodeDecodeError, AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    if math.isfinite(number) and number.is_integer() and abs(number) < 2 ** 53:
+        return int(number)
+    return None
+
+
 def _load(path):
     if not os.path.exists(path):
         return None
@@ -2498,7 +2514,7 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         _seed_ids = {}
         _dup_ids = set()
         for _sk in _seeds:
-            _sid = _exact_int_scalar(_sk)
+            _sid = _seed_identity_scalar(_sk)
             if _sid is None:
                 continue
             if _sid in _seed_ids:
@@ -2515,7 +2531,7 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         # is run on the valid deltas and its own n is what the n>=6 floor uses.
         _d, _bad_seed = [], []
         for _sk, v in _seeds.items():
-            _sid = _exact_int_scalar(_sk)
+            _sid = _seed_identity_scalar(_sk)
             if _sid is None or _sid in _dup_ids:
                 _bad_seed.append(str(_sk))
                 continue
