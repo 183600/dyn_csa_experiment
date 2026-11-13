@@ -400,11 +400,9 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         status = 'healthy'
         reason = 'training CE is falling and validation CE is not rising'
     elif val_s < -val_tol:
-        # Training CE is not decreasing (flat or rising) while validation CE
-        # is still falling.  This is not `validation_degrading` — the old
-        # final else mislabelled it and printed a reason that contradicted the
-        # sign of the validation slope.  Validation improving is not an
-        # overfitting/staleness signal; classify it by what the curves show.
+        # Validation CE is still falling while training CE is flat or rising:
+        # a validation-only improvement, not an overfitting or staleness
+        # signal.
         status = 'healthy'
         reason = ('validation CE is falling in the tail while training CE is '
                   'flat or rising (validation-only improvement)')

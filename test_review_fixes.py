@@ -531,8 +531,7 @@ def t_training_health_classifier():
     h = L.classify_training_health(hist)
     assert h['status'] == 'healthy', h
     # Training CE flat/rising while validation CE falls is a validation-only
-    # improvement, not `validation_degrading` (whose reason would contradict
-    # the observed negative validation slope).
+    # improvement, not `validation_degrading`.
     hist = [{'step': i * 100, 'train_ce': 4.0 + 0.001 * i,
              'val_ce': 4.0 - 0.05 * i, 'val_ppl': 55.0 - 0.5 * i}
             for i in range(6)]

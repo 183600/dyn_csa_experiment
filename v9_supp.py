@@ -311,7 +311,7 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     A('')
     A('## P2S3 RoPE 20k 长跑补第三种子（n=2 → n=3）')
     A('')
-    A('**背景**：`csa_fixed_rope` vs `full_rope` 的 20k 步 / ~123M token 对照（abs-PE 20k 长跑的 RoPE 镜像）在此补齐第三个 seed（同一 outdir，resume 跳过已完成的 seed）。')
+    A('**背景**：`csa_fixed_rope` vs `full_rope` 的长跑对照（abs-PE 长跑的 RoPE 镜像）在此补齐第三个 seed（同一 outdir，resume 跳过已完成的 seed）。')
     A('')
     A('| variant | PPL@20k (mean±std) | n |')
     A('|---|---|---|')

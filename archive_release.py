@@ -382,8 +382,7 @@ def cmd_verify(tar_path):
             return 1
         # Two spellings that resolve to the same extraction path (e.g. `a`
         # and `./a`, or `dir/a` and `dir/./a`) are ambiguous even though the
-        # raw member names differ.  The exact-name Counter above cannot see
-        # that collision, so normalise the archive paths as well before
+        # raw member names differ; normalise the archive paths before
         # attesting a unique release tree.
         _norm_map = {}
         for _name in names:
