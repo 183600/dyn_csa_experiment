@@ -674,15 +674,18 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
         except Exception:
             return None
         _sd = {}
-        for _r in _s.values():
+        for _rk, _r in _s.items():
             if isinstance(_r, dict) and 'seed' in _r and _r.get('variant') and L.ppl_is_usable(_r.get('ppl')) and (not _r.get('synthesized')):
-                if _variants is not None and _r['variant'] not in _variants:
+                _rv = L._record_variant_name(_r, _rk)
+                if _rv is None:
+                    continue
+                if _variants is not None and _rv not in _variants:
                     continue
                 # Normalise the seed identity so 0 and "0" do not count as two
                 # independent seeds in the displayed n.
                 _si = L._as_seed_int(_r['seed'])
                 if _si is not None:
-                    _sd.setdefault(_r['variant'], set()).add(_si)
+                    _sd.setdefault(_rv, set()).add(_si)
         _ns = [len(x) for x in _sd.values()]
         return (min(_ns), max(_ns)) if _ns else None
 

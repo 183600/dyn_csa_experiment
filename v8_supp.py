@@ -55,6 +55,24 @@ def _ppl_by_seed(outdir, full=False):
 def _paired_records(outdir):
     return L.ppl_by_seed(outdir, full=True)
 
+def _cfg_key(value):
+    """Hashable identity for a run_cfg metadata value.
+
+    Valid records carry a string, but a hand-edited/merged JSON file can hold
+    a list/dict.  Grouping keys must never raise on that input: canonicalise
+    the unhashable spelling instead of aborting the whole analysis."""
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        try:
+            return ('__unhashable__', json.dumps(value, sort_keys=True,
+                                                 separators=(',', ':'),
+                                                 default=str))
+        except (TypeError, ValueError):
+            return ('__unhashable__', repr(value))
+
+
 def _add_paired(comparisons, name, panel, a, b, who='', outdir=None):
 
     def _omit(reason):
@@ -76,7 +94,8 @@ def _add_paired(comparisons, name, panel, a, b, who='', outdir=None):
     # of one controlled contrast.  Keep the largest/current config group.
     _cfg_groups = {}
     for _s in common:
-        _cfg_groups.setdefault((panel[a][_s].get('run_cfg'), panel[b][_s].get('run_cfg')), []).append(_s)
+        _cfg_groups.setdefault((_cfg_key(panel[a][_s].get('run_cfg')),
+                                _cfg_key(panel[b][_s].get('run_cfg'))), []).append(_s)
     if len(_cfg_groups) > 1:
         _ranked = sorted(_cfg_groups.items(), key=lambda kv: (not (isinstance(kv[0][0], str) and V.CKPT_CODE and kv[0][0].endswith(f'_cs{V.CKPT_CODE}')), -len(kv[1]), str(kv[0])))
         common = _ranked[0][1]

@@ -506,6 +506,35 @@ def _probe_record_problem(rec):
         return 'missing probe_params geometry (the measurement cannot be paired)'
     return None
 
+def _niah_record_problem(rec):
+    """Why a stored NIAH-natural record is not a usable measurement (None = ok).
+
+    The reader builds grouping keys from variant/arm/eval_len/condition, so an
+    unhashable or wrongly-typed field would abort the whole analysis instead
+    of excluding one bad record.  Geometry follows the same exact-integer
+    contract as the corruption probe: a length-1 cell has no scored target.
+    """
+    if not isinstance(rec, dict):
+        return 'not a dict'
+    for _f in ('variant', 'arm'):
+        _v = rec.get(_f)
+        if not isinstance(_v, str) or not _v:
+            return f'{_f} {_v!r} is not a non-empty text name'
+    if L._as_seed_int(rec.get('seed')) is None:
+        return f'seed {rec.get("seed")!r} is not an exact integer'
+    _ln = L._as_seed_int(rec.get('eval_len'))
+    if _ln is None or _ln < 2:
+        return (f'eval_len {rec.get("eval_len")!r} is not an exact integer '
+                '>= 2 (a length-1 cell has no scored target)')
+    _cond = rec.get('condition')
+    if not isinstance(_cond, str) or not _cond:
+        return f'condition {_cond!r} is not a non-empty text name'
+    _pp = rec.get('probe_params')
+    if not isinstance(_pp, dict) or not _pp:
+        return 'missing probe_params geometry (the task cells cannot be paired)'
+    return None
+
+
 def _fp_norm(p):
     if not isinstance(p, dict):
         return p
@@ -1947,29 +1976,32 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 nraw = {}
             ncells = {}
             _dup_nkeys = set()
+            _niah_bad = []
             for _k, r in nraw.items():
                 if not isinstance(r, dict) or r.get('task') != 'niah_natural':
                     continue
                 if r.get('synthesized'):
                     continue
-                if r.get('variant') is None or r.get('seed') is None or r.get('arm') is None or r.get('condition') is None:
+                _why = _niah_record_problem(r)
+                if _why is not None:
+                    _niah_bad.append((_k, _why))
                     continue
                 if r.get('_code') != L.code_stamp():
                     # Same fail-closed rule as the corruption contrasts: stale
                     # NIAH records cannot contribute p-values.
                     continue
                 _seed = L._as_seed_int(r.get('seed'))
-                if _seed is None:
-                    continue
+                _ln = L._as_seed_int(r.get('eval_len'))
                 # acc/nll are measurements: a bool/string/NaN is not a result.
                 # Preserve the declared cell with a NaN value so the Holm
                 # family keeps its slot; a boolean is not an accuracy.
                 _acc = L._finite_scalar(r.get('acc'))
                 _nll = L._finite_scalar(r.get('nll'))
-                _r = dict(r, seed=_seed,
+                _r = dict(r, seed=_seed, eval_len=_ln,
+                          condition=r['condition'],
                           acc=(_acc if _acc is not None else float('nan')),
                           nll=(_nll if _nll is not None else float('nan')))
-                nkey = (_r['variant'], _r['arm'], _r['eval_len'], _r['condition'], json.dumps(_fp_norm(_r.get('probe_params')), sort_keys=True), str(_r.get('_code')), str(_r.get('recipe')), _val_fp_key(_r.get('val_fp')))
+                nkey = (_r['variant'], _r['arm'], _ln, _r['condition'], json.dumps(_fp_norm(_r.get('probe_params')), sort_keys=True), str(_r.get('_code')), str(_r.get('recipe')), _val_fp_key(_r.get('val_fp')))
                 grp = ncells.setdefault(nkey, {})
                 if _seed in grp:
                     # Two measurements for one (cell, seed) are ambiguous; the
@@ -1981,6 +2013,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 ncells.pop(_dk, None)
             if _dup_nkeys:
                 print(f'[v10 stats] {len(_dup_nkeys)} NIAH-natural cell(s) have duplicate (cell, seed) records — the whole ambiguous cell is dropped from the pooling')
+            if _niah_bad:
+                print(f'[v10 stats] {len(_niah_bad)} NIAH-natural record(s) are malformed and EXCLUDED before grouping: '
+                      + ', '.join(f'{_bk}({_bw})' for _bk, _bw in _niah_bad[:4]))
             niah_cells = []
             for (v, arm, Ln, cond, _pp, _cd, _recipe, _vfp), by_seed in sorted(ncells.items(), key=lambda kv: kv[0]):
                 accs = {s: r['acc'] for s, r in by_seed.items()}

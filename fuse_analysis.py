@@ -69,7 +69,14 @@ def _variant_records(variant):
             # first, then the largest group.
             _cfg_groups = {}
             for _s, _r in _keep.items():
-                _cfg_groups.setdefault(_r.get('run_cfg') if isinstance(_r, dict) else None, []).append(_s)
+                _cv = _r.get('run_cfg') if isinstance(_r, dict) else None
+                try:
+                    hash(_cv)
+                except TypeError:
+                    _cv = ('__unhashable__', json.dumps(_cv, sort_keys=True,
+                                                        separators=(',', ':'),
+                                                        default=str))
+                _cfg_groups.setdefault(_cv, []).append(_s)
             if len(_cfg_groups) > 1:
                 _ranked_cfg = sorted(
                     _cfg_groups.items(),

@@ -4409,6 +4409,21 @@ class AttnCfg:
     boundary_policy: str = 'threshold'
 
     def __post_init__(self):
+        # Dispatch strings select different forward paths; an unknown value
+        # must fail at construction instead of silently falling through to a
+        # different mechanism (or a later assert after data/model setup).
+        if self.kind not in ('full', 'csa', 'hca'):
+            raise ValueError(f'unknown attention kind {self.kind!r}; expected full/csa/hca')
+        if self.chunking not in ('fixed', 'cosine_learnable', 'cosine_abs', 'cosine_adaptive'):
+            raise ValueError(f'unknown chunking {self.chunking!r}; expected fixed/cosine_learnable/cosine_abs/cosine_adaptive')
+        if self.indexer_mode not in ('learned', 'random'):
+            raise ValueError(f'unknown indexer_mode {self.indexer_mode!r}; expected learned/random')
+        if self.content_mode not in ('pooled', 'zero'):
+            raise ValueError(f'unknown content_mode {self.content_mode!r}; expected pooled/zero')
+        if self.fuse_mode not in ('none', 'learned'):
+            raise ValueError(f'unknown fuse_mode {self.fuse_mode!r}; expected none/learned')
+        if self.boundary_policy not in ('threshold', 'reinforce'):
+            raise ValueError(f'unknown boundary_policy {self.boundary_policy!r}; expected threshold/reinforce')
         if self.open_block_mode not in OPEN_BLOCK_MODES:
             raise ValueError(f'unknown open_block_mode {self.open_block_mode!r}; expected one of {OPEN_BLOCK_MODES}')
         if self.open_block_scope not in OPEN_BLOCK_SCOPES:
@@ -8160,6 +8175,18 @@ def _json_clean(obj):
     return obj
 
 
+def _prov_data_version(prov):
+    """`provenance.data.data_version` when the provenance is a well-formed
+    object, else None.  A malformed provenance must not turn manifest writing
+    into an AttributeError after the cell has already run."""
+    if not isinstance(prov, dict):
+        return None
+    data = prov.get('data')
+    if not isinstance(data, dict):
+        return None
+    return data.get('data_version')
+
+
 def atomic_write_json(path, obj, indent=2):
     text = json.dumps(_json_clean(obj), indent=indent, default=float, allow_nan=False)
     d = os.path.dirname(os.path.abspath(path))
@@ -11826,6 +11853,22 @@ def run_cfg_knobs(fp):
     m = _RUN_CFG_RE.match(fp)
     return m.groupdict() if m else {}
 
+def _record_variant_name(rec, key):
+    """Canonical arm name for a stored panel record (None = malformed).
+
+    A record without a `variant` field falls back to the summary-key prefix,
+    matching the historical reader contract.  A non-text variant (list/dict)
+    cannot name an arm; returning None lets readers exclude it rather than
+    crash on an unhashable dict/set key."""
+    if not isinstance(rec, dict):
+        return None
+    v = rec.get('variant')
+    if v is None:
+        v = str(key).split('::', 1)[0]
+    if not isinstance(v, str) or not v:
+        return None
+    return v
+
 def variant_presence(outdir):
     out = {}
     sp = os.path.join(outdir, 'summary.json')
@@ -11844,9 +11887,9 @@ def variant_presence(outdir):
     for _k, r in raw.items():
         if not isinstance(r, dict):
             continue
-        v = r.get('variant')
+        v = _record_variant_name(r, _k)
         if v is None:
-            v = _k.split('::')[0]
+            continue
         if ppl_is_usable(r.get('ppl')) and (not r.get('synthesized')) and (_as_seed_int(r.get('seed')) is not None):
             kept[v] = kept.get(v, 0) + 1
         else:
@@ -11861,7 +11904,8 @@ def variant_presence(outdir):
     return out
 
 def format_variant_presence(presence, variants):
-    parts = [f'`{v}`: {presence[v]}' for v in variants if v in presence]
+    parts = [f'`{v}`: {presence[v]}' for v in variants
+             if isinstance(v, str) and v in presence]
     if not parts:
         return None
     return '; '.join(parts) + ' — omitted rather than quoting a cross-panel delta'
@@ -11904,10 +11948,10 @@ def _record_identity(rec, key, legacy_ok):
     seed = _as_seed_int(rec.get('seed'))
     if seed is None:
         return None
-    var = rec.get('variant')
+    var = _record_variant_name(rec, key)
     if var is None:
-        var = str(key).split('::', 1)[0]
-    return (str(var), record_tag(rec, key, legacy_ok), seed)
+        return None
+    return (var, record_tag(rec, key, legacy_ok), seed)
 
 def _as_seed_int(v):
     if v is None or isinstance(v, (bool, np.bool_)):
@@ -15695,7 +15739,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                     'rng_fp': rec.get('rng_fp'),
                     'data_fp': rec.get('data_fp'),
                     'val_fp': rec.get('val_fp'),
-                    'data_version': rec.get('data_version') or prov.get('data', {}).get('data_version'),
+                    'data_version': rec.get('data_version') or _prov_data_version(prov),
                     'code_stamp': rec.get('_code'),
                     'hyperparams': rec.get('hyperparams'),
                     'curve_summary': {'n_points': (len(_losses) if _losses else int(rec.get('curve_n_points') or 0)),
@@ -15780,7 +15824,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'config': _jsonable(cfg),
         'provenance': prov,
-        'data_version': prov.get('data', {}).get('data_version'),
+        'data_version': _prov_data_version(prov),
         'sanity': sanity,
         'reproducibility': reproducibility,
         'seed_contract': seed_contract,
@@ -20185,9 +20229,10 @@ def aggregate(summary, *, outdir=None):
         if _as_seed_int(rec.get('seed')) is None:
             print(f'[aggregate] WARNING: ignoring record {key!r}: seed {rec.get("seed")!r} is not an exact integer')
             continue
-        v = rec.get('variant')
+        v = _record_variant_name(rec, key)
         if v is None:
-            v = str(key).split('::', 1)[0]
+            print(f'[aggregate] WARNING: ignoring record {key!r}: variant {rec.get("variant")!r} is not a text arm name')
+            continue
         per_variant.setdefault((v, _protocol_tag(rec, key)), []).append(rec)
     def _seed_key(s):
         # JSON round-trips can leave the same seed as 0 or "0"; the rest of the
@@ -20960,7 +21005,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
             _ckpt_dir = cfg.get('ckpt_dir') or os.path.join(outdir, 'checkpoints')
             rec = train_variant(v, train_ids, val_batch, vocab, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=deadline_ts, save_ckpt=_save_mode, ckpt_dir=_ckpt_dir, diag_every=cfg.get('diag_every'), measure_eff=cfg.get('measure_efficiency', True), amp_dtype=cfg.get('amp_dtype', 'auto'), eager_batch=cfg.get('eager_batch', 'auto'))
             _prov = prov if prov is not None else experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
-            _hp = run_hyperparameters(cfg, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, vocab=vocab, mlp_ratio=ratios[v], data_version=_prov.get('data', {}).get('data_version'), amp_dtype=rec.get('amp_dtype', 'auto'), eager_batch=rec.get('eager_batch', 'auto'))
+            _hp = run_hyperparameters(cfg, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, vocab=vocab, mlp_ratio=ratios[v], data_version=_prov_data_version(_prov), amp_dtype=rec.get('amp_dtype', 'auto'), eager_batch=rec.get('eager_batch', 'auto'))
             _curve_ref = None
             _curve_losses = []
             _curve_ph = []
@@ -21120,6 +21165,27 @@ def preflight_fingerprint(cfg, *, stage, vocab=None, data_fp=None, probe_cfg=Non
     }, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
     return 'preflight-' + hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
 
+def _as_bool_flag(value):
+    """Boolean flag value, or None when the value is not a boolean/0/1.
+
+    ``bool("false")`` is True, so a JSON/config string must never be accepted
+    as an explicit flag: malformed values fall back to the geometry default
+    instead of silently enabling a different run mode."""
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, numbers.Integral):
+        _iv = int(value)
+        return bool(_iv) if _iv in (0, 1) else None
+    if isinstance(value, numbers.Real):
+        try:
+            _fv = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if math.isfinite(_fv) and _fv in (0.0, 1.0):
+            return bool(_fv)
+    return None
+
+
 def _is_confirmatory_cfg(cfg):
     """A confirmation / scale panel defaults to strict determinism + a
     mandatory real-architecture reproducibility check.
@@ -21129,7 +21195,11 @@ def _is_confirmatory_cfg(cfg):
     Small exploratory/test panels keep the advisory path."""
     for _k in ('confirm', 'confirmation', 'require_repro'):
         if cfg.get(_k) is not None:
-            return bool(cfg.get(_k))
+            _flag = _as_bool_flag(cfg.get(_k))
+            if _flag is not None:
+                return _flag
+            print(f'[run] WARNING: {_k}={cfg.get(_k)!r} is not a boolean flag — ignoring it (the panel mode is inferred from its geometry)')
+            break
     try:
         _d = int(cfg.get('d', 256))
         _nseeds = len(cfg.get('seeds') or [])

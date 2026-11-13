@@ -215,9 +215,10 @@ def synthesize_long_summary():
         if _r.get('steps') != _LONG_STEPS or not L.ppl_is_usable(_r.get('ppl')):
             continue
         _tw_seed = _num_or_none(_r.get('seed'))
-        if _tw_seed is None:
+        _tw_var = _r.get('variant')
+        if _tw_seed is None or not isinstance(_tw_var, str) or not _tw_var:
             continue
-        _twkey = (_r.get('variant'), str(_r.get('protocol') or ''), _tw_seed)
+        _twkey = (_tw_var, str(_r.get('protocol') or ''), _tw_seed)
         _twin_idx.setdefault(_twkey, []).append((_k, float(_r['ppl'])))
     for v, e in agg.items():
         if v in _unaligned:

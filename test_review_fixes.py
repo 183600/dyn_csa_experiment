@@ -7772,6 +7772,73 @@ def t_probe_reader_geometry_and_manifest_fail_closed():
                 raise AssertionError(f'endpoint {_bad_ep!r} was accepted')
 
 
+def t_malformed_panel_and_niah_records_do_not_crash():
+    # Panel readers build dict/set keys from a record's variant.  A JSON
+    # list/dict variant cannot name an arm, so it must be excluded rather than
+    # raising an unhashable-key TypeError during a report build.
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'good::seed0': {'variant': 'good', 'seed': 0, 'ppl': 10.0},
+                       'bad::seed0': {'variant': ['bad'], 'seed': 0, 'ppl': 9.0},
+                       'bad2::seed0': {'variant': {'bad': 1}, 'seed': 0, 'ppl': 8.0}}, f)
+        assert L.variant_presence(d) == {}
+        assert L.format_variant_presence(L.variant_presence(d), ['good', ['bad']]) is None
+        rows = L.ppl_by_seed(d)
+        assert rows == {'good': {0: 10.0}}, rows
+        recs = BR.per_seed_records(d)
+        assert set(recs) == {'good'}, recs
+        _agg = L.aggregate({'good::seed0': {'variant': 'good', 'seed': 0, 'ppl': 10.0},
+                            'bad::seed0': {'variant': ['bad'], 'seed': 0, 'ppl': 9.0}})
+        assert set(_agg) == {'good'}, _agg
+        assert BR._prefer_one_cfg([1, 2], lambda _x: ('a', ['bad'])) == [1, 2]
+        # The zero-GPU audits build the same dict keys; a malformed variant is
+        # excluded instead of aborting the audit with an unhashable key.
+        for _fn in (A.audit_attribution, A.audit_failures,
+                    A.audit_efficiency_pairs):
+            try:
+                _fn(outdirs=[d])
+            except TypeError:
+                _fn([d])
+
+    # NIAH-natural records enter a grouping key, so the same geometry/type
+    # validation as the corruption probe is required before that key is built.
+    good = {'variant': 'csa_fixed_rope', 'arm': 'learned', 'seed': 0,
+            'eval_len': 4096, 'condition': 'clean',
+            'probe_params': {'n_seq': 16, 'target': 512}}
+    assert V10._niah_record_problem(good) is None
+    # Dispatch strings are exact enums: an unknown value must not survive to a
+    # later forward-path fallthrough.
+    for _kw in ({'kind': 'bogus'}, {'chunking': 'bogus'},
+                {'indexer_mode': 'bogus'}, {'content_mode': 'bogus'},
+                {'fuse_mode': 'bogus'}, {'boundary_policy': 'bogus'}):
+        try:
+            L.AttnCfg(**_kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'AttnCfg accepted {_kw!r}')
+    # Boolean config flags are not truthiness tests: bool("false") is True.
+    assert L._is_confirmatory_cfg({'confirm': True}) is True
+    assert L._is_confirmatory_cfg({'confirm': False}) is False
+    assert L._is_confirmatory_cfg({'d': 512, 'seeds': [0, 1]}) is True
+    assert L._is_confirmatory_cfg({'d': 64, 'seeds': [0], 'confirm': 'false'}) is False
+    for bad in (dict(good, variant=['x']), dict(good, arm={'x': 1}),
+                dict(good, eval_len=True),
+                dict(good, eval_len=1), dict(good, condition=['clean']),
+                dict(good, seed=1.5), dict(good, probe_params=None)):
+        assert V10._niah_record_problem(bad) is not None, bad
+
+    # A malformed provenance object must not turn manifest writing into an
+    # AttributeError after a cell has already run.
+    assert L._prov_data_version({'data': []}) is None
+    assert L._prov_data_version({'data': {'data_version': 'dv'}}) == 'dv'
+    with tempfile.TemporaryDirectory() as d:
+        L.write_run_manifest(
+            d, {'seeds': [0], 'variants': ['a']}, 'cfg', {'data': []},
+            {'a::seed0': {'variant': 'a', 'seed': 0, 'ppl': 10.0,
+                          'losses': [1.0]}},
+            status='complete', planned_cells=['a::seed0'])
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8024,6 +8091,7 @@ def main():
     _check('L19 probe geometry requires exact integers', t_probe_geometry_exact_integers)
     _check('L20 shared validation fingerprint tolerates malformed provenance', t_shared_validation_fp_refuses_malformed_provenance)
     _check('L21 probe readers/manifest reject impossible geometry', t_probe_reader_geometry_and_manifest_fail_closed)
+    _check('L22 malformed panel/NIAH records are excluded without crashing', t_malformed_panel_and_niah_records_do_not_crash)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

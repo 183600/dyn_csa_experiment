@@ -143,7 +143,8 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None):
     # of one controlled contrast.  Keep the largest/current config group.
     _cfg_groups = {}
     for _s in common:
-        _cfg_groups.setdefault((panel[a][_s].get('run_cfg'), panel[b][_s].get('run_cfg')), []).append(_s)
+        _cfg_groups.setdefault((V8._cfg_key(panel[a][_s].get('run_cfg')),
+                                V8._cfg_key(panel[b][_s].get('run_cfg'))), []).append(_s)
     if len(_cfg_groups) > 1:
         _ranked = sorted(_cfg_groups.items(), key=lambda kv: (not (isinstance(kv[0][0], str) and V.CKPT_CODE and kv[0][0].endswith(f'_cs{V.CKPT_CODE}')), -len(kv[1]), str(kv[0])))
         common = _ranked[0][1]
@@ -358,13 +359,14 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
         except Exception:
             return None
         _sd = {}
-        for _r in _s.values():
+        for _rk, _r in _s.items():
             if isinstance(_r, dict) and 'seed' in _r and L.ppl_is_usable(_r.get('ppl')) and (not _r.get('synthesized')):
                 # Normalise the seed identity so 0 and "0" do not count as two
                 # independent seeds in the displayed n.
                 _si = L._as_seed_int(_r['seed'])
-                if _si is not None:
-                    _sd.setdefault(_r.get('variant'), set()).add(_si)
+                _rv = L._record_variant_name(_r, _rk)
+                if _si is not None and _rv is not None:
+                    _sd.setdefault(_rv, set()).add(_si)
         _ns = [len(x) for x in _sd.values()]
         return (min(_ns), max(_ns)) if _ns else None
 

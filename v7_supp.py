@@ -1813,13 +1813,25 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
                 _slot[_seed] = r
     pairs = [('warmup w=5000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w5000', 'results_lm_v7_warmup::csa_fixed::w0'), ('warmup w=10000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w10000', 'results_lm_v7_warmup::csa_fixed::w0'), ('CSA+RoPE vs CSA absPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::csa_fixed'), ('CSA+RoPE vs dense+RoPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::full_rope'), ('hybrid+RoPE vs dense+RoPE', 'results_lm_v7_rope::hybrid_fixed_rope', 'results_lm_v7_rope::full_rope')]
     per_variant = {}
+
+    def _cfg_key(value):
+        # A hand-edited record can carry a list/dict run_cfg; grouping it must
+        # exclude nothing and must not raise an unhashable-key TypeError.
+        try:
+            hash(value)
+            return value
+        except TypeError:
+            return ('__unhashable__', json.dumps(value, sort_keys=True,
+                                                 separators=(',', ':'),
+                                                 default=str))
+
     for k, v in recs.items():
         _m = {s: r for s, r in v.items() if not r.get('_dup')}
         if not _m:
             continue
         _groups = {}
         for s, r in _m.items():
-            _groups.setdefault(r.get('run_cfg'), []).append(s)
+            _groups.setdefault(_cfg_key(r.get('run_cfg')), []).append(s)
         if len(_groups) > 1:
             _cur_sfx = f'_cs{CKPT_CODE}'
             _ranked = sorted(_groups.items(), key=lambda kv: (not (isinstance(kv[0], str) and kv[0].endswith(_cur_sfx)), -len(kv[1]), str(kv[0])))

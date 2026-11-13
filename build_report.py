@@ -400,6 +400,22 @@ def _finite_ppls(r):
         return []
     return [f for f in (_as_finite(x) for x in ppls) if f is not None and f > 0.0]
 
+def _record_variant(rec, key):
+    """Canonical arm name for a stored record (None = malformed/unhashable).
+
+    A missing `variant` falls back to the summary-key prefix, matching the
+    historical reader contract.  A list/dict variant cannot name an arm; the
+    reader excludes it instead of crashing when building a dict key."""
+    if not isinstance(rec, dict):
+        return None
+    v = rec.get('variant')
+    if v is None:
+        v = str(key).split('::', 1)[0]
+    if not isinstance(v, str) or not v:
+        return None
+    return v
+
+
 _WARM_KEY_RE = re.compile('.*::w(\\d+)::seed\\d+$')
 
 def _legacy_warm_tags(s):
@@ -447,11 +463,27 @@ def _tag_of(r, key=None, legacy_ok=None):
     return ''
 
 def _prefer_one_cfg(items, cfg_of, who=''):
+    def _keyable(value):
+        # cfg_of returns (label, run_cfg); a hand-edited record can put a
+        # list/dict in run_cfg.  Keep the tuple shape while making every part
+        # hashable so one malformed record cannot abort the whole report.
+        if isinstance(value, tuple):
+            return tuple(_keyable(v) for v in value)
+        try:
+            hash(value)
+            return value
+        except TypeError:
+            return ('__unhashable__', type(value).__name__, repr(value))
+
     by = collections.defaultdict(list)
     for it in items:
-        by[cfg_of(it)].append(it)
+        by[_keyable(cfg_of(it))].append(it)
     per = collections.defaultdict(list)
-    for (label, cfg), lst in by.items():
+    for _key, lst in by.items():
+        if isinstance(_key, tuple) and len(_key) == 2:
+            label, cfg = _key
+        else:
+            label, cfg = _key, _key
         per[label].append((cfg, lst))
     kept, dropped = ([], [])
     for label, gl in per.items():
@@ -523,7 +555,11 @@ def per_seed_records(outdir):
             if _sd is None:
                 print(f"[report] record {_k!r} in {outdir} carries a non-integer seed ({r.get('seed')!r}) — skipped for pairing")
                 continue
-            _slot = out[r['variant']]
+            _v = _record_variant(r, _k)
+            if _v is None:
+                print(f"[report] record {_k!r} in {outdir} carries a non-text variant ({r.get('variant')!r}) — skipped for pairing")
+                continue
+            _slot = out[_v]
             _tk = (_tag_of(r, _k, _legacy_ok), _sd)
             if _tk in _slot:
                 print(f'[report] ambiguous (variant, protocol, seed) = ({r['variant']!r}, {_tk[0]!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
@@ -947,7 +983,9 @@ def sec_p0e():
         if r is None:
             continue
         lines.append(f'| `{v}` | {fm(_ppl_value(r))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
-    _raw_items = [_kv for _kv in s.items() if isinstance(_kv[1], dict) and 'variant' in _kv[1] and _measurable(_kv[1])]
+    _raw_items = [_kv for _kv in s.items()
+                  if isinstance(_kv[1], dict) and _measurable(_kv[1])
+                  and _record_variant(_kv[1], _kv[0]) is not None]
     if _CUR_CS:
         _cur_items = [_kv for _kv in _raw_items if _kv[1].get('_code') == _CUR_CS]
         if _raw_items and not _cur_items:
@@ -973,7 +1011,11 @@ def sec_p0e():
             if not _ppl_ok(pv):
                 _dropped_pts += 1
                 continue
-            _cell = trajs[r['variant']][int(step)]
+            _vname = _record_variant(r, _k)
+            if _vname is None:
+                print(f"[report] sec_p0e: record {_k!r} carries a non-text variant ({r.get('variant')!r}) — skipped")
+                continue
+            _cell = trajs[_vname][int(step)]
             if _sdv in _cell:
                 print(f"[report] sec_p0e: ambiguous (variant, step, seed) = ({r['variant']!r}, {int(step)}, {_sdv}): two measurable points found; keeping the FIRST")
                 continue
@@ -1320,7 +1362,11 @@ def sec_p1l():
     s = summary('results_len')
     if not s:
         return '## P1 长上下文长度外推（train@512 → eval 512..4096）— （无结果）\n\n> 注：合成 NIAH 检索探针已实现并调试（碰撞无关布局、可达标签）；本报告以 wikitext 长度外推覆盖长上下文评测（见报告头部说明）。\n\n'
-    recs = [r for r in s.values() if isinstance(r, dict) and isinstance(r.get('by_len'), dict) and (not r.get('synthesized')) and any((isinstance(c, dict) and _ppl_ok(c.get('ppl')) for c in r['by_len'].values()))]
+    recs = [r for _k, r in s.items()
+            if isinstance(r, dict) and _record_variant(r, _k) is not None
+            and isinstance(r.get('by_len'), dict) and (not r.get('synthesized'))
+            and any((isinstance(c, dict) and _ppl_ok(c.get('ppl'))
+                     for c in r['by_len'].values()))]
     _by_var = {}
     for r in recs:
         _by_var.setdefault(r.get('variant'), []).append(r)
@@ -1567,7 +1613,9 @@ def sec_p2s():
     if not d:
         return ''
     lines = ['## P2 v5 scale 面板补种子（至 4 seeds）+ 配对显著性', '', '**待检验论断**：v5 scale 的种子数不足，需 4 seeds + `full_matched`。', '', '| variant | PPL (pooled/mean; ±seed sd) | 文档 bootstrap 95% CI | n | params |', '|---|---|---|---|---|']
-    _variants = sorted({r.get('variant') for r in d.values() if isinstance(r, dict) and r.get('variant') is not None})
+    _variants = sorted({_v for _v in
+                        (_record_variant(r, _k) for _k, r in d.items())
+                        if _v is not None})
     for v in _variants:
         r = _agg_entry(d, v)
         if r is None:
