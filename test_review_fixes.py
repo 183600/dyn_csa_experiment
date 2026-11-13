@@ -1094,6 +1094,51 @@ def t_mode_validation():
         raise AssertionError('uniform corruption with vocab=1 must be rejected (no alternative token)')
     except ValueError:
         pass
+    # Row/length geometry is exact too: a boolean or fractional length must
+    # not corrupt a different span (or fail later in a slice/index).
+    for _kw in ({'eval_len': True}, {'eval_len': 1.5}, {'eval_len': -1},
+                {'target': True}, {'target': -1}, {'target': 128},
+                {'jj': True}, {'jj': 1.5}, {'jj': 99},
+                {'span_len': True}, {'span_len': 1.5}, {'span_len': 0}):
+        _args = dict(val_ids=_PANEL, eval_len=128, rho=0.5, mode='uniform',
+                     jj=0, vocab=_VOCAB, target=32)
+        _args.update(_kw)
+        try:
+            V10._corrupt_row(**_args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'_corrupt_row accepted malformed geometry {_kw!r}')
+    # Probe/fingerprint grids follow the same exact-integer geometry contract;
+    # a boolean length or a fractional density must not fingerprint a
+    # different cell.
+    for _bad in ({'eval_lens': [True]}, {'eval_lens': [1.5]},
+                 {'eval_lens': []}, {'modes': {'uniform': [True]}},
+                 {'modes': {'uniform': [1.5]}}, {'modes': 'uniform'}):
+        _pcfg = dict(V10.PROBE)
+        _pcfg.update(_bad)
+        try:
+            V10._probe_defs(_pcfg)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'_probe_defs accepted {_bad!r}')
+    _niah_base = dict(V10.PROBE['niah'])
+    for _bad, _cond in (({'eval_lens': [True]}, None),
+                        ({'eval_lens': [1.5]}, None),
+                        ({'target': True}, None),
+                        ({'niah': dict(_niah_base, n_seq=True)}, None),
+                        ({'niah': dict(_niah_base, n_seq=1.5)}, None),
+                        ({'niah': dict(_niah_base, n_pairs=True)}, None),
+                        ({'niah': dict(_niah_base, rho=-0.1)}, 'distract')):
+        _fcfg = dict(V10.PROBE)
+        _fcfg.update(_bad)
+        try:
+            V10._niah_fingerprint(_fcfg, condition=_cond)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'_niah_fingerprint accepted {_bad!r}')
 
 
 # ---------------------------------------------------------------------------
@@ -2318,6 +2363,17 @@ def t_eval_per_seq():
                 pass
             else:
                 raise AssertionError(f'eval_ppl accepted malformed sampling control {_kw!r}')
+    # A non-positive row cap is not "the full set"; the alternative is an
+    # explicit None, so 0/-1 must not silently score every row while recording
+    # a different eval_rows value.
+    for _bad_rows in (0, -1, -150):
+        try:
+            L.eval_ppl(model, ids, dev, chunk=1, eval_rows=_bad_rows,
+                       return_stats=True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'eval_ppl accepted non-positive eval_rows={_bad_rows!r}')
     # Negative/huge exact seeds are reproducible identities, not crashes.
     _neg = L.eval_ppl(model, ids, dev, chunk=1, eval_rows=150, eval_seed=-1,
                       return_stats=True)
@@ -2546,6 +2602,18 @@ def t_seed_axis_normalization():
             raise AssertionError(f'normalize_seed_list must reject {bad!r}')
     # Exact Python integers above 2**53 are preserved (only lossy floats fail).
     assert L.normalize_seed_list(['9007199254740993']) == [9007199254740993]
+    # A scalar number-like object follows the same exact-integer contract as
+    # the rest of the seed readers (Decimal('4') is seed 4; Decimal('4.9') is
+    # not silently truncated to 4).
+    from decimal import Decimal
+    assert L.normalize_seed_list(Decimal('4')) == [4]
+    for _bad_scalar in (Decimal('4.9'), object()):
+        try:
+            L.normalize_seed_list(_bad_scalar)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'normalize_seed_list accepted scalar {_bad_scalar!r}')
     # ...and every preserved id must be usable by set_seed: NumPy's RNG
     # otherwise rejects negative or >=2**32 seeds and aborts the panel.
     for huge in (-1, 2 ** 32, 9007199254740993, 10 ** 30):
@@ -3781,6 +3849,21 @@ def t_baseline_driver_refuses_overlapping_final_seeds():
         assert 'overlap' in str(e), e
     else:
         raise AssertionError('overlapping search/final seeds were not refused')
+    # Driver options are exact integers too: int(True)==1 / int(1.5)==1 must
+    # not silently turn a malformed limit into a one-trial/one-step run.
+    for _kw in ({'trial_limit': 0}, {'trial_limit': True},
+                {'search_steps': True}, {'search_steps': 1.5}):
+        try:
+            BT.run_tuning(dict(L.RUN, outdir=tempfile.mkdtemp(prefix='tune_badopt_')),
+                          outdir=tempfile.mkdtemp(prefix='tune_badopt_out_'),
+                          protocol=dict(L.BASELINE_TUNING_PROTOCOL,
+                                        arms=['csa_fixed', 'csa_dynamic'],
+                                        search_seeds=[1], final_seeds=[0]),
+                          final=False, **_kw)
+        except ValueError as e:
+            assert 'exact integer' in str(e), (e, _kw)
+        else:
+            raise AssertionError(f'run_tuning accepted malformed option {_kw!r}')
 
 
 def t_baseline_tuning_driver_multiseed_selection():
@@ -6406,6 +6489,11 @@ def t_scale_edge_case_regressions():
             pass
         else:
             raise AssertionError(f'ngram_lm_score accepted {_bad_kw!r}')
+    # A malformed scale tier is a named audit failure, not an AttributeError
+    # that aborts the report build; a non-list tier container is also refused.
+    for _bad_tiers in ([{'name': 'x', 'cfg': [1]}], 3, 'not-a-ladder'):
+        _aud = L.scale_ladder_audit(_bad_tiers)
+        assert _aud['status'] == 'fail' and _aud['problems'], _aud
     # Object-dtype large integers stay exact in the corpus fingerprint.
     import data_guard as DG
     assert DG._matrix_fingerprint(np.array([[2 ** 53]], dtype=object)) != \
@@ -7033,6 +7121,23 @@ def t_targeted_contract_edges():
     _ids, _tgt, _dist, _kdist = V7.build_niah_batch(2, 16, 4, 64, seed=0)
     assert _ids.shape == (2, 16) and _tgt.shape == (2, 15), (_ids.shape, _tgt.shape)
     assert (_tgt >= -100).all() and _dist.shape == _tgt.shape, (_tgt, _dist)
+    # The natural-text NIAH builder follows the same exact-geometry contract:
+    # a zero/boolean pair count or a fractional row count must not reach a
+    # ZeroDivisionError / TypeError deep in the construction.
+    _val = np.asarray(np.random.default_rng(0).integers(0, 128, (4, 65)), dtype=np.int64)
+    for _kw in ({'n_pairs': 0}, {'n_pairs': True}, {'n_seq': 1.5},
+                {'n_seq': 5}, {'eval_len': 70}, {'vocab': 8},
+                {'condition': 'typo'}, {'condition': 'distract', 'rho': -0.1},
+                {'condition': 'distract', 'rho': True}):
+        _args = dict(val_ids=_val, eval_len=32, target=16, n_pairs=4,
+                     vocab=128, n_seq=2, seed=0, condition='clean', rho=0.5)
+        _args.update(_kw)
+        try:
+            V10._build_niah_natural(**_args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'natural NIAH accepted malformed geometry {_kw!r}')
 
 
 def t_statistical_and_config_regressions():
@@ -7116,6 +7221,28 @@ def t_statistical_and_config_regressions():
         pass
     else:
         raise AssertionError('a string frozen-arm container was accepted')
+    # Nested plan objects are validated for in-memory manifests too: a string
+    # eval/statistics/comparison container must be a named refusal, not an
+    # AttributeError/TypeError halfway through the statistics.
+    _m3 = {'arms': ['a'], 'seeds': [0], 'manifest_sha256': 'x',
+           'code_semantics_expected': L.CODE_SEMANTICS,
+           'primary_comparisons': [], 'statistics': {'descriptive_only': True},
+           'eval': {}, 'compute_budget_disclosure': {
+               'parameter_matching': 'yes', 'flops': 'x', 'read_fraction': 'x'}}
+    for _bad_key, _bad_val in (('statistics', 'x'), ('eval', 'x'),
+                               ('primary_comparisons', 'x'),
+                               ('primary_comparisons', [1])):
+        _m4 = dict(_m3)
+        _m4[_bad_key] = _bad_val
+        try:
+            V12.finaltest_stats(manifest=_m4,
+                                bylen_path=os.path.join(tempfile.gettempdir(), 'missing_bylen.json'),
+                                probe_path=os.path.join(tempfile.gettempdir(), 'missing_probe.json'),
+                                out=os.path.join(tempfile.gettempdir(), 'missing_stats.json'))
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f'in-memory manifest accepted malformed {_bad_key}={_bad_val!r}')
 
 
 def t_audit_resume_and_curve_regressions():

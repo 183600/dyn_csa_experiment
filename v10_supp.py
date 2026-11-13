@@ -201,6 +201,40 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
     既有实现逐字节一致（同一 RNG 播种、同一调用顺序——见 _distractor_ppls
     的行缓存键）。三种新模式（span/doc/topical）同样只
     依赖 (eval_len, jj, rho, mode, span_len)，保证臂间严格配对。"""
+    # The row geometry is exact-integer state.  int(True)==1 / int(1.5)==1
+    # would silently corrupt a different span (or crash in a slice), so refuse
+    # malformed lengths before any mode branch.
+    _ints = {}
+    for _name, _value in (('eval_len', eval_len), ('target', target),
+                          ('jj', jj), ('span_len', span_len)):
+        _iv = L._as_seed_int(_value)
+        if _iv is None:
+            raise ValueError(
+                f'_corrupt_row: {_name}={_value!r} must be an exact integer')
+        _ints[_name] = _iv
+    eval_len, target = _ints['eval_len'], _ints['target']
+    jj, span_len = _ints['jj'], _ints['span_len']
+    if eval_len < 2 or target < 1 or target >= eval_len:
+        raise ValueError(
+            f'_corrupt_row needs eval_len>=2 and 1<=target<eval_len '
+            f'(got eval_len={eval_len}, target={target}); there must be a '
+            'far context outside the scored target zone')
+    if jj < 0 or span_len < 1:
+        raise ValueError(
+            f'_corrupt_row needs jj>=0 and span_len>=1 '
+            f'(got jj={jj}, span_len={span_len})')
+    _rows = np.asarray(val_ids)
+    if _rows.ndim != 2:
+        raise ValueError(
+            f'_corrupt_row: val_ids must be a 2-D token matrix, got shape {_rows.shape}')
+    if jj >= _rows.shape[0]:
+        raise ValueError(
+            f'_corrupt_row: row index jj={jj} is outside the {_rows.shape[0]}-row panel')
+    if eval_len + 1 > _rows.shape[1]:
+        raise ValueError(
+            f'_corrupt_row: eval_len+1={eval_len + 1} exceeds the panel row '
+            f'width {_rows.shape[1]}')
+    val_ids = _rows
     n_far = eval_len - target
     if mode not in _CORRUPT_MODES:
         raise ValueError(f'_corrupt_row: unknown corruption mode {mode!r} (expected one of {_CORRUPT_MODES})')
@@ -447,26 +481,93 @@ def _probe_params_current(rec, fp, mode='uniform'):
 def _probe_defs(cfg):
     """The (eval_len, rho, mode) grid of a probe config.  Absent 'modes' means
     the uniform-only protocol (cfg['rhos'])."""
+    if not isinstance(cfg, dict):
+        raise ValueError(f'_probe_defs: cfg is {type(cfg).__name__}, not an object')
     _modes = cfg.get('modes') or {'uniform': list(cfg['rhos'])}
+    if not isinstance(_modes, dict):
+        raise ValueError('_probe_defs: modes must be an object of mode -> rho list')
+    _lens = cfg.get('eval_lens')
+    if not isinstance(_lens, (list, tuple)) or not _lens:
+        raise ValueError('_probe_defs: eval_lens must be a non-empty list')
+    _lens_i = []
+    for Ln in _lens:
+        _iv = L._as_seed_int(Ln)
+        if _iv is None or _iv < 2:
+            raise ValueError(
+                f'_probe_defs: eval_len={Ln!r} must be an exact integer >= 2')
+        _lens_i.append(_iv)
     out = []
     for _mode, _rhos in _modes.items():
-        for Ln in cfg['eval_lens']:
-            for rho in _rhos:
-                out.append((int(Ln), float(rho), str(_mode)))
+        if not isinstance(_mode, str) or not _mode:
+            raise ValueError(f'_probe_defs: mode {_mode!r} must be a non-empty text name')
+        if not isinstance(_rhos, (list, tuple)):
+            raise ValueError(f'_probe_defs: rhos for mode {_mode!r} must be a list')
+        _rhos_f = []
+        for rho in _rhos:
+            if isinstance(rho, (bool, np.bool_)):
+                raise ValueError(f'_probe_defs: rho={rho!r} is a boolean, not a density')
+            try:
+                _rf = float(rho)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(f'_probe_defs: rho={rho!r} is not numeric') from None
+            if not (math.isfinite(_rf) and 0.0 <= _rf <= 1.0):
+                raise ValueError(f'_probe_defs: rho={rho!r} must be in [0,1]')
+            _rhos_f.append(_rf)
+        for Ln in _lens_i:
+            for rho in _rhos_f:
+                out.append((Ln, rho, _mode))
     return out
 
 def _niah_cell_key(v, seed, arm, Ln, cond):
     return f'{v}::s{seed}::{arm}::L{Ln}::niah::{cond}'
 
 def _niah_fingerprint(cfg, condition=None):
+    if not isinstance(cfg, dict):
+        raise ValueError(f'_niah_fingerprint: cfg is {type(cfg).__name__}, not an object')
     _n = cfg.get('niah') or {}
-    _need = max((int(_x) for _x in cfg['eval_lens'])) + 1
-    _tl = int(cfg.get('train_len') or P3MT_PAYLOAD['train_len'])
-    fp = {'n_seq': int(_n.get('n_seq', cfg['n_seq'])), 'target': int(cfg['target']), 'vocab': int(cfg.get('vocab') or P3MT_PAYLOAD['vocab']), 'n_pairs': int(_n.get('n_pairs', 8)), 'val_seq_len': max(_tl, _need), 'stat': 'niah_natural_v1'}
+    if not isinstance(_n, dict):
+        raise ValueError('_niah_fingerprint: niah must be an object')
+    _lens = cfg.get('eval_lens')
+    if not isinstance(_lens, (list, tuple)) or not _lens:
+        raise ValueError('_niah_fingerprint: eval_lens must be a non-empty list')
+    _need = 0
+    for _x in _lens:
+        _xi = L._as_seed_int(_x)
+        if _xi is None or _xi < 2:
+            raise ValueError(
+                f'_niah_fingerprint: eval_len={_x!r} must be an exact integer >= 2')
+        _need = max(_need, _xi)
+    _need += 1
+    _tl = L._as_seed_int(cfg.get('train_len') or P3MT_PAYLOAD['train_len'])
+    _target = L._as_seed_int(cfg.get('target'))
+    _vocab = L._as_seed_int(cfg.get('vocab') or P3MT_PAYLOAD['vocab'])
+    _n_seq = L._as_seed_int(_n.get('n_seq', cfg.get('n_seq')))
+    _n_pairs = L._as_seed_int(_n.get('n_pairs', 8))
+    for _name, _iv in (('train_len', _tl), ('target', _target),
+                       ('vocab', _vocab), ('n_seq', _n_seq),
+                       ('n_pairs', _n_pairs)):
+        if _iv is None or _iv < 1:
+            raise ValueError(
+                f'_niah_fingerprint: {_name}={_iv!r} must be a positive exact integer')
+    if condition not in (None, 'clean', 'distract'):
+        raise ValueError(
+            f"_niah_fingerprint: condition={condition!r} must be None, 'clean' or 'distract'")
+    fp = {'n_seq': int(_n_seq), 'target': int(_target), 'vocab': int(_vocab),
+          'n_pairs': int(_n_pairs), 'val_seq_len': max(_tl, _need),
+          'stat': 'niah_natural_v1'}
     if condition == 'distract':
         # The distractor condition's corruption density is part of the
         # measurement; the clean condition does not read rho.
-        fp['dist_rho'] = float(_n.get('rho', 0.5))
+        _rho = _n.get('rho', 0.5)
+        if isinstance(_rho, (bool, np.bool_)):
+            raise ValueError('_niah_fingerprint: rho is a boolean, not a density')
+        try:
+            _rho = float(_rho)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError('_niah_fingerprint: rho is not numeric') from None
+        if not (math.isfinite(_rho) and 0.0 <= _rho <= 1.0):
+            raise ValueError('_niah_fingerprint: rho must be in [0,1]')
+        fp['dist_rho'] = _rho
     return fp
 
 def _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed, condition, rho=0.5):
@@ -481,7 +582,63 @@ def _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed, 
     Returns (ids[n_seq, eval_len+1], q_cols, q_vals, stats)：q_cols 为
     **目标尾区内相对的 logits 列号**（预测 answer 的那一列），q_vals 为正确
     答案 token。"""
-    rng = np.random.default_rng(seed)
+    # Geometry is declared with exact integers: a boolean/string/fractional
+    # value would either crash deep in the construction or silently build a
+    # different task (e.g. int(True)==1 couple).  Refuse it up front.
+    _ints = {}
+    for _name, _value in (('eval_len', eval_len), ('target', target),
+                          ('n_pairs', n_pairs), ('vocab', vocab),
+                          ('n_seq', n_seq)):
+        _iv = L._as_seed_int(_value)
+        if _iv is None:
+            raise ValueError(
+                f'NIAH-natural: {_name}={_value!r} must be an exact integer')
+        _ints[_name] = _iv
+    eval_len, target = _ints['eval_len'], _ints['target']
+    n_pairs, vocab, n_seq = _ints['n_pairs'], _ints['vocab'], _ints['n_seq']
+    if eval_len < 2 or target < 1 or n_pairs < 1 or vocab < 4 or n_seq < 1:
+        raise ValueError(
+            'NIAH-natural needs eval_len>=2, target>=1, n_pairs>=1, '
+            f'vocab>=4 and n_seq>=1 (got eval_len={eval_len}, target={target}, '
+            f'n_pairs={n_pairs}, vocab={vocab}, n_seq={n_seq})')
+    _seed = L._as_seed_int(seed)
+    if _seed is None:
+        raise ValueError(f'NIAH-natural: seed must be an exact integer, got {seed!r}')
+    if condition not in ('clean', 'distract'):
+        raise ValueError(
+            f"NIAH-natural: condition={condition!r} must be 'clean' or 'distract'")
+    if isinstance(rho, (bool, np.bool_)):
+        raise ValueError(f'NIAH-natural: rho={rho!r} is a boolean, not a density')
+    try:
+        rho = float(rho)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'NIAH-natural: rho={rho!r} is not numeric') from None
+    if not (math.isfinite(rho) and 0.0 <= rho <= 1.0):
+        raise ValueError(f'NIAH-natural: rho={rho!r} must be in [0,1]')
+    _rows = np.asarray(val_ids)
+    if _rows.ndim != 2:
+        raise ValueError(
+            f'NIAH-natural: val_ids must be a 2-D token matrix, got shape {_rows.shape}')
+    if n_seq > _rows.shape[0]:
+        raise ValueError(
+            f'NIAH-natural: n_seq={n_seq} exceeds the available {_rows.shape[0]} '
+            'validation rows')
+    if eval_len + 1 > _rows.shape[1]:
+        raise ValueError(
+            f'NIAH-natural: eval_len+1={eval_len + 1} exceeds the validation '
+            f'row width {_rows.shape[1]}')
+    _key_hi = max(4, vocab // 4)
+    if _key_hi - 4 < n_pairs:
+        raise ValueError(
+            f'NIAH-natural: vocab={vocab} has only {_key_hi - 4} usable key '
+            f'tokens for {n_pairs} distinct keys')
+    if vocab - (3 * vocab // 4) < n_pairs:
+        raise ValueError(
+            f'NIAH-natural: vocab={vocab} has only '
+            f'{vocab - (3 * vocab // 4)} usable value tokens for {n_pairs} '
+            'distinct values')
+    val_ids = _rows
+    rng = np.random.default_rng(_seed)
     n_far = eval_len - target
     if n_far < 4 * n_pairs + 8:
         raise ValueError(f'NIAH-natural: far region ({n_far} tokens) too small for {n_pairs} couples at eval_len={eval_len}')

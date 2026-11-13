@@ -11175,6 +11175,11 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         policy = dict(SCALE_TRANSFER_POLICY)
     else:
         policy = dict(policy)
+    if tiers is not None and not isinstance(tiers, (list, tuple)):
+        problems.append(
+            f'tiers is {type(tiers).__name__}, not a list — the scale ladder '
+            'cannot be audited')
+        tiers = []
     _tol_raw = (policy.get('tokens_per_param_tolerance', 0.25)
                 if tolerance is None else tolerance)
     if isinstance(_tol_raw, (bool, np.bool_)):
@@ -11230,6 +11235,11 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             continue
         name = str(tier.get('name') or f'T{i}')
         cfg = tier.get('cfg') or {}
+        if not isinstance(cfg, dict):
+            problems.append(
+                f'{name}: cfg is {type(cfg).__name__}, not an object — the '
+                'training allocation cannot be audited')
+            continue
         row = {'name': name}
         # Optional corpus/tokenizer provenance: the ladder's cross-tier
         # contrasts (paired log PPL ratios, tokens-per-param) are only defined
@@ -14724,6 +14734,17 @@ def normalize_seed_list(seeds, *, default=(0,)):
         seeds = [seeds.item()]
     elif isinstance(seeds, (str, bytes)):
         seeds = seeds.decode().split() if isinstance(seeds, bytes) else seeds.replace(',', ' ').split()
+    else:
+        # A scalar number-like object (e.g. Decimal) is an exact seed identity
+        # when the shared contract accepts it; otherwise it is not iterable,
+        # and iterating would raise a confusing TypeError instead of rejecting
+        # the malformed seed.
+        try:
+            iter(seeds)
+        except TypeError:
+            if _as_seed_int(seeds) is None:
+                raise ValueError(f'seed must be an integer, got {seeds!r}') from None
+            seeds = [seeds]
     out = []
     seen = set()
     for raw in seeds:
@@ -15809,6 +15830,10 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
         _rows = _as_seed_int(eval_rows)
         if _rows is None:
             raise ValueError(f'eval_ppl: eval_rows must be an exact integer, got {eval_rows!r}')
+        if _rows <= 0:
+            raise ValueError(
+                f'eval_ppl: eval_rows must be positive (use None for the full '
+                f'set), got {eval_rows!r}')
         eval_rows = _rows
     # `collect_block_stats=True` enables the compression-report hooks for this
     # same forward pass, so block-length/boundary diagnostics come from it too.

@@ -431,13 +431,19 @@ def _controlled_reason(a, b):
             'd', 'n_layers', 'n_heads', 'd_head', 'mlp_ratio', 'vocab_size',
             'dataset', 'data_version', 'val_seqs', 'eval_every', 'eval_subset',
             'code', 'amp_dtype', 'eager_batch')
+    # Structural counts are exact integers.  A boolean True would otherwise
+    # compare equal to 1 and silently pass as a shared training control.
+    count_keys = {'steps', 'tokens_seen', 'n_train_tokens', 'seq_len',
+                  'batch_size', 'warmup', 'd', 'n_layers', 'n_heads',
+                  'd_head', 'vocab_size', 'val_seqs', 'eval_every',
+                  'eval_subset'}
     for k in keys:
         va, vb = ha.get(k), hb.get(k)
         if va is None or vb is None:
             if va is None and vb is None:
                 continue
             return f'unverifiable {k} (only one record carries it)'
-        if k in ('steps', 'tokens_seen'):
+        if k in count_keys:
             # Exact counts: 1000 and "1000" are the same measurement, while a
             # boolean True must not pass as 1.
             ia, ib = L._as_seed_int(va), L._as_seed_int(vb)
@@ -453,8 +459,16 @@ def _controlled_reason(a, b):
         return f"code stamp differs ({a.get('code')!r} != {b.get('code')!r})"
     if (a.get('params') is None) != (b.get('params') is None):
         return 'unverifiable parameter count (only one record carries it)'
-    if a.get('params') is not None and a.get('params') != b.get('params'):
-        return f"parameter count differs ({a.get('params')!r} != {b.get('params')!r})"
+    if a.get('params') is not None:
+        # A parameter count is an exact positive integer; a boolean/string
+        # marker or a fractional value is not a shared architecture control.
+        _pa = L._as_seed_int(a.get('params'))
+        _pb = L._as_seed_int(b.get('params'))
+        if _pa is None or _pb is None or _pa <= 0 or _pb <= 0:
+            return ('unverifiable parameter count '
+                    f"({a.get('params')!r} vs {b.get('params')!r})")
+        if _pa != _pb:
+            return f'parameter count differs ({_pa!r} != {_pb!r})'
     if (a.get('run_fingerprint') is None) != (b.get('run_fingerprint') is None):
         return 'unverifiable run_fingerprint (only one record carries it)'
     if a.get('run_fingerprint') is not None:

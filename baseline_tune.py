@@ -211,12 +211,31 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
     groups = _protocol_arm_groups(protocol, base, arms)
     trials = list(protocol['trials'])
     if trial_limit is not None:
-        trials = trials[:max(1, int(trial_limit))]
+        _limit = L._as_seed_int(trial_limit)
+        if _limit is None or _limit < 1:
+            raise ValueError(
+                f'run_tuning: trial_limit must be a positive exact integer, '
+                f'got {trial_limit!r}')
+        trials = trials[:_limit]
     if search_steps is not None:
-        search_steps = int(search_steps)
+        _steps = L._as_seed_int(search_steps)
+        if _steps is None or _steps < 1:
+            raise ValueError(
+                f'run_tuning: search_steps must be a positive exact integer, '
+                f'got {search_steps!r}')
+        search_steps = _steps
     else:
-        search_steps = int(base['steps'])
-    search_seed = int(protocol.get('search_seed', 0))
+        _steps = L._as_seed_int(base['steps'])
+        if _steps is None or _steps < 1:
+            raise ValueError(
+                f'run_tuning: base steps must be a positive exact integer, '
+                f'got {base["steps"]!r}')
+        search_steps = _steps
+    search_seed = L._as_seed_int(protocol.get('search_seed', 0))
+    if search_seed is None:
+        raise ValueError(
+            f'run_tuning: search_seed must be an exact integer, '
+            f'got {protocol.get("search_seed")!r}')
     # Tuning selection must not be decided by a single seed's validation
     # noise.  The same declared search-seed set is used for every arm and
     # every trial, and selection uses the mean validation PPL (with the

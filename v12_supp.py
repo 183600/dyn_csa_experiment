@@ -1358,7 +1358,12 @@ def _admit_confirmation_records(raw, manifest):
     impl = _frozen_implementation(manifest)
     msha = manifest.get('manifest_sha256')
     want_train_fp = _frozen_train_fp(manifest)
-    _nseq_raw = (manifest.get('eval') or {}).get('n_seqs_clean')
+    _eval_obj = manifest.get('eval')
+    if _eval_obj is not None and not isinstance(_eval_obj, dict):
+        raise SystemExit(
+            f'[p5t stats] REFUSE: manifest.eval is {type(_eval_obj).__name__}, '
+            'not an object — the frozen row count cannot be read')
+    _nseq_raw = (_eval_obj or {}).get('n_seqs_clean')
     _want_nseq = _record_int(_nseq_raw) if _nseq_raw is not None else 0
     if _nseq_raw is not None and (_want_nseq is None or _want_nseq <= 0):
         raise SystemExit(f'[p5t stats] REFUSE: eval.n_seqs_clean={_nseq_raw!r} is not a positive integer row count')
@@ -1720,6 +1725,25 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     （歧义/混切片）。by_length 汇总同样只由可采纳记录构成。"""
     if manifest is None:
         manifest = _load_manifest(FREEZE_MANIFEST)
+    # finaltest_stats is also callable with an in-memory manifest.  Validate
+    # the nested plan objects here so a malformed shape fails closed with a
+    # named refusal instead of an AttributeError/TypeError mid-analysis.
+    for _key in ('statistics', 'eval', 'binding'):
+        _obj = manifest.get(_key)
+        if _obj is not None and not isinstance(_obj, dict):
+            raise SystemExit(
+                f'[p5t stats] REFUSE: manifest.{_key} is '
+                f'{type(_obj).__name__}, not an object')
+    _comps = manifest.get('primary_comparisons')
+    if _comps is not None:
+        if not isinstance(_comps, (list, tuple)):
+            raise SystemExit(
+                f'[p5t stats] REFUSE: manifest.primary_comparisons is '
+                f'{type(_comps).__name__}, not a list')
+        if not all(isinstance(c, dict) for c in _comps):
+            raise SystemExit(
+                '[p5t stats] REFUSE: every manifest.primary_comparisons entry '
+                'must be an object')
     bylen_path = bylen_path or os.path.join(TEST_OUTDIR, 'bylen.json')
     probe_path = probe_path or os.path.join(TEST_OUTDIR, 'distractor.json')
     raw = {}
