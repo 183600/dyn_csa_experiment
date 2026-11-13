@@ -8699,10 +8699,18 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
                         continue
         except BaseException as exc:
             import traceback as _tb
-            try:
-                q.put((None, (exc, _tb.format_exc())))
-            except BaseException:
-                pass
+            _err = (exc, _tb.format_exc())
+            # Same stop-aware bounded put as the data path: a blocking put
+            # here would deadlock the producer forever once the consumer is
+            # gone (queue full + no reader), leaking the thread and the batch
+            # tensors it holds.  If stop is already set the consumer left on
+            # purpose and the error is intentionally dropped.
+            while not stop.is_set():
+                try:
+                    q.put((None, _err), timeout=0.2)
+                    break
+                except _queue.Full:
+                    continue
 
     th = _threading.Thread(target=_producer, name='batch-prefetch', daemon=True)
     th.start()
@@ -18274,7 +18282,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         _flush_loss_buffer()
     losses = [float(v) for v in losses]
     _curve_summary = _finite_curve(losses)
-    _tail_list = [float(v) for v in _tail if _is_finite_number(v)]
+    _tail_list = [v for v in (float(t) for t in _tail) if _is_finite_number(v)]
     _final_loss_smoothed = (sum(_tail_list) / len(_tail_list)) if _tail_list else None
     if _health_history:
         _health = classify_training_health(_health_history)
