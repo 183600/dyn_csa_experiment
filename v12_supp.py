@@ -1034,7 +1034,7 @@ def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
     access on a run whose own diagnostic curve says non-finite/overfitting/
     stalled.  `V12_ALLOW_UNHEALTHY=1` is the explicit, logged override.
     """
-    if cfg.get('smoke'):
+    if L._as_bool_flag(cfg.get('smoke')) is True:
         return None
     health = (ckpt_meta or {}).get('curve_health') or (train_rec or {}).get('curve_health')
     allow = os.environ.get('V12_ALLOW_UNHEALTHY', '').strip().lower() in ('1', 'true', 'yes', 'on')
@@ -1287,7 +1287,8 @@ def run_finaltest(cfg=None, guard=None):
     # `finaltest` CLI mode must run it before any test access so a plan that
     # plan_check would reject cannot consume the one-shot test.  Smoke runs use injected
     # data and are not the frozen confirmation, so they skip it.
-    if not _PLAN_DONE and not bool(cfg.get('smoke')):
+    _smoke = L._as_bool_flag(cfg.get('smoke')) is True
+    if not _PLAN_DONE and not _smoke:
         plan_check(cfg.get('manifest') or FREEZE_MANIFEST)
     manifest = _load_manifest(cfg['manifest'])
     outdir = cfg['outdir']
@@ -1295,7 +1296,6 @@ def run_finaltest(cfg=None, guard=None):
     need = max([int(x) for x in ((manifest.get('eval') or {}).get('by_length_ppl') or cfg['eval_lens'])]) + 1
     _nseq_clean = int((manifest.get('eval') or {}).get('n_seqs_clean') or cfg.get('n_seq', 16))
     test_ids = cfg.get('test_ids')
-    _smoke = bool(cfg.get('smoke'))
     if test_ids is not None:
         # A caller-supplied slice is ONLY a plumbing smoke input.  In normal
         # mode the test split must come from load_wikitest, otherwise a
@@ -1669,6 +1669,26 @@ def _admit_confirmation_records(raw, manifest):
     return admitted, (sorted(fps)[0] if fps else None)
 
 
+def _by_len_cell(rec, Ln):
+    """The one cell for a frozen length, or None when it is ambiguous.
+
+    JSON records carry string keys while an in-memory record may carry the
+    integer spelling too.  If both spellings are present, choosing one would
+    silently pick an endpoint when the two cells disagree; report no cell so
+    every consumer treats the record as unverifiable at that length.
+    """
+    if not isinstance(rec, dict):
+        return None
+    bl = rec.get('by_len')
+    if not isinstance(bl, dict):
+        return None
+    hits = [k for k in (Ln, str(Ln)) if k in bl]
+    if len(hits) != 1:
+        return None
+    cell = bl[hits[0]]
+    return cell if isinstance(cell, dict) else None
+
+
 def _doc_level_analysis(recs_a, recs_b, common, Ln):
     """Document-sampling readout for one comparison.
 
@@ -1676,8 +1696,8 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     between-doc（文档抽样不确定性）与 within-doc-across-seed（训练随机性）。
     16 条评测行不足以充分覆盖文档分布——本读数的目的就是把这个不确定性
     显式化，而不是宣称已消除。"""
-    rows_a = [recs_a[s]['by_len'].get(Ln, recs_a[s]['by_len'].get(str(Ln))) or {} for s in common]
-    rows_b = [recs_b[s]['by_len'].get(Ln, recs_b[s]['by_len'].get(str(Ln))) or {} for s in common]
+    rows_a = [_by_len_cell(recs_a[s], Ln) or {} for s in common]
+    rows_b = [_by_len_cell(recs_b[s], Ln) or {} for s in common]
     per_seq_a = [r.get('ppl_per_seq') for r in rows_a]
     per_seq_b = [r.get('ppl_per_seq') for r in rows_b]
     if not all(isinstance(x, list) and x for x in per_seq_a + per_seq_b):
@@ -2014,8 +2034,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             _n_tok = 0
             _pool_ok = True
             for r in rows:
-                bl = r.get('by_len') or {}
-                c = bl.get(Ln, bl.get(str(Ln)))
+                c = _by_len_cell(r, Ln)
                 if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated')):
                     _by_seed[r.get('seed')] = float(c['ppl'])
                     _nll_f = L._finite_scalar(c.get('nll_sum'))
@@ -2040,7 +2059,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                                                   'ppl_pooled': _pooled, 'n_tokens': _n_tok,
                                                                   'n': len(_dl), 'ppl_by_seed': {str(s): p for s, p in _by_seed.items()}, 'params': next((L._as_seed_int(r.get('params')) for r in rows
                                                                      if L._as_seed_int(r.get('params')) is not None
-                                                                     and L._as_seed_int(r.get('params')) > 0), None), 'n_seqs': next((_record_int(c.get('n_seq')) for _r in rows for c in [((_r.get('by_len') or {}).get(Ln) or (_r.get('by_len') or {}).get(str(Ln)) or {})] if isinstance(c, dict) and _record_int(c.get('n_seq')) is not None and _record_int(c.get('n_seq')) > 0), None)}
+                                                                     and L._as_seed_int(r.get('params')) > 0), None), 'n_seqs': next((_record_int(c.get('n_seq')) for _r in rows for c in [_by_len_cell(_r, Ln)] if isinstance(c, dict) and _record_int(c.get('n_seq')) is not None and _record_int(c.get('n_seq')) > 0), None)}
     for comp in manifest['primary_comparisons']:
         name = comp['name']
         a, b = (comp['a'], comp['b'])
@@ -2069,8 +2088,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         # confirm is a PRE-REGISTERED choice (statistics.min_seeds_for_confirmation,
         # manifest v3: 8, the mathematical minimum for Holm/4 with alpha=0.05).
         def _cell_ppl(rec):
-            bl = rec.get('by_len') or {}
-            c = bl.get(Ln, bl.get(str(Ln)))
+            c = _by_len_cell(rec, Ln)
             return float(c['ppl']) if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated')) else None
         dl = []
         usable = []

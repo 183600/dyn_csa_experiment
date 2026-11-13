@@ -7968,7 +7968,11 @@ def _corpus_audit_cache_key(dataset, vocab, train_ids, val_batch, meta,
     # of a later valid strict call.  Malformed values get a distinct key so
     # their (failing) report cannot alias any valid vocabulary.
     _vb = _as_seed_int(vocab)
-    _vkey = _vb if _vb is not None else ('__bad_vocab__', type(vocab).__name__, repr(vocab))
+    if _vb is not None:
+        _vkey = _vb
+    else:
+        from data_guard import _UnhashableKey
+        _vkey = _UnhashableKey(vocab)
     return (str(dataset), _vkey,
             _ids_fp(np.asarray(train_ids).reshape(-1)),
             # The report is shape-sensitive (row counts, duplicate rows, the
@@ -12887,7 +12891,8 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         try:
             hash(value)
         except TypeError:
-            return ('__unhashable__', type(value).__name__, repr(value))
+            from data_guard import _UnhashableKey
+            return _UnhashableKey(value)
         return value
     if len({_label_identity(v) for v in labels.tolist()}) != int(labels.size):
         raise ValueError(f'labels contains duplicate class identifiers: {labels.tolist()}')

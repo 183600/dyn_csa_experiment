@@ -64,12 +64,8 @@ def _cfg_key(value):
         hash(value)
         return value
     except TypeError:
-        try:
-            return ('__unhashable__', json.dumps(value, sort_keys=True,
-                                                 separators=(',', ':'),
-                                                 default=str))
-        except (TypeError, ValueError):
-            return ('__unhashable__', repr(value))
+        from data_guard import _UnhashableKey
+        return _UnhashableKey(value)
 
 
 def _add_paired(comparisons, name, panel, a, b, who='', outdir=None):

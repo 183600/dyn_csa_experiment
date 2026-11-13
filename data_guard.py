@@ -31,6 +31,7 @@ distribution shift.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import numbers
 from fractions import Fraction
@@ -69,6 +70,62 @@ _EPS = 1e-12
 _MISSING_CATEGORY = object()
 _MISSING_GROUP_NAN = object()
 _MISSING_GROUP_NAT = object()
+
+
+class _BoolKey:
+    """Type-qualified identity for a boolean label/category.
+
+    ``True == 1`` and they share a hash, so a plain dict/set key silently
+    merges a boolean category with the integer category 1.  Booleans are flags,
+    not integer measurements elsewhere in this module, so label identities keep
+    them separate while both bool spellings (bool / np.bool_) share one key.
+    """
+    __slots__ = ('value',)
+
+    def __init__(self, value):
+        self.value = bool(value)
+
+    def __hash__(self):
+        return hash((_BoolKey, self.value))
+
+    def __eq__(self, other):
+        return type(other) is _BoolKey and self.value == other.value
+
+    def __repr__(self):
+        return f'_BoolKey({self.value!r})'
+
+
+class _UnhashableKey:
+    """Type-qualified, stable identity for an unhashable label/group value.
+
+    A plain tuple sentinel such as ``('__unhashable__', type, repr)`` is itself
+    a legitimate hashable value: a real tuple with that exact spelling would
+    compare equal to the sentinel and silently merge two categories/groups.
+    Using a private class instance makes such a collision impossible while
+    keeping the key hashable and its repr deterministic.
+    """
+    __slots__ = ('type_name', 'text')
+
+    def __init__(self, value):
+        self.type_name = type(value).__name__
+        # Mappings must not depend on insertion order: two records carrying
+        # the same config in a different key order are the same identity.
+        try:
+            self.text = json.dumps(value, sort_keys=True, separators=(',', ':'),
+                                   default=repr)
+        except (TypeError, ValueError):
+            self.text = repr(value)
+
+    def __hash__(self):
+        return hash((_UnhashableKey, self.type_name, self.text))
+
+    def __eq__(self, other):
+        return (type(other) is _UnhashableKey
+                and self.type_name == other.type_name
+                and self.text == other.text)
+
+    def __repr__(self):
+        return f'_UnhashableKey({self.type_name!r}, {self.text!r})'
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +386,14 @@ def _take(data, idx):
     """Index an array/sequence with an integer index array."""
     try:
         return data[idx]
-    except TypeError:
+    except (TypeError, IndexError):
+        # str/bytes reject NumPy array indexing with IndexError rather than
+        # TypeError; handling only TypeError made the documented
+        # "string is indexable" sequence case impossible.
+        if isinstance(data, str):
+            return ''.join(data[int(i)] for i in idx)
+        if isinstance(data, (bytes, bytearray)):
+            return type(data)(data[int(i)] for i in idx)
         if isinstance(data, (list, tuple)):
             return type(data)(data[int(i)] for i in idx)
         # Fall back to NumPy for other array-likes (e.g. pandas objects are
@@ -797,6 +861,10 @@ def _group_key(value):
     of the same missing group can be split across train/val/test and no
     group-overlap check will ever fire.
     """
+    if isinstance(value, (bool, np.bool_)):
+        # True == 1 (and False == 0) in Python; a flag group is not the same
+        # group as an integer id that happens to share its value.
+        return _BoolKey(value)
     if isinstance(value, (float, np.floating)):
         f = float(value)
         if math.isnan(f):
@@ -808,7 +876,7 @@ def _group_key(value):
     except TypeError:
         # Group ids are normally hashable scalars, but an object column of
         # lists/arrays is grouped by a stable identity.
-        return ('__unhashable__', type(value).__name__, repr(value))
+        return _UnhashableKey(value)
     return value
 
 
@@ -1672,9 +1740,15 @@ def _canonical_object_cell(v):
         # np.integer, but int() on a unit-bearing value is not an integer.
         return _temporal_identity(v)
     if isinstance(v, (bool, np.bool_)):
-        return ('num', int(v))
+        # The row-key/fingerprint contract treats bool/int/float spellings of
+        # the same in-range number as one identity; use one float spelling so
+        # the canonical repr does not split `0` from `0.0` inside a composite.
+        return ('num', float(int(v)))
     if isinstance(v, (int, np.integer)):
-        return ('num', int(v))
+        iv = int(v)
+        if abs(iv) <= 2 ** 53:
+            return ('num', float(iv))
+        return ('int', iv)
     if isinstance(v, (float, np.floating)):
         f = float(v)
         if math.isnan(f):
@@ -1684,6 +1758,12 @@ def _canonical_object_cell(v):
         return ('num', 0.0 if f == 0.0 else f)
     if isinstance(v, (complex, np.complexfloating)):
         return _canonical_complex_cell(v)
+    if isinstance(v, tuple):
+        # Composite cells must use the same identity recursively: a raw tuple
+        # containing NaN/-0.0 compares inconsistently with its scalar
+        # canonical form (NaN != NaN, 0.0 == -0.0), so two equal rows could
+        # hash differently depending on nesting.
+        return ('tuple', tuple(_canonical_object_cell(x) for x in v))
     try:
         hash(v)
     except TypeError:
@@ -1887,16 +1967,16 @@ def _row_keys(X):
         # A pure string object table is the logical twin of a fixed-width
         # Unicode/bytes table; route it through that path so a cache that
         # serialised strings as object dtype still matches its typed copy.
-        if (_flat_obj and all(isinstance(v, (str, np.str_)) for v in _flat_obj)
-                and all('\x00' not in str(v) for v in _flat_obj)):
-            # Fixed-width NumPy strings cannot preserve embedded NULs (they
-            # truncate at the first NUL).  Keep NUL-bearing object strings on
-            # the exact per-cell path below so they cannot collide with a
-            # shorter string.
+        # Embedded NULs need no special case: NumPy preserves them in the
+        # fixed-width buffer and the row key is length-prefixed, so 'a\x00b'
+        # stays distinct from 'ab' (and from 'a') on both paths.  Keeping
+        # NUL-bearing object cells on the per-cell path made the same logical
+        # row hash differently depending on how a cache stored it, which hid
+        # exact duplicates from the leakage audit.
+        if _flat_obj and all(isinstance(v, (str, np.str_)) for v in _flat_obj):
             return _row_keys(np.asarray(_flat_obj, dtype=str).reshape(src.shape))
-        if (_flat_obj and all(isinstance(v, (bytes, bytearray, np.bytes_))
-                              for v in _flat_obj)
-                and all(b'\x00' not in bytes(v) for v in _flat_obj)):
+        if _flat_obj and all(isinstance(v, (bytes, bytearray, np.bytes_))
+                             for v in _flat_obj):
             # Convert each cell explicitly: np.asarray([b'a', bytearray(b'b')],
             # dtype=bytes) treats the bytearray as a sequence and refuses the
             # inhomogeneous table.  The byte content is the same identity.
@@ -1935,6 +2015,11 @@ def _row_keys(X):
                 return ('num', 0.0 if f == 0.0 else f)
             if isinstance(v, (complex, np.complexfloating)):
                 return _canonical_complex_cell(v)
+            if isinstance(v, tuple):
+                # Same recursive canonical identity as the fingerprint path;
+                # a NaN/-0.0 inside a composite cell must not defeat the
+                # NaN-safe duplicate contract.
+                return ('tuple', tuple(_cell_key(x) for x in v))
             try:
                 hash(v)
             except TypeError:
@@ -1985,6 +2070,18 @@ def _row_keys(X):
     _integral = (src.dtype != object
                  and (np.issubdtype(src.dtype, np.integer)
                       or np.issubdtype(src.dtype, np.bool_)))
+    if _integral and src.size:
+        _lim = 2 ** 53
+        if np.issubdtype(src.dtype, np.unsignedinteger):
+            _wide = bool((src > _lim).any())
+        else:
+            _wide = bool(((src > _lim) | (src < -_lim)).any())
+        if not _wide:
+            # Match the corpus fingerprint's canonical numeric form: an
+            # in-range integer table is the exact same logical table as its
+            # float64 twin, so `0` and `0.0` (or `-0.0`) must produce the same
+            # duplicate key instead of one being invisible to the other.
+            return _row_keys(np.asarray(src, dtype=np.float64))
     if _integral or (src.dtype != object and not np.issubdtype(src.dtype, np.floating)):
         _step = _hash_row_block(int(src.shape[1]), 1 << 16)
         for start in range(0, src.shape[0], _step):
@@ -2077,10 +2174,12 @@ def _split_array(X, idx):
 
 
 def _hashable_label(value):
+    if isinstance(value, (bool, np.bool_)):
+        return _BoolKey(value)
     try:
         hash(value)
     except TypeError:
-        return ('__unhashable__', type(value).__name__, repr(value))
+        return _UnhashableKey(value)
     return value
 
 

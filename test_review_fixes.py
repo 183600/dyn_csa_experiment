@@ -8145,6 +8145,68 @@ def t_malformed_panel_and_niah_records_are_excluded():
                           'losses': [1.0]}},
             status='complete', planned_cells=['a::seed0'])
 
+def t_key_identity_and_sequence_edges():
+    import data_guard as DG
+    # Embedded NULs are preserved by NumPy fixed-width strings, so a typed
+    # string table and its object twin must produce the same duplicate keys.
+    for _vals in (['a\x00b', 'c'], [b'a\x00b', b'c']):
+        _typed = np.asarray(_vals)
+        _obj = np.empty(2, dtype=object)
+        _obj[0], _obj[1] = _vals
+        assert DG._row_keys(_typed) == DG._row_keys(_obj), _vals
+        assert DG._matrix_fingerprint(_typed) == DG._matrix_fingerprint(_obj), _vals
+    # Recursive composite cells use the same canonical identity as scalars.
+    for _a, _b in ((('x', float('nan')), ('x', float('nan'))),
+                   ((0.0,), (-0.0,)), (('a', ['x']), ('a', ['x']))):
+        _obj = np.empty((2, 1), dtype=object)
+        _obj[0, 0], _obj[1, 0] = _a, _b
+        assert DG._row_keys(_obj)[0] == DG._row_keys(_obj)[1], (_a, _b)
+        assert DG.duplicate_mask(_obj).tolist() == [False, True], (_a, _b)
+        assert DG._matrix_fingerprint(_obj[:1]) == DG._matrix_fingerprint(_obj[1:]), (_a, _b)
+    # In-range integers and their float64 twin are the same logical table.
+    for _i, _f in ((0, 0.0), (0, -0.0), (1, 1.0), (2 ** 53, float(2 ** 53))):
+        assert DG._row_keys(np.array([_i], dtype=np.int64)) == \
+            DG._row_keys(np.array([_f], dtype=np.float64)), (_i, _f)
+        assert DG.duplicate_mask(np.array([_i, _f], dtype=np.float64)).tolist() == [False, True]
+    # A private unhashable key cannot collide with a real tuple spelling.
+    _list = ['a']
+    _twin = ('__unhashable__', 'list', "['a']")
+    assert DG._hashable_label(_list) != DG._hashable_label(_twin)
+    assert DG._group_key(_list) != DG._group_key(_twin)
+    assert BR._keyable_value(_list) != BR._keyable_value(_twin)
+    assert BR._keyable_value({'a': 1, 'b': 2}) == BR._keyable_value({'b': 2, 'a': 1})
+    # Python says True == 1; boolean labels/groups are still distinct
+    # identities (a flag is not an integer category).
+    assert DG._hashable_label(True) != DG._hashable_label(1)
+    assert DG._hashable_label(False) != DG._hashable_label(0)
+    assert DG._hashable_label(np.bool_(True)) == DG._hashable_label(True)
+    assert DG._group_key(True) != DG._group_key(1)
+    _rep = DG.data_quality_report(
+        np.zeros((4, 1)), y=np.array([True, 1, False, 0], dtype=object),
+        train_idx=[0, 1], val_idx=[2, 3])
+    assert len(_rep['checks']['label_distribution']) == 4, _rep['checks']['label_distribution']
+    assert DG.categorical_shift_report([True], [1])['unseen_rate'] == 1.0
+    # NumPy NaN/Inf cannot be written by a strict JSON writer; the parallel
+    # child payload normaliser maps them to null instead of crashing.
+    import par as _par
+    assert _par._norm({'nan': float('nan'), 'inf': np.float32(np.inf), 'ok': 1.5}) == {
+        'nan': None, 'inf': None, 'ok': 1.5}
+    # A trailing-dot seed spelling is not one of the exact ".0" aliases.
+    assert A._seed_identity_scalar('1.') is None
+    assert A._seed_identity_scalar('1.0') == 1
+    # chronological_split documents that plain strings/bytes are indexable.
+    assert DG.chronological_split('abcdefghij') == {
+        'train': 'abcdefgh', 'val': 'i', 'test': 'j'}
+    assert DG.chronological_split(b'abcdefghij') == {
+        'train': b'abcdefgh', 'val': b'i', 'test': b'j'}
+    # A length declared under both its int and string spelling is ambiguous.
+    assert V12._by_len_cell({'by_len': {4: {'ppl': 1.0}, '4': {'ppl': 2.0}}}, 4) is None
+    assert V12._by_len_cell({'by_len': {'4': {'ppl': 2.0}}}, 4) == {'ppl': 2.0}
+    # A malformed smoke flag does not activate smoke-only bypasses.
+    assert V12._training_health_gate({'smoke': 'false'}, 'v', 0, None, None) is not None
+    assert V12._training_health_gate({'smoke': True}, 'v', 0, None, None) is None
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8335,6 +8397,7 @@ def main():
     _check('I26 preprocessor rejects boolean/negative-eps options', t_data_guard_preprocessor_option_guards)
     _check('I27 categorical shift requires a meaningful bin count', t_categorical_shift_requires_two_bins)
     _check('I28 label-noise audit handles unhashable labels', t_data_quality_unhashable_labels)
+    _check('I29 key identity, sequence split and smoke-flag edges', t_key_identity_and_sequence_edges)
     _check('I29 categorical encoding is fitted on train only', t_categorical_encoder_train_only)
     _check('I30 train-only cleaning before preprocessing', t_clean_training_rows_and_split)
     _check('I31 declared label set catches unseen/holdout labels', t_known_labels_audit)

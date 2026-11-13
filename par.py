@@ -18,6 +18,7 @@ lifecycle, logs, and child result files.
 import collections
 import importlib
 import json
+import math
 import os
 import re
 import signal
@@ -232,12 +233,18 @@ def _norm(obj):
         if isinstance(obj, np.integer):
             return int(obj)
         if isinstance(obj, np.floating):
-            return float(obj)
+            return _norm(float(obj))
         item = obj.item()
         return _norm(item) if not isinstance(item, np.generic) else str(item)
     if isinstance(obj, np.ndarray):
         return _norm(obj.tolist())
-    if isinstance(obj, (str, int, float, bool)) or obj is None:
+    if isinstance(obj, float):
+        # Standard JSON (and the strict writer below, allow_nan=False) has no
+        # NaN/Infinity token.  A non-finite child diagnostic must not make the
+        # result file unwritable; use the same null spelling as exp_lib's
+        # JSON cleaner.
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, (str, int, bool)) or obj is None:
         return obj
     return str(obj)
 

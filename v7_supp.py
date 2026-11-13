@@ -1815,14 +1815,15 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
     per_variant = {}
 
     def _cfg_key(value):
-        # Group records by a hashable form of run_cfg metadata.
+        # Group records by a hashable form of run_cfg metadata.  A tuple
+        # sentinel would collide with a real tuple carrying that spelling; the
+        # private key type keeps distinct metadata values distinct.
         try:
             hash(value)
             return value
         except TypeError:
-            return ('__unhashable__', json.dumps(value, sort_keys=True,
-                                                 separators=(',', ':'),
-                                                 default=str))
+            from data_guard import _UnhashableKey
+            return _UnhashableKey(value)
 
     for k, v in recs.items():
         _m = {s: r for s, r in v.items() if not r.get('_dup')}

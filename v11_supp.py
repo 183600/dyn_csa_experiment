@@ -466,8 +466,15 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
                     if not isinstance(bl, dict):
                         continue
                     for Ln, mp in ((512, m512), (4096, m4096)):
-                        c = bl.get(Ln, bl.get(str(Ln)))
-                        if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated')):
+                        # by_len_cells refuses the ambiguous int/str twin of
+                        # one length; a single ambiguous record cannot supply
+                        # a defensible paired cell.
+                        try:
+                            _cells = L.by_len_cells([r], Ln)
+                        except ValueError:
+                            continue
+                        c = _cells[0] if _cells else None
+                        if isinstance(c, dict) and isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated')):
                             mp[r.get('seed')] = float(c['ppl'])
                 both = sorted(set(m512) & set(m4096))
                 if both and len(both) < len(rows):

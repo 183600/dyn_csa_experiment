@@ -470,7 +470,8 @@ def _keyable_value(value):
         hash(value)
         return value
     except TypeError:
-        return ('__unhashable__', type(value).__name__, repr(value))
+        from data_guard import _UnhashableKey
+        return _UnhashableKey(value)
 
 
 def _prefer_one_cfg(items, cfg_of, who=''):

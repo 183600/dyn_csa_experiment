@@ -129,7 +129,7 @@ def _seed_identity_scalar(value):
     # Only the canonical integer spelling and its exact ".0"/".000" aliases
     # name the same seed.  Arbitrary float() spellings (" 5 ", "1_0", "1e1",
     # "05") are malformed provenance, not a second identity for seed 5.
-    if re.fullmatch(r'-?(?:0|[1-9][0-9]*)(?:\.0*)?', text) is None:
+    if re.fullmatch(r'-?(?:0|[1-9][0-9]*)(?:\.0+)?', text) is None:
         return None
     try:
         number = float(text)
@@ -1549,6 +1549,7 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
         if _cells is not None and not isinstance(_cells, dict):
             problems.append(f'{key}: by_len is not an object — the per-length cells cannot be audited')
             continue
+        _seen_len_keys = {}
         for k, c in (_cells or {}).items():
             # Exact integers only: int(True)==1, int(4.9)==4 and a float above
             # 2**53 can all denote a length different from the one recorded.
@@ -1562,6 +1563,16 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             if Ln <= 0:
                 problems.append(f'{key}: by_len key {k!r} is not a positive sequence length')
                 continue
+            if Ln in _seen_len_keys:
+                # The integer spelling and its JSON string twin name ONE
+                # length; two cells for it make the endpoint ambiguous even
+                # when their values happen to agree.
+                problems.append(
+                    f'{key}: by_len declares length {Ln} more than once '
+                    f'(keys {_seen_len_keys[Ln]!r} and {k!r}) — the per-length '
+                    'cell is ambiguous')
+                continue
+            _seen_len_keys[Ln] = k
             if Ln < 2:
                 # A length-1 row predicts no next token; its n_tok/eval_span
                 # equality would be a vacuous "measurement" rather than a
@@ -1734,12 +1745,8 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
             hash(value)
             return value
         except TypeError:
-            try:
-                _blob = json.dumps(value, sort_keys=True, separators=(',', ':'),
-                                   default=repr)
-            except (TypeError, ValueError):
-                _blob = repr(value)
-            return ('__unhashable__', type(value).__name__, _blob)
+            from data_guard import _UnhashableKey
+            return _UnhashableKey(value)
 
     for a, recs in per_arm.items():
         cfgs = {_meta_key(r.get('run_cfg')) for r in recs}

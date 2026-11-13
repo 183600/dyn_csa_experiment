@@ -73,9 +73,8 @@ def _variant_records(variant):
                 try:
                     hash(_cv)
                 except TypeError:
-                    _cv = ('__unhashable__', json.dumps(_cv, sort_keys=True,
-                                                        separators=(',', ':'),
-                                                        default=str))
+                    from data_guard import _UnhashableKey
+                    _cv = _UnhashableKey(_cv)
                 _cfg_groups.setdefault(_cv, []).append(_s)
             if len(_cfg_groups) > 1:
                 _ranked_cfg = sorted(
