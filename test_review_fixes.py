@@ -2565,6 +2565,35 @@ def t_review3_pooled_aggregate():
     assert e['ppl_primary'] == e['ppl_pooled']
     assert e['ppl_mean_arithmetic'] != e['ppl_pooled'] or True
 
+def t_aggregate_common_dict_fields():
+    bd = {'total': 1000, 'attention': 100, 'mlp': 400,
+          'embedding': 500, 'active': 1000, 'non_embedding': 500}
+    kv = {'csa': 64}
+    base = {'variant': 'a', 'ppl': 10.0, 'params': 1000, 'run_cfg': 'x',
+            'nll_sum': 10.0, 'n_tokens': 10}
+    both = {f'a::s{s}': dict(base, seed=s, param_breakdown=bd,
+                             kv_cache_elements_per_token=kv)
+            for s in (0, 1)}
+    entry = L.aggregate(both)['a']
+    assert entry['param_breakdown'] == bd, entry
+    assert entry['kv_cache_elements_per_token'] == kv, entry
+    # One seed without the detail makes the whole arm's decomposition
+    # unverifiable: using the remaining seed would publish a capacity/KV
+    # table the other seed never measured.
+    partial = {k: dict(v) for k, v in both.items()}
+    partial['a::s1'].pop('param_breakdown')
+    partial['a::s1'].pop('kv_cache_elements_per_token')
+    entry2 = L.aggregate(partial)['a']
+    assert 'param_breakdown' not in entry2, entry2
+    assert 'kv_cache_elements_per_token' not in entry2, entry2
+    # Conflicting breakdowns are also unverifiable.
+    mixed = {k: dict(v) for k, v in both.items()}
+    mixed['a::s1']['param_breakdown'] = dict(bd, total=1001)
+    entry3 = L.aggregate(mixed)['a']
+    assert 'param_breakdown' not in entry3, entry3
+    assert entry3['kv_cache_elements_per_token'] == kv, entry3
+
+
 def t_pooled_ppl_rejects_malformed_counts():
     assert L._pooled_ppl_from_records([{'nll_sum': 10.0, 'n_tokens': 4.4},
                                        {'nll_sum': 10.0, 'n_tokens': 4.4}]) == (None, None, None)
@@ -2907,6 +2936,40 @@ def t_batch_contract_check():
     assert amb['passed'] is False, amb
 
 
+def t_window_follow_tokens_chunked():
+    # The chunked start-position scan must equal the full-mask form exactly,
+    # including overlapping repeats and a window with no following token.
+    rng = np.random.default_rng(20261113)
+    for trial in range(400):
+        n = int(rng.integers(0, 200))
+        width = int(rng.integers(1, 12))
+        src = rng.integers(0, 4, size=n, dtype=np.int64)
+        row = rng.integers(0, 4, size=width, dtype=np.int64)
+        chunk = int(rng.choice([1, 2, 7, 64, 1 << 20]))
+        got = L._window_follow_tokens(src, row, chunk=chunk)
+        ref = set()
+        for p in range(0, max(0, n - width)):
+            if np.array_equal(src[p:p + width], row):
+                ref.add(int(src[p + width]))
+        assert got == ref, (trial, n, width, chunk, got, ref)
+    # A row equal to the whole stream has no target and must not raise.
+    assert L._window_follow_tokens(np.array([1, 2, 3]), np.array([1, 2, 3])) == set()
+    assert L._window_follow_tokens(np.array([1, 2, 3]), np.array([1, 2, 3, 4])) == set()
+
+
+def t_lm_batch_metrics_unmeasured():
+    # Every target ignored is an UNMEASURED point, not a perfect 0.0/0.0.
+    model = L.SmallGPT(32, 16, 1, 2, 4, 8, [L.AttnCfg(kind='full')],
+                       mlp_ratio=2)
+    x = torch.randint(0, 32, (2, 8), dtype=torch.int64)
+    y_ignored = torch.full((2, 8), -100, dtype=torch.int64)
+    ce, acc = L._lm_batch_metrics(model, x, y_ignored, 32,
+                                  ignore_index=-100)
+    assert math.isnan(ce) and math.isnan(acc), (ce, acc)
+    y_valid = torch.randint(0, 32, (2, 8), dtype=torch.int64)
+    ce2, acc2 = L._lm_batch_metrics(model, x, y_valid, 32,
+                                    ignore_index=-100)
+    assert math.isfinite(ce2) and 0.0 <= acc2 <= 1.0, (ce2, acc2)
 
 
 def t_parallel_child_env_seed():
@@ -8414,6 +8477,7 @@ def main():
     _check('D1a eval length rejects invalid/non-integer lengths', t_eval_length_invalid_lengths)
     _check('J1 evidence metadata + significance gate', t_review3_evidence_metadata)
     _check('J2 pooled aggregation', t_review3_pooled_aggregate)
+    _check('J2a aggregate capacity/KV details require every seed', t_aggregate_common_dict_fields)
     _check('J2b pooled PPL rejects malformed counts', t_pooled_ppl_rejects_malformed_counts)
     _check('J2c document CI token counts are exact integers', t_nll_doc_ci_exact_token_counts)
     _check('J3 Holm declared-family slots', t_review3_holm_family_size)
@@ -8426,6 +8490,8 @@ def main():
     _check('E2b batch_iter uint16 transport', t_batch_iter_uint16)
     _check('E2b2 int32 narrowing ignores a stale max_id bound', t_ids_narrow_does_not_trust_stale_max_id)
     _check('E2c real batch-iterator contract check', t_batch_contract_check)
+    _check('E2c2 chunked window-continuation scan is exact', t_window_follow_tokens_chunked)
+    _check('E2c3 all-ignored batch metrics are unmeasured', t_lm_batch_metrics_unmeasured)
     _check('E2d failed loader contract blocks the panel', t_panel_blocks_on_loader_contract_failure)
     _check('E2e parallel child gets the seed hash', t_parallel_child_env_seed)
     _check('E3 small-batch overfit sanity', t_overfit_sanity)

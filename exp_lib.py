@@ -8812,6 +8812,37 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
         stop.set()
         th.join(timeout=5.0)
 
+_WINDOW_SCAN_CHUNK = 1 << 20
+
+
+def _window_follow_tokens(src, row, chunk=_WINDOW_SCAN_CHUNK):
+    """All tokens that immediately follow an occurrence of ``row`` in ``src``.
+
+    Scans the start positions in fixed-size chunks instead of materialising a
+    full-corpus boolean mask per sampled row.  The returned set is exactly the
+    set of ``src[p + len(row)]`` values over every valid start ``p``; a window
+    with no following token (``p + len(row) == len(src)``) cannot be a training
+    target and is not returned.
+    """
+    src = np.asarray(src).reshape(-1)
+    row = np.asarray(row).reshape(-1)
+    n = int(src.size)
+    width = int(row.size)
+    out = set()
+    if width <= 0 or n < width + 1:
+        return out
+    first = row[0]
+    last_start = n - width - 1
+    step = max(1, int(chunk))
+    for start in range(0, last_start + 1, step):
+        end = min(start + step, last_start + 1)
+        for offset in np.flatnonzero(src[start:end] == first):
+            pos = start + int(offset)
+            if np.array_equal(src[pos:pos + width], row):
+                out.add(int(src[pos + width]))
+    return out
+
+
 def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=None, n_batches=2):
     """Validate the ACTUAL training batch iterator, not a re-derived sample.
 
@@ -8882,13 +8913,10 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
                 for _bi in range(_xn.shape[0]):
                     _row = _xn[_bi]
                     _last = int(_yn[_bi, -1])
-                    _starts = np.flatnonzero(_src[:max(0, _src.size - seq_len)] == _row[0])
-                    _nexts = set()
-                    for _p in _starts:
-                        _p = int(_p)
-                        if _p + seq_len < _src.size and np.array_equal(
-                                _src[_p:_p + seq_len], _row):
-                            _nexts.add(int(_src[_p + seq_len]))
+                    # Chunked start-position scan: an exact synonym of the
+                    # full boolean-mask form without allocating a corpus-sized
+                    # mask per sampled row.
+                    _nexts = _window_follow_tokens(_src, _row)
                     # A repeated input window with different continuations
                     # makes the final target unverifiable from x/y alone:
                     # accepting ANY occurrence lets a corrupted iterator pass
@@ -18234,6 +18262,12 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                                         'lr': base})
                     print(f'  [nan] non-finite gradient norm at step {step + 1}; zeroing grads and skipping the update')
                     opt.zero_grad(set_to_none=True)
+                    # `unscale_` marked the gradients non-finite, so the
+                    # scaler must still update: skipping it would leave an
+                    # overflowing fp16 scale unchanged and every later step
+                    # could overflow the same way.  `update()` without `step()`
+                    # is the supported recovery path after `unscale_`.
+                    _scaler.update()
                 else:
                     _gn_post = min(_gn_pre, float(GRAD_CLIP_NORM))
                     _clip_steps += int(_gn_pre > GRAD_CLIP_NORM)
@@ -18573,7 +18607,11 @@ def _lm_batch_metrics(model, x, y, vocab, chunk=64, ignore_index=None):
                     total += F.cross_entropy(lgf, tgf, reduction='sum').double()
                     correct += (lg.argmax(-1)[valid] == tg[valid]).sum()
                     n += int(valid.sum())
-        n = max(n, 1)
+        if n <= 0:
+            # Every target was ignored (or the batch had no scoreable
+            # columns).  `0/1` would claim a perfectly measured zero loss and
+            # zero accuracy; the point is unmeasured, so report NaN.
+            return float('nan'), float('nan')
         return (float(total.item()) / n), (float(correct.item()) / n)
     finally:
         model.train(was_training)
@@ -20108,6 +20146,34 @@ def _group_params(recs):
             return v
     return None
 
+def _common_nonempty_dict(recs, key):
+    """The one non-empty dict under ``key`` shared by every record.
+
+    A single seed's value must not stand in for the arm: a partially recorded
+    panel would then publish a capacity/KV decomposition that the other seeds
+    never measured.  Any missing or mismatched value makes the arm's detail
+    unverifiable, so nothing is reported.
+    """
+    vals = []
+    for r in recs:
+        if not isinstance(r, dict):
+            return None
+        value = r.get(key)
+        if not isinstance(value, dict) or not value:
+            return None
+        vals.append(value)
+    if not vals:
+        return None
+    first = vals[0]
+    for other in vals[1:]:
+        try:
+            same = bool(first == other)
+        except Exception:
+            same = False
+        if not same:
+            return None
+    return first
+
 def _pooled_ppl_from_records(recs):
     """Token-pooled PPL: exp(sum NLL / sum N tokens) over all seeds.
 
@@ -20550,7 +20616,7 @@ def aggregate(summary, *, outdir=None):
                  'ppl_ci_seed_doc_combined': _combined_seed_doc_ci(recs),
                  'ppl_aggregation': ('pooled_token_nll' if _pooled is not None else 'arithmetic_seed_mean_fallback (records lack nll_sum/n_tokens)'),
                  'ppl_primary': (float(_pooled) if _pooled is not None else float(ppls.mean()))}
-        _pb = next((r.get('param_breakdown') for r in recs if isinstance(r.get('param_breakdown'), dict)), None)
+        _pb = _common_nonempty_dict(recs, 'param_breakdown')
         if _pb:
             entry['param_breakdown'] = _pb
             entry['params_total'] = _pb.get('total')
@@ -20559,7 +20625,7 @@ def aggregate(summary, *, outdir=None):
             entry['params_embedding'] = _pb.get('embedding')
             entry['active_params'] = _pb.get('active')
             entry['attention_param_share'] = _pb.get('attention_share')
-        _kv = next((r.get('kv_cache_elements_per_token') for r in recs if isinstance(r.get('kv_cache_elements_per_token'), dict)), None)
+        _kv = _common_nonempty_dict(recs, 'kv_cache_elements_per_token')
         if _kv:
             entry['kv_cache_elements_per_token'] = _kv
         if _fp_idx is not None:
