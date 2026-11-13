@@ -1660,10 +1660,8 @@ def _matrix_fingerprint(X):
     # Fixed-width Unicode/bytes and complex tables use the canonical per-cell
     # identity: float64 conversion would discard a complex imaginary part.
     _obj_canon = arr.dtype.kind in ('U', 'S', 'c')
-    # Native datetime/timedelta tables are temporal metadata.  The float64
-    # fallback below neither identifies NaT nor matches the object-dtype twin
-    # (whose scalar keeps its unit), so they take the same canonical per-cell
-    # path as an object column of np.datetime64/np.timedelta64 scalars.
+    # Native datetime/timedelta tables share the canonical temporal identity
+    # of an object column of np.datetime64/np.timedelta64 scalars.
     _temporal = arr.dtype.kind in ('M', 'm')
     if arr.dtype == object and arr.size:
         # Object-dtype integer tables must keep the same exactness contract:

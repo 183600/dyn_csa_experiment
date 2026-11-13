@@ -55,9 +55,7 @@ def _one_seed_record(summary, arm, seed):
     rec = summary.get(f'{arm}::seed{int(seed)}')
     if not (isinstance(rec, dict) and L.ppl_is_usable(rec.get('ppl'))):
         return None
-    # The summary key names the cell, but a merged/hand-edited record can carry
-    # a different variant or seed.  Selection would then tune an arm on another
-    # cell's PPL while the artifact claims this arm/seed was measured.
+    # A present variant/seed must agree with the summary key.
     if rec.get('variant') is not None and str(rec.get('variant')) != str(arm):
         return None
     if (rec.get('seed') is not None

@@ -2747,9 +2747,8 @@ def t_ids_narrow_does_not_trust_stale_max_id():
         b = L._ids_narrow(np.load(p2, mmap_mode='r'))
         assert a.dtype == b.dtype == np.int32, (a.dtype, b.dtype)
         assert np.array_equal(np.asarray(a), safe) and np.array_equal(np.asarray(b), safe)
-        # A SLICE of a memmap also exposes `.filename`.  It must not share the
-        # whole-file int32 sidecar: two same-shaped slices would otherwise get
-        # the first slice's tokens (silent corpus corruption).
+        # A memmap slice has its own identity; only a whole-file memmap may
+        # share the int32 sidecar.
         p3 = os.path.join(d, 'train_ids_z.npy')
         np.save(p3, np.arange(10, dtype=np.int64))
         mm3 = np.load(p3, mmap_mode='r')
@@ -3608,10 +3607,8 @@ def t_baseline_tuning_audit():
     leak['selection_split'] = 'test'
     r3 = L.baseline_tuning_audit(leak, protocol=protocol)
     assert r3['tuning_verified'] is False and any('validation' in p for p in r3['problems']), r3
-    # Tuning selection must not read a record whose own variant/seed fields
-    # disagree with the summary key.  A merged or hand-edited summary could
-    # otherwise select hyperparameters from a different cell while the artifact
-    # records this cell as measured.
+    # Tuning selection ignores a record whose present variant/seed fields
+    # disagree with the summary key.
     _ok = {'variant': 'csa_fixed', 'seed': 0, 'ppl': 9.0}
     assert BT._one_seed_record({'csa_fixed::seed0': _ok}, 'csa_fixed', 0) is _ok
     assert BT._one_seed_record({'csa_fixed::seed0': dict(_ok, variant='csa_dynamic')},
@@ -4579,11 +4576,8 @@ def t_object_byte_tables():
         _obj[:, 0] = _vals
         assert DG.duplicate_mask(_obj).tolist() == [False, True], _vals
         assert len(DG._row_keys(_obj)) == 2 and DG._matrix_fingerprint(_obj), _vals
-    # A NATIVE datetime/timedelta table and its object-dtype twin are the same
-    # logical table.  The native float64/raw-byte paths used to give a
-    # different row key and fingerprint (and NaT was not even identified),
-    # which would hide cross-split duplicates when one cache serialised the
-    # column as datetime64 and another as object.
+    # A native datetime/timedelta table and its object-dtype twin share one
+    # row key and fingerprint, including NaT.
     for _unit in ('D', 's', 'ns'):
         for _is_dt in (True, False):
             if _is_dt:

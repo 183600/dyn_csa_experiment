@@ -1392,7 +1392,7 @@ def _scale_crossovers():
         out[label] = entry
     return out
 
-_SCALE_PANEL_SPECS = {'P3SS': dict(outdir='results_lm_v10_scale_s', d=128, n_layers=4, batch=12, seq=512, steps=8000, note='small arm, 8000 steps (~49.15M tokens)'), 'P3SL': dict(outdir='results_lm_v10_scale_l', d=512, n_layers=10, batch=12, seq=512, steps=4000, note='large arm as originally run, 4000 steps (~24.58M tokens — HALF the small arm training length)'), 'P3SL_TOK': dict(outdir='results_lm_v10_scale_l8k', d=512, n_layers=10, batch=12, seq=512, steps=8000, note='token-matched large arm, 8000 steps (~49.15M tokens)'), 'P3SL_FLOP': dict(outdir='results_lm_v10_scale_lflop', d=512, n_layers=10, batch=12, seq=512, steps=None, note='compute-matched large arm (steps = 8000 * N_small/N_large, floored at 250)')}
+_SCALE_PANEL_SPECS = {'P3SS': dict(outdir='results_lm_v10_scale_s', d=128, n_layers=4, batch=12, seq=512, steps=8000, note='small arm'), 'P3SL': dict(outdir='results_lm_v10_scale_l', d=512, n_layers=10, batch=12, seq=512, steps=4000, note='large arm'), 'P3SL_TOK': dict(outdir='results_lm_v10_scale_l8k', d=512, n_layers=10, batch=12, seq=512, steps=8000, note='token-matched large arm'), 'P3SL_FLOP': dict(outdir='results_lm_v10_scale_lflop', d=512, n_layers=10, batch=12, seq=512, steps=None, note='compute-matched large arm')}
 
 def _panel_endpoint(hists, tps):
     """Final-eval gap + token count of a panel: csa_fixed vs full, seed-paired."""
@@ -1544,10 +1544,10 @@ def _equal_token_slices():
                 else:
                     step_l = step
                 tokens_large = step_l * _tps_l
-                # If the large arm stops before the small arm's target (e.g.
-                # P3SL has 4000 steps vs P3SS's 8000), the nearest step is the
-                # arm's LAST step and calling it an equal-token slice would
-                # compare 24.58M against 49.15M tokens under an equal label.
+                # If the large arm's step grid stops before the small arm's
+                # target, the nearest step is its last one; calling that an
+                # equal-token slice would compare different totals under an
+                # equal label.
                 _tok_tol = 0.5 * max(abs(float(_tps_s)), abs(float(_tps_l)))
                 if abs(tokens_large - target_tokens) > _tok_tol:
                     print(f'[stats] equal-token slice {name} @ {target_tokens / 1000000.0:.2f}M: the nearest large-arm step {step_l} has {tokens_large / 1000000.0:.2f}M tokens (difference exceeds half a step) — slice OMITTED rather than mislabelled')
