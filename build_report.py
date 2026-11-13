@@ -1460,18 +1460,26 @@ def sec_p1l():
         # but integral floats/other encodings are also validated by value.
         # Resolve them so a cell is never silently shown as "—", while a
         # malformed key (including the dict-equality alias True == 1) never
-        # supplies a cell for a different real length.
-        if Ln in by_len:
-            for _k in by_len:
-                if _k == Ln and _len_key(_k) == Ln:
-                    return by_len[_k]
-        _sk = str(Ln)
-        if _sk in by_len and _len_key(_sk) == Ln:
-            return by_len[_sk]
+        # supplies a cell for a different real length.  Two keys that name the
+        # same length (e.g. 512 and "512") are ambiguous even when their
+        # values happen to agree: choosing one would quote an endpoint the
+        # record does not uniquely define.
+        if not isinstance(by_len, dict):
+            return None
+        _hits = []
         for _k, _c in by_len.items():
-            if _len_key(_k) == Ln:
-                return _c
-        return None
+            try:
+                _lk = _len_key(_k)
+            except Exception:
+                _lk = None
+            if _lk == Ln:
+                _hits.append((_k, _c))
+        if len(_hits) > 1:
+            print(f'[report] sec_p1l: by_len declares length {Ln} more than once '
+                  f'(keys {[_k for _k, _c in _hits]!r}) — treating the cell as '
+                  'ambiguous and excluding it')
+            return None
+        return _hits[0][1] if _hits else None
 
     def _norm_seed(x):
         return _int_or(x, None)

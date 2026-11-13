@@ -3437,11 +3437,15 @@ def _rank_blocks(masked, B, ties, k=None):
     sel = gt | (eq & (eq_cum <= need[:, None]))
     del eq_cum, gt, eq, need
     rank = torch.cumsum(sel, dim=1, dtype=torch.int32)
-    # NaN has no ordering under `>`/`==`, so a row containing NaN can yield
-    # fewer than kk selections.  The helper's contract is the first k columns
-    # of the stable descending sort; use that full sort, whose NaN ordering is
-    # defined, in that case.
-    if bool((rank[:, -1] != kk).any()):
+    # NaN has no ordering under `>`/`==`.  A NaN in a row can either leave
+    # fewer than kk selections or (when enough finite entries exist) return a
+    # finite top-k that omits the NaN the stable descending sort puts first.
+    # The helper's contract is the first k columns of that stable sort, so any
+    # NaN row takes the full-sort path (whose NaN ordering is defined).
+    _needs_sort = rank[:, -1] != kk
+    if src.dtype.is_floating_point:
+        _needs_sort.logical_or_(torch.isnan(src).any(dim=1))
+    if bool(_needs_sort.any()):
         order = torch.argsort(src, dim=1, stable=True, descending=True)[:, :kk]
         return order if ties == 'earliest' else torch.sub(B - 1, order)
     rank -= 1

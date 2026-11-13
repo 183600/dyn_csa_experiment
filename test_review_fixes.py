@@ -5045,6 +5045,16 @@ def t_audit_budget_integer_runs():
             assert r['status'] == 'fail' and r.get('problems'), (bad, r)
             _panel = r['panels'][td]
             assert not isinstance(_panel, dict) or _panel.get('estimate') is None, (bad, r)
+        # Two model widths under one variant make the panel-level FLOP
+        # estimate arbitrary (the old code silently used the first record).
+        with open(sp, 'w', encoding='utf-8') as f:
+            json.dump({'v::s0': {'variant': 'v', 'params': 1000, 'steps': 3,
+                                 'batch_size': 2, 'seq_len': 8},
+                       'v::s1': {'variant': 'v', 'params': 2000, 'steps': 3,
+                                 'batch_size': 2, 'seq_len': 8}}, f)
+        r = A.audit_budget(state_files=(), panels=((td, 'v', None),))
+        assert r['status'] == 'fail' and r.get('problems'), r
+        assert r['panels'][td]['estimate'] is None, r
         with open(sp, 'w', encoding='utf-8') as f:
             json.dump({'v::s0': {'variant': 'v', 'params': 1000, 'steps': 3,
                                  'batch_size': 2, 'seq_len': 8}}, f)
@@ -6372,6 +6382,56 @@ def t_sec_p1l_rejects_malformed_length_keys():
     assert f'PPL@{2 ** 53 + 1}' in txt, txt[:600]
     # A lossy large float key must not become a valid (huge) length column.
     assert f'PPL@{2 ** 60}' not in txt and '77.0' not in txt, txt[:600]
+
+
+def t_sec_p1l_rejects_ambiguous_length_spellings():
+    # One logical length declared by both its integer and string spelling makes
+    # the endpoint ambiguous even when the two cells agree; the report must not
+    # silently quote either value (same rule as exp_lib.by_len_cells).
+    rec = {'v::s0': {'variant': 'v', 'seed': 0, '_code': BR._CUR_CS, 'by_len': {
+        512: {'ppl': 10.0, 'truncated': False},
+        '512': {'ppl': 11.0, 'truncated': False},
+        4096: {'ppl': 20.0, 'truncated': False},
+        '4096': {'ppl': 21.0, 'truncated': False},
+    }}}
+    BR._LOADED[('summary', 'results_len')] = rec
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            txt = BR.sec_p1l()
+    finally:
+        BR._LOADED.pop(('summary', 'results_len'), None)
+    for _val in ('10.0', '11.0', '20.0', '21.0'):
+        assert _val not in txt, (_val, txt[:600])
+    assert 'PPL@512' in txt and 'PPL@4096' in txt, txt[:600]
+    # A single spelling of each length still supplies its cell.
+    rec['v::s0']['by_len'] = {'512': {'ppl': 12.0, 'truncated': False},
+                              '4096': {'ppl': 22.0, 'truncated': False}}
+    BR._LOADED[('summary', 'results_len')] = rec
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            txt2 = BR.sec_p1l()
+    finally:
+        BR._LOADED.pop(('summary', 'results_len'), None)
+    assert '12.0' in txt2 and '22.0' in txt2, txt2[:600]
+
+
+def t_v7_lenphase_merge_prior_by_len():
+    # A partial length re-evaluation keeps only exact, unambiguous prior cells.
+    prev = {512: {'ppl': 1.0}, '512': {'ppl': 2.0}, '4.9': {'ppl': 3.0},
+            4096: {'ppl': 4.0}}
+    merged = V7._merge_prior_by_len(prev, {1024: {'ppl': 5.0}}, [1024],
+                                    label='v::seed0')
+    assert 512 not in merged, merged
+    assert 4096 in merged and merged[4096]['ppl'] == 4.0, merged
+    assert 1024 in merged and merged[1024]['ppl'] == 5.0, merged
+    assert all(not isinstance(k, str) for k in merged), merged
+    # A re-evaluated length replaces the old cell, never duplicates it.
+    merged2 = V7._merge_prior_by_len({512: {'ppl': 1.0}},
+                                     {512: {'ppl': 9.0}}, [512], label='x')
+    assert merged2 == {512: {'ppl': 9.0}}, merged2
+    # A non-dict/malformed prior payload is ignored rather than crashing.
+    assert V7._merge_prior_by_len([1, 2], {512: {'ppl': 1.0}}, [],
+                                  label='x') == {512: {'ppl': 1.0}}
 
 
 def t_stale_aggregate_refused():
@@ -8249,6 +8309,11 @@ def t_topk_nan_matches_stable_sort():
         [[float('inf'), 1.0, float('nan'), float('-inf'), 2.0]],
         [[float('nan'), float('nan'), 1.0]],
         [[1.0, float('nan'), 0.0], [float('nan'), 2.0, float('nan')]],
+        # The stable sort puts NaN first even when enough finite values exist
+        # to fill k; the finite top-k must NOT silently omit it.
+        [[float('nan'), 1.0, 2.0]],
+        [[float('nan'), -1.5, 1.5, -0.5, 1.5]],
+        [[0.5, float('nan'), 0.5, 2.0, 2.0, -1.0]],
     ]
     for vals in cases:
         x = torch.tensor(vals)
@@ -8487,6 +8552,8 @@ def main():
     _check('L6 stale aggregate refused', t_stale_aggregate_refused)
     _check('L7 stale length panel excluded from report', t_sec_p1l_excludes_stale_records)
     _check('L7b report length table rejects malformed length keys', t_sec_p1l_rejects_malformed_length_keys)
+    _check('L7c report length table rejects ambiguous int/str spellings', t_sec_p1l_rejects_ambiguous_length_spellings)
+    _check('L7d v7 lenphase resume merges only exact unambiguous prior cells', t_v7_lenphase_merge_prior_by_len)
     _check('L8 efficiency-pair audit + shape sweep', t_efficiency_pairs_audit_and_sweep)
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L9b archive verifier requires the external checksum', t_archive_verify_requires_external_checksum)

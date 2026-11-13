@@ -2547,6 +2547,32 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
         model.train(was)
     return out
 
+def _merge_prior_by_len(prev_by_len, new_cells, need_lens, *, label=''):
+    """Merge previously evaluated length cells with a partial re-evaluation.
+
+    Only exact integer length keys survive.  A length that is being
+    re-evaluated is replaced by the new measurement, and two spellings of one
+    length (e.g. 512 and "512") are ambiguous, so neither stale value is
+    kept instead of silently choosing one.
+    """
+    merged = {}
+    seen = set()
+    if isinstance(prev_by_len, dict):
+        for _bk, _bc in prev_by_len.items():
+            _bki = L._as_seed_int(_bk)
+            if _bki is None or _bki < 2 or _bki in need_lens:
+                continue
+            if _bki in seen:
+                merged.pop(_bki, None)
+                print(f'[resume] {label}: by_len length {_bki} is declared more '
+                      'than once — dropping the stale ambiguous cell')
+                continue
+            seen.add(_bki)
+            merged[_bki] = _bc
+    merged.update(new_cells)
+    return merged
+
+
 def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None):
     """Run exactly ONE (variant, seed) cell of a length-extrapolation phase:
     optional (re)train -> checkpoint -> by-length eval -> locked summary merge.
@@ -2738,7 +2764,13 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         # also needs the truncation flag and, for a full-length cell, the exact
         # requested span.  Re-evaluate a cell that lacks that metadata instead
         # of leaving a permanently unverifiable column.
-        _cells = L.by_len_cells([_rec], _ln)
+        try:
+            _cells = L.by_len_cells([_rec], _ln)
+        except ValueError:
+            # An ambiguous integer/string twin (or another malformed length
+            # declaration) is not a complete measurement; re-evaluate it
+            # instead of aborting the whole resume path.
+            return False
         if not _cells:
             return False
         _c = _cells[0]
@@ -2780,14 +2812,12 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         guard.record_run(time.time() - _t_ev, 0, 0, 0, 0, 0)
 
     def _merge(summary):
-        _merged = {}
         _cur_now = summary.get(key)
-        for _bk, _bc in (((_cur_now or {}).get('by_len') or {}).items() if _need_lens != list(eval_lens) else []):
-            try:
-                _merged[int(_bk)] = _bc
-            except (TypeError, ValueError, OverflowError):
-                continue
-        _merged.update(r)
+        _prev_by_len = ((_cur_now or {}).get('by_len')
+                        if isinstance(_cur_now, dict) else None)
+        _keep_previous = isinstance(_prev_by_len, dict) and _need_lens != list(eval_lens)
+        _merged = _merge_prior_by_len(
+            _prev_by_len if _keep_previous else None, r, _need_lens, label=key)
         _rec = {'variant': v, 'seed': seed, 'params': _ckp_params, 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE, 'recipe': _recipe, 'run_cfg': _run_cfg, 'eval_n_seq': n_seq, 'n_seq': n_seq}
         _prev_resume = _cur_now if isinstance(_cur_now, dict) else {}
         # `pair_reason` requires steps/tokens_seen to be present and equal;
