@@ -124,8 +124,16 @@ def _seed_identity_scalar(value):
         return None
     try:
         text = value.decode('ascii') if isinstance(value, bytes) else value
+    except (UnicodeDecodeError, AttributeError, TypeError):
+        return None
+    # Only the canonical integer spelling and its exact ".0"/".000" aliases
+    # name the same seed.  Arbitrary float() spellings (" 5 ", "1_0", "1e1",
+    # "05") are malformed provenance, not a second identity for seed 5.
+    if re.fullmatch(r'-?(?:0|[1-9][0-9]*)(?:\.0*)?', text) is None:
+        return None
+    try:
         number = float(text)
-    except (UnicodeDecodeError, AttributeError, TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if math.isfinite(number) and number.is_integer() and abs(number) < 2 ** 53:
         return int(number)
@@ -222,15 +230,29 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                 _mismatch.append((os.path.basename(_mp), _ttag, _diff))
                 continue
             _pairs.append((_mp, _mmeta, _tp, _tmeta))
-    if preferred_train_seq_len is not None:
+    if preferred_train_seq_len is not None and _pairs:
         _want_sl = _exact_int_scalar(preferred_train_seq_len)
+        if _want_sl is None:
+            out['status'] = 'not_verifiable_locally'
+            out['note'] = (f'preferred_train_seq_len={preferred_train_seq_len!r} is not an '
+                           'exact integer sequence length; refusing to guess which train '
+                           'cache the audit should examine')
+            return out
         _pref = []
         for p in _pairs:
             _got_sl = _exact_int_scalar(p[1].get('seq_len'))
-            if _want_sl is not None and _got_sl is not None and _got_sl == _want_sl:
+            if _got_sl == _want_sl:
                 _pref.append(p)
-        if _pref:
-            _pairs = _pref
+        if not _pref:
+            # The caller named a specific training cache.  Falling back to an
+            # arbitrary other seq_len would audit a different corpus than the
+            # one requested (and could report a clean result for it).
+            out['status'] = 'not_verifiable_locally'
+            out['note'] = (f'no train/test cache pair has the requested '
+                           f'train seq_len={_want_sl}; refusing to audit a '
+                           'different training cache instead')
+            return out
+        _pairs = _pref
     if not _pairs:
         if _mismatch and len(_tm) == 1 and len(_vm) == 1:
             # A present-but-different tokenizer/vocab identity is a failed
@@ -264,6 +286,18 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     out['checks']['test_fit_fp'] = test_meta.get('fit_fp')
     out['checks']['train_src_fp'] = train_meta.get('src_fp') or train_meta.get('train_fp')
     out['checks']['test_src_fp'] = test_meta.get('src_fp')
+    _train_fit_fp = train_meta.get('fit_fp')
+    _test_fit_fp = test_meta.get('fit_fp')
+    if not (_train_fit_fp and _test_fit_fp):
+        # The fit-corpus fingerprint is the binding proof that the tokenizer
+        # never saw valid/test text.  A missing one is unverified provenance,
+        # not a clean pass.
+        out['checks']['fit_fp_provenance'] = 'not_verified (train and/or test fit_fp is missing)'
+        out['status'] = 'warnings'
+        out['note'] = ('tokenizer fit-corpus provenance (fit_fp) is missing on at least '
+                       'one side; tokenizer/split provenance cannot be independently verified')
+    else:
+        out['checks']['fit_fp_provenance'] = 'verified (train and test fit_fp agree)'
     _test_vocab_int = _as_int(test_meta.get('vocab'))
     _train_vocab_int = _as_int(train_meta.get('vocab'))
     out['checks']['vocab_agree'] = bool(_test_vocab_int is not None and _train_vocab_int is not None
@@ -425,6 +459,30 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
         if _te and _tr:
             te = np.load(_te[0])
             tr = np.load(_tr[0], mmap_mode='r')
+            # c) the recorded src_fp must be the content fingerprint of the
+            # cache file it is paired with.  Echoing the field without
+            # recomputing it would let a silently modified/truncated id cache
+            # pass the provenance audit.
+            _fp_bad = []
+            if _tr[0] == _tr_path and train_meta.get('src_fp'):
+                try:
+                    _L = _import_exp_lib()
+                    if str(train_meta.get('src_fp')) != _L._ids_fp(np.asarray(tr)):
+                        _fp_bad.append('train src_fp does not match the train_ids content')
+                except Exception as _fe:
+                    _fp_bad.append(f'train src_fp could not be recomputed ({type(_fe).__name__}: {_fe})')
+            if _te[0] == _te_path and test_meta.get('src_fp'):
+                try:
+                    _L = _import_exp_lib()
+                    if str(test_meta.get('src_fp')) != _L._ids_fp(np.asarray(te)):
+                        _fp_bad.append('test src_fp does not match the test_ids content')
+                except Exception as _fe:
+                    _fp_bad.append(f'test src_fp could not be recomputed ({type(_fe).__name__}: {_fe})')
+            if _fp_bad:
+                out['status'] = 'fail'
+                out['checks']['src_fp_problems'] = _fp_bad
+                out['note'] = ('cache content fingerprint mismatch: ' + '; '.join(_fp_bad) +
+                               ' — rebuild the cache before trusting its provenance')
 
             def _uniform_rows(n_rows, cap):
                 if n_rows <= cap:
@@ -907,6 +965,14 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     continue
                 _tfp = os.path.join(cd, f'test_ids_{_ttag}.npy')
                 if not os.path.exists(_tfp):
+                    # An existing test metadata record without its ids array
+                    # is an incomplete cache, not an absent one.  Skipping it
+                    # would downgrade a broken held-out split to "no test
+                    # cache matches" and let the audit pass with a warning.
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test cache metadata {_ttag} exists but its '
+                          'test_ids array is missing — test split contract cannot '
+                          'be verified')
                     continue
                 # Train and held-out sequence lengths may differ (the training
                 # cache uses the training seq_len while the frozen test slice
@@ -1459,6 +1525,9 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
     problems = []
     for key, r in raw.items():
         if not isinstance(r, dict):
+            # A malformed top-level record must not make the whole audit look
+            # merely "not run"; it is a broken length panel.
+            problems.append(f'{key}: record is {type(r).__name__}, not an object — the per-length cells cannot be audited')
             continue
         _cells = r.get('by_len')
         if _cells is not None and not isinstance(_cells, dict):
@@ -1643,12 +1712,19 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
 
     def _meta_key(value):
         # Metadata may be any JSON value; canonicalise unhashable values so
-        # every record is still counted and reported.
+        # every record is still counted and reported.  Mapping key order is
+        # not part of a config's identity, so serialise mappings in sorted-key
+        # form instead of using repr() (which preserves insertion order).
         try:
             hash(value)
             return value
         except TypeError:
-            return ('__unhashable__', type(value).__name__, repr(value))
+            try:
+                _blob = json.dumps(value, sort_keys=True, separators=(',', ':'),
+                                   default=repr)
+            except (TypeError, ValueError):
+                _blob = repr(value)
+            return ('__unhashable__', type(value).__name__, _blob)
 
     for a, recs in per_arm.items():
         cfgs = {_meta_key(r.get('run_cfg')) for r in recs}

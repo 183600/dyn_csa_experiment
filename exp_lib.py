@@ -20832,7 +20832,16 @@ def _plan_run(cfg, summary_path, fp):
             _drop_is_stale = False
             if key in summary and 'ppl' in summary.get(key, {}):
                 old = summary[key]
-                if not ppl_is_usable(old.get('ppl')):
+                _identity_bad = (
+                    (old.get('variant') is not None and old.get('variant') != v)
+                    or (old.get('seed') is not None
+                        and _as_seed_int(old.get('seed')) != _as_seed_int(seed)))
+                if _identity_bad:
+                    _drop_msg = (f'[resume] {key} holds a record whose own '
+                                 f'variant/seed ({old.get("variant")!r}/{old.get("seed")!r}) '
+                                 'does not name this cell — DROPPING it and retraining')
+                    _drop_is_stale = True
+                elif not ppl_is_usable(old.get('ppl')):
                     _drop_msg = f"[resume] {key} holds a NON-MEASURABLE ppl ({old.get('ppl')!r}) — every statistic in this repo refuses it (`ppl_is_usable`), so counting it as 'already completed' would drop the seed from the tables silently. DROPPING it and retraining"
                 elif old.get('synthesized'):
                     _drop_msg = f'[resume] {key} is a SYNTHESIZED record (reconstructed from an old aggregate.json, no weights) — DROPPING it and retraining'

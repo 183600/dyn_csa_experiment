@@ -1209,8 +1209,12 @@ def run_warmup_cell(cfg, v, warm, seed, guard=None, ratios=None, fp=None, train_
         ratios[v] = L.variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'}, ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'))
     _cur = L.locked_json_read(spath).get(key)
     _drop_msg = None
-    if isinstance(_cur, dict) and ((_cur.get('synthesized')) or not L.result_is_current(_cur, CKPT_CODE, 'ppl')):
-        _drop_msg = f'[resume] {key} holds a record that is not current under this code semantics (stale code stamp, missing ppl, or synthesized) — DROPPING it before retraining, so a failed or truncated attempt cannot leave the old reading in place looking like a fresh result'
+    _identity_ok = (isinstance(_cur, dict)
+                    and _cur.get('variant') == v
+                    and L._as_seed_int(_cur.get('seed')) == L._as_seed_int(seed)
+                    and L._as_seed_int(_cur.get('warm_steps')) == L._as_seed_int(warm))
+    if isinstance(_cur, dict) and ((_cur.get('synthesized')) or (not _identity_ok) or not L.result_is_current(_cur, CKPT_CODE, 'ppl')):
+        _drop_msg = f'[resume] {key} holds a record that is not current under this code semantics or does not name this (variant, warm, seed) cell (stale code stamp, missing ppl, synthesized, or mislabelled) — DROPPING it before retraining, so a failed or truncated attempt cannot leave the old reading in place looking like a fresh result'
         _cur = None
     if L.result_is_current(_cur, CKPT_CODE, 'ppl'):
         if _cur.get('run_cfg') == fp:
@@ -2216,7 +2220,12 @@ def run_niah_phase(payload, guard=None, label=''):
             model.load_state_dict(_ckp['sd'])
             for Ln in seq_lens:
                 key = f'{v}::seed{seed}::len{Ln}'
-                if L.result_is_current(summary.get(key), CKPT_CODE, 'acc'):
+                _niah_rec = summary.get(key)
+                if (L.result_is_current(_niah_rec, CKPT_CODE, 'acc')
+                        and isinstance(_niah_rec, dict)
+                        and _niah_rec.get('variant') == v
+                        and L._as_seed_int(_niah_rec.get('seed')) == L._as_seed_int(seed)
+                        and L._as_seed_int(_niah_rec.get('seq_len')) == L._as_seed_int(Ln)):
                     continue
                 if not cuda_healthy():
                     print(f'  [niah] CUDA context poisoned; skipping len={Ln}')
@@ -2731,7 +2740,11 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             return False
         return True
 
-    if L.result_is_current(_cur, CKPT_CODE, 'by_len') and _cur.get('recipe') == _recipe:
+    _cur_identity_ok = (isinstance(_cur, dict)
+                        and _cur.get('variant') == v
+                        and L._as_seed_int(_cur.get('seed')) == L._as_seed_int(seed))
+    if (L.result_is_current(_cur, CKPT_CODE, 'by_len') and _cur.get('recipe') == _recipe
+            and _cur_identity_ok):
         _need_lens = [Ln for Ln in eval_lens if not _len_cell_complete(_cur, Ln)]
         if not _need_lens:
             return out

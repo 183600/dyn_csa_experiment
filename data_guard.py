@@ -1578,6 +1578,10 @@ def _hash_row_block(width, cap):
 
 
 def _canonical_object_cell(v):
+    if v is None:
+        # None is the object spelling of a missing numeric cell, the same
+        # value the numeric paths materialise as NaN.
+        return ('nan',)
     if isinstance(v, (bool, np.bool_)):
         return ('num', int(v))
     if isinstance(v, (int, np.integer)):
@@ -1641,7 +1645,9 @@ def _matrix_fingerprint(X):
                 _obj_big = True
     if arr.dtype == object and arr.size and not _obj_int and not _obj_big:
         _vals = arr.reshape(-1).tolist()
-        if not all(isinstance(v, numbers.Real) for v in _vals):
+        # None is a missing numeric cell (the numeric paths turn it into NaN),
+        # so it shares the float64 fingerprint path with real values.
+        if not all(isinstance(v, numbers.Real) or v is None for v in _vals):
             _obj_canon = True
         elif any(isinstance(v, numbers.Integral) and abs(int(v)) > 2 ** 53
                  for v in _vals):
@@ -1744,18 +1750,32 @@ def _row_keys(X):
         # the exact per-cell keys below (2**53 and 2**53+1 must stay
         # distinct).  Without this, an object-serialised cache produces
         # different duplicate keys from the typed cache with identical rows.
+        # None is a missing numeric cell, the same value as NaN, so it shares
+        # this path instead of becoming a distinct NoneType object key.
         if _flat_obj and all(isinstance(v, numbers.Real)
                              or isinstance(v, (bool, np.bool_))
+                             or v is None
                              for v in _flat_obj):
-            _real_exact = all(not isinstance(v, numbers.Integral)
+            _real_exact = all(v is None or not isinstance(v, numbers.Integral)
                               or abs(int(v)) <= 2 ** 53
                               for v in _flat_obj)
             if _real_exact:
                 return _row_keys(np.asarray(_flat_obj, dtype=np.float64).reshape(src.shape))
+        # A pure string object table is the logical twin of a fixed-width
+        # Unicode/bytes table; route it through that path so a cache that
+        # serialised strings as object dtype still matches its typed copy.
+        if _flat_obj and all(isinstance(v, (str, np.str_)) for v in _flat_obj):
+            return _row_keys(np.asarray(_flat_obj, dtype=str).reshape(src.shape))
+        if _flat_obj and all(isinstance(v, (bytes, bytearray, np.bytes_))
+                             for v in _flat_obj):
+            return _row_keys(np.asarray(_flat_obj, dtype=bytes).reshape(src.shape))
         # Object tables are often mixed/non-contiguous; float64 does not apply
         # to string columns and loses integer precision above 2**53.  Build an
         # exact canonical key per cell instead.
         def _cell_key(v):
+            if v is None:
+                # Same missing-cell identity as the numeric float path.
+                return ('nan',)
             if isinstance(v, (bool, np.bool_)):
                 # Match the typed integral path, which hashes bool as 0/1.
                 return ('num', int(v))
@@ -2486,9 +2506,12 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
 
         if isinstance(values, np.ndarray):
             if values.ndim == 0:
-                return [values.item()]
+                return [_item(values.item())]
             if values.ndim == 1:
-                return values.tolist()
+                # A 1-D object array can still hold composite categories
+                # (e.g. a list label); normalise them exactly like the 2-D
+                # row case so a list and its tuple spelling compare equal.
+                return [_item(v) for v in values.tolist()]
             return [_item(v) for v in values.tolist()]
         if isinstance(values, (str, bytes)):
             return [values]

@@ -83,14 +83,17 @@ def _fold_backup_into_aggregate(adir):
     if not isinstance(bak, dict):
         print(f'[synth] NOTE: the pre-retrain snapshot {bak_path} is valid JSON but not an object ({type(bak).__name__}) — ignoring it')
         return
-    live = {}
-    if os.path.exists(agg_path):
+    if not os.path.exists(agg_path):
+        live = {}
+    else:
         try:
             live = json.load(open(agg_path, encoding='utf-8'))
-        except Exception:
-            live = {}
-    if not isinstance(live, dict):
-        live = {}
+        except Exception as _e:
+            print(f'[synth] WARNING: the live {agg_path} cannot be parsed ({type(_e).__name__}: {_e}) — refusing to overwrite corrupt evidence from the backup; move it aside to rebuild explicitly')
+            return
+        if not isinstance(live, dict):
+            print(f'[synth] WARNING: the live {agg_path} is valid JSON but not an object ({type(live).__name__}) — refusing to overwrite it from the backup; move it aside to rebuild explicitly')
+            return
     merged = dict(live)
     recovered = {}
     for key, bentry in bak.items():
@@ -308,7 +311,6 @@ def merge_long_aggregate(adir, snapshot_agg):
         n_old_all = len(sm)
         # The fresh run supplies every seed it re-measured (old seeds are
         # replaced); the old snapshot contributes only seeds it alone measured.
-        n_old_only = n_old_all - len(_overlap)
         n_fresh = len(fm)
         sm.update(fm)
         if not sm:
@@ -319,12 +321,44 @@ def merge_long_aggregate(adir, snapshot_agg):
         sentry['ppls'] = vals
         sentry['n_seeds'] = len(vals)
         sentry['ppl_mean'] = sum(vals) / len(vals)
+        sentry['ppl_mean_arithmetic'] = sentry['ppl_mean']
         sentry['ppl_std'] = statistics.stdev(vals) if len(vals) > 1 else 0.0
         n_folded += 1
         _folded_keys.add(key)
         if n_fresh:
             _fresh_covers = n_old_all == 0 or len(_overlap) == n_old_all
-            for _f in ('avg_dyn_block_len', 'avg_block_len', 'boundary_f1_dyn', 'boundary_excess_dyn', 'delta_logit_mean', 'tokens_per_step'):
+            # The pooled totals describe the snapshot's seed set.  When the
+            # fresh aggregate re-measured every old seed, its pooled values
+            # already cover the union and must replace the stale snapshot
+            # fields; otherwise the union has no exact per-seed NLL denominator
+            # and claiming a token-pooled PPL would be false.  Reports prefer
+            # ppl_primary, so stale fields here are not cosmetic.
+            if _fresh_covers:
+                for _f in ('nll_sum', 'n_tokens', 'ppl_pooled', 'ppl_primary',
+                           'ppl_aggregation', 'ppl_median', 'ppl_iqr',
+                           'ppl_ci95_seed_t', 'ppl_ci95_doc_bootstrap',
+                           'ppl_ci_seed_doc_combined', 'params', 'param_breakdown',
+                           'params_total', 'params_attention', 'params_mlp',
+                           'params_embedding', 'active_params',
+                           'attention_param_share', 'tokens_seen'):
+                    if _f in fentry:
+                        sentry[_f] = fentry[_f]
+            else:
+                sentry['nll_sum'] = None
+                sentry['n_tokens'] = None
+                sentry['ppl_pooled'] = None
+                sentry['ppl_primary'] = float(sum(vals) / len(vals))
+                sentry['ppl_aggregation'] = ('arithmetic_seed_mean_fallback '
+                                             '(partial snapshot merge has no exact '
+                                             'per-seed NLL denominator)')
+                for _f in ('ppl_median', 'ppl_iqr', 'ppl_ci95_seed_t',
+                           'ppl_ci95_doc_bootstrap', 'ppl_ci_seed_doc_combined'):
+                    sentry[_f] = None
+            _secondary = ('avg_dyn_block_len', 'avg_block_len', 'boundary_f1_dyn',
+                          'boundary_excess_dyn', 'delta_logit_mean',
+                          'tokens_per_step')
+            _overlap_warn = bool(_overlap) and not _fresh_covers
+            for _f in _secondary:
                 _vo, _vn = (sentry.get(_f), fentry.get(_f))
                 _vn_ok = isinstance(_vn, (int, float)) and (not isinstance(_vn, bool)) and math.isfinite(_vn)
                 _vo_ok = isinstance(_vo, (int, float)) and (not isinstance(_vo, bool)) and math.isfinite(_vo)
@@ -332,18 +366,27 @@ def merge_long_aggregate(adir, snapshot_agg):
                     continue
                 if _fresh_covers:
                     sentry[_f] = _vn
-                elif _vo_ok and (n_old_only + n_fresh) > 0:
-                    w_old = n_old_only / (n_old_only + n_fresh)
+                elif _overlap_warn:
+                    # The snapshot mean still includes the overlapping seeds,
+                    # so a weighted blend with the fresh mean (which also
+                    # includes them) would double-count.  Leave the snapshot
+                    # value rather than publish a number that is not the union
+                    # mean; the per-seed PPL fields above remain exact.
+                    continue
+                elif _vo_ok and (n_old_all + n_fresh) > 0:
+                    # Disjoint seed sets: the old mean covers exactly the old
+                    # seeds, so weighting by the two set sizes is the union.
+                    w_old = n_old_all / (n_old_all + n_fresh)
                     sentry[_f] = _vo * w_old + _vn * (1.0 - w_old)
             _co, _cn = (sentry.get('ppl_curve'), fentry.get('ppl_curve'))
             if _fresh_covers:
                 if _cn:
                     sentry['ppl_curve'] = _cn
-            elif _co and _cn:
+            elif _co and _cn and not _overlap_warn:
                 _cm = {}
                 for _pt in _co:
                     try:
-                        _cm[int(_pt[0])] = [float(_pt[1]) * n_old_only, n_old_only]
+                        _cm[int(_pt[0])] = [float(_pt[1]) * n_old_all, n_old_all]
                     except (TypeError, ValueError, IndexError):
                         continue
                 for _pt in _cn:
@@ -355,6 +398,8 @@ def merge_long_aggregate(adir, snapshot_agg):
                     _acc[0] += _v * n_fresh
                     _acc[1] += n_fresh
                 sentry['ppl_curve'] = [[_s, _a / _w] for _s, (_a, _w) in sorted(_cm.items()) if _w]
+            elif _overlap_warn:
+                print(f'[v6-merge] NOTE: `{key}` has overlapping seeds and only seed-averaged secondary/curve fields in the snapshot — those fields are left at their snapshot values instead of publishing a double-counted blend; per-seed PPL fields are exact.')
     if _folded_keys:
         _base_full = _seed_map(merged.get('full'), tag='full')
         _base_sw = _seed_map(merged.get('full_sw128_matched'), tag='full_sw128_matched')
@@ -384,7 +429,7 @@ def merge_long_aggregate(adir, snapshot_agg):
         L._save_csv(merged, adir)
     except Exception as _e:
         print(f'[v6-merge] WARNING: aggregate.json was merged but the CSV could not be refreshed ({type(_e).__name__}: {_e}) — regenerate it from aggregate.json before quoting the table')
-    print(f'[v6-merge] aggregate.json: {n_folded} measured entr(ies) folded into the snapshot — per-seed PPL means/stds, the paired deltas, the seed-averaged curves and the pooled secondary means now cover every measured seed (measured values win per seed; secondary-metric stds keep their snapshot values, see the `note` on the synthesized records in summary.json)')
+    print(f'[v6-merge] aggregate.json: {n_folded} measured entr(ies) folded into the snapshot — per-seed PPL means/stds and the paired deltas cover every measured seed; pooled/secondary fields are replaced only when the fresh aggregate re-measured the full old seed set (overlapping partial merges are marked instead of publishing a double-counted blend)')
 
 def schedule_shutdown(delay_s=90):
     if os.environ.get('V6_NO_SHUTDOWN'):

@@ -997,6 +997,12 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     def _stale(rec):
         if not isinstance(rec, dict):
             return True
+        # The record's own identity must agree with the summary key used to
+        # fetch it; otherwise a mislabelled/merged record could make this cell
+        # look complete without ever measuring the requested (variant, seed).
+        if (rec.get('variant') != v
+                or L._as_seed_int(rec.get('seed')) != int(seed)):
+            return True
         # All metadata identity checks first: a stale record must not require
         # a full-file SHA-256 when it is going to be re-evaluated anyway.
         if rec.get('_code') != V.CKPT_CODE or rec.get('recipe') != _ck_recipe:

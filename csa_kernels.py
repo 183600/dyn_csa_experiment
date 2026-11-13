@@ -1352,6 +1352,12 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             dk_sw[:, :, h0:h1, :] = dksw_slab[:_hg].view(_hg, R, T, hd).permute(1, 2, 0, 3).to(dtype)
         if dv_sw is not None:
             dv_sw[:, :, h0:h1, :] = dvsw_slab[:_hg].view(_hg, R, T, hd).permute(1, 2, 0, 3).to(dtype)
+    if dsink is not None:
+        # The forward sanitises sink with nan_to_num; eager autograd gives
+        # those replaced (non-finite) entries zero gradient.  Mask the kernel
+        # gradient identically instead of differentiating through the replace.
+        dsink = torch.where(torch.isfinite(sink), dsink,
+                            torch.zeros_like(dsink))
     return (dq, dk_blk, dv_blk, dk_sw, dv_sw, dsoft, dsink)
 
 
@@ -1809,6 +1815,10 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
             p_sink_s = torch.exp(sk - mS) / ZSs
             acc = acc - (p_sink_s * GS).sum(dim=(0, 1))
         dsink = acc.to(dtype)
+        # Match eager autograd through nan_to_num: non-finite sink entries
+        # receive zero gradient.
+        dsink = torch.where(torch.isfinite(sink), dsink,
+                            torch.zeros_like(dsink))
     return (dq, dk_blk, dv_blk, dk_sw, dv_sw, dsoft, dsink)
 
 

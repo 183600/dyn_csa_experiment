@@ -801,8 +801,35 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
         return out
     _ck_recipe = d.get('recipe')
 
+    def _cell_identity_matches(_key, _rec):
+        # The summary key names the requested cell; the record's own fields
+        # must agree with it.  Without this check a merged/hand-edited record
+        # stored under one key could silently skip a different (variant, seed,
+        # arm, length, rho, mode) cell.
+        if not isinstance(_rec, dict):
+            return False
+        try:
+            _p = str(_key).split('::')
+            if (_p[0] != str(v) or L._as_seed_int(_p[1][1:]) != int(seed)
+                    or _p[2] != str(_rec.get('arm'))
+                    or L._as_seed_int(_p[3][1:]) != L._as_seed_int(_rec.get('eval_len'))):
+                return False
+            if len(_p) >= 5 and _p[3].startswith('L') and _p[4].startswith('r'):
+                _rh = float(_p[4][1:])
+                _rr = _rec.get('rho')
+                if _rr is None or not math.isfinite(float(_rr)) or abs(float(_rr) - _rh) > 1e-12:
+                    return False
+                _kmode = _p[5] if len(_p) > 5 else 'uniform'
+                if _rec.get('mode') != _kmode:
+                    return False
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return False
+        return (_rec.get('variant') == v and L._as_seed_int(_rec.get('seed')) == int(seed))
+
     def _cell_stale(_key, _fp_x, _summary=None, _mode='uniform'):
         _rec = (_summary if _summary is not None else L.locked_json_read(spath)).get(_key)
+        if not _cell_identity_matches(_key, _rec):
+            return True
         return not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp_x, _mode) and (_rec or {}).get('recipe') == _ck_recipe and ((_rec or {}).get('val_fp') is None or (_rec or {}).get('val_fp') == _val_fp))
     _vocab_ck = int(d.get('vocab', 8192))
     if cfg.get('vocab') is not None and int(cfg['vocab']) != _vocab_ck:
@@ -818,9 +845,16 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
 
     def _niah_stale(_key, _summary_n, _fp_n=None):
         _rec = (_summary_n or {}).get(_key)
+        if not _cell_identity_matches(_key, _rec):
+            return True
         _acc = L._finite_scalar(_rec.get('acc')) if isinstance(_rec, dict) else None
         _nll = L._finite_scalar(_rec.get('nll')) if isinstance(_rec, dict) else None
-        return not (isinstance(_rec, dict) and (_rec.get('task') == 'niah_natural') and _acc is not None and _nll is not None and _rec.get('_code') == V.CKPT_CODE and _rec.get('probe_params') == (_niah_fp_of('clean') if _fp_n is None else _fp_n) and _rec.get('recipe') == _ck_recipe and (_rec.get('val_fp') is None or _rec.get('val_fp') == _val_fp))
+        try:
+            _p = str(_key).split('::')
+            _cond = _p[5]
+        except (IndexError, TypeError):
+            return True
+        return not (isinstance(_rec, dict) and (_rec.get('task') == 'niah_natural') and (_rec.get('condition') == _cond) and _acc is not None and _nll is not None and _rec.get('_code') == V.CKPT_CODE and _rec.get('probe_params') == (_niah_fp_of('clean') if _fp_n is None else _fp_n) and _rec.get('recipe') == _ck_recipe and (_rec.get('val_fp') is None or _rec.get('val_fp') == _val_fp))
     _summary = L.locked_json_read(spath)
     _summary_n = L.locked_json_read(_nspath) if _nspath else {}
     _todo = False
@@ -1827,6 +1861,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 print(f'[v10 stats] WARNING: {_nsp} is valid JSON but not an object ({type(nraw).__name__}) — the NIAH-natural panel is EXCLUDED')
                 nraw = {}
             ncells = {}
+            _dup_nkeys = set()
             for _k, r in nraw.items():
                 if not isinstance(r, dict) or r.get('task') != 'niah_natural':
                     continue
@@ -1852,8 +1887,15 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 nkey = (_r['variant'], _r['arm'], _r['eval_len'], _r['condition'], json.dumps(_fp_norm(_r.get('probe_params')), sort_keys=True), str(_r.get('_code')), str(_r.get('recipe')), _val_fp_key(_r.get('val_fp')))
                 grp = ncells.setdefault(nkey, {})
                 if _seed in grp:
+                    # Two measurements for one (cell, seed) are ambiguous; the
+                    # JSON dict order must not decide which one is reported.
+                    _dup_nkeys.add(nkey)
                     continue
                 grp[_seed] = _r
+            for _dk in _dup_nkeys:
+                ncells.pop(_dk, None)
+            if _dup_nkeys:
+                print(f'[v10 stats] {len(_dup_nkeys)} NIAH-natural cell(s) have duplicate (cell, seed) records — the whole ambiguous cell is dropped from the pooling')
             niah_cells = []
             for (v, arm, Ln, cond, _pp, _cd, _recipe, _vfp), by_seed in sorted(ncells.items(), key=lambda kv: kv[0]):
                 accs = {s: r['acc'] for s, r in by_seed.items()}
