@@ -311,9 +311,8 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
         return 1
     os.makedirs(_outdir_abs, exist_ok=True)
     tar_path = os.path.join(_outdir_abs, f'{base_name}.tar.gz')
-    # `exists` is false for a dangling symlink; `lexists` is what makes a
-    # pre-planted link refuse instead of being followed outside the repo by
-    # the tar/open() calls below.
+    # `lexists` also detects a dangling symlink, so a link at an output path
+    # is refused before the tar/open() calls below can follow it.
     _existing = [p for p in (tar_path, tar_path + '.sha256',
                              os.path.join(_outdir_abs, f'{base_name}.MANIFEST.sha256'),
                              os.path.join(_outdir_abs, f'{base_name}.release_record.json'))

@@ -118,10 +118,9 @@ def _fold_backup_into_aggregate(adir):
         lentry['ppl_mean'] = sum(vals) / len(vals)
         lentry['ppl_mean_arithmetic'] = lentry['ppl_mean']
         lentry['ppl_std'] = statistics.stdev(vals) if len(vals) > 1 else 0.0
-        # The recovered union has no exact per-seed NLL denominator, so any
-        # pooled/primary field left over from the smaller live seed set would
-        # describe different data than seeds/ppls now do.  Reports prefer
-        # ppl_primary, so invalidate it explicitly and disclose the fallback.
+        # The recovered union has no exact per-seed NLL denominator, so the
+        # pooled/primary fields are cleared and reports use the arithmetic
+        # seed mean with the fallback disclosed.
         lentry['nll_sum'] = None
         lentry['n_tokens'] = None
         lentry['ppl_pooled'] = None

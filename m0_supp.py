@@ -728,9 +728,8 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
                 print(f'[m0-analysis] {name}/{label}: {e}')
                 continue
             # A log-ratio contrast is only defined when BOTH arms of the same
-            # panel were scored on the same tokenisation/corpus.  Checking only
-            # arm `a` would pool a mixed panel whose numerator and denominator
-            # use different corpora.
+            # panel were scored on the same tokenisation/corpus, so compare
+            # both corpus fingerprints.
             if _cfp is not None and _cfp_b is not None and _cfp != _cfp_b:
                 print(f'[m0-analysis] {name}/{label}: arms `{a}` and `{b}` carry '
                       f'different corpus fingerprints ({_cfp} vs {_cfp_b}) — '

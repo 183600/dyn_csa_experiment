@@ -121,8 +121,9 @@ def _run_fingerprint(cfg, *, matrix, outdir, synthetic=None, data_fp=None):
     r.pop('seeds', None)
     r.pop('outdir', None)
     r.pop('matrix', None)
-    # The data mode and scored corpus are part of the measurement identity:
-    # a synthetic smoke panel must never be resumed as WikiText evidence.
+    # The data mode and scored corpus are part of the measurement identity,
+    # so a synthetic smoke panel and WikiText evidence have different
+    # fingerprints.
     if synthetic is not None:
         r['synthetic'] = bool(synthetic)
     if data_fp is not None:

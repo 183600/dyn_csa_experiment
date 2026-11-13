@@ -69,9 +69,8 @@ _EPS = 1e-12
 # ---------------------------------------------------------------------------
 
 def _check_fraction(name, value):
-    # Booleans are not fractions: float(True) == 1.0 would silently turn a
-    # mistaken flag into a 100% split.  Temporal values are not fractions
-    # either.  Same contract as _check_count.
+    # Booleans and temporal values are not fractions.  Same contract as
+    # _check_count.
     if isinstance(value, (bool, np.bool_, np.datetime64, np.timedelta64)):
         raise ValueError(f'{name} must be a number in [0, 1], got {value!r}')
     try:

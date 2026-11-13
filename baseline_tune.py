@@ -411,8 +411,7 @@ def _relaxed_pair_reason(a, b, tuned_arms):
             if _ta != _tb:
                 return f'{k} differs ({_ta[:12]!r} vs {_tb[:12]!r})'
     # The evaluation slice is part of the measurement identity even when the
-    # training corpus matches.  Older records may omit it on both sides, but a
-    # one-sided or differing eval_fp must not be paired.
+    # training corpus matches; a one-sided or differing eval_fp is not paired.
     _ea = L._content_fp_text(a.get('eval_fp'))
     _eb = L._content_fp_text(b.get('eval_fp'))
     if (_ea is None) != (_eb is None):
