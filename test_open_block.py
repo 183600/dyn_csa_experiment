@@ -120,6 +120,20 @@ def t_config_and_segmenter():
             pass
         else:
             raise AssertionError(f'AttnCfg accepted invalid settings {kwargs}')
+    # A descriptor with no layers cannot attest the closed default (an empty
+    # all() would be vacuously true).
+    _empty_model = type('_M', (), {'blocks': []})()
+    assert L.open_block_config(_empty_model)['all_closed_default'] is False
+    # Variant names carry the cap as an exact integer identity: a fractional
+    # or boolean value must not be truncated into a different matrix cell.
+    assert L.open_block_variant_name(32.0, 'closed') == 'csa_dynamic_mb32_closed'
+    for _bad_mb in (32.9, True, 33, '32.9', object()):
+        try:
+            L.open_block_variant_name(_bad_mb, 'closed')
+        except (ValueError, TypeError):
+            pass
+        else:
+            raise AssertionError(f'open_block_variant_name accepted max_block={_bad_mb!r}')
     # The max-block alias emitted by open_block_config is a declared factor,
     # not an uncontrolled field when comparing different caps.
     import open_block_supp as O
@@ -193,6 +207,19 @@ def t_prefix_pool_reference():
         for a, b in zip(go, gr):
             assert torch.allclose(a, b, atol=2e-3, rtol=2e-3), (
                 scope, window, float((a - b).detach().abs().max()))
+    # `overlap=None` is the public no-lane spelling; it must behave exactly
+    # like overlap=0 instead of crashing in int(None).
+    for scope, window in (('full_prefix', 6), ('outside_window', 3)):
+        _none = L.causal_prefix_pool(Xa, Xb, Za, Zb, bid, Ba, Bb, None,
+                                     n_blocks=nb, scope=scope, window=window)
+        _zero = L.causal_prefix_pool(Xa, Xb, Za, Zb, bid, Ba, Bb, 0,
+                                     n_blocks=nb, scope=scope, window=window)
+        assert torch.equal(_none, _zero), (scope, 'overlap=None')
+        _ref_none = L.causal_prefix_pool_reference(
+            Xa, Xb, Za, Zb, bid, Ba, Bb, None,
+            n_blocks=nb, scope=scope, window=window)
+        assert torch.allclose(_none, _ref_none, atol=1e-4, rtol=1e-4), (
+            scope, 'overlap=None reference')
     # A future token in the SAME block must not change an earlier prefix,
     # even when its logit is far outside the past range.  A block-wide shift
     # (rather than a prefix-wide one) would underflow the earlier rows to
@@ -558,6 +585,11 @@ def t_record_identity_and_completeness():
                                              n_tokens=1.5)}, fp)
     assert cells == {}, cells
     assert OB._rec_by_cell({'A::seed0': base}, fp)
+    # Two usable records for one (variant, seed) are ambiguous even when the
+    # key spellings differ; neither may silently win by dict order.
+    _dup = {'A::seed0': base,
+            'A::seed 0': dict(base, nll_sum=11.0)}
+    assert OB._rec_by_cell(_dup, fp) == {}, OB._rec_by_cell(_dup, fp)
     # A malformed summary/descriptor is refused.
     assert OB._rec_by_cell([base], fp) == {}
     _rec_a = dict(base, open_block_config={'fingerprint': None,

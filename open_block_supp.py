@@ -316,6 +316,7 @@ def _nll_per_token(rec):
 
 def _rec_by_cell(summary, run_fingerprint=None):
     out = {}
+    ambiguous = set()
     if not isinstance(summary, dict):
         return out
     for key, rec in summary.items():
@@ -340,7 +341,22 @@ def _rec_by_cell(summary, run_fingerprint=None):
         nll = _nll_per_token(rec)
         if nll is None:
             continue
-        out[(v, seed)] = {'record': rec, 'nll': nll, 'ppl': float(rec['ppl'])}
+        cell = (v, seed)
+        if cell in out:
+            # Two usable records for one (variant, seed) are ambiguous: the
+            # summary key spelling ("0", " 0", "0_0") is not the identity.
+            # Keeping whichever the JSON happens to list last would make the
+            # paired statistic depend on dict insertion order, so the whole
+            # cell is excluded instead.
+            ambiguous.add(cell)
+            continue
+        out[cell] = {'record': rec, 'nll': nll, 'ppl': float(rec['ppl'])}
+    for cell in ambiguous:
+        out.pop(cell, None)
+    if ambiguous:
+        print('[open-block] WARNING: excluding ambiguous cell(s) with more than '
+              'one usable record for the same (variant, seed): '
+              + ', '.join(f'{v}::seed{seed}' for v, seed in sorted(ambiguous, key=str)))
     return out
 
 

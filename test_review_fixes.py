@@ -2157,6 +2157,16 @@ def t_adaptive_threshold_guard():
     for shape in ((0,), (0, 5), (3, 0), (0, 0)):
         got = L.causal_adaptive_threshold(torch.empty(shape), 16)
         assert tuple(got.shape) == shape, (shape, got.shape)
+    # The target block size is an exact structural count: booleans/fractions
+    # must not silently select a different quantile (even for empty input).
+    for _bad_target in (True, False, 0, -1, 1.5, '16.0'):
+        try:
+            L.causal_adaptive_threshold(torch.empty((0, 5)), _bad_target)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f'causal_adaptive_threshold accepted target={_bad_target!r}')
     _old = os.environ.get('CSA_ADAPTIVE_MAX_TOKENS')
     try:
         os.environ['CSA_ADAPTIVE_MAX_TOKENS'] = '1024'
@@ -2217,6 +2227,20 @@ def t_empty_pool_geometry():
     comp, last_tok, B = L.pool_blocks_single(torch.empty(0, 4), torch.empty(0, 4),
                                              torch.empty(4, 4), ids)
     assert comp.shape == (0, 4) and last_tok.shape == (0,) and B == 0
+    # `overlap=None` means "no previous-block lane" and must be accepted on the
+    # same path as overlap=0 instead of crashing in the 8-tuple geometry
+    # unpack (the None form of _pool_parts is a 4-tuple).
+    n, c = 8, 3
+    bids = L.blocks_from_cuts(n, [True, False, False, True, False, False, False],
+                              1, 3, dev)
+    g = torch.Generator().manual_seed(11)
+    Xa, Xb = torch.randn(n, c, generator=g), torch.randn(n, c, generator=g)
+    Za, Zb = torch.randn(n, c, generator=g), torch.randn(n, c, generator=g)
+    Ba, Bb = torch.randn(4, c, generator=g), torch.randn(4, c, generator=g)
+    comp_none, lt_none, B_none = L.pool_variable_blocks(Xa, Xb, Za, Zb, bids, Ba, Bb, None)
+    comp_zero, lt_zero, B_zero = L.pool_variable_blocks(Xa, Xb, Za, Zb, bids, Ba, Bb, 0)
+    assert torch.equal(comp_none, comp_zero)
+    assert torch.equal(lt_none, lt_zero) and B_none == B_zero > 0
 
 
 def t_segment_empty():
@@ -2226,6 +2250,23 @@ def t_segment_empty():
     for n in (0, -1):
         base = L.blocks_from_cuts(n, [], 2, 8, torch.device('cpu'))
         assert base.numel() == 0, (n, base)
+    # Structural geometry is exact: booleans/fractions are not silently
+    # truncated, and a zero/oversized-fixed block size fails closed.
+    for _bad in ((True, 1, 2), (1.5, 1, 2), (5, True, 2), (5, 0, 2),
+                 (5, 1, 1.5), (5, 2, 1)):
+        try:
+            L._segment(*_bad, [])
+        except (ValueError, TypeError):
+            pass
+        else:
+            raise AssertionError(f'_segment accepted malformed geometry {_bad}')
+    for _bad in ((5, 0), (5, True), (5, 2.5), (True, 2), (1.5, 2)):
+        try:
+            L.blocks_fixed(*_bad, torch.device('cpu'))
+        except (ValueError, TypeError):
+            pass
+        else:
+            raise AssertionError(f'blocks_fixed accepted malformed geometry {_bad}')
 
 
 def t_segment_uniform_stride_only_when_all_cuts():

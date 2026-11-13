@@ -903,21 +903,39 @@ def _successor_starts(n, nxt):
     return np.asarray(starts, dtype=np.int64)
 
 def _segment(n, want_cut_list, min_block, max_block):
+    # Segmentation geometry is exact-integer state: int(True)==1 / int(4.9)==4
+    # would silently build a different block table (and cache it under the
+    # wrong key).  Negative lengths remain the documented empty case.
+    _n = _as_seed_int(n)
+    _mb = _as_seed_int(min_block)
+    if _n is None or _mb is None or _mb < 1:
+        raise ValueError(
+            f'_segment: n={n!r}, min_block={min_block!r} must be integers '
+            '(min_block >= 1)')
+    n = _n
+    _explicit_max = max_block is not None
+    if not _explicit_max:
+        # `max_block=None` is "dynamic boundaries only".  At this entry point
+        # the sequence length is known, so it becomes an explicit safe bound
+        # that can never force a cut.
+        _xb = n
+    else:
+        _xb = _as_seed_int(max_block)
+    if _xb is None or (_explicit_max and _xb < _mb):
+        raise ValueError(
+            f'_segment: max_block={max_block!r} must be an exact integer >= '
+            f'min_block={min_block!r} (or None)')
+    max_block = _xb
     if n <= 0:
         # No tokens -> no blocks.  Returning the empty triple here (instead of
         # indexing ends[-1] on an empty array) keeps the public entry points
         # total for empty/negative-length inputs.
         return (np.empty(0, dtype=np.int64), {}, [])
-    # `max_block=None` is "dynamic boundaries only".  At this entry point the
-    # sequence length is known, so it becomes an explicit safe bound that can
-    # never force a cut.  The integer arithmetic below is therefore total.
-    if max_block is None:
-        max_block = int(n)
     cacheable = n <= 64
     # The segmentation below uses boolean truthiness, not the raw numeric
     # value; the cache key must normalise the same way (any non-zero value is
     # a cut, not only exactly 1).
-    key = (n, min_block, max_block, np.asarray(want_cut_list, dtype=bool).tobytes()) if cacheable else None
+    key = (n, _mb, max_block, np.asarray(want_cut_list, dtype=bool).tobytes()) if cacheable else None
     if cacheable:
         hit = _SEGMENT_CACHE.get(key)
         if hit is not None:
@@ -928,7 +946,7 @@ def _segment(n, want_cut_list, min_block, max_block):
     # through np.asarray is a no-op for the latter.  Same booleans either way.
     slots = np.nonzero(np.asarray(want_cut_list, dtype=bool))[0]
     ns = len(slots)
-    _mb, _xb = (int(min_block), int(max_block))
+    # (_mb/_xb were normalised to exact integers at the entry above.)
     # Uniform-stride closed forms.  When the next-cut signal cannot change the
     # successor (min_block == max_block), when no slot is wanted, or when every
     # slot is wanted, the successor is p + stride for a constant stride.  The
@@ -1222,6 +1240,21 @@ def _d2h_stage(shape, dtype, device):
         return (None, None)
 
 def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_count=False, return_honoured=False):
+    # Validate the exact structural geometry even on the n<=0 / n==1 shortcuts,
+    # which bypass _segment's own entry checks.
+    _n = _as_seed_int(n)
+    _mb = _as_seed_int(min_block)
+    if _n is None or _mb is None or _mb < 1:
+        raise ValueError(
+            f'blocks_from_cuts: n={n!r}, min_block={min_block!r} must be '
+            'integers (min_block >= 1)')
+    if max_block is not None:
+        _xb = _as_seed_int(max_block)
+        if _xb is None or _xb < _mb:
+            raise ValueError(
+                f'blocks_from_cuts: max_block={max_block!r} must be an exact '
+                f'integer >= min_block={min_block!r} (or None)')
+    n = _n
     # _segment() treats any non-positive length as "no tokens, no blocks";
     # the public wrapper follows the same rule.
     if n <= 0:
@@ -1508,6 +1541,12 @@ def _causal_quantile_exact(x, cols, target_block_tokens, _full_range=False):
     (ascending) column indices to evaluate.  Row/column chunking is a pure
     partition, so the values are identical to the full-table form.
     """
+    _target = _as_seed_int(target_block_tokens)
+    if _target is None or _target < 1:
+        raise ValueError(
+            f'_causal_quantile_exact: target_block_tokens='
+            f'{target_block_tokens!r} must be an exact integer >= 1')
+    target_block_tokens = _target
     n = int(x.shape[-1])
     dev = x.device
     q = max(1.0 / max(int(target_block_tokens), 1), 0.001)
@@ -1577,6 +1616,14 @@ def _adaptive_exact_limit():
 
 
 def causal_adaptive_threshold(sim, target_block_tokens):
+    # The target block size is an exact structural count, even for an empty
+    # input (the empty shortcut must not accept a different configured cell).
+    _target = _as_seed_int(target_block_tokens)
+    if _target is None or _target < 1:
+        raise ValueError(
+            f'causal_adaptive_threshold: target_block_tokens='
+            f'{target_block_tokens!r} must be an exact integer >= 1')
+    target_block_tokens = _target
     if sim.numel() == 0:
         # Preserve the caller's shape: an empty batch [0, n] or a zero-width
         # row must not turn into a flat length-0 tensor.
@@ -1637,19 +1684,30 @@ def causal_adaptive_threshold(sim, target_block_tokens):
 
 
 def blocks_fixed(n, block_size, device):
-    key = (_dev_str(device), 'blkfix', int(n), int(block_size))
+    # Exact structural integers: a fractional/boolean block size must not be
+    # truncated into a different table, and bs=0 must not reach the division
+    # below as a ZeroDivisionError.
+    n_i = _as_seed_int(n)
+    bs = _as_seed_int(block_size)
+    if n_i is None or bs is None or bs < 1:
+        raise ValueError(
+            f'blocks_fixed: n={n!r} must be an exact integer and block_size='
+            f'{block_size!r} an exact integer >= 1')
+    n = n_i
+    if n <= 0:
+        # Same total empty-sequence contract as _segment/blocks_from_cuts.
+        return torch.empty(0, dtype=torch.long, device=device)
+    key = (_dev_str(device), 'blkfix', int(n), int(bs))
     hit = _cache_get(_IDX_CACHE, key)
     if hit is not None:
         return hit
     with torch.inference_mode(False):
-        out = torch.arange(n, device=device) // int(block_size)
-        if n > 0:
-            bs = int(block_size)
-            counts = [bs] * (n // bs)
-            _rem = n % bs
-            if _rem:
-                counts.append(_rem)
-            out._pool_cpu = (counts, min(bs, n), bs if len(counts) > 1 else 0)
+        out = torch.arange(n, device=device) // int(bs)
+        counts = [bs] * (n // bs)
+        _rem = n % bs
+        if _rem:
+            counts.append(_rem)
+        out._pool_cpu = (counts, min(bs, n), bs if len(counts) > 1 else 0)
     _cache_put(_IDX_CACHE, key, out, _MASK_CACHE_BUDGET_BYTES, _idx_cache_total)
     return out
 _MASK_CACHE = {}
@@ -2707,6 +2765,14 @@ def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
             pass
 
 def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, Fd, dev, B, order, order_is_identity=False):
+    # `overlap=None` (the public API's "no B lane") and overlap=0 describe the
+    # same empty overlap window.  Normalise before the shared geometry build:
+    # `_pool_parts` returns a 4-tuple in the None form, while every downstream
+    # consumer here reads the 8-tuple geometry, and the all-integer builders
+    # cannot take None.  With zero overlap every B lane is masked out, so the
+    # forward/backward values are exactly the no-overlap ones.
+    if overlap is None:
+        overlap = 0
     counts, ends, starts, last_idx, end_prev, starts_prev, ov_start, ov_len = _pool_parts(block_ids, B, overlap, n)
     ov = overlap
     _cpu = getattr(block_ids, '_pool_cpu', None)
@@ -3082,12 +3148,15 @@ def _prefix_overlap_values(geo, Xb, Zb, B_pos_b, overlap):
     B = int(geo['n_blocks'])
     dev = geo['starts'].device
     Fd = int(Zb.shape[1]) if Zb is not None else (int(Xb.shape[1]) if Xb is not None else 0)
-    if int(overlap) <= 0 or B <= 1 or Xb is None or Zb is None:
+    # `overlap=None` is the public "no previous-block lane" spelling, the same
+    # empty window as overlap=0.
+    _ov = 0 if overlap is None else int(overlap)
+    if _ov <= 0 or B <= 1 or Xb is None or Zb is None:
         return None
     starts, ends = geo['starts'], geo['ends']
     prev_start = starts[:-1]
     prev_end = ends[:-1]
-    ov_start_prev = (prev_end - int(overlap)).clamp_min(prev_start)
+    ov_start_prev = (prev_end - _ov).clamp_min(prev_start)
     ov_len_prev = (prev_end - ov_start_prev).clamp_min(0)
     # block 0 has no previous block; the other rows take previous-block values
     ov_start = torch.cat([starts[:1], ov_start_prev], 0)
@@ -3095,7 +3164,7 @@ def _prefix_overlap_values(geo, Xb, Zb, B_pos_b, overlap):
     prev_start_full = torch.cat([starts[:1], prev_start], 0)
     # The overlap-lane width is a pure function of (geo, overlap): cache it on
     # the shared geometry dict.
-    _wkey = '_ov_w_' + str(int(overlap))
+    _wkey = '_ov_w_' + str(_ov)
     Wb = geo.get(_wkey)
     if Wb is None:
         Wb = int(ov_len.max().item()) if B else 0
@@ -3128,7 +3197,8 @@ def _prefix_overlap_terms(geo, Xb, Zb, B_pos_b, overlap, shift, use_overlap,
     B = int(geo['n_blocks'])
     dev = geo['starts'].device
     Fd = int(Zb.shape[1]) if Zb is not None else (int(Xb.shape[1]) if Xb is not None else 0)
-    if (not use_overlap) or int(overlap) <= 0 or B <= 1 or Xb is None or Zb is None:
+    _ov = 0 if overlap is None else int(overlap)
+    if (not use_overlap) or _ov <= 0 or B <= 1 or Xb is None or Zb is None:
         z = geo['starts'].new_zeros((B, Fd), dtype=torch.float32)
         return z, z.clone(), torch.zeros((B, 0), dtype=torch.long, device=dev)
     if values is None:
@@ -3282,7 +3352,8 @@ def causal_prefix_pool_reference(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
         zs = [Za[u].float() + B_pos_a[min(u - int(geo['start_of_token'][tt].item()), cap_a - 1)].float() for u in idx]
         xs = [Xa[u].float() for u in idx]
         b = int(geo['block_of_token'][tt].item())
-        if (str(scope) == 'full_prefix' and int(overlap) > 0 and b > 0
+        if (str(scope) == 'full_prefix' and overlap is not None
+                and int(overlap) > 0 and b > 0
                 and Xb is not None and Zb is not None):
             ps, pend = int(starts[b - 1]), int(starts[b - 1]) + int(counts[b - 1])
             ovs = max(ps, pend - int(overlap))
@@ -5452,9 +5523,15 @@ def open_block_variant_name(max_block, mode, scope='full_prefix'):
     """Canonical variant name for one cell of the open-block matrix."""
     if mode not in OPEN_BLOCK_MODES_SHORT:
         raise ValueError(f'unknown open-block mode {mode!r}; expected {OPEN_BLOCK_MODES_SHORT}')
-    mb = 'none' if max_block is None else str(int(max_block))
-    if max_block is not None and int(max_block) not in (32, 64, 128):
-        raise ValueError(f'unsupported max_block {max_block!r} for the open-block variant names')
+    if max_block is None:
+        mb = 'none'
+    else:
+        # The cap is an exact structural integer: int(32.9)==32 or int(True)==1
+        # would silently name a different cell of the matrix.
+        _mb = _as_seed_int(max_block)
+        if _mb is None or _mb not in (32, 64, 128):
+            raise ValueError(f'unsupported max_block {max_block!r} for the open-block variant names')
+        mb = str(_mb)
     if scope not in OPEN_BLOCK_SCOPES:
         raise ValueError(f'unknown scope {scope!r}')
     return f'csa_dynamic_mb{mb}_{mode}' + ('_ow' if scope == 'outside_window' else '')
@@ -8805,11 +8882,14 @@ def open_block_config(m):
             'overlap': int(getattr(cfg, 'overlap', 0) or 0),
         })
     blob = json.dumps(rows, sort_keys=True, separators=(',', ':'))
+    # An empty descriptor cannot attest that the model uses the closed default:
+    # the universally-quantified predicate would otherwise be vacuously true.
     return {'layers': rows,
-            'all_closed_default': all(r['open_block_mode'] == 'closed'
-                                      and r['max_block'] == 128
-                                      and r['pool_position_capacity'] == 129
-                                      for r in rows),
+            'all_closed_default': bool(rows) and all(
+                r['open_block_mode'] == 'closed'
+                and r['max_block'] == 128
+                and r['pool_position_capacity'] == 129
+                for r in rows),
             'fingerprint': hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]}
 
 def train_objective(m, *, comp_lambda=0.0, delta_lr_mult=1.0):
@@ -11383,8 +11463,16 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                 'transfer rule (policy=%r); scale contrasts carry a training-'
                 'transfer confound, not a matched optimizer control' % _transfer)
         warm = [r['warmup_fraction'] for r in rows if r.get('warmup_fraction') is not None]
-        warm_ratio = (max(warm) / min(warm)) if len(warm) == len(rows) and min(warm) > 0 else None
-        if warm_ratio is not None and warm_ratio > 2.0:
+        warm_ratio = None
+        if len(warm) == len(rows) and warm and min(warm) > 0:
+            warm_ratio = max(warm) / min(warm)
+        if len(warm) == len(rows) and min(warm) == 0.0 and max(warm) > 0.0:
+            # A zero-warmup tier against a non-zero one is an infinite ratio;
+            # the old min>0 guard silently skipped the disclosure.
+            warnings.append(
+                'warmup fraction includes 0 on at least one tier but not on '
+                'all of them — the warmup schedule is not matched across scales')
+        elif warm_ratio is not None and warm_ratio > 2.0:
             warnings.append(f'warmup fraction varies {warm_ratio:.2f}x across scales')
         feas = [r['min_seeds_for_family_significance'] for r in rows if r.get('min_seeds_for_family_significance')]
         for r in rows:
