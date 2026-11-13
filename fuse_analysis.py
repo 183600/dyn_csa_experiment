@@ -254,7 +254,7 @@ def main(argv=None):
         _abl_n_txt = str(next(iter(_abl_n.values())))
     else:
         _abl_n_txt = '、'.join((f'`{v}` {n}' for v, n in sorted(_abl_n.items())))
-    lines.append(f'> 数据来源：`results_lm_v4_abl/summary.json`（1500 步 × {_abl_n_txt} seeds/variant，seq 512）与\n> `results_lm_v3_1500/summary.json`（同配置核心面板，csa_dynamic × {_core_n} seeds）。无权重、无 GPU，\n> 仅使用每条 run 记录的 `stats`（逐层边界对齐 + 块长统计）与 `ppl_history`。\n')
+    lines.append(f'> 数据来源：`results_lm_v4_abl/summary.json`（{_abl_n_txt} seeds/variant，seq 512）与\n> `results_lm_v3_1500/summary.json`（同配置核心面板，csa_dynamic × {_core_n} seeds）。无权重、无 GPU，\n> 仅使用每条 run 记录的 `stats`（逐层边界对齐 + 块长统计）与 `ppl_history`。\n')
     lines.append('**容差说明（诚实记录）**：落盘的边界对齐只在 `tol=1` 下计算（`boundary_alignment(..., tol=1)`），逐 token 的切点位置未保存、模型权重未保存，因此**无法离线重算其它容差**。下文改用 precision / recall / 相对随机基线的超额（excess）分解来回答「F1 差异从哪来、是否真实」——这一分解对容差选择不敏感。\n')
     def _pair_cells_ok(a, b, seeds):
         try:
@@ -612,7 +612,7 @@ def main(argv=None):
         _blk_txt = '、'.join((f'{_n} {_blk[_n + '_fmt'].format(_blk[_n])}' for _n in ('len_mean', 'len_std', 'frac_at_min', 'blocks') if _n in _blk))
         _blk_max = max((_blk[_n] for _n in ('len_mean', 'len_std', 'frac_at_min', 'blocks') if _n in _blk))
         if _blk_max <= 0.01:
-            _blk_line = f'2. **分块行为不变（已由产物核验）**：同面板两臂的最大单层单种子偏移为 **{_blk_txt}**（各统计量取逐层逐 seed 差的绝对值上界，越界阈值 0.01），全部落在小数点后 1~2 位内——恒等初始化的融合卷积只经 comp_reg 的弱梯度训练，1500 步内基本没有离开恒等映射，既没有改变「在哪里切」，也没有改变「切多长」。\n'
+            _blk_line = f'2. **分块行为不变（已由产物核验）**：同面板两臂的最大单层单种子偏移为 **{_blk_txt}**（各统计量取逐层逐 seed 差的绝对值上界，越界阈值 0.01），全部落在小数点后 1~2 位内——恒等初始化的融合卷积只经 comp_reg 的弱梯度训练，在本轮训练量内基本没有离开恒等映射，既没有改变「在哪里切」，也没有改变「切多长」。\n'
         else:
             _blk_line = f'2. **分块行为在产物上并未重合（与「惰性旋钮」读法冲突，需复核）**：同面板两臂的最大单层单种子偏移为 **{_blk_txt}**（各统计量取逐层逐 seed 差的绝对值上界，越界阈值 0.01），即在该面板上 fuse 确实改变了分块行为；下文第 4 条的「没有改变块长分布」在本轮产物上**不成立**，应先查清是哪一层/哪个 seed 发生偏移再作结论。\n'
     else:
@@ -665,7 +665,7 @@ def main(argv=None):
         _c4 = '4. **结论写法（限定在本轮产物内）**：上述条件在本轮产物上成立，因此不做「fuse 有稳定收益」的正面断言；更强的结论需要新的 run。\n'
     else:
         _c4 = '4. **结论写法**：本轮产物**不满足**「惰性旋钮」的全部前置条件（第 1–3 条中至少一条报错、显著或越界）——不作「fuse 是惰性旋钮」的断言，以第 1–3 条各自的实测结果为准。\n'
-    lines.append(_c1 + _blk_line + _c3 + _c4 + '5. **遗留（如需更强断言）**：本分析限于 tol=1（落盘唯一容差）与 1500 步训练量区间；其它容差或收敛区间（20k 步）的断言需要新 run。\n')
+    lines.append(_c1 + _blk_line + _c3 + _c4 + '5. **遗留（如需更强断言）**：本分析限于 tol=1（落盘唯一容差）与当前训练量区间；其它容差或更长训练量的断言需要新 run。\n')
     md = '\n'.join(lines)
     L.atomic_write_text(os.path.join(OUT, 'fuse_report.md'), md)
     L.atomic_write_json(os.path.join(OUT, 'stats.json'), stats_out, indent=1)

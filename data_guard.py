@@ -1605,7 +1605,7 @@ def _temporal_identity(v):
 
     NumPy compares the same instant in different units as equal, so the
     duplicate/fingerprint contracts must do the same.  Microseconds are tried
-    first (the historical canonical unit for ordinary timestamps), then finer
+    first (the canonical unit for ordinary timestamps), then finer
     units so sub-microsecond precision is preserved, then coarser units so an
     instant outside the microsecond int64 range still has a stable identity.
 

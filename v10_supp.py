@@ -49,7 +49,7 @@ def make_guard():
     return g
 P3MT_PAYLOAD = dict(outdir='results_v10_mech', variants=['csa_fixed_rope', 'full_rope'], eval_lens=[512, 1024, 2048, 4096], steps=3000, train_len=512, vocab=8192)
 # 从头训练的选择器对照：与 csa_fixed_rope / full_rope 完全同一配方
-# （3000 步、同数据、同种子）训练，唯一差异是选择方式本身。P3MT 的 variants
+# （同数据、同种子）训练，唯一差异是选择方式本身。P3MT 的 variants
 # 扩入它们后，既有 ckpt 的 recipe 逐字节不变（recipe 只含 per-variant 的 mr 与
 # 语料指纹），resume 不会重训已完成的臂。
 SCRATCH_CONTROLS = ['csa_fixed_rope_randidx', 'csa_fixed_rope_allblocks']
@@ -2205,7 +2205,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('')
     A('## P3M 长度外推优势的机制验证（远距干扰注入）')
     A('')
-    A('**背景**：v7 P1L 的外推对比只是附带观察（n=3 时精确符号翻转 p 值下限 0.250）。P1L 权重未持久化，P3MT 先按 v7 P1L 原配方（seq 512、3000 步、3 seeds、AdamW lr 3e-4）重训两臂并保存权重——同时作为该外推对比的独立复现。')
+    A('**背景**：v7 P1L 的外推对比只是附带观察（n=3 时精确符号翻转 p 值下限 0.250）。P1L 权重未持久化，P3MT 先按 v7 P1L 原配方（seq 512、AdamW lr 3e-4）重训两臂并保存权重——同时作为该外推对比的独立复现。')
     A('')
     if mech_sum:
         _rows_by_v = {}
@@ -2368,7 +2368,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     if _new_c:
         A('### P3M-2 从头训练的选择器对照（同规模）')
         A('')
-        A('**背景**：测试时把已训练模型的选择器替换为随机/全块，只能回答「模型是否依赖原选择器」，不能回答「学习式选择是否优于训练充分的随机选择或全块读取」——后两者的测试时干预改变了模型训练时适应的输入分布，效果下降可能来自失配本身。P3MTC 按与 P3MT **完全相同的配方**（3000 步、同数据、同种子）从头训练两个对照：`csa_fixed_rope_randidx`（训练期选择即随机）与 `csa_fixed_rope_allblocks`（训练期就读全部块；与 `csa_fixed_rope` 逐项同构——同 c_kv 压缩、同 qk_norm、同 RoPE、同 sink/窗口，仅选择方式不同，因此它同时是**逐项对齐的 dense 对照**）。')
+        A('**背景**：测试时把已训练模型的选择器替换为随机/全块，只能回答「模型是否依赖原选择器」，不能回答「学习式选择是否优于训练充分的随机选择或全块读取」——后两者的测试时干预改变了模型训练时适应的输入分布，效果下降可能来自失配本身。P3MTC 按与 P3MT **完全相同的配方**（同数据、同种子）从头训练两个对照：`csa_fixed_rope_randidx`（训练期选择即随机）与 `csa_fixed_rope_allblocks`（训练期就读全部块；与 `csa_fixed_rope` 逐项同构——同 c_kv 压缩、同 qk_norm、同 RoPE、同 sink/窗口，仅选择方式不同，因此它同时是**逐项对齐的 dense 对照**）。')
         A('')
         A('| 比较 | n | Δ mean±std | d_z | p (exact) | p 下限 |')
         A('|---|---|---|---|---|---|')
@@ -2544,13 +2544,13 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             for k, v in sorted(_slices.items()):
                 A(f'| {k} | {v.get('n', 0)} | {v.get('mean', float('nan')):+.2f} ± {v.get('std', 0):.2f} | {v.get('cohens_dz', float('nan')):+.2f} | {v.get('p_exact_signflip', float('nan')):.3f} |')
             A('')
-            A('> `P3SL_FLOP` 的步数 = 8000 × N_small/N_large（参数量按面板两臂平均，CPU 上确定性计数；下限 250），即**参数量与步数的 6ND 代理对齐**——它不是实测 FLOPs、GPU 时间或能耗；该臂的 gap 只能读作「该代理近似相等时」的规模效应。')
+            A('> `P3SL_FLOP` 的步数按参数量比例确定性缩放（参数量按面板两臂平均，CPU 上计数），即**参数量与步数的 6ND 代理对齐**——它不是实测 FLOPs、GPU 时间或能耗；该臂的 gap 只能读作「该代理近似相等时」的规模效应。')
             A('')
     A('---')
     A('')
     A('## P3T seq-2048 topk 扫描补种子（n=2 → n=4）')
     A('')
-    A('**背景**：v9 P2T 的完整 5 点扫描只有 2 seeds，精确符号翻转 p 值下限 0.500——v9 收官后唯一仍处该下限的面板。v10 按同一配方（seq 2048、bs 1、1500 步）补 seeds 2/3（同一 outdir，resume 跳过 seed 0/1）。')
+    A('**背景**：v9 P2T 的完整 5 点扫描只有 2 seeds，精确符号翻转 p 值下限 0.500——v9 收官后唯一仍处该下限的面板。v10 按同一配方（seq 2048、bs 1）补 seeds 2/3（同一 outdir，resume 跳过 seed 0/1）。')
     A('')
     A('| variant | PPL (mean±std) | n |')
     A('|---|---|---|')
@@ -2583,9 +2583,9 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('| 路径 | 内容 |')
     A('|---|---|')
     A('| `results_v10_mech/` | P3M：两臂重训权重（ckpt/，*.pt 不入库）+ by-length 复现表 + 干扰注入探针 `distractor.json`（uniform/natural/mask/delete + span/doc/topical 模式；natural = realistic-token，§15 修订）+ NIAH-natural `niah_natural.json` |')
-    A('| `results_lm_v10_scale_s/` | P3S：d=128/4L 交叉定位面板（8000 步） |')
-    A('| `results_lm_v10_scale_l/` | P3S：d=512/10L 交叉定位面板（4000 步） |')
-    A('| `results_lm_v10_scale_l8k/` | P3S-2：等 token 大模型臂（8000 步） |')
+    A('| `results_lm_v10_scale_s/` | P3S：d=128/4L 交叉定位面板 |')
+    A('| `results_lm_v10_scale_l/` | P3S：d=512/10L 交叉定位面板 |')
+    A('| `results_lm_v10_scale_l8k/` | P3S-2：等 token 大模型臂 |')
     A('| `results_lm_v10_scale_lflop/` | P3S-2：6ND 参数量代理规模大模型臂（非实测等 FLOPs） |')
     A('| `results_lm_v9_seq2k/` | P3T：topk 扫描追加 seeds 2/3 后的 4-seed 面板 |')
     A('| `analysis_v10/stats.json` | 探针对比（含 ΔNLL、Holm）、交叉定位、等 token 切片与配对符号翻转检验 |')

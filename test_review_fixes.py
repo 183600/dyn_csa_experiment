@@ -1592,8 +1592,8 @@ def t_aggregate_rejects_malformed_seed_ids():
     assert agg['n_seeds'] == 1 and agg['seeds'] == [2], agg
     assert agg['ppl_mean'] == 20.0, agg
     # A malformed PPL-curve payload leaves no usable step.  That is an absent
-    # curve, not a crash: np.array([[]]) is a FLOAT array, so the "usable"
-    # mask needs an explicit bool dtype before its bitwise negation.
+    # curve: np.array([[]]) is a FLOAT array, so the "usable" mask needs an
+    # explicit bool dtype before its bitwise negation.
     malformed = {'a::seed0': dict(base, seed=0, ppl_history=[1, [2], None])}
     agg2 = L.aggregate(malformed)['a']
     assert agg2['n_seeds'] == 1 and agg2.get('ppl_curve') == [], agg2
@@ -3196,7 +3196,7 @@ def t_ids_fp_is_storage_width_invariant():
     hi = np.array([2 ** 63 + 1], dtype=np.uint64)
     hi2 = np.array([2 ** 63 + 2], dtype=np.uint64)
     assert L._ids_fp(hi) != L._ids_fp(hi2), 'uint64 ids must not wrap into one fingerprint'
-    # A sidecar written by an older fingerprint algorithm must not be served.
+    # A sidecar with a different fingerprint algorithm must not be served.
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, 'train_ids_x.npy')
         np.save(path, np.arange(8, dtype=np.int32))
@@ -6734,8 +6734,8 @@ def t_scale_edge_case_regressions():
 
 def t_report_health_malformed_history():
     # A malformed curve_health/history payload is an absent curve.  A truthy
-    # scalar `health_history` (1.5) or a list of non-objects must not crash the
-    # report reader.
+    # scalar `health_history` (1.5) or a list of non-objects is not a usable
+    # curve for the report reader.
     import shutil
     _saved_repo = BR.REPO
     _saved_loaded = dict(BR._LOADED)

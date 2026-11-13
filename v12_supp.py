@@ -10,7 +10,7 @@
   P5MP  —— 扩展探针在清单种子上重跑（uniform/natural/mask/delete +
            span/doc/topical 腐坏 + NIAH-natural + 从头训练
            对照臂）；
-  P5S2  —— 等训练 token 的大模型规模臂（P3SL_TOK，8000 步）；
+  P5S2  —— 等训练 token 的大模型规模臂（P3SL_TOK）；
   P5S3  —— 6ND 参数量代理规模的大模型规模臂（P3SL_FLOP，参数量比例缩步）；
   P5T   —— **冻结后的独立最终测试**：按仓库根的冻结清单
            `confirmation_frozen.json`（预注册主比较、终点、种子数、检验与
@@ -1126,8 +1126,8 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     model.load_state_dict(d.pop('sd'))
     model.eval()
     # The shared-trunk initialisation digest is part of the matched-arm
-    # contract.  Older checkpoints may not have persisted it; recover it from
-    # the loaded weights rather than silently omitting the field.
+    # contract.  Recover it from the loaded weights when the checkpoint does
+    # not carry the field.
     _ck_init = d.get('init_core_fp')
     if not _ck_init:
         try:

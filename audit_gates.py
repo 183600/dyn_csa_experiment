@@ -2169,8 +2169,8 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
                 out.setdefault('problems', []).append(
                     f'{sf}: TimeGuard state is {type(st).__name__}, not an object — the run ledger cannot be reconciled')
                 continue
-            # TimeGuard stores `runs` as an integer counter; older/foreign
-            # state files may store a list.
+            # TimeGuard stores `runs` as an integer counter; a foreign state
+            # file may store a list.
             _runs = st.get('runs')
             if isinstance(_runs, (list, tuple, dict, set)):
                 _run_count = len(_runs)

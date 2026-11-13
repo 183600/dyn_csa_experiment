@@ -412,7 +412,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     if not probe_ok:
         A(f'> 计划 n=6；**实际 n={n_contr_max}**（`distractor.json` 仅含 seeds ' + '/'.join((str(s) for s in sorted({s for c in probe_cells_ for s in c['seeds']}))) + '）。下表的 Δ 与 p 值均基于该实际种子数。')
         A('')
-    A('**做法**：P4MT 按 v7 P1L / v10 P3MT 原配方（seq 512、3000 步、AdamW lr 3e-4、bs 12）把 seeds 0–5 全部置于当前代码语义下（续跑逻辑自动跳过语义仍新的 checkpoint，只有语义陈旧的种子才真正重训）；P4MP 对同一组种子续跑探针（纯 eval，逐 cell 断点续跑，陈旧 cell 自动重测）。种子间训练/评测代码路径与 v10 完全一致。')
+    A('**做法**：P4MT 按 v7 P1L / v10 P3MT 原配方（seq 512、AdamW lr 3e-4、bs 12）把 seeds 0–5 全部置于当前代码语义下（续跑逻辑自动跳过语义仍新的 checkpoint，只有语义陈旧的种子才真正重训）；P4MP 对同一组种子续跑探针（纯 eval，逐 cell 断点续跑，陈旧 cell 自动重测）。种子间训练/评测代码路径与 v10 完全一致。')
     A('')
     if mech_sum:
         _rows_by_v = {}

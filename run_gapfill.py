@@ -134,7 +134,7 @@ def _fold_backup_into_aggregate(adir):
         recovered[key] = sorted(missing)
     if recovered:
         L.atomic_write_json(agg_path, merged, indent=2)
-        print(f'[synth] {agg_path} had lost per-seed coverage (a previous pass was interrupted between re-aggregation and the snapshot merge) — recovered from the pre-retrain snapshot: ' + ', '.join((f'{k}: seeds {v}' for k, v in sorted(recovered.items()))))
+        print(f'[synth] {agg_path} had incomplete per-seed coverage between re-aggregation and the snapshot merge — recovered from the pre-retrain snapshot: ' + ', '.join((f'{k}: seeds {v}' for k, v in sorted(recovered.items()))))
 
 def synthesize_long_summary():
     adir = os.path.join(REPO, 'results_lm_v3_long')
@@ -569,10 +569,10 @@ def run_full():
     # LAST.  The n>=3 core/ablation/scale tables are secured before the long
     # runs; on a box that already holds the panels every phase just resumes
     # and the order adds nothing.
-    L.run(L.RUN, seeds=[0, 1, 2], guard=guard, label='P-CORE 1500-step core table (results_lm_v3_1500)')
-    push_ok &= git_push('v6: results_lm_v3_1500 — 9-variant core table, 1500 steps x 3 seeds')
+    L.run(L.RUN, seeds=[0, 1, 2], guard=guard, label='P-CORE core table (results_lm_v3_1500)')
+    push_ok &= git_push('v6: results_lm_v3_1500 — 9-variant core table')
     L.run(L.RUN_ABL, seeds=[0, 1, 2], guard=guard, label='P-ABL leave-one-out ablation table (results_lm_v4_abl)')
-    push_ok &= git_push('v6: results_lm_v4_abl — leave-one-out ablation table (in-panel references + abl arms), 1500 steps x 3 seeds')
+    push_ok &= git_push('v6: results_lm_v4_abl — leave-one-out ablation table (in-panel references + abl arms)')
     L.run(L.RUN_SCALE, seeds=[0, 1, 2], guard=guard, label='P-SCALE d=384/8L/seq1024 probe (results_lm_v5_scale)')
     push_ok &= git_push('v6: results_lm_v5_scale — model-scale probe (d=384, 8L, seq1024, 5 variants x 3 seeds)')
     L.run({**L.RUN_LONG, 'variants': LONG_GAP_VARIANTS}, seeds=[0, 1, 2], guard=guard, label='P-LONG hybrid 3-seed long-run table (results_lm_v3_long)')

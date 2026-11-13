@@ -483,7 +483,7 @@ def _run_final(base, outdir, protocol, selected):
                    warmup=int(entry['selected']['warmup']))
         L.run(cfg, seeds=final_seeds, guard=None, label=f'final tuned {arm}')
         s = json.load(open(os.path.join(adir, 'summary.json'), encoding='utf-8'))
-        # A resumed panel can leave older summary keys in the file.  Only the
+        # A resumed panel can leave residual summary keys in the file.  Only the
         # declared final partition may enter the tuned comparison; merging a
         # stale seed would inflate n while the artifact still claims the
         # pre-registered final seed set.

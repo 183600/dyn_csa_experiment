@@ -208,7 +208,7 @@ def _safe_nan_to_num(x, *, where='attention', **kwargs):
             if _NAN_GUARD['first'] is None:
                 _NAN_GUARD['first'] = {'where': where, 'n_elements': n_bad}
             if _STRICT_NAN:
-                raise FloatingPointError(f'non-finite values in {where}: {n_bad} element(s) would have been silently replaced by nan_to_num (CSA_STRICT_NAN=1)')
+                raise FloatingPointError(f'non-finite values in {where}: {n_bad} element(s) (CSA_STRICT_NAN=1)')
     return torch.nan_to_num(x, **kwargs)
 
 
@@ -8700,11 +8700,8 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
         except BaseException as exc:
             import traceback as _tb
             _err = (exc, _tb.format_exc())
-            # Same stop-aware bounded put as the data path: a blocking put
-            # here would deadlock the producer forever once the consumer is
-            # gone (queue full + no reader), leaking the thread and the batch
-            # tensors it holds.  If stop is already set the consumer left on
-            # purpose and the error is intentionally dropped.
+            # Match the data path: publish the error only while the consumer
+            # is still active, using a bounded, stop-aware put.
             while not stop.is_set():
                 try:
                     q.put((None, _err), timeout=0.2)
@@ -9462,8 +9459,8 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
         except (TypeError, ValueError, OverflowError):
             out['p_holm'] = None
     # The exact test drops zero deltas, so the resolution floor is controlled
-    # by the number of NONZERO pairs.  Fall back to n for older stats dicts
-    # that do not carry the diagnostic.
+    # by the number of NONZERO pairs.  Fall back to n when the stats dict
+    # lacks that field.
     _n_eff_raw = stats.get('n_nonzero', n)
     if isinstance(_n_eff_raw, (bool, np.bool_)):
         _n_eff = n
@@ -11887,8 +11884,8 @@ def _record_variant_name(rec, key):
     """Canonical arm name for a stored panel record (None = no usable name).
 
     A record without a `variant` field falls back to the summary-key prefix,
-    matching the historical reader contract.  A non-text variant (list/dict)
-    cannot name an arm, so the caller excludes it."""
+    matching the reader contract.  A non-text variant (list/dict) cannot name
+    an arm, so the caller excludes it."""
     if not isinstance(rec, dict):
         return None
     v = rec.get('variant')
@@ -15169,7 +15166,7 @@ def seed_worker(worker_id):
     """DataLoader worker_init_fn: seed Python/NumPy/Torch from torch's
     per-worker base seed.  PyTorch already seeds its own worker RNG before
     calling this hook; re-seeding it explicitly documents the contract and
-    also covers older versions where a custom generator changes the base."""
+    covers a custom base generator as well."""
     _seed = int(torch.initial_seed()) % (2 ** 32)
     os.environ['PYTHONHASHSEED'] = str(_seed)
     random.seed(_seed)
@@ -17449,9 +17446,7 @@ def _resolve_impl_modes(cfg=None, *, device=None):
     mode inferred locally.  With neither, the machine-independent canonical
     default (fp32 / row-by-row) is used.
 
-    A frozen config naming a mode the device cannot provide is an error, not a
-    silent downgrade: the record would otherwise claim an implementation it
-    did not run.
+    A frozen config naming a mode the device cannot provide is an error.
     """
     cfg = {} if cfg is None else cfg
     amp_raw = cfg.get('amp_dtype', 'auto')
@@ -18337,9 +18332,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             print(f'[efficiency] WARNING: measurement failed ({type(_ee).__name__}: {_ee})')
             _efficiency = {'status': 'error', 'error': f'{type(_ee).__name__}: {_ee}'}
     # `tokens_seen` counts DRAWS, not unique tokens: training windows are
-    # sampled with replacement and overlap heavily, so a 3000-step run over an
-    # 8M-token cache does not consume 18.4M distinct tokens.  Record an
-    # explicit coverage estimate instead of letting readers infer uniqueness.
+    # sampled with replacement and overlap heavily, so the draw count is
+    # larger than the number of distinct tokens consumed.  Record an explicit
+    # coverage estimate instead of letting readers infer uniqueness.
     _draws = int(steps) * int(batch_size) * int(_world)
     _n_train = int(len(train_ids)) if hasattr(train_ids, '__len__') else 0
     _uniq_frac = None
@@ -18755,15 +18750,12 @@ def _batch_arrays(batch, vocab=None):
     y = np.ascontiguousarray(y, dtype=np.int64)
     if vocab is not None:
         # -100 / other ignore sentinels are allowed in targets; every other id
-        # must address a real embedding row, or the probe would silently test a
-        # different (wrapped-index) model than the training path.
+        # must address a real embedding row, matching the training path.
         xv = x.reshape(-1)
         if xv.size and (int(xv.min()) < 0 or int(xv.max()) >= int(vocab)):
             raise ValueError(f'overfit batch inputs span [{int(xv.min())}, {int(xv.max())}], outside vocab [0, {int(vocab)})')
         # Targets may carry a negative ignore sentinel, but every real target
-        # must address an embedding row.  Validating only the inputs let an
-        # out-of-vocabulary target reach cross_entropy (or silently index a
-        # wrapped row) during the probe.
+        # must address an embedding row.
         yv = y.reshape(-1)
         if yv.size and int(yv.max()) >= int(vocab):
             raise ValueError(f'overfit batch targets span [{int(yv.min())}, {int(yv.max())}], outside vocab [0, {int(vocab)}) with negative ignore ids')
@@ -21165,7 +21157,7 @@ def run_cell_job(job):
     if torch.cuda.is_available():
         _pin_cuda_determinism()
     # The parent already computed the identical fingerprint/provenance over
-    # this corpus; reuse them.  If an older job payload lacks the resolved
+    # this corpus; reuse them.  If a job payload lacks the resolved
     # implementation modes, resolve them from THIS child's device and pin them
     # into the config so the fingerprint and the training record agree.
     if 'amp_dtype' not in cfg or 'eager_batch' not in cfg:

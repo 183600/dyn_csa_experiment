@@ -261,7 +261,7 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     A('')
     _n_seen = sorted({p['n'] for p in seq2k.values()}) if seq2k else []
     _n_txt = (f'{_n_seen[0]} seeds' if len(_n_seen) == 1 else f'{_n_seen[0]}–{_n_seen[-1]} seeds') if _n_seen else '0 seeds'
-    A(f'**做法**：seq 2048、bs 1、1500 步；5 个变体全部重跑于 `results_lm_v9_seq2k`（面板内 batch/步数/token 数/训练配置完全一致）。**实际落盘 {_n_txt}**（下表每点自报 n）。')
+    A(f'**做法**：seq 2048、bs 1；5 个变体全部重跑于 `results_lm_v9_seq2k`（面板内 batch/步数/token 数/训练配置完全一致）。**实际落盘 {_n_txt}**（下表每点自报 n）。')
     A('')
     A('| variant | PPL (mean±std) | n | 等效选择率@2048 |')
     A('|---|---|---|---|')
