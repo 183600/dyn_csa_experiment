@@ -390,6 +390,14 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     elif train_s is None or val_s is None:
         status = 'insufficient_data'
         reason = 'fewer than two finite train/validation eval points; cannot classify'
+    elif gap_tol is not None and last_gap is not None and last_gap > gap_tol:
+        # An explicit gap threshold is a level check, not a slope check: a
+        # run whose validation CE sits far above its training CE is overfit
+        # even if the short tail slope happens to look flat.  Only an
+        # explicitly supplied gap_tol changes the default slope-based verdict.
+        status = 'overfitting'
+        reason = (f'validation minus training CE gap {last_gap:+.4g} exceeds the '
+                  f'configured gap_tol {gap_tol:g}')
     elif train_s < -train_tol and val_s > val_tol:
         status = 'overfitting'
         reason = 'training CE is still falling while validation CE is rising'
@@ -423,6 +431,8 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         'train_slope_tol': train_tol,
         'val_slope_tol': val_tol,
         'slope_tol_mode': ('adaptive_2se' if slope_tol is None else 'fixed'),
+        'gap_tol': gap_tol,
+        'gap_mode': ('level_check' if gap_tol is not None else 'reported_only'),
         'gap_last': last_gap,
         'best_step': int(best[0]) if best is not None else None,
         'best_val_ppl': float(best[1]) if best is not None else None,
@@ -5852,6 +5862,27 @@ def _array_id_range(arr):
 _IDS_FP_ALGO = 2
 
 
+def _ids_fp_memo_safe(arr):
+    """True only when an address-keyed fingerprint memo cannot go stale.
+
+    A read-only view can still share its storage with a writeable base (or be
+    a read-only memmap another process can rewrite), so ``writeable=False``
+    alone is not an immutability proof: mutating the base leaves the view's
+    pointer/shape/strides unchanged and the memo would return the old digest.
+    Memoise only an own-data, non-mapped array with no base.
+    """
+    flags = getattr(arr, 'flags', None)
+    if flags is None or bool(getattr(flags, 'writeable', True)):
+        return False
+    if not bool(getattr(flags, 'owndata', False)):
+        return False
+    if getattr(arr, 'base', None) is not None:
+        return False
+    if isinstance(arr, np.memmap) or getattr(arr, 'filename', None) is not None:
+        return False
+    return True
+
+
 def _ids_fp(train_ids):
     # Pure function of the token values, memoised on (data pointer, layout)
     # with a weak reference to the array: a dead entry can never alias a
@@ -5866,9 +5897,10 @@ def _ids_fp(train_ids):
         _key = (train_ids.__array_interface__['data'][0], train_ids.shape, train_ids.strides, train_ids.dtype.str)
     except (AttributeError, TypeError):
         _key = None
-    # Only immutable arrays are keyed by storage address; a writeable array
-    # is re-hashed because its contents can change under the same pointer.
-    if _key is not None and getattr(getattr(train_ids, 'flags', None), 'writeable', False):
+    # Only truly immutable own-data arrays are keyed by storage address; any
+    # writeable array, view or mmap is re-hashed because its contents can
+    # change under the same pointer.
+    if _key is not None and not _ids_fp_memo_safe(train_ids):
         _key = None
     if _key is not None:
         _hit = _IDS_FP_MEMO.get(_key)
@@ -12815,6 +12847,25 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         return value
     if len({_label_identity(v) for v in labels.tolist()}) != int(labels.size):
         raise ValueError(f'labels contains duplicate class identifiers: {labels.tolist()}')
+    # The returned mapping is JSON-keyed.  Distinct label identities can share
+    # one str() spelling (1 vs "1", or two different objects with the same
+    # repr); a plain str key would then silently overwrite one class and make
+    # f1_positive/prevalence read the wrong record.  Keep the historical
+    # spelling whenever it is unique, and type-qualify only collisions.
+    _class_keys = [str(x) for x in labels.tolist()]
+    if len(set(_class_keys)) != len(_class_keys):
+        _class_keys = []
+        _used_keys = set()
+        for _x in labels.tolist():
+            _v = _x.item() if isinstance(_x, np.generic) else _x
+            _base = f'{type(_v).__name__}:{_v!r}'
+            _key = _base
+            _suffix = 1
+            while _key in _used_keys:
+                _suffix += 1
+                _key = f'{_base}#{_suffix}'
+            _used_keys.add(_key)
+            _class_keys.append(_key)
     if y_score is not None:
         try:
             y_score = np.asarray(y_score, dtype=float)
@@ -12833,14 +12884,16 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
                     f'{int(labels.size)} identit(ies); a column-per-label score '
                     'matrix must name exactly one label per column')
     pos = None
+    pos_idx = None
     if labels.size == 2:
         if positive_label is None:
-            pos = labels[-1]
+            pos_idx = int(labels.size) - 1
         else:
             hits = np.where(labels == positive_label)[0]
             if hits.size == 0:
                 raise ValueError(f'positive_label={positive_label!r} is not in labels {labels.tolist()}')
-            pos = labels[int(hits[0])]
+            pos_idx = int(hits[0])
+        pos = labels[pos_idx]
     elif positive_label is not None:
         raise ValueError('positive_label is only meaningful for a binary endpoint')
     if y_pred is None:
@@ -12865,7 +12918,7 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
     rs = []
     all_f1s = []
     total_tp = total_fp = total_fn = 0
-    for lab in labels:
+    for lab, lab_key in zip(labels, _class_keys):
         tp = int(np.sum((y_true == lab) & (y_pred == lab)))
         fp = int(np.sum((y_true != lab) & (y_pred == lab)))
         fn = int(np.sum((y_true == lab) & (y_pred != lab)))
@@ -12873,7 +12926,7 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         precision = tp / (tp + fp) if tp + fp else 0.0
         recall = tp / (tp + fn) if tp + fn else 0.0
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-        per_class[str(lab)] = {'precision': precision, 'recall': recall, 'f1': f1, 'support': support}
+        per_class[lab_key] = {'precision': precision, 'recall': recall, 'f1': f1, 'support': support}
         all_f1s.append(f1)
         # Balanced accuracy / macro recall are also averages over the full
         # REQUESTED label set.  A label absent from y_true (but requested, or
@@ -12892,12 +12945,13 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
     # score merely because it happens to be absent from this sample.
     macro_f1 = float(np.mean(all_f1s)) if all_f1s else 0.0
     weighted_f1 = float(np.average(f1s, weights=supports)) if supports else 0.0
-    f1_positive = per_class[str(pos)]['f1'] if pos is not None else None
+    f1_positive = per_class[_class_keys[pos_idx]]['f1'] if pos_idx is not None else None
     out = {
         'n': int(y_true.size),
-        'labels': [str(x) for x in labels],
-        'positive_label': (str(pos) if pos is not None else None),
-        'prevalence': {str(lab): float(np.mean(y_true == lab)) for lab in labels},
+        'labels': list(_class_keys),
+        'positive_label': (_class_keys[pos_idx] if pos_idx is not None else None),
+        'prevalence': {lab_key: float(np.mean(y_true == lab))
+                       for lab, lab_key in zip(labels, _class_keys)},
         'accuracy': float(np.mean(y_true == y_pred)) if y_true.size else None,
         'balanced_accuracy': float(np.mean(rs)) if rs else None,
         'f1_macro': macro_f1,
@@ -12934,7 +12988,7 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
             out['imbalance_warning'] = ('positives rarer than 1:1000 — PR-AUC is the primary ranking metric; ROC-AUC can look optimistic'
                                         if rare < 1e-3 else None)
     elif labels.size == 2 and out.get('positive_label') is not None:
-        prev = out['prevalence'].get(str(pos), 0.0)
+        prev = out['prevalence'].get(_class_keys[pos_idx], 0.0)
         if min(prev, 1.0 - prev) < 1e-3:
             out['imbalance_warning'] = ('positives rarer than 1:1000 — report PR-AUC with scores; F1 must name its averaging rule and recall should be reported per class')
     return out

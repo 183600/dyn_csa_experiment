@@ -651,6 +651,27 @@ def _pair_reason(ra, rb):
         return f'disagreeing {sorted(_disagree)}'
     return None
 
+def _pair_condition_tail(r):
+    """Everything `_pair_reason` requires to agree, except run_cfg itself.
+
+    Grouping seeds only by run_cfg still let seed 0 use optimizer A and seed 1
+    optimizer B (or different corpus/eval fingerprints) and pooled both into
+    one sign-flip test: each seed pair can be internally consistent while the
+    paired observations come from different recipes.  Include the remaining
+    controlled fields so one test never fabricates n across conditions.
+    """
+    return (
+        _keyable_value(r.get('train_knobs')),
+        tuple((_k in r, _keyable_value(r.get(_k)))
+              for _k in ('amp_dtype', 'amp_grad_scaler', 'eager_batch')),
+        _content_fp_text(r.get('data_fp')),
+        _content_fp_text(r.get('val_fp')),
+        _content_fp_text(r.get('eval_fp')),
+        _content_fp_text(r.get('init_core_fp')),
+        tuple(_int_or(r.get(_k), None) for _k in PAIR_STEP_KEYS),
+    )
+
+
 def paired_row(a_records, b_records):
     common = sorted(set(a_records) & set(b_records))
     if not common:
@@ -670,12 +691,14 @@ def paired_row(a_records, b_records):
     _cfg_groups = collections.defaultdict(list)
     for _tk in common:
         _cfg_groups[(_keyable_value(a_records[_tk].get('run_cfg')),
-                     _keyable_value(b_records[_tk].get('run_cfg')))].append(_tk)
+                     _keyable_value(b_records[_tk].get('run_cfg')),
+                     _pair_condition_tail(a_records[_tk]),
+                     _pair_condition_tail(b_records[_tk]))].append(_tk)
     if len(_cfg_groups) > 1:
         _ranked = sorted(_cfg_groups.items(),
                          key=lambda kv: (not (isinstance(kv[0][0], str) and _CUR_CS and kv[0][0].endswith(f'_cs{_CUR_CS}')), -len(kv[1]), str(kv[0])))
         _keep_cfg, _kept_keys = _ranked[0]
-        print(f'[report] paired_row: the paired seeds span {len(_cfg_groups)} run_cfg groups; pooling them would fabricate n, so only the largest/current group ({len(_kept_keys)} seed(s)) is tested and the rest are skipped')
+        print(f'[report] paired_row: the paired seeds span {len(_cfg_groups)} training-condition groups; pooling them would fabricate n, so only the largest/current group ({len(_kept_keys)} seed(s)) is tested and the rest are skipped')
         common = _kept_keys
     dl, kept, skipped = ([], [], [])
     for s in common:

@@ -849,7 +849,22 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             rec['declared_split_strategy'] = meta.get('split_strategy') or 'unrecorded'
             rec['shuffle_at_split'] = meta.get('shuffle_at_split')
             rec['tokenizer_fit_split'] = meta.get('tokenizer_fit_split')
-            rec['val_fingerprint_recorded'] = bool(meta.get('val_fp'))
+            _val_fp = meta.get('val_fp')
+            rec['val_fingerprint_recorded'] = bool(_val_fp)
+            if not _val_fp:
+                _warn(f'{cd}/{tag}: cache has no validation fingerprint (val_fp); the holdout slice cannot be bound to the audited contents')
+            else:
+                try:
+                    _val_fp_now = _sidecar_fp(np.asarray(va).reshape(-1))
+                except Exception as _ve:
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: validation fingerprint could not be recomputed '
+                          f'({type(_ve).__name__}: {_ve})')
+                else:
+                    if str(_val_fp) != _val_fp_now:
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: validation fingerprint in the cache '
+                              'metadata does not match the val_batch contents')
             if _declares_shuffle(meta.get('shuffle_at_split')):
                 rec['status'] = 'fail'
                 _fail(f'{cd}/{tag}: metadata declares a shuffled split')
@@ -2110,14 +2125,36 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
         _step_vals = sorted({
             _si for _r, _p in _valid
             if (_si := _exact_int_scalar(_r.get('steps'))) is not None})
-        _tok_vals = sorted({
-            _ti for _r, _p in _valid
-            if (_ti := _exact_int_scalar(_r.get('tokens_seen'))) is not None})
+        # Each record must contribute the SAME token allocation, whether it
+        # spells out tokens_seen or only carries steps/batch/seq.  Comparing
+        # only the explicitly present tokens_seen values lets a record with
+        # no field be derived to a different total while the panel still
+        # looks unanimous.
+        _tok_vals_set = set()
+        _tok_bad = []
+        for _r, _p in _valid:
+            _raw_tok = _r.get('tokens_seen')
+            if _raw_tok is not None:
+                _ti = _exact_int_scalar(_raw_tok)
+                if _ti is None or _ti <= 0:
+                    _tok_bad.append(_raw_tok)
+                else:
+                    _tok_vals_set.add(_ti)
+                continue
+            _si = _exact_int_scalar(_r.get('steps'))
+            _bi = _exact_int_scalar(_r.get('batch_size', 12))
+            _qi = _exact_int_scalar(_r.get('seq_len', 512))
+            if (_si is not None and _si > 0 and _bi is not None and _bi > 0
+                    and _qi is not None and _qi > 0):
+                _tok_vals_set.add(_si * _bi * _qi)
+        _tok_vals = sorted(_tok_vals_set)
         _conflict = []
+        if _tok_bad:
+            _conflict.append(f'invalid tokens_seen values {_tok_bad}')
         if steps is None and len(_step_vals) > 1:
             _conflict.append(f'steps {_step_vals}')
         if len(_tok_vals) > 1:
-            _conflict.append(f'tokens_seen {_tok_vals}')
+            _conflict.append(f'tokens {_tok_vals}')
         if _conflict:
             out['status'] = 'fail'
             out.setdefault('problems', []).append(

@@ -592,6 +592,11 @@ def _load_manifest(path):
                         raise SystemExit(f'[v12] REFUSE: per-arm mr for {_arm!r} is not numeric ({_asig["mr"]!r})')
                     if not math.isfinite(_mr) or _mr <= 1.0:
                         raise SystemExit(f'[v12] REFUSE: per-arm mr for {_arm!r} must be finite and > 1 ({_mr!r})')
+    # Validate the training-corpus binding shape at load time too: a
+    # malformed declaration must fail before any held-out access, not be
+    # silently treated as "no literal value" and then paired with an
+    # arbitrary derivable train_fp later.
+    _frozen_train_fp(m)
     m['manifest_sha256'] = _file_sha256(path)
     return m
 
@@ -694,15 +699,55 @@ def _frozen_train_fp(manifest):
     case every admission/checkpoint must still agree on ONE non-null train_fp
     and the first P5T access locks it.
     """
-    for _obj in (manifest.get('binding') or {}, manifest):
+    _fp_keys = ('training_data_fingerprint', 'canonical_train_fp',
+                'train_fp', 'training_fp')
+
+    def _take(label, value):
+        if value is None:
+            return None
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (str, dict)):
+            raise SystemExit(
+                f'[v12] REFUSE: {label}={value!r} is not a training-corpus '
+                'fingerprint (expected a non-empty string or an object)')
+        if isinstance(value, str):
+            if not value:
+                raise SystemExit(
+                    f'[v12] REFUSE: {label} is an empty training-corpus '
+                    'fingerprint — an empty/absent identity cannot bind a corpus')
+            return value
+        for _sub in ('canonical_train_fp', 'train_fp', 'value'):
+            if _sub not in value:
+                continue
+            _sv = value[_sub]
+            if _sv is None:
+                continue
+            if (isinstance(_sv, (bool, np.bool_))
+                    or not isinstance(_sv, str) or not _sv):
+                raise SystemExit(
+                    f'[v12] REFUSE: {label}.{_sub}={_sv!r} is not a '
+                    'non-empty text fingerprint')
+            return _sv
+        # Declared geometry fields are part of the binding, so validate them
+        # here instead of silently ignoring a malformed value until P5T.
+        for _cnt, _minimum in (('seq_len', 2), ('n_train_tokens', 1)):
+            if _cnt not in value or value[_cnt] is None:
+                continue
+            _iv = L._as_seed_int(value[_cnt])
+            if _iv is None or _iv < _minimum:
+                raise SystemExit(
+                    f'[v12] REFUSE: {label}.{_cnt}={value[_cnt]!r} is not an '
+                    f'exact integer >= {_minimum}')
+        return None
+
+    for _obj_name, _obj in (('binding', manifest.get('binding') or {}),
+                            ('manifest', manifest)):
         if not isinstance(_obj, dict):
             continue
-        for _k in ('training_data_fingerprint', 'canonical_train_fp', 'train_fp', 'training_fp'):
-            _v = _obj.get(_k)
-            if isinstance(_v, dict):
-                _v = (_v.get('canonical_train_fp') or _v.get('train_fp')
-                      or _v.get('value'))
-            if isinstance(_v, str) and _v:
+        for _k in _fp_keys:
+            if _k not in _obj:
+                continue
+            _v = _take(f'{_obj_name}.{_k}', _obj.get(_k))
+            if _v is not None:
                 return _v
     return None
 

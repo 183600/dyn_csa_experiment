@@ -1629,11 +1629,17 @@ def _temporal_identity(v):
         except (OverflowError, ValueError, TypeError):
             return None
 
+    # The unit is part of the identity: the same raw integer means a
+    # different instant in different units (1 ns != 1 us).  A value that is
+    # exactly representable in microseconds is canonicalised there, so the
+    # same instant stored as ns/us/ms still shares one key; values that need
+    # a finer or coarser unit carry that unit explicitly and can never alias
+    # a microsecond value with the same integer.
     for _unit in ('us', 'ns', 'ps', 'fs', 'as',
                   'ms', 's', 'm', 'h', 'D', 'W', 'M', 'Y'):
         _n = _exact(_unit)
         if _n is not None:
-            return ('dt', typ, _n)
+            return ('dt', typ, _unit, _n)
     return ('dt', typ, str(v))
 
 
@@ -1783,6 +1789,12 @@ def _matrix_fingerprint(X):
                 h.update(_s)
             continue
         if _wide_int:
+            # A wide-integer table has no exact float64 twin, so its raw
+            # uint64 bytes must not share a fingerprint with a float table
+            # whose bytes happen to be identical (e.g. uint64 2**62 vs the
+            # float 1.0 bit pattern).  In-range integer tables keep their
+            # cross-dtype float fingerprint intentionally.
+            h.update(b'WIDE_INT')
             if _blk.dtype == object:
                 _flat_vals = [int(v) for v in _blk.reshape(-1).tolist()]
                 _flat = [v & (2 ** 64 - 1) for v in _flat_vals]
@@ -2363,6 +2375,32 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             raw_labels = [tuple(r) for r in _rows_y]
             labels = [tuple(_label_key(v) for v in r) for r in _rows_y]
 
+        # Report/histogram keys are strings, but distinct label identities can
+        # share one str() spelling (1 vs "1").  A plain str key would merge
+        # them and hide a real train->holdout category shift; keep the usual
+        # spelling when it is unique and type-qualify only collisions.
+        _label_display = {}
+        _display_owner = {}
+        for _v in labels:
+            if _v is None or (isinstance(_v, tuple) and any(x is None for x in _v)):
+                continue
+            _cat = _hashable_label(_v)
+            if _cat in _label_display:
+                continue
+            _text = str(_v)
+            _owner = _display_owner.get(_text)
+            if _owner is not None and _owner != _cat:
+                _text = f'{type(_v).__name__}:{_v!r}'
+                _suffix = 1
+                while _text in _display_owner and _display_owner[_text] != _cat:
+                    _suffix += 1
+                    _text = f'{type(_v).__name__}:{_v!r}#{_suffix}'
+            _display_owner[_text] = _cat
+            _label_display[_cat] = _text
+
+        def _label_text(v):
+            return _label_display.get(_hashable_label(v), str(v))
+
         def _raw_missing_atom(v):
             if v is None:
                 return True
@@ -2435,7 +2473,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                         continue
                     key = _hashable_label(lab)
                     if key not in known:
-                        text = str(lab)
+                        text = _label_text(lab)
                         counts[text] = counts.get(text, 0) + 1
                 unknown_by_split[name] = counts
             checks['unknown_labels_by_split'] = unknown_by_split
@@ -2449,12 +2487,14 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                     warnings.append(_msg)
         # Stringify before counting so mixed/object label types cannot make
         # np.unique raise (and so a numpy scalar and its Python twin count as
-        # one category).  This is an audit histogram, not a model input.
+        # one category).  Colliding spellings use the type-qualified display
+        # key built above, so int 1 and str "1" stay separate categories.
         def _label_hist(values):
             hist = {}
             for v in values:
                 if not _label_missing(v):
-                    hist[str(v)] = hist.get(str(v), 0) + 1
+                    text = _label_text(v)
+                    hist[text] = hist.get(text, 0) + 1
             return {k: hist[k] for k in sorted(hist)}
         checks['label_distribution'] = _label_hist(labels)
         checks['label_distribution_by_split'] = {
@@ -2467,14 +2507,14 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         # into it.  String identities keep the report well-defined for mixed
         # categorical labels.
         label_shift = {}
-        _train_lab = [str(labels[i]) for i in
+        _train_lab = [_label_text(labels[i]) for i in
                       np.asarray(ref, dtype=np.int64).reshape(-1).tolist()
                       if not _label_missing(labels[i])]
         for name in ('val', 'test'):
             _rows = np.asarray(split_rows[name], dtype=np.int64).reshape(-1).tolist()
             if not _rows:
                 continue
-            _hold_lab = [str(labels[i]) for i in _rows
+            _hold_lab = [_label_text(labels[i]) for i in _rows
                          if not _label_missing(labels[i])]
             if not _train_lab or not _hold_lab:
                 continue

@@ -7839,6 +7839,98 @@ def t_probe_reader_geometry_and_manifest_fail_closed():
                 raise AssertionError(f'endpoint {_bad_ep!r} was accepted')
 
 
+def t_identity_fingerprint_and_pairing_regressions():
+    import data_guard as DG
+    # Different instants stored in different units must not share a temporal
+    # identity (a coarse->fine fallback previously dropped the unit).
+    assert DG._temporal_identity(np.datetime64(1, 'ns')) != \
+        DG._temporal_identity(np.datetime64(1, 'us'))
+    for _s in ('2020-01-01', '100000-01-01', '300000-01-01'):
+        _ids = {DG._temporal_identity(np.datetime64(_s).astype(f'datetime64[{u}]'))
+                for u in ('Y', 'D', 'h', 'm', 's', 'ms')}
+        assert len(_ids) == 1, (_s, _ids)
+    # A wide integer's uint64 bytes must not collide with an unrelated float
+    # table that happens to have the same bytes.
+    _wide = np.array([[4607182418800017408]], dtype=np.uint64)
+    _one = np.array([[1.0]], dtype=np.float64)
+    assert DG._matrix_fingerprint(_wide) != DG._matrix_fingerprint(_one)
+    _wide_obj = np.empty((1, 1), dtype=object)
+    _wide_obj[0, 0] = 4607182418800017408
+    assert DG._matrix_fingerprint(_wide) == DG._matrix_fingerprint(_wide_obj)
+    # A read-only view of a writeable base can change under the same pointer;
+    # the corpus fingerprint memo must not return the stale digest.
+    _base = np.arange(8, dtype=np.int64)
+    _view = _base.view()
+    _view.flags.writeable = False
+    _fp1 = L._ids_fp(_view)
+    _base[0] = 999
+    assert L._ids_fp(_view) != _fp1
+    assert L._ids_fp(_view) == L._ids_fp(np.array([999, 1, 2, 3, 4, 5, 6, 7]))
+    # Distinct class identities with the same str() spelling must not be
+    # collapsed into one per-class/prevalence record.
+    _lab = np.array([1, '1'], dtype=object)
+    _y = np.array([1, 1, '1', '1'], dtype=object)
+    _cm = L.classification_metrics(_y, y_pred=_y, labels=_lab)
+    assert len(_cm['per_class']) == 2 and len(_cm['prevalence']) == 2, _cm
+    assert _cm['f1_positive'] == 1.0, _cm
+    # Label histograms and train->holdout shift keep those identities apart.
+    _rep = DG.data_quality_report(np.zeros((4, 1)), y=np.array([1, '1', 1, '1'], dtype=object),
+                                  train_idx=[0, 2], val_idx=[1, 3])
+    assert len(_rep['checks']['label_distribution']) == 2, _rep['checks']['label_distribution']
+    assert _rep['checks']['label_distribution_shift_vs_train']['val']['js_divergence'] > 0.5
+    # Report pairing must not pool seeds that ran under different controlled
+    # conditions even when each seed pair is internally consistent.
+    _base_rec = dict(run_cfg='cfg', steps=1, tokens_seen=1, data_fp='d',
+                     val_fp='v', eval_fp='e', init_core_fp='i')
+    _a = {('', 0): dict(_base_rec, variant='a', seed=0, ppl=10.0, train_knobs={'opt': 'sgd'}),
+          ('', 1): dict(_base_rec, variant='a', seed=1, ppl=11.0, train_knobs={'opt': 'adam'})}
+    _b = {('', 0): dict(_base_rec, variant='b', seed=0, ppl=11.0, train_knobs={'opt': 'sgd'}),
+          ('', 1): dict(_base_rec, variant='b', seed=1, ppl=12.0, train_knobs={'opt': 'adam'})}
+    _pair = BR.paired_row(_a, _b)
+    assert _pair is not None and _pair[2]['n'] == 1, _pair
+    # A panel with one explicit tokens_seen and one derived from
+    # steps*batch*seq is not unanimous when the two differ.
+    with tempfile.TemporaryDirectory() as _td:
+        _sp = os.path.join(_td, 'summary.json')
+        with open(_sp, 'w', encoding='utf-8') as _f:
+            json.dump({'v::s0': {'variant': 'v', 'params': 1000, 'steps': 3,
+                                 'batch_size': 2, 'seq_len': 8},
+                       'v::s1': {'variant': 'v', 'params': 1000, 'tokens_seen': 100}}, _f)
+        _bud = A.audit_budget(state_files=(), panels=((_td, 'v', None),))
+        assert _bud['status'] == 'fail' and _bud['panels'][_td]['estimate'] is None, _bud
+    # A recorded validation fingerprint must be checked against the val rows.
+    with tempfile.TemporaryDirectory() as _td:
+        _tag = 'tiny'
+        np.save(os.path.join(_td, f'train_ids_{_tag}.npy'), np.arange(40, dtype=np.int64))
+        np.save(os.path.join(_td, f'val_batch_{_tag}.npy'),
+                np.arange(100, 108, dtype=np.int64).reshape(2, 4))
+        with open(os.path.join(_td, f'meta_{_tag}.json'), 'w', encoding='utf-8') as _f:
+            json.dump({'vocab': 40, 'seq_len': 4, 'split_strategy': 'ordered',
+                       'val_fp': 'WRONG'}, _f)
+        _out = A.audit_split_discipline(cache_dirs=[_td], min_shift_tokens=1)
+        _rec = _out['caches'][os.path.abspath(_td)]['corpora'][_tag]
+        assert _rec['status'] == 'fail', _rec
+    # gap_tol is an explicit level check, not a no-op option.
+    _hist = [{'step': i, 'train_ce': 1.0, 'val_ce': 1.0 + 0.1 * i,
+              'gap': 0.1 * i} for i in range(6)]
+    assert L.classify_training_health(_hist)['status'] == 'underfitting_or_stalled'
+    assert L.classify_training_health(_hist, gap_tol=0.2)['status'] == 'overfitting'
+    # A malformed frozen training-corpus binding must be refused at load time,
+    # not silently treated as "no literal value".
+    with tempfile.TemporaryDirectory() as _td:
+        _p = os.path.join(_td, 'manifest.json')
+        _m = _write_manifest(_p, list(range(12)))
+        _m['binding'] = {'training_data_fingerprint': True}
+        with open(_p, 'w', encoding='utf-8') as _f:
+            json.dump(_m, _f)
+        try:
+            V12._load_manifest(_p)
+        except SystemExit as _e:
+            assert 'training' in str(_e).lower(), str(_e)[:200]
+        else:
+            raise AssertionError('a boolean training_data_fingerprint was accepted')
+
+
 def t_malformed_panel_and_niah_records_are_excluded():
     # Panel readers build dict/set keys from a record's variant.  A JSON
     # list/dict variant cannot name an arm, so the readers exclude it.
@@ -8157,6 +8249,7 @@ def main():
     _check('L20 shared validation fingerprint tolerates malformed provenance', t_shared_validation_fp_refuses_malformed_provenance)
     _check('L21 probe readers/manifest reject impossible geometry', t_probe_reader_geometry_and_manifest_fail_closed)
     _check('L22 malformed panel/NIAH records are excluded', t_malformed_panel_and_niah_records_are_excluded)
+    _check('L23 temporal/wide-int/memo/class/label/pairing identity regressions', t_identity_fingerprint_and_pairing_regressions)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
