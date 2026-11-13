@@ -3437,6 +3437,15 @@ def _rank_blocks(masked, B, ties, k=None):
     sel = gt | (eq & (eq_cum <= need[:, None]))
     del eq_cum, gt, eq, need
     rank = torch.cumsum(sel, dim=1, dtype=torch.int32)
+    # NaN has no ordering under `>`/`==` (PyTorch sorts it first in descending
+    # order), so a row containing NaN can select fewer than kk columns and
+    # leave the sentinel buffer uninitialised.  The indexer masks non-finite
+    # scores upstream, but this helper's contract is "the first k columns of
+    # the stable descending sort"; use that full sort (whose NaN ordering is
+    # defined) instead of returning garbage.  Finite inputs keep the hot path.
+    if bool((rank[:, -1] != kk).any()):
+        order = torch.argsort(src, dim=1, stable=True, descending=True)[:, :kk]
+        return order if ties == 'earliest' else torch.sub(B - 1, order)
     rank -= 1
     rank.masked_fill_(~sel, kk)
     # Scatter the selected source columns into [n, kk] (column order); the
@@ -13918,6 +13927,15 @@ def controlled_variables_report(recs, arms):
     }
 
 def _params_of_arm(recs, arm):
+    """The one exact parameter count shared by every record of ``arm``.
+
+    A single record's count must not stand in for the arm: if any seed omits
+    ``params`` (or carries a malformed/different count), the arm's parameter
+    size is unverifiable, not matched.  Returning the first available value
+    would let one missing seed disappear and turn a parameter-confounded
+    contrast into a "controlled" one.
+    """
+    vals = []
     for (v, _t, _s), r in recs.items():
         if v != arm:
             continue
@@ -13925,9 +13943,12 @@ def _params_of_arm(recs, arm):
         # corrupted count into a different, apparently valid one, and bool is
         # not a count.
         p = _as_seed_int(r.get('params'))
-        if p is not None and p > 0:
-            return p
-    return None
+        if p is None or p <= 0:
+            return None
+        vals.append(p)
+    if not vals or len(set(vals)) != 1:
+        return None
+    return vals[0]
 
 def _param_control(recs, a, b):
     """Relative parameter-count difference between two arms, and whether it is
@@ -13951,13 +13972,32 @@ def _param_control(recs, a, b):
     return (float(rel), bool(rel <= 0.01))
 
 def _param_breakdown_of_arm(recs, arm):
+    """The one non-empty breakdown shared by every record of ``arm``.
+
+    A single record's breakdown cannot stand in for the arm: if one seed omits
+    it (or carries a different breakdown), the active/non-embedding capacity
+    is unverifiable.  Returning the first available dict would let the missing
+    seed disappear and label a partially recorded arm as controlled.
+    """
+    vals = []
     for (v, _t, _s), r in recs.items():
         if v != arm:
             continue
         pb = r.get('param_breakdown')
-        if isinstance(pb, dict) and pb:
-            return pb
-    return None
+        if not isinstance(pb, dict) or not pb:
+            return None
+        vals.append(pb)
+    if not vals:
+        return None
+    first = vals[0]
+    for other in vals[1:]:
+        try:
+            same = bool(first == other)
+        except Exception:
+            same = False
+        if not same:
+            return None
+    return first
 
 def _param_control_detail(recs, a, b):
     """Capacity breakdown for a pair: total as well as non-embedding and

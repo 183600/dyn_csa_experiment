@@ -1546,6 +1546,16 @@ def t_finaltest_requires_parameter_matching():
                                       bylen_path=os.path.join(td, 'bylen.json'),
                                       probe_path=os.path.join(td, 'probe.json'),
                                       out=os.path.join(td, 'stats6.json'))
+            # A single pair without `params` makes the whole parameter
+            # comparison unverifiable: averaging only the seeds that happen to
+            # carry the count must not turn a missing measurement into True.
+            _partial_params = _records(params=1000, init='INIT')
+            _partial_params[('b_arm', 0)].pop('params')
+            V12._admit_confirmation_records = lambda raw, man: (_partial_params, None)
+            st7 = V12.finaltest_stats(manifest=manifest,
+                                      bylen_path=os.path.join(td, 'bylen.json'),
+                                      probe_path=os.path.join(td, 'probe.json'),
+                                      out=os.path.join(td, 'stats7.json'))
         finally:
             V12._admit_confirmation_records = _old_admit
             V12._test_probe_stats = _old_probe
@@ -1558,6 +1568,10 @@ def t_finaltest_requires_parameter_matching():
         assert st6['comparisons']['c1']['init_core_fp_recorded'] is False, st6['comparisons']['c1']
         assert st6['comparisons']['c1']['same_init_core_fp'] is False, st6['comparisons']['c1']
         assert st6['confirmed'] == [], st6['confirmed']
+        assert st7['comparisons']['c1']['param_matched'] is None, st7['comparisons']['c1']
+        assert st7['comparisons']['c1']['param_rel_diff'] is None, st7['comparisons']['c1']
+        assert st7['comparisons']['c1']['params_unverifiable_seeds'] == [0], st7['comparisons']['c1']
+        assert st7['confirmed'] == [], st7['confirmed']
 
 
 def t_freeze_lock():
@@ -6093,6 +6107,28 @@ def t_param_and_compute_control_detail():
                             'train_time_s': 20.0, 'tokens_seen': 100.0}}
     _rel, ok = L._param_control(recs, 'a', 'b')
     assert ok is True, 'total parameters are matched'
+    # A breakdown recorded on only some seeds is likewise unverifiable: the
+    # remaining records must not be averaged as if they all carried it.
+    _partial_bd = {('a', 'p', 0): {'params': 1000, 'param_breakdown': bd},
+                   ('a', 'p', 1): {'params': 1000},
+                   ('b', 'p', 0): {'params': 1000, 'param_breakdown': bd},
+                   ('b', 'p', 1): {'params': 1000, 'param_breakdown': bd}}
+    _partial_detail = L._param_control_detail(_partial_bd, 'a', 'b')
+    assert _partial_detail['total_controlled'] is True, _partial_detail
+    assert _partial_detail['active_controlled'] is None, _partial_detail
+    assert _partial_detail['non_embedding_controlled'] is None, _partial_detail
+    # One seed without a parameter count makes the whole arm unverifiable:
+    # using the remaining seeds would let a missing measurement look matched.
+    _partial = {('a', 'p', 0): {'params': 1000},
+                ('a', 'p', 1): {},
+                ('b', 'p', 0): {'params': 1000},
+                ('b', 'p', 1): {'params': 1000}}
+    assert L._param_control(_partial, 'a', 'b') == (None, None)
+    _mixed = {('a', 'p', 0): {'params': 1000},
+              ('a', 'p', 1): {'params': 1100},
+              ('b', 'p', 0): {'params': 1050},
+              ('b', 'p', 1): {'params': 1050}}
+    assert L._param_control(_mixed, 'a', 'b') == (None, None)
     d = L._param_control_detail(recs, 'a', 'b')
     assert d['total_controlled'] is True and d['active_controlled'] is False, d
     assert d['active_rel_diff'] > 0.01, d
@@ -8207,6 +8243,29 @@ def t_key_identity_and_sequence_edges():
     assert V12._training_health_gate({'smoke': True}, 'v', 0, None, None) is None
 
 
+def t_topk_nan_matches_stable_sort():
+    import csa_kernels as K
+    # A NaN k-th value used to leave the candidate buffer uninitialised (the
+    # uninitialised sentinel column became an out-of-range gather index).
+    cases = [
+        [[float('inf'), 1.0, float('nan'), float('-inf'), 2.0]],
+        [[float('nan'), float('nan'), 1.0]],
+        [[1.0, float('nan'), 0.0], [float('nan'), 2.0, float('nan')]],
+    ]
+    for vals in cases:
+        x = torch.tensor(vals)
+        B = int(x.shape[1])
+        rv, ri = torch.sort(x, dim=-1, descending=True, stable=True)
+        for k in range(1, B + 1):
+            v, i = K._stable_topk_desc(x, k)
+            assert torch.equal(i, ri[:, :k]), (vals, k, i, ri[:, :k])
+            assert torch.equal(v.view(torch.int32), rv[:, :k].view(torch.int32)), (vals, k)
+            assert torch.equal(L._rank_blocks(x, B, 'earliest', k), ri[:, :k]), (vals, k)
+            _latest = torch.argsort(x.flip(1), dim=1, stable=True, descending=True)
+            _latest = torch.sub(B - 1, _latest)
+            assert torch.equal(L._rank_blocks(x, B, 'latest', k), _latest[:, :k]), (vals, k)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8398,6 +8457,7 @@ def main():
     _check('I27 categorical shift requires a meaningful bin count', t_categorical_shift_requires_two_bins)
     _check('I28 label-noise audit handles unhashable labels', t_data_quality_unhashable_labels)
     _check('I29 key identity, sequence split and smoke-flag edges', t_key_identity_and_sequence_edges)
+    _check('I29b stable top-k handles NaN like the full stable sort', t_topk_nan_matches_stable_sort)
     _check('I29 categorical encoding is fitted on train only', t_categorical_encoder_train_only)
     _check('I30 train-only cleaning before preprocessing', t_clean_training_rows_and_split)
     _check('I31 declared label set catches unseen/holdout labels', t_known_labels_audit)

@@ -2134,12 +2134,16 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             res['power_first_holm_gate_effective'] = {f'q={q:.2f}': L.signflip_power(_n_eff_nonzero, len(manifest['primary_comparisons']), q, _alpha) for q in (0.8, 0.85, 0.9, 0.95)}
         # Parameter counts are exact positive integers; bool/fractional or
         # lossy large values are malformed provenance, not a matched arm.
-        _pa = [p for p in (L._as_seed_int(recs_a[s].get('params')) for s in usable)
-               if p is not None and p > 0]
-        _pb = [p for p in (L._as_seed_int(recs_b[s].get('params')) for s in usable)
-               if p is not None and p > 0]
-        if _pa and _pb:
-            _am, _bm = float(np.mean(_pa)), float(np.mean(_pb))
+        # Every usable PAIR must expose BOTH counts: averaging over only the
+        # records that happen to carry `params` would let one missing seed
+        # disappear while the remaining records still look matched, turning
+        # an unverifiable comparison into a confirmed parameter-matched one.
+        _params_a = [L._as_seed_int(recs_a[s].get('params')) for s in usable]
+        _params_b = [L._as_seed_int(recs_b[s].get('params')) for s in usable]
+        _param_complete = bool(usable) and all(
+            p is not None and p > 0 for p in _params_a + _params_b)
+        if _param_complete:
+            _am, _bm = float(np.mean(_params_a)), float(np.mean(_params_b))
             _rel = abs(_am - _bm) / max(_am, _bm, 1.0)
             res['param_matched'] = bool(_rel <= 0.01)
             res['param_rel_diff'] = float(_rel)
@@ -2148,6 +2152,9 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         else:
             res['param_matched'] = None
             res['param_rel_diff'] = None
+            res['params_unverifiable_seeds'] = [
+                int(s) for s, pa, pb in zip(usable, _params_a, _params_b)
+                if pa is None or pa <= 0 or pb is None or pb <= 0]
         # Every usable PAIR must carry a digest for both arms.  A union over
         # the non-null values would let one missing digest disappear while the
         # remaining 23 records still attest the same init, confirming a
