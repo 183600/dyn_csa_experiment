@@ -1577,6 +1577,25 @@ def _hash_row_block(width, cap):
     return max(1, min(int(cap), _HASH_BLOCK_BYTES // max(1, 8 * int(width))))
 
 
+def _canonical_complex_cell(v):
+    """Canonical identity of a complex scalar (object or NumPy spelling).
+
+    The typed table's ``.tolist()`` yields a Python complex, while an object
+    table may hold ``np.complex64``/``np.complex128`` scalars.  Both spellings
+    are the same (real, imaginary) pair; the parts use the same NaN/Inf/zero
+    canonicalisation as the real path so a missing/overflowed component is one
+    identity and ``-0.0`` matches ``0.0``.
+    """
+    z = complex(v)
+    def _part(x):
+        if math.isnan(x):
+            return ('nan',)
+        if math.isinf(x):
+            return ('inf', 1 if x > 0 else -1)
+        return ('num', 0.0 if x == 0.0 else x)
+    return ('cplx', _part(z.real), _part(z.imag))
+
+
 def _canonical_object_cell(v):
     if v is None:
         # None is the object spelling of a missing numeric cell, the same
@@ -1611,6 +1630,8 @@ def _canonical_object_cell(v):
         if math.isinf(f):
             return ('inf', 1 if f > 0 else -1)
         return ('num', 0.0 if f == 0.0 else f)
+    if isinstance(v, (complex, np.complexfloating)):
+        return _canonical_complex_cell(v)
     try:
         hash(v)
     except TypeError:
@@ -1639,6 +1660,11 @@ def _matrix_fingerprint(X):
     # Fixed-width Unicode/bytes and complex tables use the canonical per-cell
     # identity: float64 conversion would discard a complex imaginary part.
     _obj_canon = arr.dtype.kind in ('U', 'S', 'c')
+    # Native datetime/timedelta tables are temporal metadata.  The float64
+    # fallback below neither identifies NaT nor matches the object-dtype twin
+    # (whose scalar keeps its unit), so they take the same canonical per-cell
+    # path as an object column of np.datetime64/np.timedelta64 scalars.
+    _temporal = arr.dtype.kind in ('M', 'm')
     if arr.dtype == object and arr.size:
         # Object-dtype integer tables must keep the same exactness contract:
         # the float64 fallback collapses 2**53 and 2**53+1.
@@ -1696,6 +1722,15 @@ def _matrix_fingerprint(X):
             _wide_neg = bool((arr < 0).any())
     for start in range(0, arr.shape[0], _step):
         _blk = arr[start:start + _step]
+        if _temporal:
+            h.update(b'OBJ_CANON')
+            # Iterate the native scalars (not .tolist(), which converts a
+            # datetime64 to date/int and would lose the unit identity).
+            for v in _blk.reshape(-1):
+                _s = repr(_canonical_object_cell(v)).encode('utf-8', 'backslashreplace')
+                h.update(len(_s).to_bytes(8, 'little'))
+                h.update(_s)
+            continue
         if _obj_big:
             h.update(b'OBJ_BIG')
             for v in _blk.reshape(-1).tolist():
@@ -1838,6 +1873,8 @@ def _row_keys(X):
                 if math.isinf(f):
                     return ('inf', 1 if f > 0 else -1)
                 return ('num', 0.0 if f == 0.0 else f)
+            if isinstance(v, (complex, np.complexfloating)):
+                return _canonical_complex_cell(v)
             try:
                 hash(v)
             except TypeError:
@@ -1851,6 +1888,17 @@ def _row_keys(X):
         # is width-dependent and the float path discards the imaginary part.
         # Reuse the exact canonical per-cell identity of an object table.
         return _row_keys(src.astype(object))
+    if src.dtype.kind in ('M', 'm'):
+        # Native datetime/timedelta arrays must share the object-dtype twin's
+        # temporal identity (including NaT).  Assign each scalar explicitly:
+        # astype(object) would turn datetime64[D] into datetime.date and
+        # datetime64[ns] into an int, losing both the type and the unit.
+        obj = np.empty(src.shape, dtype=object)
+        src_flat = src.reshape(-1)
+        obj_flat = obj.reshape(-1)
+        for i in range(int(src_flat.size)):
+            obj_flat[i] = src_flat[i]
+        return _row_keys(obj)
     if src.dtype.kind in ('U', 'S'):
         _tag = b'U' if src.dtype.kind == 'U' else b'S'
         _step = _hash_row_block(int(src.shape[1]), 1 << 16)

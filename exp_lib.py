@@ -8475,7 +8475,17 @@ def _ids_narrow(train_ids):
     _hit = _NARROW_MEMO.get(_key)
     if _hit is not None and _hit[0]() is train_ids:
         return _hit[1]
-    _path = getattr(train_ids, 'filename', None)
+    # Only a whole-file memmap may use the shared sidecar.  A slice/view also
+    # exposes `.filename`, but two same-shaped views of one file would then
+    # resolve to the SAME sidecar path and silently serve the first view's
+    # tokens for the second.  `_array_file_path` verifies that the array is the
+    # root memmap's exact layout (full file, offset 0/same data pointer).
+    _path = _array_file_path(train_ids)
+    if _path is not None:
+        try:
+            _path = os.fsdecode(_path)
+        except (TypeError, ValueError):
+            _path = None
     if _path and train_ids.size:
         # A disk-backed corpus is mapped read-only.  Workers share one int32
         # sidecar next to the cache.

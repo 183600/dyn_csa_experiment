@@ -2747,6 +2747,17 @@ def t_ids_narrow_does_not_trust_stale_max_id():
         b = L._ids_narrow(np.load(p2, mmap_mode='r'))
         assert a.dtype == b.dtype == np.int32, (a.dtype, b.dtype)
         assert np.array_equal(np.asarray(a), safe) and np.array_equal(np.asarray(b), safe)
+        # A SLICE of a memmap also exposes `.filename`.  It must not share the
+        # whole-file int32 sidecar: two same-shaped slices would otherwise get
+        # the first slice's tokens (silent corpus corruption).
+        p3 = os.path.join(d, 'train_ids_z.npy')
+        np.save(p3, np.arange(10, dtype=np.int64))
+        mm3 = np.load(p3, mmap_mode='r')
+        left = np.asarray(L._ids_narrow(mm3[0:5]))
+        right = np.asarray(L._ids_narrow(mm3[5:10]))
+        assert left.tolist() == [0, 1, 2, 3, 4], left
+        assert right.tolist() == [5, 6, 7, 8, 9], right
+        assert np.asarray(L._ids_narrow(mm3)).tolist() == list(range(10))
 
 
 def t_batch_contract_check():
@@ -3597,6 +3608,20 @@ def t_baseline_tuning_audit():
     leak['selection_split'] = 'test'
     r3 = L.baseline_tuning_audit(leak, protocol=protocol)
     assert r3['tuning_verified'] is False and any('validation' in p for p in r3['problems']), r3
+    # Tuning selection must not read a record whose own variant/seed fields
+    # disagree with the summary key.  A merged or hand-edited summary could
+    # otherwise select hyperparameters from a different cell while the artifact
+    # records this cell as measured.
+    _ok = {'variant': 'csa_fixed', 'seed': 0, 'ppl': 9.0}
+    assert BT._one_seed_record({'csa_fixed::seed0': _ok}, 'csa_fixed', 0) is _ok
+    assert BT._one_seed_record({'csa_fixed::seed0': dict(_ok, variant='csa_dynamic')},
+                               'csa_fixed', 0) is None
+    assert BT._one_seed_record({'csa_fixed::seed0': dict(_ok, seed=1)},
+                               'csa_fixed', 0) is None
+    # A legacy record may omit the redundant fields; the key then supplies
+    # the identity.
+    _legacy = {'ppl': 9.0}
+    assert BT._one_seed_record({'csa_fixed::seed0': _legacy}, 'csa_fixed', 0) is _legacy
 
 
 
@@ -4554,6 +4579,27 @@ def t_object_byte_tables():
         _obj[:, 0] = _vals
         assert DG.duplicate_mask(_obj).tolist() == [False, True], _vals
         assert len(DG._row_keys(_obj)) == 2 and DG._matrix_fingerprint(_obj), _vals
+    # A NATIVE datetime/timedelta table and its object-dtype twin are the same
+    # logical table.  The native float64/raw-byte paths used to give a
+    # different row key and fingerprint (and NaT was not even identified),
+    # which would hide cross-split duplicates when one cache serialised the
+    # column as datetime64 and another as object.
+    for _unit in ('D', 's', 'ns'):
+        for _is_dt in (True, False):
+            if _is_dt:
+                _vals = [np.datetime64('2020-01-01', _unit),
+                         np.datetime64('NaT', _unit),
+                         np.datetime64('2020-01-02', _unit)]
+            else:
+                _vals = [np.timedelta64(1, _unit), np.timedelta64('NaT', _unit),
+                         np.timedelta64(-2, _unit)]
+            _typed = np.array(_vals, dtype=('datetime64' if _is_dt else 'timedelta64') + f'[{_unit}]').reshape(-1, 1)
+            _obj = np.empty(_typed.shape, dtype=object)
+            _obj[:, 0] = _vals
+            assert DG._row_keys(_typed) == DG._row_keys(_obj), (_unit, _is_dt, 'row keys')
+            assert DG._matrix_fingerprint(_typed) == DG._matrix_fingerprint(_obj), (
+                _unit, _is_dt, 'fingerprint')
+            assert DG.duplicate_mask(_typed).tolist() == [False, False, False], (_unit, _is_dt)
     # A complex value is a (real, imaginary) pair, and the object/fixed-width
     # twins must share one fingerprint.
     _z = np.array([[1 + 2j], [1 + 3j]], dtype='complex128')
@@ -4563,6 +4609,22 @@ def t_object_byte_tables():
     _zo[:, 0] = [1 + 2j, 1 + 3j]
     assert DG._row_keys(_z) == DG._row_keys(_zo)
     assert DG._matrix_fingerprint(_z) == DG._matrix_fingerprint(_zo)
+    # An object column may hold NumPy complex SCALARS rather than Python
+    # complex values; both spellings are the same (real, imaginary) pair.
+    for _dt in ('complex64', 'complex128'):
+        _typed = np.array([1 + 2j, 3 + 4j], dtype=_dt).reshape(-1, 1)
+        _obj = np.empty(_typed.shape, dtype=object)
+        _obj[:, 0] = list(_typed[:, 0])
+        assert DG._row_keys(_typed) == DG._row_keys(_obj), _dt
+        assert DG._matrix_fingerprint(_typed) == DG._matrix_fingerprint(_obj), _dt
+    # A NaN/Inf component must not make the same scalar compare unequal, and
+    # -0.0 is the same component as 0.0.
+    _z0 = np.array([complex(float('nan'), 1.0),
+                    complex(0.0, -0.0)], dtype=complex).reshape(-1, 1)
+    _z1 = np.array([complex(float('nan'), 1.0),
+                    complex(0.0, 0.0)], dtype=complex).reshape(-1, 1)
+    assert DG._row_keys(_z0) == DG._row_keys(_z1)
+    assert DG._matrix_fingerprint(_z0) == DG._matrix_fingerprint(_z1)
 
 
 def t_public_exports_resolve():

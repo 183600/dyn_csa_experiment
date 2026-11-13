@@ -53,9 +53,17 @@ def _trial_cfg(base, outdir, arms, seeds, steps, knobs):
 
 def _one_seed_record(summary, arm, seed):
     rec = summary.get(f'{arm}::seed{int(seed)}')
-    if isinstance(rec, dict) and L.ppl_is_usable(rec.get('ppl')):
-        return rec
-    return None
+    if not (isinstance(rec, dict) and L.ppl_is_usable(rec.get('ppl'))):
+        return None
+    # The summary key names the cell, but a merged/hand-edited record can carry
+    # a different variant or seed.  Selection would then tune an arm on another
+    # cell's PPL while the artifact claims this arm/seed was measured.
+    if rec.get('variant') is not None and str(rec.get('variant')) != str(arm):
+        return None
+    if (rec.get('seed') is not None
+            and L._as_seed_int(rec.get('seed')) != int(seed)):
+        return None
+    return rec
 
 
 def _mean_std(values):
