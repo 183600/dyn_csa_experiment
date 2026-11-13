@@ -4521,11 +4521,8 @@ def t_categorical_and_cache_guards():
 
 
 def t_object_byte_tables():
-    # Object columns can mix Python bytes, bytearray and np.bytes_.  The
-    # fixed-width fast path must normalise each cell's byte CONTENT: a bare
-    # np.asarray(list_of_bytearray, dtype=bytes) treats the mutable container
-    # as a sequence and raises on the mixed table, taking duplicate detection
-    # and the corpus fingerprint down with it.
+    # Object columns may mix Python bytes, bytearray and np.bytes_; the
+    # fixed-width path identifies each cell by its byte content.
     import data_guard as DG
     vals = [b'a', bytearray(b'b'), np.bytes_(b'c')]
     arr = np.empty((len(vals), 1), dtype=object)
@@ -4557,9 +4554,8 @@ def t_object_byte_tables():
         _obj[:, 0] = _vals
         assert DG.duplicate_mask(_obj).tolist() == [False, True], _vals
         assert len(DG._row_keys(_obj)) == 2 and DG._matrix_fingerprint(_obj), _vals
-    # A complex value is a (real, imaginary) pair.  The float64 fallback used
-    # to discard the imaginary part, so 1+2j and 1+3j shared one fingerprint;
-    # the object/fixed-width twins must also agree.
+    # A complex value is a (real, imaginary) pair, and the object/fixed-width
+    # twins must share one fingerprint.
     _z = np.array([[1 + 2j], [1 + 3j]], dtype='complex128')
     assert DG._matrix_fingerprint(_z[:1]) != DG._matrix_fingerprint(_z[1:])
     assert DG.duplicate_mask(_z).tolist() == [False, False]
