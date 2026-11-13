@@ -452,9 +452,8 @@ def _safe_exp_ppl(x):
     try:
         x = float(x)
     except OverflowError:
-        # A finite Python integer/Decimal outside the binary64 range still has
-        # a well-defined exp limit: +inf (or underflow to 0 for a huge negative
-        # exponent), not "no value".
+        # A finite Python integer/Decimal outside the binary64 range has a
+        # well-defined exp limit: +inf, or 0.0 for a huge negative exponent.
         try:
             return float('inf') if x > 0 else 0.0
         except Exception:
@@ -842,13 +841,12 @@ def cosine_similarity_consecutive(H, eps=1e-08):
     # the whole sequence fits in one chunk.
     if H.dim() < 2:
         if H.dim() == 0:
-            # A scalar is not a sequence; return the same empty result the
-            # length-0/1 sequence branches produce rather than indexing 0-D.
+            # A scalar has no consecutive pairs; it yields the same empty
+            # result as the length-0/1 sequence branches.
             return H.new_empty((0,))
         # A 1-D tensor is a sequence of scalar features; each scalar is its
         # own feature row, so unsqueeze before normalising.  The consecutive
-        # similarities are the elementwise products: reducing over the time
-        # axis here would return one scalar instead of T-1 values.
+        # similarities are the elementwise products along the time axis.
         h = F.normalize(H.unsqueeze(-1), dim=-1, eps=eps).squeeze(-1)
         return h[1:] * h[:-1]
     T = int(H.shape[-2])
@@ -17624,8 +17622,7 @@ def _safe_path_component(value):
     # Dot segments are path syntax even though every character is allowed;
     # treat them like any other sanitised value so the component can never be
     # '.', '..' or an empty segment on its own.  The empty spelling also needs
-    # the digest: otherwise '' (returned as '_') would collide with the
-    # ordinary value '_' and two variants would share one checkpoint path.
+    # the digest so that distinct raw values keep distinct checkpoint paths.
     if s != raw or s in ('.', '..') or not s:
         s = f'{s}-{hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:12]}'
     return s or '_'

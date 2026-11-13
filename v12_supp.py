@@ -717,9 +717,8 @@ def _frozen_train_fp(manifest):
                     f'[v12] REFUSE: {label} is an empty training-corpus '
                     'fingerprint — an empty/absent identity cannot bind a corpus')
             return value
-        # Collect EVERY declared literal first: two different non-null aliases
-        # in one object cannot both bind the corpus, so returning the first
-        # one would silently pick a frozen identity.
+        # Collect every declared literal first: two different non-null aliases
+        # in one object cannot both bind the corpus.
         _found = []
         for _sub in ('canonical_train_fp', 'train_fp', 'value'):
             if _sub not in value:
@@ -739,9 +738,8 @@ def _frozen_train_fp(manifest):
                 f'fingerprints ({", ".join(f"{_n}={_v!r}" for _n, _v in _found)}) '
                 '— an ambiguous binding cannot identify the frozen corpus')
         # Declared geometry fields are part of the binding, so validate them
-        # here rather than at P5T.  This check must run even when a literal
-        # fingerprint is present, otherwise a malformed seq_len/token count
-        # would be silently ignored.
+        # here rather than at P5T, including when a literal fingerprint is
+        # present.
         for _cnt, _minimum in (('seq_len', 2), ('n_train_tokens', 1)):
             if _cnt not in value or value[_cnt] is None:
                 continue

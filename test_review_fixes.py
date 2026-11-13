@@ -7921,8 +7921,7 @@ def t_identity_fingerprint_and_pairing_regressions():
     assert L.classify_training_health(_hist)['status'] == 'underfitting_or_stalled'
     assert L.classify_training_health(_hist, gap_tol=0.2)['status'] == 'overfitting'
     # Consecutive cosine similarity over a 1-D (scalar-feature) sequence keeps
-    # the time axis: T-1 values, not one scalar.  Short/scalar inputs are
-    # empty rather than an indexing error.
+    # the time axis with T-1 values; short/scalar inputs yield an empty result.
     _c1 = L.cosine_similarity_consecutive(torch.tensor([1.0, -2.0, 3.0]))
     assert _c1.shape == (2,) and torch.equal(_c1, torch.tensor([-1.0, -1.0])), _c1
     assert L.cosine_similarity_consecutive(torch.tensor([2.0])).shape == (0,)
