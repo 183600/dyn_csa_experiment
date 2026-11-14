@@ -7820,6 +7820,15 @@ def t_categorical_encoder_train_only():
     assert np.array_equal(bundle['train'], x_train), bundle
     assert np.array_equal(bundle['val'], x_hold), bundle
     assert bundle['encoder'].get_stats() == stats, bundle
+    # The training fingerprint follows the same numeric identity as the
+    # learned category space: an int cell and its exactly-equal float spelling
+    # are one level, so they must not produce two different corpus digests.
+    from data_guard import _categorical_fingerprint
+    _ints = np.array([[0], [1], [2]], dtype=object)
+    _floats = np.array([[0.0], [-0.0], [2.0]], dtype=object)
+    _ints[1, 0] = 1
+    _floats[1, 0] = 1.0
+    assert _categorical_fingerprint(_ints) == _categorical_fingerprint(_floats)
     onehot = L.LeakageSafeCategoricalEncoder(encoding='onehot').fit(train)
     oh_hold = onehot.transform(holdout)
     assert oh_hold.shape == (3, 4 + 3), oh_hold.shape
@@ -8737,6 +8746,27 @@ def t_key_identity_and_sequence_edges():
         assert DG._row_keys(np.array([_i], dtype=np.int64)) == \
             DG._row_keys(np.array([_f], dtype=np.float64)), (_i, _f)
         assert DG.duplicate_mask(np.array([_i, _f], dtype=np.float64)).tolist() == [False, True]
+    # Composite numeric identities follow the scalar contract: Python says
+    # 1 == 1.0, so a list/dict group id must not split them (a leakage check
+    # that grouped one split by [1] and another by [1.0] would miss the same
+    # group).  Booleans stay a distinct identity, and integers above 2**53
+    # stay distinct from the rounded float that happens to share their bits.
+    assert DG._group_key([1]) == DG._group_key([1.0])
+    assert DG._group_key({'k': 1}) == DG._group_key({'k': 1.0})
+    assert DG._group_key([-0.0]) == DG._group_key([0])
+    assert DG._group_key([1]) != DG._group_key([True])
+    assert DG._group_key([2 ** 53]) == DG._group_key([float(2 ** 53)])
+    assert DG._group_key([2 ** 53 + 1]) != DG._group_key([float(2 ** 53 + 1)])
+    # The same identity must drive the leakage gate: a group spelled [1] in
+    # train and [1.0] in validation is ONE group, not two.
+    _g = np.empty(3, dtype=object)
+    _g[0], _g[1], _g[2] = [1], [1.0], [2]
+    try:
+        DG.assert_no_split_leakage([0], [1], [2], groups=_g)
+    except ValueError as _e:
+        assert 'share group ids' in str(_e), _e
+    else:
+        raise AssertionError('list group [1] and [1.0] were treated as different groups across splits')
     # A private unhashable key cannot collide with a real tuple spelling.
     _list = ['a']
     _twin = ('__unhashable__', 'list', "['a']")

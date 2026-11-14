@@ -144,14 +144,22 @@ def _unhashable_identity(value):
             return ('nat',)
         return _temporal_identity(value)
     if isinstance(value, (int, np.integer)):
-        return ('int', int(value))
+        # Python's scalar group contract treats 1 and 1.0 as the same group
+        # (their hashes/equality agree).  Use one numeric tag for both and
+        # canonicalise every integral float to its exact integer spelling, so
+        # a list/dict group id cannot split [1] from [1.0].  A float above
+        # 2**53 already denotes a specific integer; int(f) is that exact
+        # value, while 2**53 + 1 stays distinct from float(2**53 + 1).
+        return ('num', int(value))
     if isinstance(value, (float, np.floating)):
         f = float(value)
         if math.isnan(f):
             return ('nan',)
         if math.isinf(f):
             return ('inf', 1 if f > 0 else -1)
-        return ('float', 0.0 if f == 0.0 else f)
+        if f.is_integer():
+            return ('num', int(f))
+        return ('num', f)
     if isinstance(value, (complex, np.complexfloating)):
         # Canonicalise signed zero and missing/overflowed components exactly
         # like the row-key/fingerprint paths, so a composite group id does not
@@ -1321,7 +1329,13 @@ def _categorical_fingerprint(X):
     arr = np.asarray(X, dtype=object)
     h.update(str(arr.shape).encode('ascii'))
     for row in arr.tolist():
-        h.update(repr(row).encode('utf-8', errors='replace'))
+        # The encoder's category identity treats numerically equal cells as
+        # one level (`_hashable_label(1) == _hashable_label(1.0)`), so the
+        # training fingerprint must not split the same table merely because
+        # one serialisation spells an integer as a float.  Canonicalise each
+        # cell exactly like the row/fingerprint contract.
+        h.update(repr(tuple(_canonical_object_cell(v) for v in row))
+                 .encode('utf-8', errors='replace'))
         h.update(b'\x1f')
     return h.hexdigest()[:16]
 
