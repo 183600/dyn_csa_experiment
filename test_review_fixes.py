@@ -9674,6 +9674,36 @@ def t_review9_kernel_ref_zero_block_rows():
     assert torch.equal(got, ref), 'kernel ref indexed an empty block table'
 
 
+def t_kernel_zero_block_soft_backward_shape():
+    import csa_kernels as CK
+    torch.manual_seed(3)
+    R, T, nh, hd, w = 2, 5, 2, 3, 2
+    q = torch.randn(R, T, nh, hd)
+    k_sw = torch.randn(R, T, nh, hd)
+    v_sw = torch.randn_like(k_sw)
+    k_blk = torch.empty(R, 0, nh, hd)
+    v_blk = torch.empty_like(k_blk)
+    last = torch.empty(R, 0, dtype=torch.long)
+    want = CK._attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw,
+                            torch.empty(R, T, 0, dtype=torch.int32), None,
+                            last, None, None, w, 0.5)
+    qg = q.clone().requires_grad_(True)
+    kg = k_sw.clone().requires_grad_(True)
+    vg = v_sw.clone().requires_grad_(True)
+    soft = torch.rand(R, T, 2, requires_grad=True)
+    got = CK.gathered_attention_kernel(
+        qg, k_blk, v_blk, torch.zeros(R, T, 2, dtype=torch.int32), last,
+        kg, vg, w, 0.5, soft=soft,
+        sel_valid=torch.ones(R, T, 2, dtype=torch.bool), impl='ref')
+    assert torch.equal(got.detach(), want), \
+        'kernel wrapper changed the window-only result with an empty block table'
+    got.sum().backward()
+    assert soft.grad is not None and tuple(soft.grad.shape) == tuple(soft.shape), \
+        'empty-block soft lanes must receive a full-width zero gradient'
+    assert not bool(soft.grad.any()), \
+        'dropped block lanes cannot depend on the soft prior'
+
+
 def t_review9_adaptive_threshold_nan_prefix_is_causal():
     x = torch.tensor([[1., 2., float('nan'), 3., 4., 5., 6., 7.,
                        float('inf'), 9., 10., 11.]])
@@ -9790,6 +9820,54 @@ def t_round10_prefix_reference_honours_use_overlap():
             Xa, Xb, Za, Zb, bid, Ba, Bb, (3 if use_ov else None),
             use_overlap=use_ov)
         assert torch.allclose(got, ref, atol=1e-6), (use_ov, (got - ref).abs().max())
+
+
+def t_round12_signal_to_noise_exact_zero():
+    # A zero-variance contrast with a tiny but nonzero mean is infinite
+    # signal-to-noise, not "no effect"; the old absolute 1e-12 floor made the
+    # reported ratio depend on the effect unit.
+    fp = ('steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_'
+          'dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX')
+    for _eps in (1e-10, 1e-13, 1e-15):
+        _s = {}
+        for _i in range(6):
+            _s[f'a::seed{_i}'] = dict(variant='a', seed=_i, run_cfg=fp, steps=1,
+                                      tokens_seen=1, params=100, ppl=1.0 + _eps)
+            _s[f'b::seed{_i}'] = dict(variant='b', seed=_i, run_cfg=fp, steps=1,
+                                      tokens_seen=1, params=100, ppl=1.0)
+        _r = L.methodology_audit(_s, design={'c': [('a', 'b', 'test')]},
+                                 baselines={}, verbose=False)
+        _e = _r['components']['c'][0]
+        assert _e['mean'] != 0.0 and _e['std'] == 0.0, (_eps, _e['mean'], _e['std'])
+        assert _e['signal_to_noise'] == float('inf'), (_eps, _e['signal_to_noise'])
+    # The exactly-zero contrast still reports no signal (not inf).
+    _s = {}
+    for _i in range(6):
+        _s[f'a::seed{_i}'] = dict(variant='a', seed=_i, run_cfg=fp, steps=1,
+                                  tokens_seen=1, params=100, ppl=1.0)
+        _s[f'b::seed{_i}'] = dict(variant='b', seed=_i, run_cfg=fp, steps=1,
+                                  tokens_seen=1, params=100, ppl=1.0)
+    _r = L.methodology_audit(_s, design={'c': [('a', 'b', 'test')]},
+                             baselines={}, verbose=False)
+    assert _r['components']['c'][0]['signal_to_noise'] == 0.0
+
+
+def t_round12_power_enumeration_scale_invariance():
+    # A pure change of effect unit must not change the pre-access power
+    # simulation: the exact enumeration uses fixed |d_i|, so the confirming
+    # pattern set and every q-model probability are scale-free.  A tiny panel
+    # must not have its whole tail swallowed by an absolute tie slack, and a
+    # huge one must not overflow the null sums.
+    rng = np.random.default_rng(12)
+    d = rng.normal(size=8) * 0.1
+    base = V12._power_enumeration(list(d), 'positive', 0.05, 4)
+    assert base['status'] == 'ok'
+    for _c in (1e-200, 1e-15, 1e-12, 1e-6, 1e6, 1e12, 1e200):
+        got = V12._power_enumeration([float(x) * _c for x in d], 'positive', 0.05, 4)
+        assert got['status'] == 'ok', (_c, got)
+        assert got['power_holm_conservative'] == base['power_holm_conservative'], (_c, got)
+        assert got['fraction_patterns_confirming_holm'] == base['fraction_patterns_confirming_holm'], _c
+        assert got['min_same_sign_for_holm_confirmation'] == base['min_same_sign_for_holm_confirmation'], _c
 
 
 def t_round10_power_artifact_requires_exact_counts():
@@ -10223,6 +10301,7 @@ def main():
     _check('N11 sink softmax broadcasts 1-D/2-D/non-head sinks', t_review9_sink_softmax_broadcasts_shapes)
     _check('N12 zero block rows + non-empty top-k stays window-only', t_review9_gathered_attention_zero_block_rows)
     _check('N12b kernel reference zero block rows + non-empty top-k', t_review9_kernel_ref_zero_block_rows)
+    _check('N12c kernel zero block rows + soft prior keeps gradient shape', t_kernel_zero_block_soft_backward_shape)
     _check('N13 adaptive threshold is causal with a NaN prefix', t_review9_adaptive_threshold_nan_prefix_is_causal)
     _check('N14 batch_iter accepts exactly one causal window', t_review9_batch_iter_accepts_one_window)
     _check('N15 host pooling geometry refuses int32 overflow', t_review9_pool_geometry_int32_guard)
@@ -10232,6 +10311,8 @@ def main():
     _check('N19 power artifact / confirmatory geometry require exact counts', t_round10_power_artifact_requires_exact_counts)
     _check('N20 effect-unit rescaling keeps p/trend/meta summaries invariant', t_round11_effect_scale_invariance)
     _check('N20b saddlepoint + TOST margin stay scale-invariant', t_round11b_saddlepoint_and_tost_scale)
+    _check('N20c power enumeration stays scale-invariant', t_round12_power_enumeration_scale_invariance)
+    _check('N20d signal-to-noise treats only exact zero as no effect', t_round12_signal_to_noise_exact_zero)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

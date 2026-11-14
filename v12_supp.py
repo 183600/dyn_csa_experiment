@@ -1593,6 +1593,18 @@ def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
     mags = [abs(float(x)) for x in deltas]
     if n == 0 or all(mm == 0.0 for mm in mags):
         return {'n': n, 'status': 'no_data'}
+    # The enumeration and its tie tolerance are invariant under a common
+    # positive rescaling of the magnitudes, and the power/fraction fields must
+    # be too.  Normalise by an exact power of two before building the null
+    # sums: without it the absolute `_tol` floor below swallows every effect
+    # for a tiny panel (all p become 1, power 0) and the sums overflow for a
+    # huge one.  A power-of-two rescale leaves the sign-pattern ordering and
+    # every reported probability unchanged.
+    _amax = max(mags)
+    if math.isfinite(_amax):
+        _, _e = math.frexp(_amax)
+        if _e:
+            mags = [math.ldexp(mm, -_e) for mm in mags]
     if n > 16:
         return {'n': n, 'status': 'too_many_seeds_for_enumeration',
                 'note': 'n>16: enumeration skipped (2^n patterns); use the symbol-test projection table instead'}

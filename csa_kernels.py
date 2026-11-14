@@ -1498,6 +1498,16 @@ def gathered_attention_kernel(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w
     # 直通 S 路径只会把 A 路径的梯度复制一份（双倍）。宽度 0 === 无先验。
     if soft is not None and int(getattr(soft, 'shape', ())[-1]) == 0:
         soft = None
+    # 空块表（Bm=0）时块泳道不可能有效：与前向/反向参考实现一致，先丢弃
+    # 这些泳道。必须在这里切片（而不是只在 _attn_*_ref 内部截断），否则
+    # autograd 会把内部截断后的 zero-width dsoft 返回给调用方的全宽 soft，
+    # 形状不匹配直接报错；经由切片节点回传则会自动把被丢弃泳道的梯度补零。
+    if int(k_blk.shape[1]) == 0 and int(topk_idx.shape[-1]) > 0:
+        topk_idx = topk_idx[..., :0]
+        if sel_valid is not None:
+            sel_valid = sel_valid[..., :0]
+        if soft is not None:
+            soft = soft[..., :0]
     return FusedSparseAttention.apply(impl, q, k_blk, v_blk, k_sw, v_sw, topk_idx,
                                       sel_valid, last_tok, soft, sink_logits, int(w), float(scale))
 

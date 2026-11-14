@@ -15227,7 +15227,10 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                         _rel_std = (100.0 * float(st['std']) / _b_mean) if _b_mean > 0 else float('nan')
                         if float(st['std']) > 0:
                             _noise_ratio = abs(float(st['mean'])) / float(st['std'])
-                        elif abs(float(st['mean'])) <= 1e-12:
+                        elif float(st['mean']) == 0.0:
+                            # Exact zero only: an absolute 1e-12 cutoff would
+                            # report a tiny-but-consistent effect as no signal
+                            # (scale-dependent verdict).
                             _noise_ratio = 0.0
                         else:
                             _noise_ratio = float('inf')
