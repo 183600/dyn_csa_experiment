@@ -4531,8 +4531,8 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
         # exactly, so a no-grad/forward-only pass can skip it without changing
         # any output value (the same argument the closed path uses).  The
         # requires_grad guard mirrors gathered_attention: building the dead
-        # straight-through subgraph when no input needs grad only wastes
-        # memory (forward values are identical either way).
+        # straight-through subgraph when no input needs grad is unnecessary
+        # (forward values are identical either way).
         _soft_live = (soft is not None and torch.is_grad_enabled() and any(
             _t is not None and getattr(_t, 'requires_grad', False)
             for _t in (soft, q, k_blk, v_blk, k_sw, v_sw, sink_logits)))
@@ -11574,9 +11574,8 @@ def student_t_two_sided_p(t, df):
         # valid (infinite-magnitude) statistic: fail closed to p=0, not NaN.
         _t = float('inf')
     except (TypeError, ValueError):
-        # A string/None/object is malformed evidence.  Mapping it to +inf
-        # (the previous behaviour) silently produced the strongest possible
-        # p=0.
+        # A string/None/object is malformed evidence, not an infinite
+        # statistic: refuse it rather than returning the strongest p=0.
         return float('nan')
     # Keep df as an exact integer; converting it to float can overflow even
     # though _student_t_sf can handle it exactly.

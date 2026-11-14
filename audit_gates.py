@@ -2374,10 +2374,8 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
                 _tok_vals_set.add(_si * _bi * _qi)
             else:
                 # No measured token count and no derivable geometry for THIS
-                # record.  Silently skipping it made the audit depend on JSON
-                # order: when the first record happened to be complete the
-                # panel reported "ok" while a later unauditable record was
-                # ignored; reversing the key order reported "fail".
+                # record: count it as missing so the panel cannot report "ok"
+                # over an unauditable record.
                 _tok_missing += 1
         _tok_vals = sorted(_tok_vals_set)
         _param_vals = sorted({_p for _r, _p in _valid})

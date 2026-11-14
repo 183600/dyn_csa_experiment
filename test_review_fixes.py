@@ -11038,9 +11038,9 @@ def t_round19_composite_identity_and_checkpoint_geometry():
 
 
 def t_round19b_ngram_public_entry_points_reject_float_ids():
-    # The count-table helper rejects float ids, but the public entry points
-    # used to cast them to int64 first (1.9 -> 1), silently remapping a
-    # different token.  The guard must be reachable from the public APIs.
+    # The count-table helper rejects float ids, so the public entry points
+    # must reject them too instead of casting to int64 (which would remap
+    # 1.9 -> 1).  The guard must be reachable from the public APIs.
     import exp_lib as L
     for _bad_train in ([1.0, 2.0], np.array([1.0, 2.0]),
                        np.array([[1.0, 2.0]])):

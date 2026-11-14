@@ -107,7 +107,7 @@ class _UnhashableKey:
         # Use the same value identity the scalar `_group_key` contract uses
         # INSIDE composite containers: -0.0 == 0.0, NaNs are one missing
         # value, mappings ignore insertion order.  Serialising the raw object
-        # with json/repr made [0.0] and [-0.0] (or {'x': 0.0} and
+        # with json/repr would make [0.0] and [-0.0] (or {'x': 0.0} and
         # {'x': -0.0}) different groups, so the same group could be split
         # across train/test without the leakage check firing.
         try:
