@@ -1492,8 +1492,8 @@ def t_finaltest_decision_rule_matches_frozen_manifest():
     # complete pairs.  `coverage_ok` is reported but NOT required, and the
     # init-core digests are reported instrumentation, never decision inputs.
     # A stricter gate (param_matched is True / same_init_core_fp is True /
-    # coverage_ok) is post-freeze drift: it can only fail to confirm what the
-    # pre-registered rule confirms.
+    # coverage_ok) would exceed the frozen rule and can only fail to confirm
+    # what the pre-registered rule confirms.
     with tempfile.TemporaryDirectory() as td:
         seeds = list(range(12))
         manifest = {
@@ -1653,7 +1653,7 @@ def t_review5_js_gate_and_floor_denominator():
                                   max_scan_tokens=64, sample_rows=1, strict=False)
     assert not any('JS divergence' in x for x in rep_ok['hard_failures']), rep_ok
     assert rep_ok['status'] != 'fail', rep_ok
-    # An unreachable threshold is refused as a gate defect, not silently kept.
+    # An unreachable threshold is refused, not silently kept.
     for bad in ({'shift_fail': 1.5}, {'shift_fail': 0.1, 'shift_warn': 0.2}):
         try:
             L.audit_corpus_split(tr, va_same, 200, dataset='js-gate-test',
@@ -1799,13 +1799,13 @@ def t_review5_power_enumeration():
     assert res_nd['status'] == 'ok' and res_nd['min_same_sign_for_holm_confirmation'] is None, res_nd
     # A non-directional comparison still has a defined power: the rejecting
     # set is symmetric under a global sign flip, so either true direction
-    # gives the same number.  Reporting all zeros made every such comparison
-    # look underpowered.
+    # gives the same number.  All-zero output would label every such
+    # comparison underpowered.
     res_nd10 = V12._power_enumeration([1.0] * 10, None, 0.05, 4)
     assert res_nd10['power_holm_conservative']['q=0.95'] > 0.5, res_nd10
     # n=16 is the documented enumeration ceiling.  The null-tail lookup must
-    # be logarithmic; the old linear scan made this O(4**n) and effectively
-    # hung at the ceiling (seed panels are expected to grow).
+    # be logarithmic; a linear scan is O(4**n) and hangs at the ceiling (seed
+    # panels are expected to grow).
     _res16 = V12._power_enumeration([1.0] * 16, 'positive', 0.05, 4)
     assert _res16['status'] == 'ok' and _res16['power_holm_conservative']['q=0.95'] > 0.0, _res16
     # direction-aware: the all-opposite pattern (0 same-sign) rejects the
@@ -3628,8 +3628,8 @@ def t_audit_sidecar_fp_matches_exp_lib():
     assert A._sidecar_fp(hi2) == L._ids_fp(hi2)
     assert A._sidecar_fp(hi) != A._sidecar_fp(hi2)
     # A non-C-contiguous view (transpose/slice/negative stride) is the same
-    # logical token array.  The audit must hash it exactly like exp_lib; a
-    # dtype-canonicalising branch used to skip the layout normalisation.
+    # logical token array.  The audit must hash it exactly like exp_lib, and
+    # dtype-canonicalising branches must normalise the layout too.
     _base = np.arange(6 * 7, dtype=np.int64).reshape(6, 7)
     for _dt in (np.int8, np.uint16, np.int32):
         _b = (_base % 100).astype(_dt)

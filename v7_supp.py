@@ -557,11 +557,10 @@ class HybridAttentionRoPE(L.HybridAttention):
             # rope csa/hca layer ALWAYS runs the per-row eager `_single_rope`
             # loop.  Running it silently under a kernel-enabled process would
             # stamp eager numbers with the `-tk1:<backend>` suffix (a false
-            # "kernel vs eager" pairing) — the exact silent-mixing defect the
-            # exp_lib dispatch refuses for non-rope layers.  Refuse loudly
-            # instead; unset CSA_KERNEL for RoPE arms (the frozen v12 plan is
-            # eager-only and refuses CSA_KERNEL globally, and the m0/B-tier
-            # arms are non-rope, so no current driver legitimately hits this).
+            # "kernel vs eager" pairing).  Refuse loudly instead; unset
+            # CSA_KERNEL for RoPE arms (the frozen v12 plan is eager-only and
+            # refuses CSA_KERNEL globally, and the m0/B-tier arms are non-rope,
+            # so no current driver legitimately hits this).
             if L._CK is not None and self.cfg.kind in ('csa', 'hca'):
                 try:
                     _rope_kernel_on = L._CK.kernel_enabled()
@@ -2651,7 +2650,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
                f'_det{L.determinism_label()}_trfp{_train_fp}')
     # A proper arm-independent run fingerprint for `pair_reason`: the p1l recipe
     # above intentionally carries the per-arm `mr`, so using it as `run_cfg`
-    # made every frozen pair fail the "different run_cfg" check.
+    # would make every frozen pair fail the "different run_cfg" check.
     _run_cfg = L._run_fp({'steps': steps, 'seq_len': train_len, 'batch_size': batch_size,
                           'n_train_tokens': 8000000, 'lr': 0.0003, 'weight_decay': 0.1,
                           'warmup': 50, 'comp_lambda': 0.05, 'delta_lr_mult': 10.0,

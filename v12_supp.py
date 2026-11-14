@@ -1615,8 +1615,8 @@ def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
         stat = abs(_signed)
         # exact p: #null sums >= observed statistic (ties included, as in the
         # exact test's "at least as extreme" rule).  _sums is sorted, so use
-        # binary search: the previous linear scan made this O(4**n) and would
-        # hang long before the advertised n<=16 ceiling (2**16 patterns).
+        # binary search; a linear scan would be O(4**n) and hang long before
+        # the advertised n<=16 ceiling (2**16 patterns).
         _p = (len(_sums) - _bisect.bisect_left(_sums, stat - _tol)) / _total
         # A two-sided rejection is only a CONFIRMATION when the observed
         # direction also matches the pre-registered sign (decision_rule's
@@ -2917,18 +2917,14 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                           'same_init_core_fp': stats['comparisons'].get(k, {}).get('same_init_core_fp'),
                                           'init_core_fp_recorded': stats['comparisons'].get(k, {}).get('init_core_fp_recorded')}
                                       for k in _rej if k not in _conf}
-    # DISCLOSURE: the implemented decision rule is STRICTER than the manifest
-    # The implemented rule is EXACTLY the manifest decision_rule (v3/v4
-    # wording, unchanged): "p_holm < alpha AND direction matches AND
+    # DISCLOSURE: the implemented rule is EXACTLY the manifest decision_rule
+    # (v3/v4 wording): "p_holm < alpha AND direction matches AND
     # param_matched is not false AND >= min_seeds_for_confirmation complete
     # pairs".  `param_matched is not false` means True or the unverifiable
     # None both pass — only a measured >1% mismatch blocks — and the
     # init-core digests are reported instrumentation, never decision inputs.
-    # An earlier implementation was silently stricter (param_matched is True
-    # + init-digest gates + a coverage_ok veto in the report fallback); that
-    # drift was reverted so the confirmatory label means exactly what the
-    # pre-registration says.  The disclosure block stays so any future
-    # divergence is visible next to every 'confirmed' list.
+    # The disclosure block keeps any future divergence visible next to every
+    # 'confirmed' list.
     stats['decision_rule_applied'] = {
         'manifest_rule': (manifest.get('statistics') or {}).get('decision_rule'),
         'implementation_gates': ['p_holm < alpha (strict <)', 'direction_ok is True',

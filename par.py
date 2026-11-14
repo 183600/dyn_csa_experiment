@@ -403,15 +403,10 @@ def _job_watchdog_seconds(job, ctx):
 def _note_watchdog_kill(job, elapsed_seconds):
     """Feed a watchdog kill back into the TimeGuard (booking + calibration).
 
-    A killed cell never calls record_run, so without this hook (a) the pace
-    calibration (and the watchdog bound derived from it) stays too low and
-    the same healthy cell is killed at the same wall-clock point on every
-    resume, and (b) the REAL wall-clock the killed cell consumed never enters
-    the budget ledger — reconcile() refunds the full estimate, so repeated
-    kill-and-retry systematically UNDERSTATES spent GPU hours.  The fix books
-    the actual elapsed seconds with steps_done=0 (booked_untracked, pace
-    calibration untouched) and separately feeds the calibration note.
-    Mirrors the estimate parameters of _job_watchdog_seconds."""
+    A killed cell never calls record_run.  Book its actual elapsed seconds
+    with steps_done=0 (booked_untracked, leaving pace calibration untouched)
+    and separately feed the calibration note.  Mirrors the estimate parameters
+    of _job_watchdog_seconds."""
     try:
         import exp_lib as _L
         cap = (job or {}).get("guard_cap")

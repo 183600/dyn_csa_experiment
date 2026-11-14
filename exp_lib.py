@@ -8311,8 +8311,8 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
     # Training-only reference distribution; the holdout never defines it.
     if tr.size and va.size:
         # The gate operates on the NORMALIZED JS divergence (js/ln2 in [0, 1]).
-        # A threshold above the reachable range is a gate that can never fire;
-        # validate it here so the dead-threshold defect cannot regress.
+        # A threshold above the reachable range is a gate that can never fire,
+        # so reject it here.
         try:
             _sw = float(shift_warn)
             _sf = float(shift_fail)
@@ -20349,15 +20349,11 @@ class TimeGuard:
     def note_watchdog_kill(self, elapsed_seconds, steps, d=256, n_layers=6, seq_len=512, batch_size=12, variant=None):
         """Lift the calibrated per-step floor after a dispatcher-watchdog kill
         (par.py).  A cell killed at `elapsed_seconds` demonstrably needs MORE
-        than that for `steps` steps, so its true sps exceeds
-        elapsed/steps — yet a killed cell never records a run, so without
-        this hook the calibration (and hence the watchdog bound
-        max(3*est, est+1h) derived from it) would stay wrong and the same
-        healthy cell would be killed at the same wall-clock point on every
-        resume (uncalibrated hardware, CPU workers).  Lifting the floor
-        to the kill time itself makes the next bound ~3.45x larger, so the
-        retry window grows geometrically until a healthy cell fits; a truly
-        hung cell is still killed on every attempt, just later."""
+        than that for `steps` steps, so its true sps exceeds elapsed/steps.
+        Lifting the floor to the kill time itself makes the next bound ~3.45x
+        larger, so the retry window grows geometrically until a healthy cell
+        fits; a truly hung cell is still killed on every attempt, just
+        later."""
         if not steps or int(steps) <= 0 or not float(elapsed_seconds) > 0:
             return
         floor = float(elapsed_seconds) / int(steps)
