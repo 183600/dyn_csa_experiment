@@ -89,10 +89,22 @@ def _hydrate_curve_sidecars(outdir, obj):
         try:
             with open(_path, encoding='utf-8') as _f:
                 _data = json.load(_f)
-        except Exception:
+        except FileNotFoundError:
+            # A missing optional sidecar is not corrupt evidence: the record
+            # simply has no hydrated curve (the caller may still have an
+            # inline history or an explicit reference).
             continue
-        if isinstance(_data, dict) and isinstance(_data.get('ppl_history'), list):
-            _r['ppl_history'] = _data['ppl_history']
+        except Exception as _e:
+            raise RuntimeError(
+                f'{_path} exists but cannot be parsed '
+                f'({type(_e).__name__}: {_e}); refusing to build a report over '
+                'a corrupt curve sidecar — repair or remove the file') from _e
+        if not isinstance(_data, dict) or not isinstance(_data.get('ppl_history'), list):
+            raise RuntimeError(
+                f'{_path} does not hold a {{"ppl_history": [...]}} object '
+                f'({type(_data).__name__}); refusing to build a report over '
+                'corrupt curve evidence — repair or remove the file')
+        _r['ppl_history'] = _data['ppl_history']
     return obj
 
 def summary(outdir):
@@ -1093,11 +1105,14 @@ def sec_p0e():
         if len(_cur_items) < len(_raw_items):
             print(f'[report] sec_p0e: {len(_raw_items) - len(_cur_items)} measurable trajectory record(s) predate the current code semantics — excluded from the trajectory and conclusions')
         _raw_items = _cur_items
-    _s_items = _prefer_one_cfg(_raw_items, lambda kv: (kv[1].get('variant'), kv[1].get('run_cfg')), who='sec_p0e')
+    _s_items = _prefer_one_cfg(
+        _raw_items,
+        lambda kv: (_record_variant(kv[1], kv[0]), kv[1].get('run_cfg')),
+        who='sec_p0e')
     trajs = collections.defaultdict(lambda: collections.defaultdict(dict))
     _dropped_pts = 0
     for _k, r in _s_items:
-        if not isinstance(r, dict) or 'variant' not in r:
+        if not isinstance(r, dict):
             continue
         if not _measurable(r):
             continue
@@ -1115,7 +1130,7 @@ def sec_p0e():
                 continue
             _cell = trajs[_vname][int(step)]
             if _sdv in _cell:
-                print(f"[report] sec_p0e: ambiguous (variant, step, seed) = ({r['variant']!r}, {int(step)}, {_sdv}): two measurable points found; keeping the FIRST")
+                print(f"[report] sec_p0e: ambiguous (variant, step, seed) = ({_vname!r}, {int(step)}, {_sdv}): two measurable points found; keeping the FIRST")
                 continue
             _cell[_sdv] = float(pv)
     if _dropped_pts:
@@ -1141,8 +1156,9 @@ def sec_p0e():
             for _k, r in _s_items:
                 if isinstance(r, dict):
                     _sd_rec = _int_or(r.get('seed'), None)
-                    if _sd_rec is not None:
-                        _rec_of.setdefault((r.get('variant'), _sd_rec), r)
+                    _v_rec = _record_variant(r, _k)
+                    if _sd_rec is not None and _v_rec is not None:
+                        _rec_of.setdefault((_v_rec, _sd_rec), r)
             _paired = []
             _pair_gated = []
             for _sd in _paired_raw:

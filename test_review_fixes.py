@@ -10798,6 +10798,160 @@ def t_round17_report_keeps_key_only_variant():
     assert 'csa_fixed' in txt and 'PPL@4096' in txt and '20.0' in txt, txt[:800]
 
 
+def t_round18_fail_closed_edge_cases():
+    # A float cache with NaN/Inf must produce a failing report (and a strict
+    # RuntimeError), not crash inside the overlap scan's int(max(...)).
+    tr = np.arange(100000, dtype=float)
+    tr[500] = np.nan
+    va = np.zeros((2, 4), dtype=float)
+    r = L.audit_corpus_split(tr, va, 10, max_scan_tokens=1000, strict=False)
+    assert r['status'] == 'fail' and any('NaN/Inf' in x for x in r['hard_failures']), r
+    try:
+        L.audit_corpus_split(tr, va, 10, max_scan_tokens=1000, strict=True)
+        raise AssertionError('strict corpus gate did not refuse a non-finite cache')
+    except RuntimeError:
+        pass
+
+    # Explicit JSON nulls and a non-positive timestamp are malformed TimeGuard
+    # state, not a silent reset/phantom refund.
+    for bad in ({'booked_seconds': 3.0, 'booked_untracked': None, 'bookings': {}},
+                {'booked_seconds': 3.0, 'bookings': None},
+                {'booked_seconds': 3.0,
+                 'bookings': {'tok': {'seconds': 2.0, 'pid': 1, 'ts': -1.0}}}):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'state.json')
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(bad, f)
+            try:
+                L.TimeGuard(dict(total_hours=10, margin=0.9, state_path=p))
+                raise AssertionError(f'malformed TimeGuard state accepted: {bad!r}')
+            except (ValueError, TypeError):
+                pass
+
+    # CPU determinism mode must be part of the resume identity.
+    _old = os.environ.get('CSA_DETERMINISTIC')
+    try:
+        os.environ.pop('CSA_DETERMINISTIC', None)
+        L._pin_cuda_determinism()
+        assert L.determinism_label() == 'cpu'
+        os.environ['CSA_DETERMINISTIC'] = '1'
+        L._pin_cuda_determinism()
+        assert L.determinism_label() == 'cpu_strict', L.determinism_label()
+        os.environ['CSA_DETERMINISTIC'] = 'warn'
+        L._pin_cuda_determinism()
+        assert L.determinism_label() == 'cpu_warn', L.determinism_label()
+    finally:
+        if _old is None:
+            os.environ.pop('CSA_DETERMINISTIC', None)
+        else:
+            os.environ['CSA_DETERMINISTIC'] = _old
+        torch.use_deterministic_algorithms(False)
+
+    # A summary cell with no seed-bearing metadata is not "verified".
+    tr2 = np.arange(512, dtype=np.int64) % 97
+    va2 = np.arange(64, dtype=np.int64).reshape(2, 32) % 97
+    prov = L.experiment_provenance({'dataset': 'unit', 'n_train_tokens': 512,
+                                    'seq_len': 32}, train_ids=tr2, val_batch=va2,
+                                   vocab=97)
+    with tempfile.TemporaryDirectory() as d:
+        cfg = {'seeds': [0], 'variants': ['full'], 'outdir': d,
+               'n_train_tokens': 512, 'seq_len': 32}
+        path = L.write_run_manifest(
+            d, cfg, 'FP', prov,
+            {'full::seed0': {'ppl': 10.0, 'losses': [3.0, 2.3]}})
+        integ = json.load(open(path, encoding='utf-8'))['panels']['FP']['tracking_integrity']
+        assert integ['with_seed_metadata'] == 0, integ
+        assert integ['seed_metadata_mismatch'] == ['full::seed0'], integ
+
+    # The count-model floor's matched denominator must be bound to the
+    # selected trial, and missing token counts must not pass as consistent.
+    rng = np.random.default_rng(7)
+    vocab = 32
+    train = rng.integers(0, vocab, size=600)
+    val = rng.integers(0, vocab, size=(4, 25))
+    proto = dict(L.SIMPLE_BASELINE_POLICY,
+                 arms={'unigram': {'order': 1}, 'bigram': {'order': 2}},
+                 grids={'unigram': {'alpha': [0.1, 1.0]},
+                        'bigram': {'alpha': [0.1, 1.0], 'interpolation': [0.5, 1.0]}})
+    art = L.simple_baseline_fit(train, val, vocab, protocol=proto)
+    assert L.simple_baseline_audit(art, protocol=proto)['baseline_verified'] is True
+    bad = json.loads(json.dumps(art))
+    bad['best_ppl_matched'] = 1e-4
+    assert L.simple_baseline_audit(bad, protocol=proto)['baseline_verified'] is False
+    bad2 = json.loads(json.dumps(art))
+    for entry in bad2['baselines'].values():
+        for trial in entry['trials']:
+            trial.pop('n_tokens', None)
+    rb = L.simple_baseline_audit(bad2, protocol=proto)
+    assert rb['baseline_verified'] is False and any('n_tokens' in x for x in rb['problems']), rb
+
+    # A record with no by_len cells must not leave the length audit "ok".
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, 'bylen.json')
+        cell = {'n_tok': 511, 'eval_span': 512, 'n_seq': 1, 'truncated': False}
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'512': cell}}, 'b::s0': {}}, f)
+        out = A.audit_length(p)
+        assert out['status'] == 'fail' and any('no by_len' in x for x in out['problems']), out
+
+    # A budget panel with params but no derivable token allocation fails.
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'variant': 'csa_fixed', 'params': 100}}, f)
+        out = A.audit_budget(state_files=(), panels=((d, 'csa_fixed', None),))
+        assert out['status'] == 'fail', out
+
+    # Equal list/dict object cells (signed zero, dict order) are duplicates.
+    import data_guard as DG
+    obj = np.empty((2, 1), dtype=object)
+    obj[0, 0], obj[1, 0] = [0.0], [-0.0]
+    assert DG.duplicate_mask(obj).tolist() == [False, True], DG._row_keys(obj)
+    assert DG._matrix_fingerprint(obj[:1]) == DG._matrix_fingerprint(obj[1:])
+    obj2 = np.empty((2, 1), dtype=object)
+    obj2[0, 0], obj2[1, 0] = {'x': 0.0, 'y': 1}, {'y': 1, 'x': -0.0}
+    assert DG.duplicate_mask(obj2).tolist() == [False, True], DG._row_keys(obj2)
+
+    # A fresh aggregate that covers the whole union must clear stale pooled
+    # fields rather than keep the snapshot's (different-seed) value.
+    import run_gapfill as RG
+    with tempfile.TemporaryDirectory() as td:
+        ap = os.path.join(td, 'aggregate.json')
+        fresh = {'h': {'variant': 'h', 'run_cfg': 'CFG', 'seeds': [0, 1],
+                       'ppls': [10.0, 12.0], 'n_seeds': 2,
+                       'ppl_mean': 11.0, 'ppl_std': math.sqrt(2.0)}}
+        snap = {'h': {'variant': 'h', 'run_cfg': 'CFG', 'seeds': [0, 1],
+                      'ppls': [100.0, 120.0], 'n_seeds': 2,
+                      'ppl_mean': 110.0, 'ppl_std': 10.0,
+                      'ppl_primary': 110.0, 'ppl_pooled': 110.0}}
+        L.atomic_write_json(ap, fresh, indent=2)
+        RG.merge_long_aggregate(td, snap)
+        m = json.load(open(ap, encoding='utf-8'))['h']
+        assert m['ppl_mean'] == 11.0 and 'ppl_primary' not in m and 'ppl_pooled' not in m, m
+
+    # The torch reference attention sanitises non-finite softmax weights just
+    # like the eager path.
+    import csa_kernels as CK
+    q = torch.zeros(1, 2, 1, 4)
+    empty = torch.zeros(1, 0, 1, 4)
+    q[0, 0, 0, 0] = float('inf')
+    out = CK.gathered_attention_kernel(
+        q, empty, empty, topk_idx=torch.zeros(1, 2, 0, dtype=torch.int64),
+        last_tok=torch.full((1, 2), -1, dtype=torch.int64),
+        k_sw=empty, v_sw=empty, w=0, scale=1.0, impl='ref')
+    assert torch.isfinite(out).all(), out
+
+    # A corrupt curve sidecar is refused, not silently dropped.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, 'curves'))
+        with open(os.path.join(d, 'curves', 'bad.json'), 'w', encoding='utf-8') as f:
+            f.write('{not json')
+        try:
+            BR._hydrate_curve_sidecars(d, {'a': {'ppl_history_ref': 'curves/bad.json'}})
+            raise AssertionError('corrupt curve sidecar was silently ignored')
+        except RuntimeError:
+            pass
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -11143,6 +11297,7 @@ def main():
     _check('N49 seed recovery keeps seed-averaged fields consistent', t_round16_seed_recovery_keeps_seed_averaged_fields_consistent)
     _check('N50 error-analysis provenance + archive required-file symlinks', t_round17_error_compare_and_archive_fail_closed)
     _check('N51 report keeps key-only legacy variant records', t_round17_report_keeps_key_only_variant)
+    _check('N52 fail-closed edges: corpus/TimeGuard/seed metadata/audits/merge/kernel', t_round18_fail_closed_edge_cases)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

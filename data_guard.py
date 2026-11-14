@@ -1759,6 +1759,19 @@ def _canonical_object_cell(v):
         # canonical form (NaN != NaN, 0.0 == -0.0), so two equal rows could
         # hash differently depending on nesting.
         return ('tuple', tuple(_canonical_object_cell(x) for x in v))
+    if isinstance(v, list):
+        # Lists are unhashable, but they still have value identity.  Falling
+        # back to repr() would split [0.0] from [-0.0] and let an exact
+        # duplicate row (or a cross-split leak) escape detection.
+        return ('list', tuple(_canonical_object_cell(x) for x in v))
+    if isinstance(v, dict):
+        # Equal dicts with different insertion order are the same cell.
+        _items = sorted(((_canonical_object_cell(_k), _canonical_object_cell(_x))
+                         for _k, _x in v.items()), key=lambda _kv: repr(_kv[0]))
+        return ('dict', tuple(_items))
+    if isinstance(v, (set, frozenset)):
+        return ('set', tuple(sorted((_canonical_object_cell(x) for x in v),
+                                    key=repr)))
     try:
         hash(v)
     except TypeError:
@@ -2012,6 +2025,16 @@ def _row_keys(X):
                 # a NaN/-0.0 inside a composite cell must not defeat the
                 # NaN-safe duplicate contract.
                 return ('tuple', tuple(_cell_key(x) for x in v))
+            if isinstance(v, list):
+                return ('list', tuple(_cell_key(x) for x in v))
+            if isinstance(v, dict):
+                _items = sorted(((_cell_key(_k), _cell_key(_x))
+                                 for _k, _x in v.items()),
+                                key=lambda _kv: repr(_kv[0]))
+                return ('dict', tuple(_items))
+            if isinstance(v, (set, frozenset)):
+                return ('set', tuple(sorted((_cell_key(x) for x in v),
+                                            key=repr)))
             try:
                 hash(v)
             except TypeError:

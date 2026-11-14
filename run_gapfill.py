@@ -408,6 +408,13 @@ def merge_long_aggregate(adir, snapshot_agg):
                            'attention_param_share', 'tokens_seen'):
                     if _f in fentry:
                         sentry[_f] = fentry[_f]
+                    else:
+                        # The fresh aggregate covers the whole union, so a
+                        # field it does not report is unavailable for this
+                        # seed set.  Keeping the snapshot's value would
+                        # publish a statistic (e.g. ppl_primary) that
+                        # describes a different seed set.
+                        sentry.pop(_f, None)
             else:
                 sentry['nll_sum'] = None
                 sentry['n_tokens'] = None

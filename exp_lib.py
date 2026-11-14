@@ -8490,16 +8490,23 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
     if tr.size < 2:
         report['hard_failures'].append('training stream has fewer than 2 tokens')
     # No NaN/Inf can hide in an integer token cache, but a float cache (future
-    # feature matrix) is checked explicitly.
+    # feature matrix) is checked explicitly.  The exact-overlap scan below
+    # converts token maxima to Python ints, so it must be skipped for a
+    # non-finite float cache: the failure is already recorded, and the scan
+    # must not turn it into an uncaught ValueError/OverflowError.
+    _tr_all_finite = True
+    _va_all_finite = True
     if not np.issubdtype(tr.dtype, np.integer):
         _bad = int(np.size(tr) - np.isfinite(tr).sum())
         report['nonfinite_train'] = _bad
         if _bad:
+            _tr_all_finite = False
             report['hard_failures'].append(f'{_bad} NaN/Inf values in train')
     if not np.issubdtype(va.dtype, np.integer):
         _bad = int(np.size(va) - np.isfinite(va).sum())
         report['nonfinite_val'] = _bad
         if _bad:
+            _va_all_finite = False
             report['hard_failures'].append(f'{_bad} NaN/Inf values in validation')
 
     if va.ndim == 2 and va.size:
@@ -8512,7 +8519,7 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
     # stream.  Small caches are scanned completely; large ones report the
     # scanned fraction instead of pretending the sample is a proof.
     overlap = None
-    if tr.size and va.ndim == 2 and va.shape[0]:
+    if tr.size and va.ndim == 2 and va.shape[0] and _tr_all_finite and _va_all_finite:
         import audit_gates as _AG
         _rows = np.unique(np.linspace(0, va.shape[0] - 1,
                                       min(int(sample_rows), va.shape[0]),
@@ -13589,6 +13596,7 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         problems.append(f'missing simple-baseline evidence for arms {missing}')
     n_tokens_by_arm = {}
     selected_values = {}
+    selected_matched = {}
     for arm, entry in baselines.items():
         if not isinstance(entry, dict):
             problems.append(f'{arm}: malformed baseline entry')
@@ -13661,6 +13669,13 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             problems.append(f'{arm}: no finite selected {metric} value')
             continue
         selected_values[arm] = chosen_f
+        _chosen_mp = chosen_trial.get('ppl_matched')
+        if _chosen_mp is not None:
+            _chosen_mp_f = _finite_scalar(_chosen_mp)
+            if _chosen_mp_f is None or _chosen_mp_f <= 0.0:
+                problems.append(f'{arm}: selected trial ppl_matched is not a finite positive value ({_chosen_mp!r})')
+            else:
+                selected_matched[arm] = _chosen_mp_f
         _chosen_f = _finite_scalar(chosen_trial.get(metric))
         if _chosen_f is None:
             problems.append(f'{arm}: selected trial has no finite {metric}')
@@ -13670,7 +13685,11 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             problems.append(f'{arm}: selected trial is not the minimum-{metric} trial')
         nt = set()
         for t in trials:
-            if not isinstance(t, dict) or t.get('n_tokens') is None:
+            if not isinstance(t, dict):
+                problems.append(f'{arm}: malformed trial record cannot supply an evaluation-token count')
+                continue
+            if t.get('n_tokens') is None:
+                problems.append(f'{arm}: trial has no n_tokens — the evaluation-token count is unverifiable')
                 continue
             # Exact positive integer only: int(100.4) and int(100.9) both
             # collapse to 100 and would hide unequal evaluation sizes.
@@ -13699,6 +13718,19 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         _reported_f = _finite_scalar(reported_ppl)
         if _reported_f is not None and abs(_reported_f - selected_values[best_name]) > 1e-12:
             problems.append('best_ppl does not match the minimum selected arm')
+        # The matched-denominator floor is used for the panel-vs-floor claim,
+        # so it must be the SAME selected trial's measurement, not a free
+        # number a corrupted artifact can set to any value.
+        _best_matched = artifact.get('best_ppl_matched')
+        if _best_matched is not None:
+            _bm = _finite_scalar(_best_matched)
+            _sel_mp = selected_matched.get(best_name)
+            if _bm is None or _bm <= 0.0:
+                problems.append(f'best_ppl_matched={_best_matched!r} is not a finite positive PPL')
+            elif _sel_mp is None:
+                problems.append('best_ppl_matched is reported but the selected trial has no ppl_matched evidence')
+            elif abs(_bm - _sel_mp) > 1e-12:
+                problems.append('best_ppl_matched does not match the selected trial\'s matched-denominator PPL')
     out = {'status': 'ok' if not problems else 'fail',
            'baseline_verified': not problems,
            'selection_metric': metric, 'selection_split': split,
@@ -15950,8 +15982,18 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 _cands = _base_cands
             if _cands:
                 _ref_key, _ref = min(_cands, key=lambda kv: float(kv[1]['ppl_mean']))
-                _panel_val_fps = {r.get('val_fp') for r in recs.values() if r.get('val_fp')}
-                _panel_eval_fps = {r.get('eval_fp') for r in recs.values() if r.get('eval_fp')}
+                # The floor is compared against THIS reference arm, so its
+                # fingerprints must come from the records that produced that
+                # arm (same variant and protocol), not from an unrelated arm
+                # that happened to share a slice.
+                _ref_v = _ref.get('variant')
+                _ref_t = str(_ref.get('protocol') or '')
+                _ref_recs = [r for (v, t, _s), r in recs.items()
+                             if v == _ref_v and str(t or '') == _ref_t]
+                if not _ref_recs:
+                    _ref_recs = list(recs.values())
+                _panel_val_fps = {r.get('val_fp') for r in _ref_recs if r.get('val_fp')}
+                _panel_eval_fps = {r.get('eval_fp') for r in _ref_recs if r.get('eval_fp')}
                 _sb_data = _sb.get('data') or {}
                 # `cache_val_fp` is the full validation cache fingerprint (the
                 # one panel records carry); `val_fp`/`eval_fp` describe the
@@ -16653,9 +16695,15 @@ def _pin_cuda_determinism():
     return 'cudnn'
 
 def determinism_label():
+    _det = bool(torch.are_deterministic_algorithms_enabled())
     if not torch.cuda.is_available():
-        return 'cpu'
-    if torch.are_deterministic_algorithms_enabled():
+        # CPU runs are a first-class reproduction target: CSA_DETERMINISTIC
+        # still toggles torch's deterministic-algorithm mode there, so the
+        # resume fingerprint must distinguish strict/warn from the default.
+        if not _det:
+            return 'cpu'
+        return 'cpu_strict' if not torch.is_deterministic_algorithms_warn_only_enabled() else 'cpu_warn'
+    if _det:
         return 'strict' if not torch.is_deterministic_algorithms_warn_only_enabled() else 'warn'
     return 'cudnn' if torch.backends.cudnn.deterministic else 'off'
 
@@ -17067,7 +17115,11 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                            for k in ('seed', 'data_seed') if _hp.get(k) is not None)
         _rng_seeds_ok = all(_as_seed_int(_rng.get(k)) is not None
                             for k in _rng_keys if _rng.get(k) is not None)
-        _ok = (_rec_seed == _expected and _hp_seeds_ok and _rng_seeds_ok
+        # A cell with no seed-bearing metadata at all is NOT verified: the
+        # summary key (or a forced top-level seed) alone cannot show that the
+        # record was produced by that seed rather than copied under it.
+        _ok = (bool(_vals) and _rec_seed == _expected and _hp_seeds_ok
+               and _rng_seeds_ok
                and all(v == _expected for v in _vals))
         if _ok:
             _seed_ok += 1
@@ -20868,9 +20920,10 @@ class TimeGuard:
                         or float(_booked) < 0.0):
                     raise ValueError(f'booked_seconds={_booked!r} is not a finite non-negative number')
                 st['booked_seconds'] = float(_booked)
-                if st.get('booked_untracked') is not None:
+                if 'booked_untracked' in st:
                     _untracked = st.get('booked_untracked')
                     if (isinstance(_untracked, (bool, np.bool_))
+                            or _untracked is None
                             or not isinstance(_untracked, numbers.Real)
                             or not math.isfinite(float(_untracked))
                             or float(_untracked) < 0.0):
@@ -20903,8 +20956,8 @@ class TimeGuard:
                     _clean_by_class[str(_k)] = float(_v)
                 st['sps_by_class'] = _clean_by_class
                 _bookings = st.get('bookings')
-                if _bookings is not None:
-                    if not isinstance(_bookings, dict):
+                if 'bookings' in st:
+                    if _bookings is None or not isinstance(_bookings, dict):
                         raise ValueError(f'bookings={_bookings!r} is not an object')
                     for _tok, _b in _bookings.items():
                         if not isinstance(_b, dict):
@@ -20919,8 +20972,14 @@ class TimeGuard:
                             _ts = _b.get('ts')
                             if (isinstance(_ts, (bool, np.bool_))
                                     or not isinstance(_ts, numbers.Real)
-                                    or not math.isfinite(float(_ts))):
-                                raise ValueError(f'bookings[{_tok!r}].ts={_ts!r} is not finite')
+                                    or not math.isfinite(float(_ts))
+                                    or float(_ts) <= 0.0):
+                                raise ValueError(f'bookings[{_tok!r}].ts={_ts!r} is not a positive finite timestamp')
+                        elif _b.get('ts') is None:
+                            # A booking without a timestamp cannot be aged out
+                            # safely; keep the historical dead-pid fallback
+                            # only (no phantom-age refund).
+                            pass
             except Exception as e:
                 print(f'[cap] FATAL: {self.state_path} exists but cannot be parsed ({type(e).__name__}: {e}).  Refusing to start with a silently RESET state (booked time would read as 0) — move it aside to start fresh.')
                 raise

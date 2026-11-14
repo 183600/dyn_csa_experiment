@@ -1707,6 +1707,7 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
     import numpy as np
     by_len = {}
     problems = []
+    _records_without_cells = 0
     for key, r in raw.items():
         if not isinstance(r, dict):
             # A malformed top-level record must not make the whole audit look
@@ -1716,6 +1717,12 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
         _cells = r.get('by_len')
         if _cells is not None and not isinstance(_cells, dict):
             problems.append(f'{key}: by_len is not an object — the per-length cells cannot be audited')
+            continue
+        if not _cells:
+            # An arm with no length cells contributes no evidence.  Skipping
+            # it silently would let the remaining arms report a clean
+            # cross-arm audit while this arm was never measured.
+            _records_without_cells += 1
             continue
         _seen_len_keys = {}
         for k, c in (_cells or {}).items():
@@ -1857,6 +1864,10 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                 problems.append(f'{key}: L{Ln} cell has a non-boolean `truncated` value {c.get("truncated")!r} — unverifiable, not a full-length measurement')
             elif c.get('truncated'):
                 problems.append(f'{key}: L{Ln} cell is marked truncated — it must not enter cross-length means')
+    if _records_without_cells and by_len:
+        problems.append(
+            f'{_records_without_cells} record(s) have no by_len cells — those '
+            'arms were not audited and the cross-arm length comparison is incomplete')
     out = {'status': 'ok', 'by_length': {}}
     for Ln, e in sorted(by_len.items()):
         ok = (len(e['n_tok']) == 1 and None not in e['n_tok']
@@ -2407,7 +2418,14 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
                 continue
             tok = _steps_i * _batch * _seq
         else:
-            tok = None
+            # No measured token count and no derivable steps/geometry: the
+            # 6ND allocation cannot be reconciled.  Reporting status "ok"
+            # with estimate=None would present an unauditable panel as clean.
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: records carry params but neither tokens_seen nor a positive step count — the FLOP allocation cannot be derived')
+            out['panels'][d] = {'params': p0, 'steps': _steps, 'tokens': None, 'estimate': None}
+            continue
         est = train_flops_estimate(p0, tok) if tok else None
         out['panels'][d] = {'params': p0, 'steps': _steps, 'tokens': tok, 'estimate': est}
     for sf in state_files:

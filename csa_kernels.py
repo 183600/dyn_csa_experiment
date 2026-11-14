@@ -1195,10 +1195,13 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                 zA.mul_(scale)
             zA.masked_fill_(~lane_ok, MINL)
             if sink_v is None:
-                P_A = torch.softmax(zA, dim=-1) * (anyrow[:, :, None] if anyrow is not None else 1.0)
+                # Eager's sink-softmax helper sanitises non-finite weights
+                # with nan_to_num; the reference must do the same or an
+                # inf/NaN logit leaks NaN into the value and gradient.
+                P_A = torch.nan_to_num(torch.softmax(zA, dim=-1)) * (anyrow[:, :, None] if anyrow is not None else 1.0)
             else:
                 zext = torch.cat([sink_v[h].expand(R, t1 - t0, 1), zA], dim=-1)
-                P_A = torch.softmax(zext, dim=-1)[..., 1:]
+                P_A = torch.nan_to_num(torch.softmax(zext, dim=-1))[..., 1:]
             Vl = torch.cat([Vb, Vw], dim=-2)
             out[:, t0:t1, h, :] = torch.einsum('rtm,rtmd->rtd', P_A, Vl).to(dtype)
         del src32, lt_sel, sel_ok, src_win, win_ok, lane_ok, anyrow, src_sel
@@ -1219,7 +1222,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
       dq          = Σ_l dz_l · K_l · scale
       dk_l        = dz_l · q · scale
       dV_l        = (P_A_l · anyrow) · dO   （前向值只经 A，见上）
-      dλ_l        = dzS_l（块泳道）；dsoft_l = dλ_l · [soft ≥ 1e-12] / soft
+      dλ_l        = dzS_l（块泳道）；dsoft_l = dλ_l · [soft > 1e-12] / soft
       dsink_h     = −Σ_{r,t} (P_sink^A·GA + P_sink^S·GS)
     """
     R, T, nh, hd = q.shape
@@ -1342,17 +1345,17 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                     s_live = lane_ok.clone()
                     s_live[:, :, :nb] &= (soft_c > 0)
                 if sink_v is None:
-                    P_A = torch.softmax(zA, dim=-1)
+                    P_A = torch.nan_to_num(torch.softmax(zA, dim=-1))
                     P_A_f = P_A * (anyrow[:, :, None] if anyrow is not None else 1.0)
                     GA = (P_A * gh).sum(dim=-1)
                     dzA = P_A * (gh - GA[:, :, None])
                     if soft_c is not None:
-                        P_S = torch.softmax(zS, dim=-1)
+                        P_S = torch.nan_to_num(torch.softmax(zS, dim=-1))
                         GS = (P_S * gh).sum(dim=-1)
                         dzS = P_S * (gh - GS[:, :, None])
                 else:
                     zext = torch.cat([sink_v[h].expand(R, t1 - t0, 1), zA], dim=-1)
-                    P_full = torch.softmax(zext, dim=-1)
+                    P_full = torch.nan_to_num(torch.softmax(zext, dim=-1))
                     P_A = P_full[..., 1:]
                     P_sinkA = P_full[..., 0]
                     P_A_f = P_A
@@ -1360,7 +1363,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                     dzA = P_A * (gh - GA[:, :, None])
                     if soft_c is not None:
                         zextS = torch.cat([sink_v[h].expand(R, t1 - t0, 1), zS], dim=-1)
-                        P_fullS = torch.softmax(zextS, dim=-1)
+                        P_fullS = torch.nan_to_num(torch.softmax(zextS, dim=-1))
                         P_S = P_fullS[..., 1:]
                         P_sinkS = P_fullS[..., 0]
                         GS = (P_S * gh).sum(dim=-1)
@@ -1383,7 +1386,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                     sf = soft_c
                     _live_b = s_live[:, :, :nb]
                     dsoft[:, t0:t1, :] += torch.where(
-                        _live_b & (sf >= 1e-12),
+                        _live_b & (sf > 1e-12),
                         dl / sf.clamp_min(1e-12), torch.zeros_like(dl)).to(dtype)
                 if need_dkb or need_dksw:
                     dkl = torch.einsum('rtm,rtd->rtmd', dz, qh)
@@ -2306,7 +2309,7 @@ def _attach_attn_kernels(ns):
                 PS = tl.exp(zS - mS) / ZSs
                 g = tl.sum(dO_v * v_v, 1)
                 dzS = PS * (g - GS)
-                ds_h = tl.where(sf >= 1e-12, dzS / tl.maximum(sf, 1e-12), 0.0)
+                ds_h = tl.where(sf > 1e-12, dzS / tl.maximum(sf, 1e-12), 0.0)
                 acc += ds_h.to(dsoft_ptr.dtype.element_ty).to(tl.float32)
             tl.store(dsoft_ptr + ((r * T + ti) * NB + j), acc.to(dsoft_ptr.dtype.element_ty), mask=tm)
 
