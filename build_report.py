@@ -1167,7 +1167,7 @@ def sec_p0e():
             elif not (math.isfinite(g_last) and math.isfinite(slope)):
                 verdict = f'**结论：尾段差距统计量不可用**（`g_last` 或 `slope` 非有限值：g_last={g_last!r}、slope={slope!r}），**本轮不给出渐近线读法**——这不是「差距不再收窄」，是**无法判定**。上表已剔除非有限的曲线点；若此处仍出现，说明该面板的尾段整体缺失，需补跑。'
             elif g_last <= 0:
-                verdict = f'**结论：渐近线在 {_lastk:g}k 内反演**——`csa_fixed` 追平并超过 dense，P0-2 的质疑成立，此前「worse asymptote」的表述需撤回。'
+                verdict = f'**结论：渐近线在 {_lastk:g}k 内反演**——`csa_fixed` 追平并超过 dense，P0-2 的质疑成立。'
             elif slope < -1e-06:
                 x0 = steps[-1] - g_last * 1000.0 / slope
                 if steps[-1] < x0 <= steps[-1] * 10:
