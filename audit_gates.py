@@ -185,7 +185,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
          （load_wikitest 运行期同样硬校验，这里独立复核落盘副本）；
       c. train/test id 缓存的 src_fp 与文件内容指纹自洽；
       d. train/test 文档重叠：k-gram shingle 的 shared/test 比例与最差单行
-         重叠比例（Jaccard 因 4M-vs-65k 的构造上限只作诊断记录）。"""
+         重叠比例（Jaccard 的构造上限使其不能作为阈值，只作诊断记录）。"""
     if cache_dir in (None, ''):
         cache_dir = os.environ.get('WT103_CACHE_DIR') or './wt103_cache'
     out = {'status': 'ok', 'checks': {}}

@@ -2034,7 +2034,7 @@ def run_finaltest(cfg=None, guard=None):
     if not _smoke:
         # Run the leakage gate BEFORE the `accessed` lock is written
         # and before any evaluation.  A gate that can never fire (a
-        # Jaccard<=0.05 on a 4M-vs-65k shingle pair) is not a gate, and a
+        # Jaccard<=0.05 on a full-train-vs-test-slice shingle pair) is not a gate, and a
         # `not_verifiable_locally` result must not pass silently.  Both are
         # hard refusals; only a verifiable, clean audit unlocks the panel.
         _cache_dir = L._wt_cache_dir()

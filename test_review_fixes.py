@@ -10153,8 +10153,8 @@ def t_round13_tuning_rejects_duplicate_seed_aliases():
 
 
 def t_round13_f_sf_large_degrees_of_freedom():
-    # The incomplete-beta continued fraction needs more than 500 terms when
-    # both dfs are huge; F(1; N, N) has upper tail 0.5 by symmetry.
+    # The incomplete-beta continued fraction must converge when both dfs are
+    # huge; F(1; N, N) has upper tail 0.5 by symmetry.
     for df in (1e6, 1e8):
         got = L._f_sf(1.0, df, df)
         assert got is not None and abs(got - 0.5) < 1e-5, (df, got)
