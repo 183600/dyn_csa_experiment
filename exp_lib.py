@@ -2319,11 +2319,29 @@ def _n_blocks_cached(block_ids):
 def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n_blocks=None, monotonic=False):
     n, Fd = Xa.shape
     dev = Xa.device
+    if overlap is not None:
+        _ov = _as_seed_int(overlap)
+        if _ov is None or _ov < 0:
+            raise ValueError(
+                f'pool_variable_blocks: overlap={overlap!r} must be a '
+                'non-negative exact integer (or None)')
+        overlap = _ov
     if n == 0:
         # Empty sequence: no blocks to pool.  Keep the same return contract as
         # the non-empty path.
         return (Xa[:0], torch.empty(0, dtype=torch.long, device=dev), 0)
-    B = int(n_blocks) if n_blocks is not None else _n_blocks_cached(block_ids)
+    if n_blocks is None:
+        B = _n_blocks_cached(block_ids)
+    else:
+        B = _as_seed_int(n_blocks)
+        if B is None or B <= 0:
+            raise ValueError(
+                f'pool_variable_blocks: n_blocks={n_blocks!r} must be a '
+                'positive exact integer (or None)')
+        if int(block_ids.max().item()) >= B:
+            raise ValueError(
+                f'pool_variable_blocks: n_blocks={n_blocks!r} is smaller than '
+                f'the largest block id {int(block_ids.max().item())} + 1')
     # The documented "no B lane" spelling is (Xb, Zb) == (None, None) (e.g. an
     # HCA arm).  The A-only pooling is exactly `pool_blocks_single`; delegating
     # here also avoids indexing the absent B tensors when the block ids need a
@@ -2980,7 +2998,18 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     if n == 0:
         # Same empty-sequence contract as pool_variable_blocks.
         return (X[:0], torch.empty(0, dtype=torch.long, device=dev), 0)
-    B = int(n_blocks) if n_blocks is not None else _n_blocks_cached(block_ids)
+    if n_blocks is None:
+        B = _n_blocks_cached(block_ids)
+    else:
+        B = _as_seed_int(n_blocks)
+        if B is None or B <= 0:
+            raise ValueError(
+                f'pool_blocks_single: n_blocks={n_blocks!r} must be a '
+                'positive exact integer (or None)')
+        if int(block_ids.max().item()) >= B:
+            raise ValueError(
+                f'pool_blocks_single: n_blocks={n_blocks!r} is smaller than '
+                f'the largest block id {int(block_ids.max().item())} + 1')
     order, _ident = ((_arange_cache(block_ids.numel(), block_ids.device), True) if monotonic else _block_order(block_ids, n))
     if _ident:
         Xs, Zs = (X, Z)
@@ -3090,7 +3119,14 @@ def _open_block_geometry(bid, n_blocks=None):
     """
     if bid.dim() != 1:
         raise ValueError(f'_open_block_geometry expects a 1-D block-id row, got {tuple(bid.shape)}')
-    _key = -1 if n_blocks is None else int(n_blocks)
+    _nb = None
+    if n_blocks is not None:
+        _nb = _as_seed_int(n_blocks)
+        if _nb is None or _nb < 0:
+            raise ValueError(
+                f'_open_block_geometry: n_blocks={n_blocks!r} must be a '
+                'non-negative exact integer (or None)')
+    _key = -1 if _nb is None else int(_nb)
     _cache = getattr(bid, '_open_geo_cache', None)
     if _cache is not None:
         _hit = _cache.get(_key)
@@ -3102,8 +3138,16 @@ def _open_block_geometry(bid, n_blocks=None):
         geo = {'n': 0, 'n_blocks': 0, 'counts': z, 'starts': z, 'ends': z,
                'start_of_token': z, 'offset': z, 'block_of_token': z}
     else:
-        B = int(n_blocks) if n_blocks is not None else int(bid.max().item()) + 1
+        B = int(_nb) if _nb is not None else int(bid.max().item()) + 1
+        if B <= 0:
+            raise ValueError(
+                f'_open_block_geometry: n_blocks={n_blocks!r} cannot describe '
+                'a non-empty block-id row')
         bid_long = bid.long()
+        if _nb is not None and int(bid_long.max().item()) >= B:
+            raise ValueError(
+                f'_open_block_geometry: n_blocks={n_blocks!r} is smaller than '
+                f'the largest block id {int(bid_long.max().item())} + 1')
         counts = torch.bincount(bid.reshape(-1).long(), minlength=B)[:B]
         ends = torch.cumsum(counts, 0)
         starts = ends - counts
@@ -3138,16 +3182,29 @@ def _open_prefix_geometry(bid, n_blocks=None, scope='full_prefix', window=128,
                     single per-query row, not an O(T^2) table.
       valid    [T, P] candidate validity (j < plen, or plen>0 for summaries)
     """
+    _nb = None
+    if n_blocks is not None:
+        _nb = _as_seed_int(n_blocks)
+        if _nb is None or _nb < 0:
+            raise ValueError(
+                f'_open_prefix_geometry: n_blocks={n_blocks!r} must be a '
+                'non-negative exact integer (or None)')
+    _wn = _as_seed_int(window)
+    if _wn is None or _wn < 0:
+        raise ValueError(
+            f'_open_prefix_geometry: window={window!r} must be a non-negative '
+            'exact integer')
+    window = _wn
     _ckey = None
     if window_start is None:
-        _ckey = (int(n_blocks) if n_blocks is not None else -1,
-                 str(scope), int(window), bool(candidate_table))
+        _ckey = (int(_nb) if _nb is not None else -1,
+                 str(scope), int(_wn), bool(candidate_table))
         _pcache = getattr(bid, '_open_prefix_cache', None)
         if _pcache is not None:
             _hit = _pcache.get(_ckey)
             if _hit is not None:
                 return _hit
-    geo = _open_block_geometry(bid, n_blocks=n_blocks)
+    geo = _open_block_geometry(bid, n_blocks=_nb)
     # Drop the private cache scalars attached to the shared geometry dict.
     _base_geo = {k: v for k, v in geo.items()
                  if not (isinstance(k, str) and k.startswith('_'))}
@@ -3315,6 +3372,13 @@ def causal_prefix_pool(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
     """
     if Xa.dim() != 2:
         raise ValueError(f'causal_prefix_pool expects Xa [T, Fd], got {tuple(Xa.shape)}')
+    if overlap is not None:
+        _ov = _as_seed_int(overlap)
+        if _ov is None or _ov < 0:
+            raise ValueError(
+                f'causal_prefix_pool: overlap={overlap!r} must be a '
+                'non-negative exact integer (or None)')
+        overlap = _ov
     geo = _open_block_geometry(bid, n_blocks=n_blocks)
     T = int(geo['n'])
     Fd = int(Xa.shape[1])
@@ -3416,6 +3480,13 @@ def causal_prefix_pool_reference(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
     This is deliberately simple and loops over queries; it is the oracle the
     cumulative-sum form is tested against (forward and gradients).
     """
+    if overlap is not None:
+        _ov = _as_seed_int(overlap)
+        if _ov is None or _ov < 0:
+            raise ValueError(
+                f'causal_prefix_pool_reference: overlap={overlap!r} must be a '
+                'non-negative exact integer (or None)')
+        overlap = _ov
     geo = _open_block_geometry(bid, n_blocks=n_blocks)
     T = int(geo['n'])
     Fd = int(Xa.shape[1])
@@ -4621,6 +4692,12 @@ class AttnCfg:
                 out = int(f)
             else:
                 raise ValueError(f'{label} must be an integer, got {value!r}')
+            if abs(out) >= 2 ** 53:
+                # Above 2**53 a binary64 spelling cannot represent every
+                # integer, and a count this large cannot size a tensor; reject
+                # it rather than silently aliasing a different config.
+                raise ValueError(
+                    f'{label} must be below 2**53 in magnitude, got {value!r}')
             if out < int(minimum):
                 raise ValueError(f'{label} must be >= {minimum}, got {value!r}')
             return out
@@ -6940,6 +7017,11 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                 _mt = json.load(open(_mp, encoding='utf-8'))
             except Exception:
                 continue
+            if not isinstance(_mt, dict):
+                raise RuntimeError(
+                    f'load_wikitest: {_mp} is {type(_mt).__name__}, not a JSON '
+                    'object — the train cache metadata is corrupt, so the test '
+                    'tokenizer identity cannot be paired; rebuild the cache')
             if _mt.get('fit_fp'):
                 _train_fit_fps.add(_mt['fit_fp'])
         if _train_fit_fps and meta.get('fit_fp') not in _train_fit_fps:
@@ -7143,6 +7225,10 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             _mt = json.load(open(_mp, encoding='utf-8'))
         except Exception:
             continue
+        if not isinstance(_mt, dict):
+            raise RuntimeError(
+                f'load_wikitest: {_mp} is {type(_mt).__name__}, not a JSON '
+                'object — the train cache metadata is corrupt; rebuild the cache')
         _mv = _as_seed_int(_mt.get('vocab'))
         if _mv is None:
             raise RuntimeError(f'load_wikitest: cached train corpus vocab in {_mp} is not a positive exact integer — the splits cannot be paired; delete wt103_cache/ and rebuild both')
@@ -8329,6 +8415,11 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
     supremum ln 2 ~= 0.693 and could never fire.
     """
     import data_guard as _DG
+    if meta is not None and not isinstance(meta, dict):
+        raise ValueError(
+            f'audit_corpus_split: meta must be a JSON object (or None), got '
+            f'{type(meta).__name__}; corrupt cache metadata cannot attest a '
+            'split')
     tr = np.asarray(train_ids).reshape(-1)
     va = np.asarray(val_batch)
     report = {
@@ -8439,7 +8530,11 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
 
     # Document-level proof, when the cache carries it.
     _docs = (meta or {}).get('doc_ids') or {}
-    if _docs:
+    if _docs and not isinstance(_docs, dict):
+        report['hard_failures'].append(
+            'cache document-id metadata is not an object — the split '
+            'disjointness cannot be verified')
+    elif _docs:
         report['documents'] = {k: _docs.get(k) for k in
                                ('train_count', 'validation_count', 'overlap',
                                 'disjoint', 'policy')}
@@ -8941,6 +9036,8 @@ def _cache_id_upper_bound(path):
         with open(meta_path, encoding='utf-8') as fh:
             meta = json.load(fh)
     except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(meta, dict):
         return None
     for key in ('max_id', 'max_token_id', 'token_max'):
         raw = meta.get(key)
@@ -11271,20 +11368,51 @@ def _f_sf(f, df1, df2):
     P(F >= f) = I_x(df2/2, df1/2)，x = df2 / (df2 + df1*f)（标准恒等式，
     由 CDF 的 I_{df1 f/(df1 f + df2)}(df1/2, df2/2) 与 I_x(a,b) 的补关系
     得到）。用于 scaling_trend 的失拟（lack-of-fit）检验。"""
+    if (isinstance(f, (bool, np.bool_))
+            or isinstance(df1, (bool, np.bool_))
+            or isinstance(df2, (bool, np.bool_))):
+        return None
     if not (df1 > 0.0 and df2 > 0.0):
         return None
     if f != f or f == float('inf'):
         return 0.0
-    if not math.isfinite(f):
-        return None
-    if f <= 0.0:
-        return 1.0
-    x = df2 / (df2 + df1 * f)
-    return _betai(df2 / 2.0, df1 / 2.0, x)
+    try:
+        if f <= 0.0:
+            return 1.0
+        if not math.isfinite(f):
+            return None
+        # Beyond the exact incomplete-beta range the limit distributions are
+        # stable: as df2 -> inf, df1*F -> chi2_df1; as both dfs -> inf, F -> 1
+        # (P(F >= 1) = 0.5 by the reciprocal symmetry).  This also handles
+        # exact integer dfs beyond the binary64 range.
+        _big1 = df1 > 1e8
+        _big2 = df2 > 1e8
+        if _big1 and _big2:
+            return 1.0 if f < 1.0 else (0.5 if f == 1.0 else 0.0)
+        if _big2:
+            try:
+                _x = df1 * f
+            except OverflowError:
+                return 0.0
+            return chi2_sf(_x, df1)
+        if _big1:
+            try:
+                _x = df2 / f
+            except OverflowError:
+                _x = 0.0
+            return float(min(1.0, max(0.0, 1.0 - chi2_sf(_x, df2))))
+        x = df2 / (df2 + df1 * f)
+        return _betai(df2 / 2.0, df1 / 2.0, x)
+    except OverflowError:
+        # A finite integer beyond the binary64 range has an F tail below any
+        # representable probability: 0 is the correct limit (not an error).
+        return 0.0
 
 
 def _student_t_sf(t, df):
     """Student t 的上尾概率 P(T >= t)。"""
+    if isinstance(t, (bool, np.bool_)) or isinstance(df, (bool, np.bool_)):
+        return float('nan')
     if not (df > 0.0):
         return float('nan')
     # `t != t` detects NaN without converting arbitrary-size integers to
@@ -11332,6 +11460,8 @@ def student_t_two_sided_p(t, df):
 
 def _t_critical(conf, df):
     """双侧置信区间的 t 临界值；用二分求解，避免依赖 scipy。"""
+    if isinstance(conf, (bool, np.bool_)) or isinstance(df, (bool, np.bool_)):
+        return float('nan')
     if not (0.0 < conf < 1.0) or not (df > 0.0):
         return float('nan')
     target = (1.0 - conf) / 2.0
@@ -11356,6 +11486,8 @@ def _t_critical(conf, df):
 
 def chi2_sf(x, df):
     """卡方分布上尾概率 P(chi2_df >= x)（Cochran Q 用）。"""
+    if isinstance(x, (bool, np.bool_)) or isinstance(df, (bool, np.bool_)):
+        return float('nan')
     if not (df > 0.0):
         return float('nan')
     # Same non-converting NaN/infinity checks as _student_t_sf.
@@ -20644,7 +20776,74 @@ class TimeGuard:
         if os.path.exists(self.state_path):
             try:
                 with open(self.state_path, encoding='utf-8') as f:
-                    st.update(json.load(f))
+                    raw = json.load(f)
+                if not isinstance(raw, dict):
+                    raise ValueError(
+                        f'the file is valid JSON but not an object ({type(raw).__name__})')
+                st.update(raw)
+                # Every field below feeds the cap arithmetic.  A malformed
+                # value must fail closed: reading a string/NaN/bool as booked
+                # time would silently reset or inflate the remaining budget.
+                _booked = st.get('booked_seconds', 0.0)
+                if (isinstance(_booked, (bool, np.bool_))
+                        or not isinstance(_booked, numbers.Real)
+                        or not math.isfinite(float(_booked))
+                        or float(_booked) < 0.0):
+                    raise ValueError(f'booked_seconds={_booked!r} is not a finite non-negative number')
+                st['booked_seconds'] = float(_booked)
+                if st.get('booked_untracked') is not None:
+                    _untracked = st.get('booked_untracked')
+                    if (isinstance(_untracked, (bool, np.bool_))
+                            or not isinstance(_untracked, numbers.Real)
+                            or not math.isfinite(float(_untracked))
+                            or float(_untracked) < 0.0):
+                        raise ValueError(f'booked_untracked={_untracked!r} is not a finite non-negative number')
+                    st['booked_untracked'] = float(_untracked)
+                _runs = _as_seed_int(st.get('runs', 0))
+                if _runs is None or _runs < 0:
+                    raise ValueError(f'runs={st.get("runs")!r} is not a non-negative exact integer')
+                st['runs'] = int(_runs)
+                _norm = st.get('norm_sps')
+                if _norm is not None:
+                    if (isinstance(_norm, (bool, np.bool_))
+                            or not isinstance(_norm, numbers.Real)
+                            or not math.isfinite(float(_norm))
+                            or float(_norm) < 0.0):
+                        raise ValueError(f'norm_sps={_norm!r} is not a finite non-negative rate')
+                    st['norm_sps'] = float(_norm)
+                _by_class = st.get('sps_by_class')
+                if _by_class is None:
+                    _by_class = {}
+                if not isinstance(_by_class, dict):
+                    raise ValueError(f'sps_by_class={_by_class!r} is not an object')
+                _clean_by_class = {}
+                for _k, _v in _by_class.items():
+                    if (isinstance(_v, (bool, np.bool_))
+                            or not isinstance(_v, numbers.Real)
+                            or not math.isfinite(float(_v))
+                            or float(_v) < 0.0):
+                        raise ValueError(f'sps_by_class[{_k!r}]={_v!r} is not a finite non-negative rate')
+                    _clean_by_class[str(_k)] = float(_v)
+                st['sps_by_class'] = _clean_by_class
+                _bookings = st.get('bookings')
+                if _bookings is not None:
+                    if not isinstance(_bookings, dict):
+                        raise ValueError(f'bookings={_bookings!r} is not an object')
+                    for _tok, _b in _bookings.items():
+                        if not isinstance(_b, dict):
+                            raise ValueError(f'bookings[{_tok!r}] is not an object')
+                        _bs = _b.get('seconds')
+                        if (isinstance(_bs, (bool, np.bool_))
+                                or not isinstance(_bs, numbers.Real)
+                                or not math.isfinite(float(_bs))
+                                or float(_bs) < 0.0):
+                            raise ValueError(f'bookings[{_tok!r}].seconds={_bs!r} is not a finite non-negative number')
+                        if _b.get('ts') is not None:
+                            _ts = _b.get('ts')
+                            if (isinstance(_ts, (bool, np.bool_))
+                                    or not isinstance(_ts, numbers.Real)
+                                    or not math.isfinite(float(_ts))):
+                                raise ValueError(f'bookings[{_tok!r}].ts={_ts!r} is not finite')
             except Exception as e:
                 print(f'[cap] FATAL: {self.state_path} exists but cannot be parsed ({type(e).__name__}: {e}).  Refusing to start with a silently RESET state (booked time would read as 0) — move it aside to start fresh.')
                 raise

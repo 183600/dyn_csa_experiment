@@ -609,10 +609,12 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     # preserving the requested order so n stays the number of unique seeds.
     _seen_seeds = set()
     seeds = []
-    for s in (_requested_seeds or avail_seeds):
-        s = L._as_seed_int(s)
+    for _s_raw in (_requested_seeds or avail_seeds):
+        s = L._as_seed_int(_s_raw)
         if s is None:
-            raise SystemExit(f'open-block: invalid seed identifier {s!r} — seeds must be integers')
+            raise SystemExit(
+                f'open-block: invalid seed identifier {_s_raw!r} — seeds must '
+                'be integers')
         if s not in _seen_seeds:
             _seen_seeds.add(s)
             seeds.append(s)

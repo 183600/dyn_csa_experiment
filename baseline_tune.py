@@ -42,6 +42,17 @@ sys.path.insert(0, REPO)
 import exp_lib as L
 
 
+def _load_json_object(path, kind='panel'):
+    """Read a JSON object; a valid-JSON non-object is corrupt evidence."""
+    with open(path, encoding='utf-8') as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict):
+        raise RuntimeError(
+            f'{path} is valid JSON but not an object ({type(obj).__name__}); '
+            f'refusing to read the {kind} over corrupt data')
+    return obj
+
+
 def _trial_cfg(base, outdir, arms, seeds, steps, knobs):
     cfg = dict(base)
     cfg.update(outdir=outdir, variants=list(arms), seeds=[int(s) for s in seeds],
@@ -287,7 +298,7 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
             cfg = _trial_cfg(base, tdir, _grp['arms'], search_seeds, search_steps, knobs)
             cfg.update(_ov)
             L.run(cfg, seeds=search_seeds, guard=None, label=f'baseline tuning trial {ti + 1}/{len(trials)} ({"/".join(_grp["arms"])})')
-            summary = json.load(open(os.path.join(tdir, 'summary.json'), encoding='utf-8'))
+            summary = _load_json_object(os.path.join(tdir, 'summary.json'), kind='tuning trial panel')
             for arm in _grp['arms']:
                 records = {}
                 for seed in search_seeds:
@@ -376,7 +387,7 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
         raise RuntimeError(f'[tune] tuning artifact failed its own audit: {audit.get("problems")}')
     if final:
         _run_final(base, outdir, protocol, selected)
-        L.methodology_audit(json.load(open(os.path.join(outdir, 'final', 'summary.json'), encoding='utf-8')),
+        L.methodology_audit(_load_json_object(os.path.join(outdir, 'final', 'summary.json'), kind='final tuned panel'),
                             outdir=os.path.join(outdir, 'final'), verbose=True)
     return artifact
 
@@ -491,7 +502,7 @@ def _run_final(base, outdir, protocol, selected):
                    weight_decay=float(entry['selected']['weight_decay']),
                    warmup=int(entry['selected']['warmup']))
         L.run(cfg, seeds=final_seeds, guard=None, label=f'final tuned {arm}')
-        s = json.load(open(os.path.join(adir, 'summary.json'), encoding='utf-8'))
+        s = _load_json_object(os.path.join(adir, 'summary.json'), kind='final tuned arm panel')
         # A resumed panel can leave residual summary keys in the file.  Only the
         # declared final partition may enter the tuned comparison; merging a
         # stale seed would inflate n while the artifact still claims the
@@ -537,7 +548,7 @@ def _run_final(base, outdir, protocol, selected):
         L.log_experiment_event(final_dir, {'kind': 'panel_finish', 'tracking_schema': 2, 'label': 'tuned final baselines', 'run_cfg': _final_fp, 'code': L.code_stamp(), 'provenance': _prov, 'data_version': _dv, 'n_cells_planned': len(_planned), 'n_cells_measured': len(merged), 'n_cells_missing': max(0, len(_planned) - len(merged))})
     except Exception as _te:
         print(f'[tune] WARNING: could not write the final-panel manifest/events ({type(_te).__name__}: {_te})')
-    tuning = json.load(open(os.path.join(outdir, 'baseline_tuning.json'), encoding='utf-8'))
+    tuning = _load_json_object(os.path.join(outdir, 'baseline_tuning.json'), kind='tuning artifact')
     tuning['final_outdir'] = final_dir
     tuning['final_records'] = {k: {'ppl': v.get('ppl'), 'seed': v.get('seed'),
                                    'params': v.get('params'), 'run_cfg': v.get('run_cfg'),

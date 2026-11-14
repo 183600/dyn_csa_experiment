@@ -885,6 +885,9 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             except Exception as _e:
                 print(f'[p3mp] FATAL: {_msp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — without it no checkpoint can be attributed to a training recipe, so the probe would score unknown weights.  Move it aside to re-train.')
                 raise
+            if not isinstance(mech_summ, dict):
+                print(f'[p3mp] FATAL: {_msp} is valid JSON but not an object ({type(mech_summ).__name__}) — without a record table no checkpoint can be attributed to a training recipe.  Move it aside to re-train.')
+                raise SystemExit(1)
     ck = os.path.join(cfg['ckpt_dir'], L.direct_ckpt_name(v, seed))
     if not os.path.exists(ck):
         print(f'[p3mp] SKIP {v} s{seed}: no checkpoint {ck} (run phase P3MT first)')
@@ -1112,6 +1115,9 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP', par=None):
         except Exception as _e:
             print(f'[p3mp] FATAL: {_msp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — without it no checkpoint can be attributed to a training recipe, so the probe would score unknown weights.  Move it aside to re-train.')
             raise
+        if not isinstance(mech_summ, dict):
+            print(f'[p3mp] FATAL: {_msp} is valid JSON but not an object ({type(mech_summ).__name__}) — without a record table no checkpoint can be attributed to a training recipe.  Move it aside to re-train.')
+            raise SystemExit(1)
     print(f'[p3mp] val slice {val_ids.shape}, arms={cfg['arms']}, modes={cfg.get('modes') or {'uniform': cfg['rhos']}}' + (f", niah={cfg['niah']}" if cfg.get('niah') else ''))
     _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
     _panel_prov = L.experiment_provenance({'dataset': 'wikitext', 'n_train_tokens': cfg.get('n_train_tokens') or 8000000, 'seq_len': train_len}, val_batch=val_ids, vocab=cfg.get('vocab') or 8192)
@@ -2190,6 +2196,8 @@ def _fmt_pm(cell, std=None):
 def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     v10_analysis(out=stats_p)
     st = json.load(open(stats_p, encoding='utf-8'))
+    if not isinstance(st, dict):
+        raise RuntimeError(f'{stats_p} is valid JSON but not an object ({type(st).__name__}); refusing to build a report over it')
     probe = st['probe']
     xo = st['crossover_panels']
     fit = st['crossover_fit']
@@ -2199,6 +2207,9 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     mp = os.path.join(P3MT_PAYLOAD['outdir'], 'summary.json')
     if os.path.exists(mp):
         mech_sum = json.load(open(mp, encoding='utf-8'))
+        if not isinstance(mech_sum, dict):
+            print(f'[report] WARNING: {mp} is valid JSON but not an object ({type(mech_sum).__name__}) — the mechanism records are omitted')
+            mech_sum = {}
     lines = []
     A = lines.append
     A('# CSA / HCA 受控机制研究 — v10 补实验报告（外推机制 + 反转点标度 + topk 补种子）')

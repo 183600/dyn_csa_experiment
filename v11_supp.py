@@ -302,6 +302,8 @@ def _one_record_per_seed(rows, label=''):
 def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     v11_analysis(out=stats_p)
     st = json.load(open(stats_p, encoding='utf-8'))
+    if not isinstance(st, dict):
+        raise RuntimeError(f'{stats_p} is valid JSON but not an object ({type(st).__name__}); refusing to build a report over it')
     probe = st['probe']
     xo = st['crossover_panels']
     fit = st['crossover_fit']
@@ -311,6 +313,9 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     mp = os.path.join(V10.P3MT_PAYLOAD['outdir'], 'summary.json')
     if os.path.exists(mp):
         mech_sum = json.load(open(mp, encoding='utf-8'))
+        if not isinstance(mech_sum, dict):
+            print(f'[report] WARNING: {mp} is valid JSON but not an object ({type(mech_sum).__name__}) — the mechanism records are omitted')
+            mech_sum = {}
     probe_cells_ = probe.get('cells', [])
     contr_ = probe.get('contrasts', {})
     n_contr_max = max((v['n'] for v in contr_.values()), default=0)
@@ -350,6 +355,11 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
         except Exception as _pe:
             _prov_unreadable.append((_p.split('/')[0], f'{type(_pe).__name__}: {_pe}'))
             print(f'[provenance] WARNING: {_p} cannot be parsed ({type(_pe).__name__}: {_pe}) — reported as unreadable, NOT silently omitted')
+            continue
+        if not isinstance(_d, dict):
+            _prov_unreadable.append((_p.split('/')[0],
+                                     f'valid JSON but not an object ({type(_d).__name__})'))
+            print(f'[provenance] WARNING: {_p} is valid JSON but not an object ({type(_d).__name__}) — reported as unreadable, NOT silently omitted')
             continue
         _tot = _st = _sy = _me = 0
         for _k, _v in _d.items():

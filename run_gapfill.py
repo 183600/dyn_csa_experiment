@@ -687,6 +687,10 @@ def run_smoke():
             _got = json.load(open(_sp, encoding='utf-8'))
         except Exception:
             _got = {}
+        if not isinstance(_got, dict):
+            print(f'\n[smoke] FAILED: {_sp} is valid JSON but not an object '
+                  f'({type(_got).__name__}); the smoke panel is corrupt, not empty.')
+            sys.exit(1)
     _bad = [f'{v}::seed0' for v in smoke_cfg['variants'] if not L.ppl_is_usable((_got.get(f'{v}::seed0') or {}).get('ppl'))]
     if _bad:
         print(f'\n[smoke] FAILED: no usable PPL was measured for {_bad} — the pipeline is degraded; results_smoke/ is KEPT for inspection instead of being deleted.')

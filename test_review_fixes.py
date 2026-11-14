@@ -10160,6 +10160,17 @@ def t_round13_f_sf_large_degrees_of_freedom():
         assert got is not None and abs(got - 0.5) < 1e-5, (df, got)
     # Ordinary df still match the exact beta identity direction.
     assert 0.0 < L._f_sf(2.0, 3.0, 7.0) < 1.0
+    # A finite integer beyond the binary64 range is an enormous F statistic,
+    # not an internal overflow; its upper tail is 0.  A boolean is not a
+    # statistic at all.
+    assert L._f_sf(10 ** 400, 3.0, 7.0) == 0.0
+    assert L._f_sf(-10 ** 400, 3.0, 7.0) == 1.0
+    assert L._f_sf(True, 3.0, 7.0) is None
+    # Dfs beyond the incomplete-beta range use the stable limits: both huge
+    # gives P(F>=1)=0.5 by reciprocal symmetry; one huge reduces to chi2.
+    assert abs(L._f_sf(1.0, 10 ** 400, 10 ** 400) - 0.5) < 1e-12
+    assert abs(L._f_sf(1.0, 10 ** 400, 3.0)
+               + L._f_sf(1.0, 3.0, 10 ** 400) - 1.0) < 1e-12
 
 
 
@@ -10331,6 +10342,178 @@ def t_round14_leakage_nonobject_metadata_fails():
         rep = A.audit_leakage(cache_dir=d)
         assert rep['status'] == 'fail', rep
         assert any('not an object' in p for p in rep.get('problems') or []), rep
+
+
+def t_round15_timeguard_state_requires_wellformed_object():
+    # The TimeGuard ledger decides whether a panel may start.  A valid-JSON
+    # non-object (or a malformed numeric field) must fail closed instead of
+    # silently resetting/inflating the booked time.
+    cases = [
+        [["booked_seconds", 3.0]],
+        {'booked_seconds': '3.0'},
+        {'booked_seconds': float('nan')},
+        {'booked_seconds': -1.0},
+        {'runs': True},
+        {'runs': 3.5},
+        {'norm_sps': 'fast'},
+        {'sps_by_class': []},
+        {'sps_by_class': {'x': True}},
+        {'bookings': []},
+        {'bookings': {'tok': {'seconds': '1'}}},
+        {'bookings': {'tok': []}},
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        for i, bad in enumerate(cases):
+            path = os.path.join(d, f'bad{i}.json')
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(bad, f)
+            try:
+                L.TimeGuard(dict(total_hours=10, margin=0.9, state_path=path))
+                raise AssertionError(f'malformed TimeGuard state accepted: {bad!r}')
+            except (ValueError, TypeError):
+                pass
+        good = os.path.join(d, 'good.json')
+        with open(good, 'w', encoding='utf-8') as f:
+            json.dump({'booked_seconds': 3.0, 'runs': 2,
+                       'sps_by_class': {'x': 1.0}, 'norm_sps': 0.5,
+                       'bookings': {'tok': {'seconds': 2.0, 'pid': 1, 'ts': 1.0}}},
+                      f)
+        g = L.TimeGuard(dict(total_hours=10, margin=0.9, state_path=good))
+        assert abs(g.spent_hours() - 3.0 / 3600.0) < 1e-12, g.state
+        assert g.state['runs'] == 2 and g.state['sps_by_class'] == {'x': 1.0}, g.state
+
+
+def t_round15_power_enumeration_requires_exact_plan():
+    # A bool/fractional family size or an invalid alpha is not a plan: the
+    # conservative Holm threshold would otherwise be computed for a different
+    # family, certifying power the frozen panel does not have.
+    for _m in (True, 4.9, 0, -1, None, '4.0'):
+        r = V12._power_enumeration([1.0, 2.0, 3.0], 'positive', 0.05, _m)
+        assert r['status'] == 'invalid_options', (_m, r)
+    for _a in (True, 0.0, 1.0, -0.1, float('nan'), float('inf')):
+        r = V12._power_enumeration([1.0, 2.0, 3.0], 'positive', _a, 4)
+        assert r['status'] == 'invalid_options', (_a, r)
+    for _bad in ([True, 1.0], [1.0, float('nan')], [1.0, float('inf')], ['x']):
+        r = V12._power_enumeration(_bad, 'positive', 0.05, 4)
+        assert r['status'] == 'invalid_data', (_bad, r)
+    ok = V12._power_enumeration([1.0, 2.0, 3.0], 'positive', 0.05, 4)
+    assert ok['status'] == 'ok', ok
+    # The Holm slot must use the validated exact family size.
+    assert abs(ok['threshold_holm_conservative'] - 0.05 / 4) < 1e-15, ok
+
+
+def t_round15_power_and_admission_refuse_nonobject_inputs():
+    assert isinstance(V12._power_artifact_problem([], {}), str)
+    assert isinstance(V12._power_artifact_problem(
+        {'statistics': []}, {'status': 'ok'}), str)
+    for _man in ({'statistics': []}, None, []):
+        try:
+            V12._admit_confirmation_records({}, _man)
+            raise AssertionError(f'non-object manifest accepted: {_man!r}')
+        except SystemExit:
+            pass
+    for _raw in ([], 'records', 3):
+        try:
+            V12._admit_confirmation_records(_raw, {'arms': ['a']})
+            raise AssertionError(f'non-object records accepted: {_raw!r}')
+        except SystemExit:
+            pass
+
+
+def t_round15_panel_reader_requires_object():
+    with tempfile.TemporaryDirectory() as d:
+        bad = os.path.join(d, 'summary.json')
+        with open(bad, 'w', encoding='utf-8') as f:
+            json.dump([], f)
+        try:
+            BT._load_json_object(bad, kind='panel')
+            raise AssertionError('baseline_tune accepted a non-object panel')
+        except RuntimeError:
+            pass
+        good = os.path.join(d, 'good.json')
+        with open(good, 'w', encoding='utf-8') as f:
+            json.dump({'x': 1}, f)
+        assert BT._load_json_object(good) == {'x': 1}
+
+
+def t_round15_structural_geometry_counts_are_exact():
+    # n_blocks/overlap/window are exact structural counts.  A boolean or
+    # fractional spelling must not be truncated into a different geometry
+    # (int(True)=1, int(2.9)=2) at any entry point.
+    dev = torch.device('cpu')
+    bid = L.blocks_from_cuts(8, np.zeros(7, dtype=bool), 2, 4, dev)
+    assert int(bid.max().item()) >= 0
+    for _bad in (True, 1.5, -1, '2.0'):
+        for fn in (lambda b: L._open_block_geometry(bid, n_blocks=b),
+                   lambda b: L._open_prefix_geometry(bid, n_blocks=b)):
+            try:
+                fn(_bad)
+                raise AssertionError(f'non-exact n_blocks accepted: {_bad!r}')
+            except ValueError:
+                pass
+    # A declared block count must cover every actual block id.
+    try:
+        L._open_block_geometry(bid, n_blocks=int(bid.max().item()))
+        raise AssertionError('too-small n_blocks accepted')
+    except ValueError:
+        pass
+    for _bad in (True, -1, 1.5):
+        try:
+            L._open_prefix_geometry(bid, window=_bad)
+            raise AssertionError(f'non-exact window accepted: {_bad!r}')
+        except ValueError:
+            pass
+    Xa = torch.randn(8, 3)
+    Za = torch.randn(8, 3)
+    Ba = torch.randn(5, 3)
+    Bb = torch.randn(5, 3)
+    for _bad in (True, -1, 1.5):
+        try:
+            L.pool_variable_blocks(Xa, Xa, Za, Za, bid, Ba, Bb, _bad, monotonic=True)
+            raise AssertionError(f'non-exact overlap accepted: {_bad!r}')
+        except ValueError:
+            pass
+    # Valid empty geometry still works (the open-block smoke path uses it).
+    empty = torch.empty(0, dtype=torch.long)
+    assert L._open_prefix_geometry(empty, n_blocks=0)['n'] == 0
+    for _bad in (True, 1.5, 1e20, 2 ** 53):
+        try:
+            L.AttnCfg(block_size=_bad)
+            raise AssertionError(f'AttnCfg accepted a non-exact block_size: {_bad!r}')
+        except ValueError:
+            pass
+
+
+def t_round15_corpus_audit_meta_must_be_object():
+    tr = np.arange(100, dtype=np.int64) % 10
+    va = (np.arange(100, 110, dtype=np.int64) % 10).reshape(1, -1)
+    for _bad in ('x', 3, []):
+        try:
+            L.audit_corpus_split(tr, va, 10, dataset='wikitext', meta=_bad)
+            raise AssertionError(f'non-object corpus meta accepted: {_bad!r}')
+        except ValueError:
+            pass
+    # A truthy non-object doc_ids table is corrupt provenance: it must become
+    # a named hard failure, not an AttributeError.
+    try:
+        L.audit_corpus_split(tr, va, 10, dataset='wikitext',
+                             meta={'doc_ids': 'corrupt'})
+        raise AssertionError('non-object doc_ids metadata was accepted')
+    except RuntimeError as e:
+        assert 'document-id' in str(e), e
+
+
+def t_round15_distribution_helpers_reject_boolean_arguments():
+    # Boolean flags are not statistics/degrees of freedom; treating True as 1
+    # would report a probability for a test the caller never specified.
+    assert math.isnan(L._student_t_sf(True, 5))
+    assert math.isnan(L._student_t_sf(1.0, True))
+    assert math.isnan(L.chi2_sf(1.0, True))
+    assert math.isnan(L.chi2_sf(True, 3))
+    assert math.isnan(L._t_critical(0.95, True))
+    assert math.isnan(L._t_critical(True, 5))
+    assert L._f_sf(1.0, True, 7.0) is None
+    assert L._f_sf(1.0, 3.0, np.bool_(True)) is None
 
 
 def main():
@@ -10662,6 +10845,14 @@ def main():
     _check('N36 driver readers reject malformed summaries', t_round14_driver_readers_refuse_malformed_summaries)
     _check('N37 locked JSON helpers require an object', t_round14_locked_json_requires_object)
     _check('N38 non-object cache metadata fails the leakage audit', t_round14_leakage_nonobject_metadata_fails)
+
+    _check('N39 TimeGuard state must be a well-formed object', t_round15_timeguard_state_requires_wellformed_object)
+    _check('N40 power enumeration requires an exact plan/effects', t_round15_power_enumeration_requires_exact_plan)
+    _check('N41 power/admission refuse non-object inputs', t_round15_power_and_admission_refuse_nonobject_inputs)
+    _check('N42 panel readers require an object', t_round15_panel_reader_requires_object)
+    _check('N43 structural geometry counts are exact integers', t_round15_structural_geometry_counts_are_exact)
+    _check('N44 corpus-audit metadata must be an object', t_round15_corpus_audit_meta_must_be_object)
+    _check('N45 distribution helpers reject boolean args', t_round15_distribution_helpers_reject_boolean_arguments)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

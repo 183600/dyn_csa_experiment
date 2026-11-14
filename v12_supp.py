@@ -1321,6 +1321,11 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     mech_summ = {}
     if os.path.exists(cfg['mech_summary']):
         mech_summ = json.load(open(cfg['mech_summary'], encoding='utf-8'))
+        if not isinstance(mech_summ, dict):
+            raise RuntimeError(
+                f'[p5t] REFUSE {v} s{seed}: {cfg["mech_summary"]} is valid JSON '
+                f'but not an object ({type(mech_summ).__name__}) — the training '
+                'records cannot attest the checkpoint')
     _tr = mech_summ.get(f'{v}::seed{seed}') or {}
     if not _tr or not L.result_is_current(_tr, V.CKPT_CODE, 'by_len') or _tr.get('synthesized'):
         print(f'[p5t] REFUSE {v} s{seed}: no current training record backs the checkpoint — the weights have no traceable provenance')
@@ -1589,17 +1594,42 @@ def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
     """
     import bisect as _bisect
     import itertools as _it
+    try:
+        deltas = list(deltas)
+    except TypeError:
+        return {'n': 0, 'status': 'invalid_data',
+                'note': 'deltas is not an iterable of paired effects'}
     n = len(deltas)
-    mags = [abs(float(x)) for x in deltas]
+    # The family size and significance level decide the Holm threshold; a
+    # boolean/fractional count (int(True)=1, int(4.9)=4) or an invalid level
+    # would certify power for a different plan.  Refuse them explicitly.
+    _m = L._as_seed_int(m_comparisons)
+    _alpha = L._valid_alpha01(alpha)
+    if _m is None or _m <= 0 or _alpha is None:
+        return {'n': n, 'status': 'invalid_options',
+                'note': ('m_comparisons must be a positive exact integer and '
+                         'alpha a finite number in (0,1); the power simulation '
+                         'cannot be computed for a malformed plan')}
+    mags = []
+    for _x in deltas:
+        if isinstance(_x, (bool, np.bool_)) or not isinstance(_x, numbers.Real):
+            return {'n': n, 'status': 'invalid_data',
+                    'note': 'paired delta(s) contain a non-numeric or boolean value'}
+        try:
+            _f = float(_x)
+        except (TypeError, ValueError, OverflowError):
+            return {'n': n, 'status': 'invalid_data',
+                    'note': 'paired delta(s) cannot be represented as finite floats'}
+        if not math.isfinite(_f):
+            return {'n': n, 'status': 'invalid_data',
+                    'note': 'non-finite paired delta(s) — the power simulation '
+                            'cannot be computed from a corrupted panel'}
+        mags.append(abs(_f))
     if n == 0 or all(mm == 0.0 for mm in mags):
         return {'n': n, 'status': 'no_data'}
     # A NaN/Inf magnitude would make every comparison false and silently
     # report status='ok' with zero power.  Refuse the corrupted panel instead
     # of certifying an artifact from it.
-    if any(not math.isfinite(mm) for mm in mags):
-        return {'n': n, 'status': 'invalid_data',
-                'note': 'non-finite paired delta(s) — the power simulation '
-                        'cannot be computed from a corrupted panel'}
     # The enumeration and its tie tolerance are invariant under a common
     # positive rescaling of the magnitudes, and the power/fraction fields must
     # be too.  Normalise by an exact power of two before building the null
@@ -1621,8 +1651,8 @@ def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
                    for signs in _it.product((1.0, -1.0), repeat=n))
     _total = float(len(_sums))
     _tol = 1e-12 * max(1.0, max(_sums) if _sums else 1.0)
-    _thr_holm = float(alpha) / max(1, int(m_comparisons))
-    _thr_marginal = float(alpha)
+    _thr_holm = _alpha / int(_m)
+    _thr_marginal = _alpha
     exp_dir = None
     if expected_sign == 'positive':
         exp_dir = 1.0
@@ -1780,6 +1810,14 @@ def _power_artifact_problem(manifest, power):
     enumeration, or a different comparison family satisfies nothing."""
     if not isinstance(power, dict):
         return f'the artifact is not a JSON object ({type(power).__name__})'
+    if not isinstance(manifest, dict):
+        return f'the frozen manifest is not an object ({type(manifest).__name__})'
+    _stat = manifest.get('statistics')
+    if _stat is None:
+        _stat = {}
+    if not isinstance(_stat, dict):
+        return (f'manifest.statistics is {type(_stat).__name__}, not an object; '
+                'the power artifact cannot be bound to a frozen plan')
     _status = power.get('status')
     _skip_now = os.environ.get('V12_SKIP_POWER', '').strip().lower() in ('1', 'true', 'yes', 'on')
     if _status == 'skipped':
@@ -1793,7 +1831,6 @@ def _power_artifact_problem(manifest, power):
     if power.get('manifest') != _sha:
         return (f"manifest sha256 {str(power.get('manifest'))[:12]}… does not match "
                 f"the frozen manifest {str(_sha)[:12]}… (stale artifact from another plan)")
-    _stat = manifest.get('statistics') or {}
     _raw_alpha, _raw_palpha = _stat.get('alpha', 0.05), power.get('alpha')
     if isinstance(_raw_alpha, (bool, np.bool_)) or isinstance(_raw_palpha, (bool, np.bool_)):
         return 'artifact alpha/m_comparisons is malformed (a boolean is not a level)'
@@ -2193,6 +2230,17 @@ def _admit_confirmation_records(raw, manifest):
     出现两条可采纳记录 = 歧义，**拒绝运行**（而不是后者覆盖前者）；
     可采纳记录的 data_fp 必须全局唯一（同一冻结 test 切片），否则拒绝。
     返回 (admitted[(variant, seed)] -> record, unified data_fp)。"""
+    if not isinstance(manifest, dict):
+        raise SystemExit(
+            f'[p5t stats] REFUSE: frozen manifest is {type(manifest).__name__}, '
+            'not an object')
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise SystemExit(
+            f'[p5t stats] REFUSE: confirmation records are '
+            f'{type(raw).__name__}, not a JSON object — the bylen panel is '
+            'corrupt, so no admission decision can be made')
     _arms_raw = manifest.get('arms')
     if (not isinstance(_arms_raw, (list, tuple)) or not _arms_raw
             or not all(isinstance(a, str) and a for a in _arms_raw)):
@@ -3035,6 +3083,10 @@ def _fmt_pm(cell):
 def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     v12_analysis(out=stats_p)
     st = json.load(open(stats_p, encoding='utf-8'))
+    if not isinstance(st, dict):
+        raise RuntimeError(
+            f'{stats_p} is valid JSON but not an object ({type(st).__name__}); '
+            'refusing to build a report over it')
     ft = st.get('finaltest') or {}
     lines = []
     A = lines.append
@@ -3524,11 +3576,20 @@ def run_smoke():
     _, val_ids, _, _, _ = L.load_wikitext(1024, 4000000)
     cfg = dict(FINALTEST_CFG, manifest=_mpath, outdir='results_smoke_v12', ckpt_dir='results_smoke_v12/ckpt', mech_summary='results_smoke_v12/summary.json', bylen_summary='results_smoke_v12/bylen.json', probe_summary='results_smoke_v12/distractor.json', n_seq=4, chunk=2, stats_out='results_smoke_v12/test_stats.json', test_ids=np.asarray(val_ids[:4, :1025], dtype=np.int64), smoke=True)
     stats = run_finaltest(cfg)
-    got = {r['variant'] for r in json.load(open('results_smoke_v12/bylen.json', encoding='utf-8')).values() if isinstance(r, dict)}
+    _bylen = json.load(open('results_smoke_v12/bylen.json', encoding='utf-8'))
+    if not isinstance(_bylen, dict):
+        raise SystemExit(
+            f'[smoke] FAILED: results_smoke_v12/bylen.json is valid JSON but '
+            f'not an object ({type(_bylen).__name__}); the smoke panel is corrupt')
+    got = {r['variant'] for r in _bylen.values() if isinstance(r, dict)}
     assert {'csa_fixed_rope', 'csa_fixed_rope_allblocks'} <= got, f'finaltest bylen cells missing: {got}'
     _probe = {}
     if os.path.exists('results_smoke_v12/distractor.json'):
         _probe = json.load(open('results_smoke_v12/distractor.json', encoding='utf-8'))
+        if not isinstance(_probe, dict):
+            raise SystemExit(
+                f'[smoke] FAILED: results_smoke_v12/distractor.json is valid JSON '
+                f'but not an object ({type(_probe).__name__}); the smoke probe is corrupt')
     _pgot = {(r.get('mode', 'uniform'), r['arm'], float(r['rho'])) for r in _probe.values() if isinstance(r, dict)}
     _pwant = {('uniform', 'learned', 0.0), ('uniform', 'learned', 0.5), ('uniform', 'dense', 0.0), ('uniform', 'dense', 0.5)}
     _pwant = {w for w in _pwant if w[1] != 'dense'}  # full_rope arm is not in the smoke manifest
