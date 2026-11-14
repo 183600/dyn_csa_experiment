@@ -9817,8 +9817,8 @@ def t_round10_power_artifact_requires_exact_counts():
 def t_round11_effect_scale_invariance():
     # A pure change of effect unit (log10 -> ln -> percent, or a near-limit
     # rescaling) must not change a p-value, a trend verdict or a
-    # random-effects summary.  Raw squares used to overflow/underflow at the
-    # float limits while the report still printed a finite-looking answer.
+    # random-effects summary.  Raw squares overflow/underflow at the float
+    # limits while the report still prints a finite-looking answer.
     rng = np.random.default_rng(41)
     for _c in (1e-300, 1e300):
         for n in (6, 21, 41):
@@ -9890,7 +9890,7 @@ def t_round11_effect_scale_invariance():
 def t_round11b_saddlepoint_and_tost_scale():
     # The private saddlepoint helper must be scale-invariant on its own, not
     # only through exact_signflip_p's normalisation: direct near-limit inputs
-    # used to overflow x*x / t*T and return a different tail.
+    # would otherwise overflow x*x / t*T and return a different tail.
     rng = np.random.default_rng(43)
     for _n in (41, 60):
         _d = rng.normal(size=_n).tolist()
@@ -9903,7 +9903,7 @@ def t_round11b_saddlepoint_and_tost_scale():
             assert abs(_b[0] - _base_br[0]) < 1e-12, (_n, _c, _b, _base_br)
 
     # The exact MITM helper must also survive a direct near-limit call: its
-    # half-sums overflowed before the same normalisation was added.
+    # half-sums overflow without the same normalisation.
     for _n in (22, 30):
         _d = rng.normal(size=_n)
         _d = _d / np.max(np.abs(_d))
