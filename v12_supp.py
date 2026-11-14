@@ -1036,7 +1036,8 @@ def _freeze_lock_mirror_path():
     The outdir lock lives inside a gitignored results directory, so renaming or
     deleting that directory resets the freeze with no trace — exactly the
     one-shot-access promise the lock is supposed to enforce.  The mirror is
-    meant to be COMMITTED (it is whitelisted in .gitignore), so a results-dir
+    meant to be COMMITTED (an explicit `!confirmation_freeze_lock.json`
+    whitelist line in .gitignore keeps it trackable), so a results-dir
     rename cannot erase the fact that a first test access happened."""
     return os.path.join(os.path.dirname(os.path.abspath(FREEZE_MANIFEST)) or '.',
                         'confirmation_freeze_lock.json')

@@ -166,19 +166,6 @@ def _axis_steps(histories):
             return []
     return sorted(common)
 
-def signflip(deltas):
-    # Delegate to the repository-wide deterministic implementation: exact
-    # enumeration up to n=20, exact meet-in-the-middle up to n=40, and a
-    # deterministic normal approximation beyond that.  This keeps the result
-    # poolable with the exact p-values used by the other panels.  Keep the
-    # original scalar types so a boolean flag is rejected by exp_lib instead
-    # of being converted to a paired effect of 0/1 here.
-    _flat = np.asarray(deltas, dtype=object).reshape(-1).tolist()
-    r = L.exact_signflip_p(_flat)
-    if r.get('method') == 'none':
-        return None
-    return r['p']
-
 def sample_std(deltas, axis=None):
     d = np.asarray(deltas, dtype=float)
     if axis is None:

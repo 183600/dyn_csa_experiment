@@ -823,6 +823,13 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk, need_soft=True):
       last_tok 单调不减，首个因果块必为块 0，两种形式对所有池化输入
       同值；此处直接取 eager 形式）；
     - soft 在无效槽位直接置 0（eager 在下游乘 keep=0，值等价）。
+
+    与 eager 的两处已知形态差异（下游等价，外部对拍时须知）：
+    - 宽度：eager `lightning_indexer` 把 idx 填充到固定宽度 topk，本参考
+      （及 Triton 内核）返回 min(topk, B)；validity 掩码逐位一致，
+      下游仅消费 valid 泳道；
+    - 本函数不做「首达去重」——与 eager 仅在 topk_distinct=True
+      （层内唯一调用模式）时逐位等价。
     """
     R, T, nIH, hd = qI.shape
     Bm = kI.shape[1]
@@ -1109,6 +1116,11 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     后丢弃 sink 列：P_l = e_l / (e_sink + Σ e)。
     无 sink 且全泳道无效的行：softmax 在全 MINL 上给出均匀分布，eager
     以 anyrow 乘法清零——本实现以同样的 anyrow 语义清零。
+
+    已知形态差异（下游等价）：本参考不实现 eager 的首达去重
+    （topk_distinct=True 语义），也不在同一 softmax 内去重
+    「块泳道 ∩ 滑窗」的重叠 token——eager 同样不去重（与 NSA 式
+    拼接分支一致的既定设计）。
     """
     R, T, nh, hd = q.shape
     nb = topk_idx.shape[-1]

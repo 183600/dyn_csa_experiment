@@ -995,9 +995,29 @@ def t_scaling_trend_primary_direction_and_floor():
     ragged[0] = {'label': 'A', 'scale': 1.0, 'effects': [0.0] * 6 + [10.0] * 6,
                  'seeds': list(range(12))}
     r5 = L.scaling_trend(ragged, min_seeds=3, min_points=3)
-    assert r5['heterogeneity']['I2_percent'] > 75.0, r5['heterogeneity']
+    # Heterogeneity is normalised by the pooled within-scale pure-error
+    # variance, so A's huge within-scale spread correctly DISCOUNTS its lack
+    # of fit: F = 21/11 with df=(1,21) is not significant and I2 stays below
+    # the 75% gate (the old raw-Q I2 of ~96% was an artefact of the effect
+    # unit, not evidence of heterogeneity).
+    assert abs(r5['heterogeneity']['F'] - 21.0 / 11.0) < 1e-9, r5['heterogeneity']
+    assert r5['heterogeneity']['p'] > 0.05 and r5['heterogeneity']['I2_percent'] < 75.0, r5['heterogeneity']
     assert r5['heterogeneity_paired']['I2_percent'] == 0.0, r5['heterogeneity_paired']
     assert r5['significant'] is True and r5['verdict'] == 'effect_increases_with_scale', r5
+
+    # Regression: the heterogeneity statistics must be INVARIANT under
+    # rescaling of the effect measure (log10 -> ln -> percent).  The old
+    # unnormalised Q carried the effect unit, so its chi2 "p" (and the
+    # heterogeneous_trend verdict) flipped under a pure change of units.
+    for _c in (math.log(10.0), 100.0, 1e-3):
+        _scaled = [{'label': p['label'], 'scale': p['scale'],
+                    'effects': [e * _c for e in p['effects']],
+                    'seeds': list(p['seeds'])} for p in ragged]
+        r5b = L.scaling_trend(_scaled, min_seeds=3, min_points=3)
+        for _k in ('Q', 'F', 'p', 'I2_percent'):
+            assert math.isclose(r5['heterogeneity'][_k], r5b['heterogeneity'][_k], rel_tol=1e-12), (_c, _k)
+            assert math.isclose(r5['heterogeneity_paired'][_k], r5b['heterogeneity_paired'][_k], rel_tol=1e-12), (_c, _k)
+        assert r5b['verdict'] == r5['verdict']
 
     # A two-point fit is a line; min_points=3 must not be reported as a trend.
     r4 = L.scaling_trend(_pts(6)[:2], min_seeds=3, min_points=3)
@@ -2669,7 +2689,10 @@ def t_shipped_manifest_consistency():
         v2 = json.load(f)
     # v4 (2026-11-14) removed ee/es from the machine-checkable signature:
     # they are diagnostic-eval monitoring knobs, not training-recipe identity.
-    assert v2['manifest_version'] == 4
+    # v5 (2026-11-14) is a documentation-only correction of the v4 note: the
+    # implemented CONFIRMED gate was restored (review-6) to exactly the
+    # registered decision_rule text, so no normative field changed.
+    assert v2['manifest_version'] == 5
     assert 'ee' not in v2['binding']['training_recipe_signature']
     assert 'es' not in v2['binding']['training_recipe_signature']
     n = len(v2['seeds'])
@@ -2694,6 +2717,14 @@ def t_shipped_manifest_consistency():
     # the revision history must record the 6->12 change and its precondition
     hist = v2['revision']['history']
     assert any(h.get('version') == 1 for h in hist) and any(h.get('version') == 2 for h in hist) and any(h.get('version') == 3 for h in hist)
+    # v5 must supersede the v4 note's (now stale) claim that the implemented
+    # decision rule is strictly tighter than the registered text: review-6
+    # restored the implementation to the registered v3 wording, and the
+    # manifest must say so instead of contradicting the code.
+    _v5 = [h for h in hist if h.get('version') == 5]
+    assert _v5 and 'supersedes' in _v5[0]['change'], _v5
+    assert 'param_matched' in _v5[0]['change'] and 'never decision inputs' in _v5[0]['change']
+    assert v2['statistics']['decision_rule'].startswith('A comparison is CONFIRMED only if'), v2['statistics']['decision_rule'][:60]
     # v3 pins the per-arm parameter-matching knob
     per = v2.get('binding', {}).get('per_arm_recipe_signature') or {}
     assert set(per) == set(v2['arms']), per

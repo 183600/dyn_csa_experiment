@@ -118,6 +118,18 @@ def _compare_reason(meta_a, meta_b, seq_len, max_seq_a=None, max_seq_b=None):
     if _msb is not None and _sl > _msb:
         return (f'requested seq_len={_sl} exceeds checkpoint B position-table '
                 f'capacity max_seq={_msb}')
+    # A's capacity is checked symmetrically: B is run on A's validation
+    # batch, but A itself is also evaluated at seq_len, and an over-capacity
+    # table used to surface only as a cryptic embedding/position lookup error
+    # after most of the work was done.
+    _msa = max_seq_a if max_seq_a is not None else meta_a.get('train_len') or meta_a.get('max_seq')
+    try:
+        _msa = int(_msa) if _msa is not None else None
+    except (TypeError, ValueError, OverflowError):
+        _msa = None
+    if _msa is not None and int(seq_len) > _msa:
+        return (f'requested seq_len={int(seq_len)} exceeds checkpoint A position-table '
+                f'capacity max_seq={_msa}')
     return None
 
 

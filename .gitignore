@@ -108,3 +108,7 @@ results_smoke_bench/
 # 审计报告与证据归档为本地产物（归档发布到只读位置，不入库）
 audit_report.json
 archive/
+
+# 冻结锁的 git 跟踪镜像：有意入库（显式豁免，防止未来有人把 json 全忽略掉）
+# —— v12_supp._freeze_lock_mirror_path 依赖它可提交，作为 test 一次性访问的证据。
+!confirmation_freeze_lock.json

@@ -2471,7 +2471,6 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
                     if math.isfinite(f):
                         _v.append(f)
                 return (float(np.median(_v)) if _v else None)
-            ra, rb = eff[a][0], eff[b][0]
 
             def _env_rows(rows):
                 envs = {(r.get('device'), r.get('torch')) for r in rows}

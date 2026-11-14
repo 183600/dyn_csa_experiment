@@ -15,9 +15,10 @@ scope in `confirmation_frozen.json`; everything else is exploratory.
 > **Version naming.** `v12` is the driver/study generation; `CODE_SEMANTICS =`
 > `v11.128` is the library measurement-semantics stamp that the frozen plan
 > binds. They are not the same numbering scheme, and the mismatch is intentional.
-> The frozen manifest is at `manifest_version: 4` (see its `revision.history`; v4 removed the uncheckable ee/es pins and documented the tokenizer token cap, still strictly before any test-split access);
-> the continuous-loop CI is intentionally disabled until that signed commit is
-> fixed and P5T has run.
+> The frozen manifest is at `manifest_version: 5` (see its `revision.history`; v4 removed the uncheckable ee/es pins and documented the tokenizer token cap, and v5 corrected the v4 note's description of the implemented decision rule back to the registered v3 wording — no normative field changed; both still strictly before any test-split access);
+> per the manifest's v3 `ci_loop` note the continuous-loop CI is supposed to stay
+disabled until the frozen commit is signed and P5T has run — check the workflow's
+> actual state (`gh workflow list`) before relying on this.
 
 > **Evidence levels.** v6-v11 are exploratory (selected on the same validation
 split). Only the frozen v12 fixed-chunk comparisons are confirmatory. See

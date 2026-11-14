@@ -33,7 +33,6 @@ import numpy as np
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(REPO, "par_jobs")
-_KILL = {"on": False}
 _OFF = ("", "0", "no", "off", "false", "none", "serial")
 
 
@@ -552,7 +551,6 @@ def run_jobs(jobs, ctx, phase_label="phase"):
     results = [None] * len(entries)
     started = time.monotonic()
     next_heartbeat = started + 60.0
-    _KILL["on"] = False
 
     try:
         while pending or running:
@@ -608,11 +606,41 @@ def run_jobs(jobs, ctx, phase_label="phase"):
                             "continuing the phase.",
                             flush=True,
                         )
+                        # The child writes result.json as its LAST action (in
+                        # a finally block), after the cell handler has already
+                        # merged the summary and refunded its TimeGuard
+                        # booking.  So a VALID pre-existing result means the
+                        # measurement completed and the process is merely
+                        # hanging in interpreter/CUDA teardown: adopt that
+                        # result instead of overwriting it with
+                        # watchdog_timeout, and do NOT re-book the elapsed
+                        # seconds (the child's own record_run already booked
+                        # them — booking again would double-count the cell
+                        # against the run-time cap).
+                        _prior = _read_result(entry["result_path"])
+                        _prior_ok = (
+                            isinstance(_prior, dict)
+                            and isinstance(_prior.get("status"), str)
+                            and bool(_prior.get("status").strip())
+                            and _prior.get("status") != "unreadable_result"
+                        )
                         _terminate_entries([entry])
-                        _reconcile_guards([entry["job"]])
-                        _note_watchdog_kill(entry["job"], elapsed)
                         entry["log_f"].close()
                         entry["done"] = True
+                        if _prior_ok:
+                            print(
+                                f"[par] {entry['name']} had already written a "
+                                f"valid result (status={_prior.get('status')}) "
+                                "before hanging in teardown; adopting it and "
+                                "skipping the watchdog time re-booking.",
+                                flush=True,
+                            )
+                            entry["result"] = _prior
+                            results[entry["idx"]] = _prior
+                            _dump_log_tail(entry)
+                            continue
+                        _reconcile_guards([entry["job"]])
+                        _note_watchdog_kill(entry["job"], elapsed)
                         result = {
                             "status": "watchdog_timeout",
                             "kind": entry["job"].get("kind"),
@@ -676,7 +704,6 @@ def run_jobs(jobs, ctx, phase_label="phase"):
                 time.sleep(0.2)
 
     except BaseException:
-        _KILL["on"] = True
         _terminate_entries(entries)
         _reconcile_guards([entry["job"] for entry in entries])
         print(

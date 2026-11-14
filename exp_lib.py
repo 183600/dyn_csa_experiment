@@ -2115,6 +2115,10 @@ def _window_attn_mask(T, window, s, e, lo, device, dtype):
     # so every layer/step reuses the same read-only 0.0/-inf table (SDPA never
     # mutates the mask).  Built outside inference mode so a table first created
     # during eval remains a normal tensor for a later training recompute.
+    # NOTE: window must be >= 1 — `window == 0` yields an EMPTY lane set
+    # (kpos<=qpos & kpos>qpos-0 is contradictory).  Every in-repo caller is
+    # guarded by `0 < window < T`; a debug assert is deliberately not added on
+    # this hot path.
     key = (_dev_str(device), 'winmask', int(T), int(window), int(s), int(e), int(lo), str(dtype))
     mask = _cache_get(_WINDOW_MASK_CACHE, key)
     if mask is None:
@@ -6292,6 +6296,17 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                                            ranges_trusted=_fast)
         if meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget':
             _problems.append('cache does not attest the frozen train-prefix tokenizer fit')
+        # The fit cap is a function of the CURRENT code constant and the
+        # requested budget; the cache tag pins the budget (cap{n_train_tokens})
+        # but NOT TOKENIZER_FIT_TOKENS, so a cache built under a different
+        # fit-token constant would otherwise be served as current protocol.
+        # Fail closed into a rebuild instead.
+        _hit_fit_cap = min(int(TOKENIZER_FIT_TOKENS), int(n_train_tokens))
+        if _as_seed_int(meta.get('tokenizer_fit_token_cap')) != _hit_fit_cap:
+            _problems.append(
+                f'cache tokenizer fit token cap {meta.get("tokenizer_fit_token_cap")!r} does not '
+                f'match the current protocol cap {_hit_fit_cap} (min(TOKENIZER_FIT_TOKENS, '
+                f'n_train_tokens)); the fit corpus size changed — rebuild the corpus cache')
         if not meta.get('fit_fp'):
             _problems.append(
                 'cache does not record the tokenizer fit-corpus fingerprint; '
@@ -7534,8 +7549,14 @@ class _DocDeduplicator:
 
     A document is a group: once seen (tokenizer fit, train or validation) any
     exact copy or a near copy within ``near_threshold`` SimHash bits is skipped
-    on every later split.  This is what keeps a document (or a lightly edited
-    copy) from appearing on both sides of the split.
+    on every later split.  Measured sensitivity: a 1-word edit of a 12/30/60/
+    150-word document moves the SimHash by ~17/11/8/5 bits on average, so for
+    WikiText's short line-"documents" this layer is effectively an EXACT-copy
+    filter (only near-identical short lines or lightly edited LONG documents
+    fall inside the Hamming-3 net).  The load-bearing guarantees are exact
+    dedup + the official article-level split + the P5T 13-gram shingle
+    overlap gate; residual near-duplicate leakage is measured there, not
+    assumed away here.
     """
 
     def __init__(self, *, near_threshold=3, bands=4):
@@ -10929,11 +10950,16 @@ def _gammaincc(a, x):
     if x == 0.0:
         return 1.0
     gln = math.lgamma(a)
+    # The series at x ~ a needs O(sqrt(a)) terms; a fixed 1000-iteration cap
+    # silently truncates for a >~ 2.5e4 (rel err 8e-6 at df=1e5 and growing),
+    # so the cap is adaptive (20*sqrt(a)+100, floor 1000 — unchanged for the
+    # small-a regime every current caller reaches).
+    _cap = max(1000, int(20.0 * math.sqrt(a)) + 100)
     if x < a + 1.0:
         ap = float(a)
         s = 1.0 / a
         d = s
-        for _ in range(1000):
+        for _ in range(_cap):
             ap += 1.0
             d *= x / ap
             s += d
@@ -10946,7 +10972,7 @@ def _gammaincc(a, x):
     c = 1.0 / tiny
     d = 1.0 / b
     h = d
-    for i in range(1, 1000):
+    for i in range(1, _cap):
         an = -float(i) * (float(i) - a)
         b += 2.0
         d = an * d + b
@@ -11012,6 +11038,24 @@ def _betai(a, b, x):
     if x < (a + 1.0) / (a + b + 2.0):
         return float(bt * _betacf(a, b, x) / a)
     return float(1.0 - bt * _betacf(b, a, 1.0 - x) / b)
+
+
+def _f_sf(f, df1, df2):
+    """F 分布的上尾概率 P(F >= f)，df1/df2 > 0。
+
+    P(F >= f) = I_x(df2/2, df1/2)，x = df2 / (df2 + df1*f)（标准恒等式，
+    由 CDF 的 I_{df1 f/(df1 f + df2)}(df1/2, df2/2) 与 I_x(a,b) 的补关系
+    得到）。用于 scaling_trend 的失拟（lack-of-fit）检验。"""
+    if not (df1 > 0.0 and df2 > 0.0):
+        return None
+    if f != f or f == float('inf'):
+        return 0.0
+    if not math.isfinite(f):
+        return None
+    if f <= 0.0:
+        return 1.0
+    x = df2 / (df2 + df1 * f)
+    return _betai(df2 / 2.0, df1 / 2.0, x)
 
 
 def _student_t_sf(t, df):
@@ -11100,9 +11144,12 @@ def chi2_sf(x, df):
         return float('nan')
     if x <= 0.0:
         return 1.0
-    # The Wilson-Hilferty transformation is accurate to O(1/df) for very
-    # large df and never materialises df as a float.
-    if df == float('inf') or df > 1e5:
+    # The Wilson-Hilferty transformation is bulk-accurate only (|x-df|/df
+    # small); in the tail its relative error grows with df (measured 2.7% at
+    # x=1.05*df, df=1e6).  The exact branches above stay accurate to <1e-7
+    # up to df=1e8 with the adaptive iteration cap, so the approximation is
+    # reserved for df beyond that, and never materialises df as a float.
+    if df == float('inf') or df > 1e8:
         try:
             _ratio = x / df
         except (OverflowError, ZeroDivisionError):
@@ -11581,16 +11628,70 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     # of the point means around their grand mean: a clean monotone ladder has
     # a large grand-mean Q by construction.  Residual Q (df=k-2) asks the
     # question the verdict needs: is a single slope an adequate summary?
+    #
+    # The residual sum `sum(n*resid**2)` is in EFFECT UNITS, so it must be
+    # normalised before it can be compared against any chi2/F table: the raw
+    # quantity is not scale-invariant and its "p" would flip with the
+    # (arbitrary) unit of the effect measure (log10 vs ln vs percent).  The
+    # normalisation is the pooled within-scale pure-error variance
+    # s2 = SS_pe/df_pe (df_pe = sum(n_i - 1)) — exactly the per-observation
+    # variance the WLS weights n_i presuppose — and the exact Gaussian test is
+    # the lack-of-fit F = (SS_lof/df_lof)/(SS_pe/df_pe); Q_norm = SS_lof/s2 is
+    # its dimensionless cousin (invariant under rescaling of the effects).
+    # Without within-scale replication (df_pe = 0) no pure error exists: the
+    # test is reported UNAVAILABLE rather than emitting a dimensional
+    # statistic whose p depends on the effect unit.
     if k >= 2:
-        q = float((n * resid ** 2).sum())
         dfh = k - 2
-        p_q = chi2_sf(q, dfh) if dfh > 0 else None
-        i2 = float(max(0.0, (q - dfh) / q) * 100.0) if (dfh > 0 and q > 0) else 0.0
-        c = float(n.sum() - (n ** 2).sum() / n.sum())
-        tau2 = float(max(0.0, (q - dfh) / c)) if (dfh > 0 and c > 0) else 0.0
-        out['heterogeneity'] = {'Q': q, 'df': int(dfh), 'p': p_q, 'I2_percent': i2, 'tau2': tau2,
-                                'method': 'lack-of-fit Q around the WLS slope (weights = n)',
-                                'note': 'high I2 means the scale points deviate from a single slope; it is not the spread of a monotone ladder around its mean'}
+        _ss_pe = 0.0
+        _df_pe = 0
+        for p in pts:
+            _eff = np.asarray(p['effects'], dtype=float)
+            _ss_pe += float(((_eff - float(_eff.mean())) ** 2).sum())
+            _df_pe += len(_eff) - 1
+        _ss_lof = float((n * resid ** 2).sum())
+        _c = float(n.sum() - (n ** 2).sum() / n.sum())
+        if dfh > 0 and _df_pe > 0 and _ss_pe > 0.0:
+            _s2 = _ss_pe / _df_pe
+            q = _ss_lof / _s2
+            f_stat = (_ss_lof / dfh) / _s2
+            p_q = _f_sf(f_stat, dfh, _df_pe)
+            i2 = float(max(0.0, (q - dfh) / q) * 100.0) if q > 0 else 0.0
+            tau2 = float(max(0.0, (q - dfh) * _s2 / _c)) if _c > 0 else None
+            out['heterogeneity'] = {'Q': q, 'df': int(dfh), 'df_pure_error': int(_df_pe),
+                                    'F': f_stat, 'p': p_q, 'I2_percent': i2, 'tau2': tau2,
+                                    'method': ('lack-of-fit F around the WLS slope '
+                                               '(weights = n_seeds per scale, normalised by the '
+                                               'pooled within-scale pure-error variance)'),
+                                    'note': ('Q/F/p are dimensionless (residual SS over the pooled '
+                                             'within-scale variance), so the test is invariant under '
+                                             'rescaling of the effect measure; high I2 means the scale '
+                                             'points deviate from a single slope, not the spread of a '
+                                             'monotone ladder around its mean')}
+        elif dfh > 0 and _df_pe > 0 and _ss_pe == 0.0:
+            # Exact zero within-scale variance with a nonzero residual SS:
+            # the lack-of-fit F diverges (infinitely strong evidence against
+            # the single slope).  Report the limit, not a fake finite Q.
+            if _ss_lof > 0.0:
+                out['heterogeneity'] = {'Q': None, 'df': int(dfh), 'df_pure_error': int(_df_pe),
+                                        'F': None, 'p': 0.0, 'I2_percent': 100.0, 'tau2': None,
+                                        'method': 'lack-of-fit F with zero pure error',
+                                        'note': ('within-scale variance is exactly zero while the '
+                                                 'fitted slope has a nonzero residual SS, so F '
+                                                 'diverges: p=0, I2=100; Q/F/tau2 have no finite value')}
+            else:
+                out['heterogeneity'] = {'Q': 0.0, 'df': int(dfh), 'df_pure_error': int(_df_pe),
+                                        'F': 0.0, 'p': 1.0, 'I2_percent': 0.0, 'tau2': 0.0,
+                                        'method': 'lack-of-fit F around the WLS slope (weights = n_seeds per scale)',
+                                        'note': 'perfect fit and zero within-scale variance: no heterogeneity'}
+        elif dfh > 0:
+            out['heterogeneity'] = {'Q': None, 'df': int(dfh), 'df_pure_error': int(_df_pe),
+                                    'F': None, 'p': None, 'I2_percent': None, 'tau2': None,
+                                    'method': 'unavailable',
+                                    'note': ('every scale point has a single observation, so no '
+                                             'within-scale pure error exists to normalise the '
+                                             'residual SS; a raw (dimensional) Q would depend on the '
+                                             'effect unit and is refused')}
     # The paired path only uses seeds completed at EVERY scale.  Extra seeds at
     # some scales cannot contribute a paired slope, so they must not decide
     # whether the paired trend is "heterogeneous" either: report a separate
@@ -11605,11 +11706,42 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         _cp = float(len(complete))
         _q_p = float((_cp * _rp ** 2).sum())
         _df_p = k - 2
-        _p_p = chi2_sf(_q_p, _df_p) if _df_p > 0 else None
-        _i2_p = float(max(0.0, (_q_p - _df_p) / _q_p) * 100.0) if (_df_p > 0 and _q_p > 0) else 0.0
-        out['heterogeneity_paired'] = {'Q': _q_p, 'df': int(_df_p), 'p': _p_p,
-                                       'I2_percent': _i2_p, 'n_complete_seeds': len(complete),
-                                       'method': 'lack-of-fit over complete-seed scale means (weights = n_complete)',
+        # Same pure-error normalisation as the all-seed Q above: the complete
+        # seeds' within-scale deviations are the only replication this path
+        # has, and the raw `_cp * sum(rp**2)` is in effect units (its "p"
+        # would flip with the effect unit).  df_pe = k*(n_complete-1).
+        _ss_pe_p = 0.0
+        for lb in labels:
+            _ce = np.asarray([by_seed[s][lb] for s in complete], dtype=float)
+            _ss_pe_p += float(((_ce - float(_ce.mean())) ** 2).sum())
+        _df_pe_p = k * (len(complete) - 1)
+        _c_p = _cp * (k - 1)
+        if _df_p > 0 and _df_pe_p > 0 and _ss_pe_p > 0.0:
+            _s2_p = _ss_pe_p / _df_pe_p
+            _qn_p = _q_p / _s2_p
+            _f_p = (_q_p / _df_p) / _s2_p
+            _p_p = _f_sf(_f_p, _df_p, _df_pe_p)
+            _i2_p = float(max(0.0, (_qn_p - _df_p) / _qn_p) * 100.0) if _qn_p > 0 else 0.0
+            _tau2_p = float(max(0.0, (_qn_p - _df_p) * _s2_p / _c_p)) if _c_p > 0 else None
+            _het_method_p = ('lack-of-fit F over complete-seed scale means '
+                             '(weights = n_complete, normalised by the pooled '
+                             'within-scale pure-error variance)')
+        elif _df_p > 0 and _ss_pe_p == 0.0:
+            # Zero within-scale variance: every complete seed walks the same
+            # ladder, so the residual SS decides in the limit.
+            _p_p = 0.0 if _q_p > 0.0 else 1.0
+            _i2_p = 100.0 if _q_p > 0.0 else 0.0
+            _qn_p = 0.0 if _q_p <= 0.0 else None
+            _f_p = None if _q_p > 0.0 else 0.0
+            _tau2_p = None if _q_p > 0.0 else 0.0
+            _het_method_p = 'lack-of-fit F with zero pure error'
+        else:
+            _qn_p = _f_p = _p_p = _i2_p = _tau2_p = None
+            _het_method_p = 'unavailable'
+        out['heterogeneity_paired'] = {'Q': _qn_p, 'df': int(_df_p), 'df_pure_error': int(_df_pe_p),
+                                       'F': _f_p, 'p': _p_p, 'I2_percent': _i2_p, 'tau2': _tau2_p,
+                                       'n_complete_seeds': len(complete),
+                                       'method': _het_method_p,
                                        'note': 'gates the paired trend verdict; the all-seed heterogeneity above stays descriptive'}
         het_for_verdict = out['heterogeneity_paired']
     p_primary = paired.get('p_exact_signflip') if paired_primary else wls.get('p')
@@ -16581,7 +16713,8 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
     # Per-document NLL (eval-subset uncertainty must be visible, not
     # only the seed-to-seed spread).  Rows are the fixed evaluation documents;
     # with eval_rows sampling, a row with no sampled target gets 0 tokens and
-    # is excluded by the bootstrap consumer.
+    # is excluded by the bootstrap consumers (_doc_bootstrap_ppl_ci /
+    # _combined_seed_doc_ci drop zero-token rows before resampling).
     _row_nll = torch.zeros(int(val_batch.shape[0]), dtype=torch.float64, device=device) if return_stats else None
     _row_ntok = torch.zeros(int(val_batch.shape[0]), dtype=torch.long, device=device) if return_stats else None
     for _a in need_reg_layers:
@@ -18237,6 +18370,14 @@ def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
         n_dec = min(max(1, int(decode_tokens)), max(1, int(ids.shape[1]) - 1))
         dec = []
         for t in range(max(1, int(ids.shape[1]) - n_dec), int(ids.shape[1]) + 1):
+            # One untimed call per prefix LENGTH: the first forward at a new
+            # shape can include one-time kernel selection / allocator growth,
+            # which would otherwise land in the timed p50/p95 as a bias (the
+            # sweep helper warms every (batch, length) cell for the same
+            # reason).
+            model(ids[:, :t])
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
             t0 = time.perf_counter()
             model(ids[:, :t])
             if device.type == 'cuda':
@@ -18918,7 +19059,12 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
               'train_ce_fixed_final': _last_train_ce,
               'train_val_gap_final': _health.get('gap_last'),
               'best_step': _best_step, 'best_val_ppl': _best_val_ppl,
+              # `best_val_ppl` comes from the in-training eval_subset CURVE;
+              # the headline `ppl` is the final full-batch measurement, so
+              # this delta MIXES bases (diagnostics only — `curve_health`
+              # carries the same-base subset-vs-subset spelling).
               'final_minus_best': (float(ppl - _best_val_ppl) if (_is_finite_number(ppl) and _best_val_ppl is not None) else None),
+              'final_minus_best_basis': 'final full-batch ppl minus best eval_subset curve ppl (mixed bases; diagnostics only — never a reported endpoint)',
               'opt_diag': _diag, 'opt_diag_summary': _opt_summary,
               'peak_memory': _peak, 'efficiency': _efficiency,
               'checkpoints': _checkpoints}
@@ -20608,7 +20754,17 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
         rows.append((np.asarray(_nll, dtype=float), np.asarray(_ntok, dtype=float)))
     if len({len(a) for a, _ in rows}) != 1:
         return None
-    R = len(rows[0][0])
+    nll_mat = np.stack([a for a, _ in rows], axis=0)          # [S, R]
+    ntok_mat = np.stack([b for _, b in rows], axis=0)         # [S, R]
+    # A row with no scored tokens carries no measurement and must not enter
+    # the resampling population: keeping it would waste multinomial draws on
+    # a (0, 0) column and dilute the effective document count.  Same rule as
+    # _combined_seed_doc_ci / _nll_doc_ci; the eval rows are shared across
+    # seeds, so the union test is exact.
+    _keep = ntok_mat.sum(axis=0) > 0
+    nll_mat = nll_mat[:, _keep]
+    ntok_mat = ntok_mat[:, _keep]
+    R = int(nll_mat.shape[1])
     if R < 2:
         # Resampling ONE document always reproduces the same pooled PPL, so a
         # percentile interval would be [ppl, ppl] — false certainty rather
@@ -20616,8 +20772,6 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
         # seed x document helper already reports R<2 as unverifiable; keep the
         # standalone helper consistent instead of inventing a zero-width CI.
         return None
-    nll_mat = np.stack([a for a, _ in rows], axis=0)          # [S, R]
-    ntok_mat = np.stack([b for _, b in rows], axis=0)         # [S, R]
     rng = np.random.default_rng(int(seed))
     nll_col = nll_mat.sum(axis=0)
     ntok_col = ntok_mat.sum(axis=0)
@@ -20818,11 +20972,33 @@ def aggregate(summary, *, outdir=None):
             return _tag_of(rec)
         return record_tag(rec, key, _legacy_warm_ok)
     _legacy_warm_ok = legacy_warm_tags(summary)
+    # Records dropped from a group because they carry no usable measurement
+    # (an `error` record with no PPL, or a diverged inf/NaN PPL) must stay
+    # VISIBLE: a shrunken n_seeds is otherwise indistinguishable from "fewer
+    # seeds were planned".  `_plan_run` retrains such cells and prints; this
+    # is the same disclosure for the artifact readers actually consume.
+    _dropped = {}
     per_variant = {}
     for key, rec in summary.items():
-        if not isinstance(rec, dict) or 'ppl' not in rec or 'seed' not in rec:
+        if not isinstance(rec, dict) or 'seed' not in rec:
             continue
-        if not ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
+        _v_drop = None
+        _tag_drop = None
+        if 'ppl' not in rec or not ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
+            # Classify the drop reason for the disclosure below; the record
+            # itself is still excluded from every group exactly as before.
+            _v_drop = _record_variant_name(rec, key)
+            if _v_drop is not None:
+                _tag_drop = _protocol_tag(rec, key)
+                _bucket = ('synthesized' if rec.get('synthesized')
+                           else ('nonfinite_ppl' if 'ppl' in rec else 'error_no_ppl'))
+                _d = _dropped.setdefault((_v_drop, _tag_drop),
+                                         {'synthesized': 0, 'nonfinite_ppl': 0,
+                                          'error_no_ppl': 0, 'seeds': []})
+                _d[_bucket] = _d.get(_bucket, 0) + 1
+                _s = _as_seed_int(rec.get('seed'))
+                if _s is not None and _bucket != 'synthesized':
+                    _d['seeds'].append(_s)
             continue
         # A seed id is the unit of independent replication.  `int()` would
         # turn True into 1 and 1.5 into 1, fabricating extra or duplicate
@@ -20836,6 +21012,15 @@ def aggregate(summary, *, outdir=None):
             print(f'[aggregate] WARNING: ignoring record {key!r}: variant {rec.get("variant")!r} is not a text arm name')
             continue
         per_variant.setdefault((v, _protocol_tag(rec, key)), []).append(rec)
+    if _dropped:
+        _parts = []
+        for (_dv, _dt), _d in sorted(_dropped.items()):
+            _lbl = f'{_dv}#{_dt}' if _dt else _dv
+            _parts.append(f'{_lbl}: {_d["error_no_ppl"]} error/no-ppl + {_d["nonfinite_ppl"]} non-finite-ppl'
+                          + (f' (seeds {sorted(set(_d["seeds"]))})' if _d['seeds'] else '')
+                          + (f' + {_d["synthesized"]} synthesized' if _d['synthesized'] else ''))
+        print('[aggregate] NOTE: these (variant, protocol) groups dropped records with no usable measurement '
+              '(they are NOT part of n_seeds/ppl_*): ' + '; '.join(_parts))
     def _seed_key(s):
         # JSON round-trips can leave the same seed as 0 or "0"; the rest of the
         # readers normalise through `_as_seed_int`.  Keying dedup/pairing on the
@@ -20970,6 +21155,18 @@ def aggregate(summary, *, outdir=None):
                  'ppl_ci_seed_doc_combined': _combined_seed_doc_ci(recs),
                  'ppl_aggregation': ('pooled_token_nll' if _pooled is not None else 'arithmetic_seed_mean_fallback (records lack nll_sum/n_tokens)'),
                  'ppl_primary': (float(_pooled) if _pooled is not None else float(ppls.mean()))}
+        # Disclose the records this (variant, protocol) group LOST because
+        # they carry no usable measurement: n_seeds above only counts the
+        # survivors, and a shrunken panel must never read as "fewer seeds
+        # were planned".
+        _dr = _dropped.get((_v, _tag))
+        if _dr is not None:
+            entry['n_dropped_error_no_ppl'] = int(_dr['error_no_ppl'])
+            entry['n_dropped_nonfinite_ppl'] = int(_dr['nonfinite_ppl'])
+            if _dr['error_no_ppl'] or _dr['nonfinite_ppl']:
+                entry['dropped_seeds'] = sorted(set(_dr['seeds']))
+            if _dr['synthesized']:
+                entry['n_dropped_synthesized'] = int(_dr['synthesized'])
         _pb = _common_nonempty_dict(recs, 'param_breakdown')
         if _pb:
             entry['param_breakdown'] = _pb
