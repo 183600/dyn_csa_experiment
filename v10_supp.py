@@ -2131,7 +2131,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
         if 'omitted' in v:
             print(f'  {k:38s} omitted — {v['omitted']}')
             continue
-        print(f'  {k:38s} Δ={v['mean']:+7.2f} ± {v.get('std', 0):5.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  n={v['n']}')
+        _ptxt = ('' if v.get('param_controlled') is True else
+                 (f'  params {100.0 * v['param_rel_diff']:+.1f}% [capacity-confounded: system-level]' if v.get('param_controlled') is False else '  params unverifiable [system-level]'))
+        print(f'  {k:38s} Δ={v['mean']:+7.2f} ± {v.get('std', 0):5.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  n={v['n']}{_ptxt}')
     for label, v in xo.items():
         if v.get('status') == 'ok':
             if not v['mean_crossed']:

@@ -1244,6 +1244,11 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             lane_ok = torch.cat([sel_ok, win_ok], dim=-1)
             anyrow = (sel_ok.any(dim=-1) | win_ok.any(dim=-1)) if sink_v is None else None
             soft_c = soft[:, t0:t1, :].to(_wdt) if soft is not None else None
+            # 宽度为 0 的 soft 先验（nb == 0）没有可偏置的泳道，S 路径与
+            # A 路径逐位相同——它只会把 logits 梯度翻倍。宽度 0 === 无先验
+            # （与 eager 的 gathered_attention 入口规则一致）。
+            if soft_c is not None and int(soft_c.shape[-1]) == 0:
+                soft_c = None
             seg_b_c = None
             if need_dkb or need_dvb:
                 kb_keys = r_idx.expand(R, t1 - t0, nb) * Bm + src64
@@ -1444,6 +1449,10 @@ def gathered_attention_kernel(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w
     与 eager 产生分歧——直接调用时必须先自行去重。
     """
     impl = impl or _op_impl('ATTN')
+    # 与 eager 相同的规则：宽度为 0 的 soft 先验没有任何泳道可偏置，其
+    # 直通 S 路径只会把 A 路径的梯度复制一份（双倍）。宽度 0 === 无先验。
+    if soft is not None and int(getattr(soft, 'shape', ())[-1]) == 0:
+        soft = None
     return FusedSparseAttention.apply(impl, q, k_blk, v_blk, k_sw, v_sw, topk_idx,
                                       sel_valid, last_tok, soft, sink_logits, int(w), float(scale))
 

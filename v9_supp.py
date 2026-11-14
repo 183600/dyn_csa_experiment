@@ -167,6 +167,20 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None):
     res['seeds'] = [s for s in common if s not in set(skipped)]
     res['n_skipped_config_mismatch'] = len(skipped)
     res['n_unstamped'] = unstamped
+    # Parameter-control disclosure (the same 1% gate `methodology_audit`
+    # applies to the declared design tables): a paired contrast whose arms
+    # differ in total parameter count is capacity-confounded and may only be
+    # quoted as a system-level difference, never as an isolated mechanism
+    # claim.  The fields travel with the stats record so reports can label it.
+    _pc = L.paired_param_control([panel[a][s] for s in res['seeds']],
+                                 [panel[b][s] for s in res['seeds']])
+    res.update(_pc)
+    if _pc.get('param_controlled') is False:
+        print(f'[stats] {who}{name}: arms differ in total parameters by {100.0 * _pc["param_rel_diff"]:.1f}% '
+              f'({_pc["params_a"]:,} vs {_pc["params_b"]:,}) — capacity-confounded: system-level difference only, '
+              'not an isolated mechanism claim')
+    elif _pc.get('param_controlled') is None:
+        print(f'[stats] {who}{name}: parameter counts unverifiable on the paired records — param control not established (label as system-level unless a matched arm exists)')
     comparisons[name] = res
     return res
 
@@ -193,7 +207,9 @@ def v9_analysis(out='analysis_v9/stats.json'):
         if 'omitted' in v:
             print(f'  {k:38s} omitted — {v['omitted']}')
             continue
-        print(f'  {k:38s} Δ={v['mean']:+7.2f} ± {v.get('std', 0):5.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  n={v['n']}')
+        _ptxt = ('' if v.get('param_controlled') is True else
+                 (f'  params {100.0 * v['param_rel_diff']:+.1f}% [capacity-confounded: system-level]' if v.get('param_controlled') is False else '  params unverifiable [system-level]'))
+        print(f'  {k:38s} Δ={v['mean']:+7.2f} ± {v.get('std', 0):5.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  n={v['n']}{_ptxt}')
     return out_d
 
 def _fmt_pm(cell, std=None):

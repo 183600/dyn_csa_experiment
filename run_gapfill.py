@@ -108,6 +108,18 @@ def _fold_backup_into_aggregate(adir):
             merged[key] = bentry
             recovered[key] = sorted(missing)
             continue
+        # Recovering a seed from the pre-retrain snapshot pools two groups of
+        # measurements, legitimate only under ONE shared run_cfg fingerprint
+        # (configuration + code stamp, design_notes §3.1).  A differing or
+        # missing fingerprint means the snapshot seed was produced by another
+        # configuration: recovering it would mix stamps inside one mean/std.
+        _cfg_b, _cfg_l = bentry.get('run_cfg'), lentry.get('run_cfg')
+        if not (isinstance(_cfg_b, str) and _cfg_b and isinstance(_cfg_l, str)
+                and _cfg_l and _cfg_b == _cfg_l):
+            print(f'[synth] NOTE: `{key}`: the pre-retrain snapshot holds seed(s) {sorted(missing)} '
+                  f'under a different run_cfg fingerprint ({str(_cfg_b)[:24]}… vs live {str(_cfg_l)[:24]}…) — '
+                  'they are NOT recovered (cross-configuration pooling is forbidden, design_notes §3.1)')
+            continue
         sm = dict(sm_b)
         sm.update(sm_l)
         seeds_sorted = sorted(sm)
@@ -320,6 +332,22 @@ def merge_long_aggregate(adir, snapshot_agg):
         if not isinstance(sentry, dict):
             merged[key] = fentry
             continue
+        # Config identity: folding snapshot-only seeds into a fresh entry pools
+        # two groups of measurements, which is only legitimate when they share
+        # ONE run_cfg fingerprint (configuration + code stamp).  A differing —
+        # or missing — fingerprint means the snapshot values were produced by a
+        # different configuration; pooling them would silently mix stamps in
+        # one mean/std, exactly what design_notes §3.1 forbids.  The fresh
+        # entry then stands alone (the snapshot values stay in the .v6bak).
+        _cfg_s, _cfg_f = sentry.get('run_cfg'), fentry.get('run_cfg')
+        if not (isinstance(_cfg_s, str) and _cfg_s and isinstance(_cfg_f, str)
+                and _cfg_f and _cfg_s == _cfg_f):
+            print(f'[v6-merge] NOTE: `{key}` was re-measured under a different run_cfg fingerprint '
+                  f'(snapshot {str(_cfg_s)[:24]}… vs fresh {str(_cfg_f)[:24]}…) — the snapshot\'s seed(s) '
+                  'are NOT pooled in (cross-configuration pooling is forbidden, design_notes §3.1); '
+                  'the fresh entry stands alone')
+            merged[key] = fentry
+            continue
         sm = _seed_map(sentry, tag=str(key))
         fm = _seed_map(fentry, tag=str(key))
         _overlap = set(sm) & set(fm)
@@ -416,11 +444,28 @@ def merge_long_aggregate(adir, snapshot_agg):
             elif _overlap_warn:
                 print(f'[v6-merge] NOTE: `{key}` has overlapping seeds and only seed-averaged secondary/curve fields in the snapshot — those fields are left at their snapshot values instead of publishing a double-counted blend; per-seed PPL fields are exact.')
     if _folded_keys:
-        _base_full = _seed_map(merged.get('full'), tag='full')
-        _base_sw = _seed_map(merged.get('full_sw128_matched'), tag='full_sw128_matched')
+        _base_full_entry = merged.get('full')
+        _base_sw_entry = merged.get('full_sw128_matched')
+        _base_full = _seed_map(_base_full_entry, tag='full')
+        _base_sw = _seed_map(_base_sw_entry, tag='full_sw128_matched')
 
-        def _repair_delta(entry, base_map, mean_f, std_f, n_f):
+        def _repair_delta(entry, base_entry, base_map, mean_f, std_f, n_f):
             if not base_map:
+                return
+            # Paired deltas subtract two measurements, which design_notes §3.1
+            # only allows under ONE shared run_cfg fingerprint.  When the
+            # (folded) variant entry and the base arm were produced by
+            # different configurations/code stamps, repairing the delta here
+            # would publish a cross-configuration pairing; the entry then keeps
+            # whatever same-config dPPL the fresh aggregate itself computed.
+            _cfg_e = entry.get('run_cfg') if isinstance(entry, dict) else None
+            _cfg_b = base_entry.get('run_cfg') if isinstance(base_entry, dict) else None
+            if not (isinstance(_cfg_e, str) and _cfg_e and isinstance(_cfg_b, str)
+                    and _cfg_b and _cfg_e == _cfg_b):
+                print(f'[v6-merge] NOTE: `{str(entry.get("variant") if isinstance(entry, dict) else "")}` '
+                      f'and the base arm were measured under different run_cfg fingerprints '
+                      f'({str(_cfg_e)[:24]}… vs {str(_cfg_b)[:24]}…) — the paired dPPL fields are NOT '
+                      'recomputed across configurations; they keep the fresh aggregate\'s same-config values')
                 return
             vm = _seed_map(entry, tag=str(entry.get('variant') if isinstance(entry, dict) else ''))
             common = sorted(set(vm) & set(base_map))
@@ -436,9 +481,9 @@ def merge_long_aggregate(adir, snapshot_agg):
                 continue
             _v = entry.get('variant') or str(key).split('#')[0].split('@')[0]
             if _v != 'full':
-                _repair_delta(entry, _base_full, 'dPPL_vs_full_mean', 'dPPL_vs_full_std', 'n_paired')
+                _repair_delta(entry, _base_full_entry, _base_full, 'dPPL_vs_full_mean', 'dPPL_vs_full_std', 'n_paired')
             if _v not in ('full', 'full_sw128_matched'):
-                _repair_delta(entry, _base_sw, 'dPPL_vs_sw128m_mean', 'dPPL_vs_sw128m_std', 'n_paired_sw128m')
+                _repair_delta(entry, _base_sw_entry, _base_sw, 'dPPL_vs_sw128m_mean', 'dPPL_vs_sw128m_std', 'n_paired_sw128m')
     L.atomic_write_json(agg_path, merged, indent=2)
     try:
         L._save_csv(merged, adir)

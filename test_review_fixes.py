@@ -1485,9 +1485,15 @@ def t_recipe_signature():
         os.unlink(_bad_path)
 
 
-def t_finaltest_requires_parameter_matching():
-    # A confirmation must be parameter-matched.  Missing params is
-    # unverifiable, not a pass: the decision rule may not treat None like True.
+def t_finaltest_decision_rule_matches_frozen_manifest():
+    # The pre-registered decision rule (confirmation_frozen.json v3,
+    # statistics.decision_rule) is: CONFIRMED iff p_holm < 0.05 AND direction
+    # matches AND `param_matched is not false` AND >= min_seeds_for_confirmation
+    # complete pairs.  `coverage_ok` is reported but NOT required, and the
+    # init-core digests are reported instrumentation, never decision inputs.
+    # A stricter gate (param_matched is True / same_init_core_fp is True /
+    # coverage_ok) is post-freeze drift: it can only fail to confirm what the
+    # pre-registered rule confirms.
     with tempfile.TemporaryDirectory() as td:
         seeds = list(range(12))
         manifest = {
@@ -1517,14 +1523,16 @@ def t_finaltest_requires_parameter_matching():
         _old_probe = V12._test_probe_stats
         try:
             V12._test_probe_stats = lambda *a, **k: {}
+            # params missing -> param_matched is None ("not false"): the frozen
+            # rule CONFIRMS; None must not be silently treated like False.
             V12._admit_confirmation_records = lambda raw, man: (_records(), None)
             st = V12.finaltest_stats(manifest=manifest,
                                      bylen_path=os.path.join(td, 'bylen.json'),
                                      probe_path=os.path.join(td, 'probe.json'),
                                      out=os.path.join(td, 'stats.json'))
             assert st['comparisons']['c1']['param_matched'] is None
-            assert st['confirmed'] == [], st['confirmed']
-            # Missing matched-init provenance is also not a confirmation.
+            assert st['confirmed'] == ['c1'], st['confirmed']
+            # Missing init provenance is instrumentation-only: it cannot veto.
             V12._admit_confirmation_records = lambda raw, man: (_records(params=1000), None)
             st2 = V12.finaltest_stats(manifest=manifest,
                                       bylen_path=os.path.join(td, 'bylen.json'),
@@ -1532,14 +1540,15 @@ def t_finaltest_requires_parameter_matching():
                                       out=os.path.join(td, 'stats2.json'))
             assert st2['comparisons']['c1']['param_matched'] is True
             assert st2['comparisons']['c1']['init_core_fp_recorded'] is False
-            assert st2['confirmed'] == [], st2['confirmed']
+            assert st2['confirmed'] == ['c1'], st2['confirmed']
             # With parameter matching AND a shared init digest it confirms.
             V12._admit_confirmation_records = lambda raw, man: (_records(params=1000, init='INIT'), None)
             st3 = V12.finaltest_stats(manifest=manifest,
                                       bylen_path=os.path.join(td, 'bylen.json'),
                                       probe_path=os.path.join(td, 'probe.json'),
                                       out=os.path.join(td, 'stats3.json'))
-            # One missing per-seed digest is unverifiable, not a shared init.
+            # One missing per-seed digest is unverifiable (reported False),
+            # but the init digest is not a decision input.
             _partial = _records(params=1000, init='INIT')
             _partial[('b_arm', 0)].pop('init_core_fp')
             V12._admit_confirmation_records = lambda raw, man: (_partial, None)
@@ -1558,7 +1567,8 @@ def t_finaltest_requires_parameter_matching():
                                       probe_path=os.path.join(td, 'probe.json'),
                                       out=os.path.join(td, 'stats5.json'))
             # A boolean is a flag, not a shared-init digest: str(True) must not
-            # make two malformed arms look like the same initialization.
+            # make two malformed arms look like the same initialization
+            # (reported), but it is still not a decision input.
             V12._admit_confirmation_records = lambda raw, man: (_records(params=1000, init=True), None)
             st6 = V12.finaltest_stats(manifest=manifest,
                                       bylen_path=os.path.join(td, 'bylen.json'),
@@ -1581,15 +1591,15 @@ def t_finaltest_requires_parameter_matching():
         assert st3['confirmed'] == ['c1'], st3['confirmed']
         assert st4['comparisons']['c1']['init_core_fp_recorded'] is False, st4['comparisons']['c1']
         assert st4['comparisons']['c1']['same_init_core_fp'] is False, st4['comparisons']['c1']
-        assert st4['confirmed'] == [], st4['confirmed']
+        assert st4['confirmed'] == ['c1'], st4['confirmed']
         assert st5['by_length']['a_arm']['4096']['n_seqs'] is None, st5['by_length']['a_arm']['4096']
         assert st6['comparisons']['c1']['init_core_fp_recorded'] is False, st6['comparisons']['c1']
         assert st6['comparisons']['c1']['same_init_core_fp'] is False, st6['comparisons']['c1']
-        assert st6['confirmed'] == [], st6['confirmed']
+        assert st6['confirmed'] == ['c1'], st6['confirmed']
         assert st7['comparisons']['c1']['param_matched'] is None, st7['comparisons']['c1']
         assert st7['comparisons']['c1']['param_rel_diff'] is None, st7['comparisons']['c1']
         assert st7['comparisons']['c1']['params_unverifiable_seeds'] == [0], st7['comparisons']['c1']
-        assert st7['confirmed'] == [], st7['confirmed']
+        assert st7['confirmed'] == ['c1'], st7['confirmed']
 
 
 def t_freeze_lock():
@@ -1908,9 +1918,16 @@ def t_audit_resolution_classification():
         return s
     design = {'c': [('a', 'b', 'test')]}
     # n=6, effect > noise, p=0.0625 > alpha, but the exact-test floor (0.031)
-    # is BELOW alpha -> a genuine null-ish reading, NOT a resolution ceiling.
+    # is BELOW alpha -> powered, non-noise, resolution-OK, not significant:
+    # the 'measured' tier (descriptive).  It must NOT be reported as
+    # 'noise_level' (whose printed meaning is "effect within seed noise"),
+    # nor as resolution-limited.
     r = L.methodology_audit(_summary([1, 1, 1, 1, 1, -0.5]), design=design, verbose=False)
-    assert 'c' in r['noise_level_components'] and 'c' not in r['resolution_limited_components'], r
+    assert 'c' in r['measured_components'], r
+    assert 'c' not in r['noise_level_components'], r
+    assert 'c' not in r['resolution_limited_components'], r
+    # and a component whose exclusive status is 'measured' is listed once.
+    assert r['measured_components'].count('c') == 1, r
     # n=4 strong effect -> the floor (0.125) is above alpha -> resolution-limited.
     r2 = L.methodology_audit(_summary([1, 1, 1, 0.9]), design=design, verbose=False)
     assert 'c' in r2['resolution_limited_components'], r2
@@ -8670,6 +8687,310 @@ def t_topk_nan_matches_stable_sort():
             assert torch.equal(L._rank_blocks(x, B, 'latest', k), _latest[:, :k]), (vals, k)
 
 
+
+def t_zero_width_soft_is_no_prior():
+    # A zero-width soft prior (index_topk == 0 / no selectable blocks) carries
+    # no lanes: the straight-through S path would be numerically identical to
+    # the hard A path and DOUBLE every gradient through the softmax logits.
+    # Width 0 must therefore behave exactly like soft=None (forward AND
+    # gradients), in both the eager path and the kernel reference twin.
+    torch.manual_seed(0)
+    n, nh, hd, w, Bm = 6, 2, 4, 2, 3
+    q0 = torch.randn(n, nh, hd, dtype=torch.float64)
+    kb0 = torch.randn(Bm, nh, hd, dtype=torch.float64)
+    vb0 = torch.randn(Bm, nh, hd, dtype=torch.float64)
+    ksw0 = torch.randn(n, nh, hd, dtype=torch.float64)
+    vsw0 = torch.randn(n, nh, hd, dtype=torch.float64)
+    sk0 = torch.randn(nh, dtype=torch.float64)
+    tidx = torch.zeros(n, 0, dtype=torch.int32)
+    lt = torch.tensor([1, 3, 5], dtype=torch.int64)
+    sv = torch.ones(n, 0, dtype=torch.bool)
+    wgt = None
+
+    def _run(soft):
+        nonlocal wgt
+        q = q0.clone().requires_grad_(True)
+        kb = kb0.clone().requires_grad_(True)
+        vb = vb0.clone().requires_grad_(True)
+        ksw = ksw0.clone().requires_grad_(True)
+        vsw = vsw0.clone().requires_grad_(True)
+        sk = sk0.clone().requires_grad_(True)
+        out = L.gathered_attention(q, kb, vb, tidx, lt, ksw, vsw, w, 1.0,
+                                   soft=soft, sink_logits=sk, sel_valid=sv,
+                                   topk_distinct=True, soft_form=True)
+        if wgt is None:
+            wgt = torch.arange(1, out.numel() + 1, dtype=out.dtype).view_as(out)
+        g = torch.autograd.grad((out * wgt).sum(), [q, kb, ksw, vsw, sk])
+        return out.detach().clone(), g
+
+    out_n, g_n = _run(None)
+    out_z, g_z = _run(torch.empty(n, 0, dtype=torch.float64))
+    assert torch.equal(out_n, out_z), 'forward must be unchanged'
+    for a, b in zip(g_n, g_z):
+        assert torch.equal(a, b), 'a zero-width soft prior must not double the gradient'
+
+    # kernel reference twin (CPU backend of the fused path)
+    import csa_kernels as CK
+    R, T = 1, 6
+    qk0 = torch.randn(R, T, nh, hd, dtype=torch.float64)
+    kkb0 = torch.randn(R, Bm, nh, hd, dtype=torch.float64)
+    kvb0 = torch.randn(R, Bm, nh, hd, dtype=torch.float64)
+    kksw0 = torch.randn(R, T, nh, hd, dtype=torch.float64)
+    kvsw0 = torch.randn(R, T, nh, hd, dtype=torch.float64)
+    ksink0 = torch.randn(nh, dtype=torch.float64)
+    tidx2 = torch.zeros(R, T, 0, dtype=torch.int32)
+    tval2 = torch.ones(R, T, 0, dtype=torch.bool)
+    tlt2 = torch.tensor([[1, 3, 5]], dtype=torch.int64)
+    wk = None
+
+    def _run_k(soft):
+        nonlocal wk
+        q = qk0.clone().requires_grad_(True)
+        kb = kkb0.clone().requires_grad_(True)
+        ksw = kksw0.clone().requires_grad_(True)
+        sk = ksink0.clone().requires_grad_(True)
+        out = CK.gathered_attention_kernel(q, kb, kvb0, tidx2, tlt2, ksw, kvsw0, w, 1.0,
+                                           soft=soft, sink_logits=sk, sel_valid=tval2, impl='ref')
+        if wk is None:
+            wk = torch.arange(1, out.numel() + 1, dtype=out.dtype).view_as(out)
+        g = torch.autograd.grad((out * wk).sum(), [q, kb, ksw, sk])
+        return out.detach().clone(), g
+
+    out_kn, g_kn = _run_k(None)
+    out_kz, g_kz = _run_k(torch.empty(R, T, 0, dtype=torch.float64))
+    assert torch.equal(out_kn, out_kz)
+    for a, b in zip(g_kn, g_kz):
+        assert torch.equal(a, b), 'kernel twin: a zero-width soft prior must not double the gradient'
+
+
+def t_pair_reason_refuses_boolean_fingerprints():
+    # A boolean is a flag, not a corpus identity (assert_shared_validation_fp
+    # raises on it).  When BOTH records carry one, the pair must be refused as
+    # unverifiable — not silently paired through the absent-vs-absent path.
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    base = dict(variant='a', seed=0, run_cfg=fp, steps=1, tokens_seen=1, ppl=10.0)
+    a = dict(base, data_fp=True)
+    b = dict(base, variant='b', data_fp=True)
+    r = L.pair_reason(a, b)
+    assert r is not None and 'unverifiable data_fp' in r, r
+    a2 = dict(base, init_core_fp=True)
+    b2 = dict(base, variant='b', init_core_fp=True)
+    r2 = L.pair_reason(a2, b2)
+    assert r2 is not None and 'unverifiable init_core_fp' in r2, r2
+    # the honest case is untouched: identical string fingerprints still pair
+    ok = L.pair_reason(dict(base, data_fp='abc'), dict(base, variant='b', data_fp='abc'))
+    assert ok is None, ok
+
+
+def t_classify_measured_tier_direct():
+    # _classify_group_status must return 'measured' for a controlled, powered,
+    # non-noise, resolution-OK, not-significant contrast — falling through to
+    # 'noise_level' would mislabel a measurably non-noise effect as noise.
+    e = [{'controlled': True, 'n': 6, 'significant_global': False,
+          'within_seed_noise': False, 'n_nonzero': 6}]
+    assert L._classify_group_status(e, min_n=3, alpha=0.05, m_family=1) == 'measured'
+    all_noise = [{'controlled': True, 'n': 6, 'significant_global': False,
+                  'within_seed_noise': True, 'n_nonzero': 6}]
+    assert L._classify_group_status(all_noise, min_n=3, alpha=0.05, m_family=1) == 'noise_level'
+    low_res = [{'controlled': True, 'n': 4, 'significant_global': False,
+                'within_seed_noise': False, 'n_nonzero': 4}]
+    assert L._classify_group_status(low_res, min_n=3, alpha=0.05, m_family=1) == 'resolution_limited'
+    under = [{'controlled': True, 'n': 2, 'significant_global': False,
+              'within_seed_noise': False, 'n_nonzero': 2}]
+    assert L._classify_group_status(under, min_n=3, alpha=0.05, m_family=1) == 'underpowered'
+
+
+def t_v6_merge_refuses_cross_config_pooling():
+    # The v6 long-panel merge may only pool snapshot seeds into a fresh entry
+    # (and recompute paired dPPL fields) when BOTH sides share one run_cfg
+    # fingerprint; cross-configuration pooling/pairing violates design_notes
+    # 3.1 and must be skipped loudly.
+    import run_gapfill as RG
+    with tempfile.TemporaryDirectory() as td:
+        agg_path = os.path.join(td, 'aggregate.json')
+        fresh = {
+            'hybrid_fixed': {'variant': 'hybrid_fixed', 'run_cfg': 'CFG_NEW_csX',
+                             'seeds': [0, 1, 2], 'ppls': [20.0, 21.0, 22.0],
+                             'n_seeds': 3, 'ppl_mean': 21.0, 'ppl_std': 1.0,
+                             'dPPL_vs_full_mean': -5.0, 'dPPL_vs_full_std': 0.5, 'n_paired': 3},
+            'arm_same_cfg': {'variant': 'arm_same_cfg', 'run_cfg': 'CFG_SAME_csX',
+                             'seeds': [0], 'ppls': [30.0], 'n_seeds': 1,
+                             'ppl_mean': 30.0, 'ppl_std': 0.0},
+        }
+        L.atomic_write_json(agg_path, fresh, indent=2)
+        snapshot = {
+            'hybrid_fixed': {'variant': 'hybrid_fixed', 'run_cfg': 'CFG_OLD_csW',
+                             'seeds': [0, 1, 2, 3], 'ppls': [90.0, 91.0, 92.0, 99.0],
+                             'n_seeds': 4, 'ppl_mean': 93.0, 'ppl_std': 4.0},
+            'full': {'variant': 'full', 'run_cfg': 'CFG_OLD_csW',
+                     'seeds': [0, 1, 2, 3], 'ppls': [25.0, 26.0, 27.0, 28.0],
+                     'n_seeds': 4, 'ppl_mean': 26.5, 'ppl_std': 1.0},
+            'arm_same_cfg': {'variant': 'arm_same_cfg', 'run_cfg': 'CFG_SAME_csX',
+                             'seeds': [0, 1], 'ppls': [30.0, 32.0],
+                             'n_seeds': 2, 'ppl_mean': 31.0, 'ppl_std': 1.0},
+        }
+        RG.merge_long_aggregate(td, snapshot)
+        merged = json.load(open(agg_path, encoding='utf-8'))
+        # re-measured under a different run_cfg: the snapshot seed 3 (99.0,
+        # old config) must NOT be pooled into the fresh entry
+        assert merged['hybrid_fixed']['seeds'] == [0, 1, 2], merged['hybrid_fixed']
+        assert 99.0 not in merged['hybrid_fixed']['ppls'], merged['hybrid_fixed']
+        # the fresh entry's own same-config dPPL fields survive untouched
+        # (the snapshot `full` is a different run_cfg: no cross-config pairing)
+        assert merged['hybrid_fixed']['dPPL_vs_full_mean'] == -5.0, merged['hybrid_fixed']
+        # same-config fold still recovers the snapshot-only seed 1
+        assert merged['arm_same_cfg']['seeds'] == [0, 1], merged['arm_same_cfg']
+        # snapshot-only arms (not re-measured) are restored unchanged
+        assert merged['full']['seeds'] == [0, 1, 2, 3], merged['full']
+
+        # same-config pairing DOES repair the delta over the union
+        fresh2 = {'h2': {'variant': 'h2', 'run_cfg': 'CFG_SAME_csX',
+                         'seeds': [0], 'ppls': [10.0], 'n_seeds': 1,
+                         'ppl_mean': 10.0, 'ppl_std': 0.0}}
+        L.atomic_write_json(agg_path, fresh2, indent=2)
+        snapshot2 = {
+            'h2': {'variant': 'h2', 'run_cfg': 'CFG_SAME_csX',
+                   'seeds': [0, 1], 'ppls': [10.0, 12.0], 'n_seeds': 2,
+                   'ppl_mean': 11.0, 'ppl_std': 1.0},
+            'full': {'variant': 'full', 'run_cfg': 'CFG_SAME_csX',
+                     'seeds': [0, 1], 'ppls': [20.0, 22.0], 'n_seeds': 2,
+                     'ppl_mean': 21.0, 'ppl_std': 1.0},
+        }
+        RG.merge_long_aggregate(td, snapshot2)
+        merged2 = json.load(open(agg_path, encoding='utf-8'))
+        assert merged2['h2']['seeds'] == [0, 1], merged2['h2']
+        assert merged2['h2']['dPPL_vs_full_mean'] == -10.0, merged2['h2']
+        assert merged2['h2']['n_paired'] == 2, merged2['h2']
+
+        # _fold_backup_into_aggregate: same guard for the .v6bak -> live fold
+        live = {'a': {'variant': 'a', 'run_cfg': 'CFG_NEW_csX',
+                      'seeds': [0, 1], 'ppls': [5.0, 6.0], 'n_seeds': 2,
+                      'ppl_mean': 5.5, 'ppl_std': 0.5}}
+        L.atomic_write_json(agg_path, live, indent=2)
+        bak = {'a': {'variant': 'a', 'run_cfg': 'CFG_OLD_csW',
+                     'seeds': [0, 1, 7], 'ppls': [5.0, 6.0, 70.0],
+                     'n_seeds': 3, 'ppl_mean': 27.0, 'ppl_std': 1.0}}
+        L.atomic_write_json(os.path.join(td, 'aggregate.json.v6bak'), bak, indent=2)
+        RG._fold_backup_into_aggregate(td)
+        m3 = json.load(open(agg_path, encoding='utf-8'))
+        assert m3['a']['seeds'] == [0, 1], m3['a']
+        assert 70.0 not in m3['a']['ppls'], m3['a']
+
+
+def t_sec_p1l_accepts_integral_float_spelling():
+    # JSON object keys are always strings, so an integral-float length key
+    # (1024.0) reaches the report as "1024.0".  The promised validated-by-value
+    # resolution must accept that canonical spelling; fractional floats stay
+    # rejected, and a duplicate integer spelling stays ambiguous.
+    rec = {'v::s0': {'variant': 'v', 'seed': 0, '_code': BR._CUR_CS, 'by_len': {
+        '512': {'ppl': 10.0, 'truncated': False},
+        '1024.0': {'ppl': 28.0, 'truncated': False},
+        '2048.00': {'ppl': 31.0, 'truncated': False},
+        '4096.5': {'ppl': 99.0, 'truncated': False},
+    }}}
+    BR._LOADED[('summary', 'results_len')] = rec
+    try:
+        txt = BR.sec_p1l()
+    finally:
+        BR._LOADED.pop(('summary', 'results_len'), None)
+    assert 'PPL@1024' in txt and '28.0' in txt, txt[:600]
+    assert 'PPL@2048' in txt and '31.0' in txt, txt[:600]
+    assert 'PPL@512' in txt and '10.0' in txt, txt[:600]
+    assert '99.0' not in txt and 'PPL@4096' not in txt, txt[:600]
+    # int + integral-float spellings of one length are still ambiguous
+    rec2 = {'v::s0': {'variant': 'v', 'seed': 0, '_code': BR._CUR_CS, 'by_len': {
+        512: {'ppl': 10.0, 'truncated': False},
+        '512.0': {'ppl': 11.0, 'truncated': False},
+        '4096': {'ppl': 20.0, 'truncated': False},
+    }}}
+    BR._LOADED[('summary', 'results_len')] = rec2
+    try:
+        txt2 = BR.sec_p1l()
+    finally:
+        BR._LOADED.pop(('summary', 'results_len'), None)
+    assert 'PPL@512' in txt2 and txt2.count('PPL@512') == 1, txt2[:600]
+    assert 'PPL@4096' in txt2 and '20.0' in txt2, txt2[:600]
+
+
+def t_driver_paired_param_disclosure():
+    # v8/v9(+v10/v11 via V9.add_paired) driver-level contrasts must carry the
+    # parameter-control disclosure: matched counts -> True, mismatched ->
+    # False (+ capacity-confounded note), missing -> None (unverifiable).
+    import v8_supp as V8D
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+
+    def _panel(params_a, params_b, seeds=(0, 1, 2)):
+        pa, pb = {}, {}
+        for s in seeds:
+            ra = {'variant': 'x', 'seed': s, 'run_cfg': fp, 'steps': 1,
+                  'tokens_seen': 1, 'ppl': 20.0 + s}
+            rb = {'variant': 'y', 'seed': s, 'run_cfg': fp, 'steps': 1,
+                  'tokens_seen': 1, 'ppl': 22.0 + s}
+            if params_a is not None:
+                ra['params'] = params_a
+            if params_b is not None:
+                rb['params'] = params_b
+            pa[s] = ra
+            pb[s] = rb
+        return pa, pb
+
+    comps = {}
+    pa, pb = _panel(1000, 1250)
+    res = V8D._add_paired(comps, 'mismatch', {'x': pa, 'y': pb}, 'x', 'y')
+    assert res['param_controlled'] is False and abs(res['param_rel_diff'] - 0.2) < 1e-12, res
+    assert res['params_a'] == 1000 and res['params_b'] == 1250, res
+    comps2 = {}
+    pa, pb = _panel(1000, 1000)
+    res2 = V8D._add_paired(comps2, 'matched', {'x': pa, 'y': pb}, 'x', 'y')
+    assert res2['param_controlled'] is True and res2['param_rel_diff'] == 0.0, res2
+    comps3 = {}
+    pa, pb = _panel(None, 1000)
+    res3 = V8D._add_paired(comps3, 'missing', {'x': pa, 'y': pb}, 'x', 'y')
+    assert res3['param_controlled'] is None and res3['param_rel_diff'] is None, res3
+    # a single bad count makes the arm unverifiable, not averaged
+    comps4 = {}
+    pa, pb = _panel(1000, 1000)
+    pb[2]['params'] = 1001
+    res4 = V8D._add_paired(comps4, 'inconsistent', {'x': pa, 'y': pb}, 'x', 'y')
+    assert res4['param_controlled'] is None, res4
+
+
+def t_v12_frozen_rule_helper():
+    # One implementation of the manifest-v3 decision rule, shared by
+    # finaltest_stats and the report fallback.  Gate semantics: strict
+    # p_holm < alpha; direction_ok is True; param_matched is NOT False (None
+    # = unverifiable passes); n_effective >= min floor; coverage_ok and the
+    # init digests are never decision inputs.
+    ok_holm = {'p_holm': 0.001}
+    ok_comp = {'direction_ok': True, 'param_matched': True, 'n_effective': 12,
+               'min_seeds_for_confirmation': 8}
+    assert V12._frozen_rule_confirms(ok_holm, ok_comp, 0.05) is True
+    # param_matched None (unverifiable) passes; only a measured mismatch blocks
+    assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, param_matched=None), 0.05) is True
+    assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, param_matched=False), 0.05) is False
+    # coverage_ok / init digests never veto
+    assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, coverage_ok=False,
+                                                   same_init_core_fp=False,
+                                                   init_core_fp_recorded=False), 0.05) is True
+    # strict < alpha (0.05 exactly does not pass)
+    assert V12._frozen_rule_confirms({'p_holm': 0.05}, ok_comp, 0.05) is False
+    assert V12._frozen_rule_confirms({'p_holm': 0.0500001}, ok_comp, 0.05) is False
+    # direction and n floor
+    assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, direction_ok=False), 0.05) is False
+    assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, direction_ok=None), 0.05) is False
+    assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, n_effective=7), 0.05) is False
+    assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, n_effective=8), 0.05) is True
+    # fallback floor when the comparison does not declare one
+    assert V12._frozen_rule_confirms(ok_holm, {'direction_ok': True, 'param_matched': None,
+                                               'n_effective': 8}, 0.05, 8) is True
+    assert V12._frozen_rule_confirms(ok_holm, {'direction_ok': True, 'param_matched': None,
+                                               'n_effective': 7}, 0.05, 8) is False
+    # malformed inputs fail closed
+    assert V12._frozen_rule_confirms({}, ok_comp, 0.05) is False
+    assert V12._frozen_rule_confirms(None, None, 0.05) is False
+    assert V12._frozen_rule_confirms({'p_holm': True}, ok_comp, 0.05) is False
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -8720,7 +9041,7 @@ def main():
     _check('R5e review-5 guards: pre-access power enumeration', t_review5_power_enumeration)
     _check('R5f review-5 guards: rope layer refuses under CSA_KERNEL', t_review5_rope_kernel_guard)
     _check('C5 freeze lock', t_freeze_lock)
-    _check('C5b final test requires parameter matching', t_finaltest_requires_parameter_matching)
+    _check('C5b final test decision rule matches the frozen manifest', t_finaltest_decision_rule_matches_frozen_manifest)
     _check('C9 aggregate seed normalization', t_aggregate_seed_normalization)
     _check('C9b aggregate rejects malformed seed ids', t_aggregate_rejects_malformed_seed_ids)
     _check('C10 audit resolution classification', t_audit_resolution_classification)
@@ -8938,6 +9259,13 @@ def main():
     _check('L21 probe readers/manifest reject impossible geometry', t_probe_reader_geometry_and_manifest_fail_closed)
     _check('L22 malformed panel/NIAH records are excluded', t_malformed_panel_and_niah_records_are_excluded)
     _check('L23 temporal/wide-int/memo/class/label/pairing identity regressions', t_identity_fingerprint_and_pairing_regressions)
+    _check('M1 zero-width soft prior == no prior (values and gradients)', t_zero_width_soft_is_no_prior)
+    _check('M2 pair_reason refuses boolean fingerprints on both sides', t_pair_reason_refuses_boolean_fingerprints)
+    _check('M3 classify status has a measured tier', t_classify_measured_tier_direct)
+    _check('M4 v6 merge refuses cross-configuration pooling/pairing', t_v6_merge_refuses_cross_config_pooling)
+    _check('M5 report accepts integral-float length spellings', t_sec_p1l_accepts_integral_float_spelling)
+    _check('M6 driver paired contrasts carry param-control disclosure', t_driver_paired_param_disclosure)
+    _check('M7 v12 frozen decision rule helper (single implementation)', t_v12_frozen_rule_helper)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

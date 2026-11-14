@@ -929,8 +929,15 @@ def _recipe_matches_signature(recipe, sig):
     nt/lr/wd/d/L/H/Dh/v/wu/cl/dlm/ee/es）；mt/mr/det/df/cs 与变体/环境/数据
     绑定，不由签名钉死。recipe 不可解码或任一声明字段不匹配 → False。
     长度 checkpoint 的 `p1l_` 配方按同一组语义键解码（见 `_recipe_knobs`）；
-    该路径不运行训练中验证，故 `ee`/`es`（只影响中间评测、不影响权重）不
-    由它承载，不因此拒绝整条记录。"""
+    该配方的字符串格式不携带 `ee`/`es`，故缺少这两个键时不拒绝整条记录。
+    理由：`ee`/`es` 只门控**诊断性**的固定批训练侧评测（`diag_eval_every`：
+    健康监控专用，绝不参与模型选择，也不改动权重或冻结端点——端点在测试
+    切片上重评），因此它们不是权重的训练配方；P5C 自身以
+    `diag_eval_every=250` 训练，该事实由阶段配置与 `run_length_extrapolation`
+    的调用点约束，不由 p1l 配方字符串承载。manifest **v4** 已据此把
+    `ee`/`es` 从可机检签名中移除（预访问修订，见其 revision.history）；
+    对 v3 时代的旧清单，本函数对 p1l 配方跳过这两个键，而不是拒绝整条
+    记录（v3 的 `ee=250`/`es=128` 对 p1l 记录本就是不可机检的死字母）。"""
     if not isinstance(sig, dict) or not sig:
         return True
     if not isinstance(recipe, str):
@@ -2410,6 +2417,37 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
     return out
 
 
+def _frozen_rule_confirms(holm_entry, comp, alpha, n_seeds_fallback=8):
+    """The manifest-v3 decision rule for ONE frozen comparison.
+
+    CONFIRMED iff p_holm < alpha (strict — the manifest text says
+    `p_holm < 0.05`, while the generic holm_adjust `reject` uses `<=`) AND
+    direction_ok is True AND `param_matched is not false` (True or the
+    unverifiable None; only a measured >1% mismatch blocks) AND the effective
+    pair count reaches the declared min_seeds_for_confirmation floor.
+    `coverage_ok` and the init-core digests are reported instrumentation,
+    never decision inputs.  Both `finaltest_stats` and the report's legacy
+    fallback call this ONE implementation so they cannot drift apart again.
+    """
+    _ph = (holm_entry or {}).get('p_holm') if isinstance(holm_entry, dict) else None
+    try:
+        if _ph is None or not math.isfinite(float(_ph)) or float(_ph) >= alpha:
+            return False
+    except (TypeError, ValueError, OverflowError):
+        return False
+    comp = comp if isinstance(comp, dict) else {}
+    if comp.get('direction_ok') is not True:
+        return False
+    if comp.get('param_matched') is False:
+        return False
+    try:
+        _n = int(comp.get('n_effective') or comp.get('n') or 0)
+        _floor = int(comp.get('min_seeds_for_confirmation') or n_seeds_fallback)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return _n >= _floor
+
+
 def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analysis_v12/test_stats.json'):
     """Zero-GPU: paired confirmation statistics under the frozen plan.
 
@@ -2706,15 +2744,19 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # expected_sign marks a non-directional mechanism readout).  The strict `<`
     # matches the manifest's `p_holm < 0.05` (the generic holm_adjust uses `<=`).
     # The pre-registered decision rule (manifest v3) requires p_holm < alpha
-    # AND the observed direction AND parameter matching AND at least
+    # AND the observed direction AND `param_matched is not false` (True or
+    # unverifiable — None; only a measured >1% mismatch blocks) AND at least
     # `min_seeds_for_confirmation` complete pairs.  `coverage_ok` (all 12
     # seeds) is reported but is not an all-or-nothing veto: one failed
     # L4096 cell may not annihilate an otherwise complete comparison.
-    _conf = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is True
-             and stats['comparisons'].get(k, {}).get('param_matched') is True
-             and stats['comparisons'].get(k, {}).get('same_init_core_fp') is True
-             and stats['comparisons'].get(k, {}).get('init_core_fp_recorded') is True
-             and int(stats['comparisons'].get(k, {}).get('n_effective') or 0) >= int(stats['comparisons'].get(k, {}).get('min_seeds_for_confirmation') or len(manifest['seeds']))]
+    # `same_init_core_fp` / `init_core_fp_recorded` are NOT decision inputs:
+    # the manifest records the init digest as reported instrumentation
+    # ("reported and compared"), so they stay in `not_confirmed_reasons`
+    # for transparency but never gate the CONFIRMED set.
+    _conf = [k for k in _rej if _frozen_rule_confirms(stats['holm'].get(k, {}),
+                                                       stats['comparisons'].get(k, {}),
+                                                       _alpha,
+                                                       len(manifest['seeds']))]
     stats['confirmed'] = _conf
     stats['significant_nondirectional'] = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is None]
     stats['not_confirmed_reasons'] = {k: {'param_matched': stats['comparisons'].get(k, {}).get('param_matched'),
@@ -2726,21 +2768,25 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                           'init_core_fp_recorded': stats['comparisons'].get(k, {}).get('init_core_fp_recorded')}
                                       for k in _rej if k not in _conf}
     # DISCLOSURE: the implemented decision rule is STRICTER than the manifest
-    # wording.  The manifest (v3) decision_rule is "p_holm < alpha AND direction
-    # matches AND param_matched is not false AND >= 8 complete pairs"; the
-    # implementation additionally requires `same_init_core_fp` and
-    # `init_core_fp_recorded` to be true, and interprets param_matched
-    # strictly (True, not merely "not false" — a missing params field cannot
-    # confirm).  Stricter-than-preregistered is safe (fewer confirmations) but
-    # must be visible next to every 'confirmed' list, not only in the source.
+    # The implemented rule is EXACTLY the manifest decision_rule (v3/v4
+    # wording, unchanged): "p_holm < alpha AND direction matches AND
+    # param_matched is not false AND >= min_seeds_for_confirmation complete
+    # pairs".  `param_matched is not false` means True or the unverifiable
+    # None both pass — only a measured >1% mismatch blocks — and the
+    # init-core digests are reported instrumentation, never decision inputs.
+    # An earlier implementation was silently stricter (param_matched is True
+    # + init-digest gates + a coverage_ok veto in the report fallback); that
+    # drift was reverted so the confirmatory label means exactly what the
+    # pre-registration says.  The disclosure block stays so any future
+    # divergence is visible next to every 'confirmed' list.
     stats['decision_rule_applied'] = {
         'manifest_rule': (manifest.get('statistics') or {}).get('decision_rule'),
         'implementation_gates': ['p_holm < alpha (strict <)', 'direction_ok is True',
-                                 'param_matched is True (stricter than the manifest "not false": missing params cannot confirm)',
-                                 'same_init_core_fp is True (addition beyond the manifest rule)',
-                                 'init_core_fp_recorded is True (addition beyond the manifest rule)',
+                                 'param_matched is not False (True or unverifiable None; a measured >1% mismatch blocks)',
                                  'n_effective >= min_seeds_for_confirmation'],
-        'note': 'The implemented rule is STRICTER than the pre-registered wording; it can only reduce the confirmed set, never enlarge it. A revision that intends these gates to be part of the pre-registration must record them in the manifest revision history before the first test access.',
+        'excluded_gates': ['coverage_ok (reported, not required — v3 removed the all-seeds veto)',
+                           'same_init_core_fp / init_core_fp_recorded (reported instrumentation, never decision inputs)'],
+        'note': 'The implemented rule matches the pre-registered manifest wording exactly (one shared helper, v12_supp._frozen_rule_confirms, is used by finaltest_stats and the report fallback).',
     }
     _m = len(manifest['primary_comparisons'])
     _n = len(manifest['seeds'])
@@ -2896,7 +2942,17 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         A('')
         _conf = ft.get('confirmed')
         if _conf is None:
-            _conf = [k for k, v in holm.items() if v.get('reject') and (comps.get(k, {}).get('direction_ok') is True) and (comps.get(k, {}).get('param_matched') is True) and (comps.get(k, {}).get('same_init_core_fp') is True) and (comps.get(k, {}).get('init_core_fp_recorded') is True) and (comps.get(k, {}).get('coverage_ok') is True)]
+            # Legacy stats files without a `confirmed` key: re-derive the
+            # pre-registered decision rule EXACTLY as `finaltest_stats` does
+            # (manifest v3): strict p_holm < alpha (not holm_adjust's `<=`
+            # reject flag), direction_ok is True, `param_matched is not false`
+            # (None = unverifiable does not block), and n >= the declared
+            # min_seeds_for_confirmation floor.  `coverage_ok` is reported,
+            # NOT required — v3 explicitly removed the all-12-seeds veto —
+            # and the init-core digests are instrumentation, not decision
+            # inputs.
+            _conf = [k for k, v in holm.items()
+                     if _frozen_rule_confirms(v, comps.get(k, {}), _alpha)]
         if _conf:
             A(f'**确认结果**：{len(_conf)}/{len(comps)} 个冻结主比较在 Holm 校正后成立**且方向符合预注册**（{sorted(_conf)}）——这是预注册规则下的确认性证据。')
         else:
@@ -3251,8 +3307,11 @@ def run_smoke():
     # Smoke must never write into the frozen wt103_cache: a differently
     # tokenised tok_v5_*.json could make a later cold P5T build fail AFTER the
     # test read.  An isolated cache under the smoke outdir keeps the frozen
-    # cache clean.
-    os.environ.setdefault('WT103_CACHE_DIR', os.path.join('results_smoke_v12', 'wt103_cache'))
+    # cache clean.  The override is UNCONDITIONAL: `setdefault` would let an
+    # exported WT103_CACHE_DIR (e.g. pointing at the frozen cache) silently
+    # redirect the smoke's cold build into exactly the directory this guard
+    # exists to protect.
+    os.environ['WT103_CACHE_DIR'] = os.path.join('results_smoke_v12', 'wt103_cache')
     print('[smoke] 1) tiny frozen-confirmation roundtrip on a synthetic local test split')
     L.set_seed(0)
     shutil.rmtree('results_smoke_v12', ignore_errors=True)

@@ -3976,6 +3976,13 @@ def _finfo_min(dtype):
 def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None, topk_distinct=False, soft_form=False, v_stacked=None, k_stacked=None):
     n = q.shape[0]
     dev = q.device
+    # A zero-width soft prior (index_topk == 0 / no selectable blocks) carries
+    # no lanes, so the straight-through branch below would add an S path that
+    # is numerically IDENTICAL to the hard A path (soft_logits == logits when
+    # there are no block lanes to bias) and double every gradient through the
+    # softmax logits.  A width-0 prior is therefore exactly "no prior".
+    if soft is not None and int(getattr(soft, 'shape', ())[-1]) == 0:
+        soft = None
     if mem_budget_bytes is None:
         mem_budget_bytes = _attn_transient_budget(dev)
     if mem_budget_bytes is None:
@@ -4248,6 +4255,11 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
     K = int(topk_idx.shape[1])
     dev = q.device
     nh, hd = int(q.shape[1]), int(q.shape[2])
+    # Same rule as `gathered_attention`: a zero-width soft prior has no lanes
+    # to bias, so its straight-through S path would only duplicate the hard
+    # path's gradient.  Treat it as "no prior".
+    if soft is not None and int(getattr(soft, 'shape', ())[-1]) == 0:
+        soft = None
     if mem_budget_bytes is None:
         mem_budget_bytes = _attn_transient_budget(dev)
     if mem_budget_bytes is None:
@@ -6157,7 +6169,6 @@ def _wt_cache_dir(cache_dir=None):
 
 
 def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_dir=None):
-    from datasets import load_dataset
     cache_dir = _wt_cache_dir(cache_dir)
     os.makedirs(cache_dir, exist_ok=True)
     tag = f'v5_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}'
@@ -6287,6 +6298,12 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     ds = local_wikitext_if_available(cache_dir)
     if ds is None:
         last_err = None
+        # The Hub import happens ONLY on the network path: a warm cache or the
+        # WT103_RAW_TXT local-dump fallback must work on machines (including
+        # air-gapped ones) without `datasets` installed — the fallback is a
+        # pure availability path, so its preconditions must not include the
+        # Hub client.
+        from datasets import load_dataset
         for repo in ('Salesforce/wikitext', 'wikitext'):
             try:
                 # Request train/validation EXPLICITLY.  Calling without
@@ -6305,8 +6322,14 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         raise TypeError(f"load_wikitext: the loaded corpus object does not expose the ['train']/['validation'] splits (got {type(ds).__name__}); refusing to tokenise a corpus we cannot identify")
     # Tokenizer fit is a frozen TRAIN prefix with an explicit token cap:
     # every document it sees is also inside the model's training region (for
-    # caps below the global cap), never a validation/test row.  The cap
-    # is fixed across the scale ladder so S1/S2/S3 share one tokenizer version.
+    # caps below the global cap), never a validation/test row.  The fit cap is
+    # `min(TOKENIZER_FIT_TOKENS, n_train_tokens)`, i.e. it DEPENDS on the
+    # requested train-token budget: two caches built at different caps can
+    # carry different tokenizer fits.  The scale ladder pins one cap per cache
+    # (the cache tag embeds the cap, and cross-cache pairing is refused
+    # fail-closed), so arms inside one comparison always share one tokenizer —
+    # but "one tokenizer version across all tiers" is a property of the plan's
+    # cap choices, not of this loader.
     _fit_cap = min(int(TOKENIZER_FIT_TOKENS), int(n_train_tokens))
     # Only the frozen prefix is needed for the tokenizer fit; the rest of the
     # train split's text does not enter the fit.
@@ -9245,19 +9268,32 @@ def pair_reason(ra, rb):
     # Both-present equality is required; a one-sided fingerprint is
     # unverifiable, exactly like the optimizer-descriptor gate above.
     for _k in ('data_fp', 'val_fp', 'eval_fp'):
-        _pa = _content_fp_text(ra.get(_k))
-        _pb = _content_fp_text(rb.get(_k))
+        _ra, _rb = ra.get(_k), rb.get(_k)
+        # A boolean is a flag, not a corpus identity
+        # (`assert_shared_validation_fp` raises on it for exactly this reason).
+        # When BOTH sides carry a boolean the canonical text mapping would see
+        # two absent values and silently take the permissive absent-vs-absent
+        # path — two records with garbage provenance would pair as if
+        # controlled.  Refuse instead.
+        if isinstance(_ra, (bool, np.bool_)) or isinstance(_rb, (bool, np.bool_)):
+            return f'unverifiable {_k} (a boolean is not a corpus / evaluation-slice fingerprint)'
+        _pa = _content_fp_text(_ra)
+        _pb = _content_fp_text(_rb)
         if (_pa is None) != (_pb is None):
             return f'unverifiable {_k} (only one record carries the corpus / evaluation-slice fingerprint)'
         if _pa is not None and _pa != _pb:
             return f'different {_k} ({_pa[:12]}… vs {_pb[:12]}…)'
     # Matched initialization: same seed is not enough (architectures consume
     # different amounts of RNG), so compare the shared-trunk init digest.
-    # Both-present equality is required; one-sided is unverifiable.  RNG-state
-    # equality is deliberately NOT required: architecture-induced RNG
-    # consumption is part of the arm.
-    _ia = _content_fp_text(ra.get('init_core_fp'))
-    _ib = _content_fp_text(rb.get('init_core_fp'))
+    # Both-present equality is required; one-sided is unverifiable; a boolean
+    # digest is refused (same rule as the corpus fingerprints above).
+    # RNG-state equality is deliberately NOT required: architecture-induced
+    # RNG consumption is part of the arm.
+    _ra, _rb = ra.get('init_core_fp'), rb.get('init_core_fp')
+    if isinstance(_ra, (bool, np.bool_)) or isinstance(_rb, (bool, np.bool_)):
+        return 'unverifiable init_core_fp (a boolean is not a matched-initialization digest)'
+    _ia = _content_fp_text(_ra)
+    _ib = _content_fp_text(_rb)
     if (_ia is None) != (_ib is None):
         return 'unverifiable init_core_fp (only one record carries the matched-initialization digest)'
     if _ia is not None and _ia != _ib:
@@ -14144,6 +14180,43 @@ def _param_control(recs, a, b):
     rel = abs(pa - pb) / max(pa, pb, 1)
     return (float(rel), bool(rel <= 0.01))
 
+def paired_param_control(recs_a, recs_b):
+    """Parameter-control disclosure for a driver-level paired contrast.
+
+    `methodology_audit` enforces the parameter gate only for the declared
+    design tables; driver-level contrasts (v8/v9/v10/v11 `add_paired`) publish
+    exact sign-flip p-values without it.  This helper mirrors `_param_control`
+    (total-count relative difference, 1% tolerance) on the driver panel shape:
+    an iterable of the paired records of each arm.  Returns a dict with
+    `params_a` / `params_b` (the single exact count shared by every supplied
+    record, else None), `param_rel_diff` and `param_controlled` (True / False /
+    None = unverifiable).  A `param_controlled is False` contrast is
+    capacity-confounded: it may be quoted as a SYSTEM-level difference, never
+    as an isolated mechanism claim.
+    """
+    def _one(recs):
+        vals = []
+        for r in recs or ():
+            if not isinstance(r, dict):
+                return None
+            p = _as_seed_int(r.get('params'))
+            if p is None or p <= 0:
+                return None
+            vals.append(p)
+        if not vals or len(set(vals)) != 1:
+            return None
+        return vals[0]
+    out = {'params_a': None, 'params_b': None, 'param_rel_diff': None,
+           'param_controlled': None}
+    pa, pb = _one(recs_a), _one(recs_b)
+    out['params_a'], out['params_b'] = pa, pb
+    if pa is None or pb is None:
+        return out
+    rel = abs(pa - pb) / max(pa, pb, 1)
+    out['param_rel_diff'] = float(rel)
+    out['param_controlled'] = bool(rel <= 0.01)
+    return out
+
 def _param_breakdown_of_arm(recs, arm):
     """The one non-empty breakdown shared by every record of ``arm``.
 
@@ -14363,7 +14436,12 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
         fl = holm_min_attainable_p(_n_eff or 0, m_family, alpha)
         if math.isfinite(fl) and fl > alpha:
             return 'resolution_limited'
-    return 'noise_level'
+    # Powered, at least one non-noise contrast, resolution floor below alpha,
+    # yet nothing reached corrected significance: this is exactly the
+    # docstring's `measured` tier (a controlled contrast with n >= min_n and
+    # no corrected significance).  Falling through to 'noise_level' here would
+    # mislabel a measurably-non-noise effect as "within seed noise".
+    return 'measured'
 
 def _scope_design(design, present):
     """Keep only claims this panel actually tests: a component enters the
@@ -14878,7 +14956,12 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             if any(e.get('significant') for e in entries if e.get('controlled')):
                 lists['nominally_significant'].append(comp)
             if any(int(e.get('n') or 0) >= int(min_n) and e.get('controlled') for e in entries):
-                lists['measured'].append(comp)
+                # `lists['measured']` doubles as the descriptive tier "has a
+                # controlled, powered contrast" (see the printed report line),
+                # so a component whose exclusive status is already 'measured'
+                # must not be appended a second time.
+                if comp not in lists['measured']:
+                    lists['measured'].append(comp)
             report[group_name][comp] = entries
             _arms = meta[comp]['arms']
             _cv = controlled_variables_report(recs, _arms)

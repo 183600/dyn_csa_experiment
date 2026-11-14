@@ -1451,9 +1451,34 @@ def sec_p1l():
                 return None
             v = int(f)
         else:
-            v = _int_or(Ln, None)
-            if v is None:
-                return None
+            # JSON object keys are ALWAYS strings, so an integral-float length
+            # key (e.g. 1024.0) reaches this branch as "1024.0" — the in-memory
+            # Real branch above can never fire for a JSON-loaded panel.  Accept
+            # the canonical integral-float spelling (`-?digits\.0+`) so the
+            # promised "validated by value" resolution actually happens for the
+            # only real input path; anything else stays a non-identity.
+            if isinstance(Ln, (str, bytes)):
+                try:
+                    _s = Ln.decode('ascii') if isinstance(Ln, bytes) else Ln
+                except (UnicodeDecodeError, AttributeError):
+                    return None
+                if re.fullmatch(r'-?(?:0|[1-9][0-9]*)\.0+', _s) is not None:
+                    try:
+                        f = float(_s)
+                    except (TypeError, ValueError, OverflowError):
+                        return None
+                    if math.isfinite(f) and abs(f) < 2 ** 53:
+                        v = int(f)
+                    else:
+                        return None
+                else:
+                    v = _int_or(_s, None)
+                    if v is None:
+                        return None
+            else:
+                v = _int_or(Ln, None)
+                if v is None:
+                    return None
         return v if v >= 2 else None
 
     def _cell_at(by_len, Ln):
