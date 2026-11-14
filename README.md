@@ -15,7 +15,7 @@ scope in `confirmation_frozen.json`; everything else is exploratory.
 > **Version naming.** `v12` is the driver/study generation; `CODE_SEMANTICS =`
 > `v11.128` is the library measurement-semantics stamp that the frozen plan
 > binds. They are not the same numbering scheme, and the mismatch is intentional.
-> The frozen manifest is at `manifest_version: 3` (see its `revision.history`);
+> The frozen manifest is at `manifest_version: 4` (see its `revision.history`; v4 removed the uncheckable ee/es pins and documented the tokenizer token cap, still strictly before any test-split access);
 > the continuous-loop CI is intentionally disabled until that signed commit is
 > fixed and P5T has run.
 

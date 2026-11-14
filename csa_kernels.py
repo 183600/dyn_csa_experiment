@@ -2526,7 +2526,9 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         # 只在 eval（compression_report 经 enable_block_stats 开启）时触发；
         # 没有它内核模式的记录会丢掉全部块长/边界诊断。
         for _b in range(B):
-            attn._stats.append(torch.bincount(bid_full[_b]))
+            # .long(): torch.bincount requires an int64 input on some backends
+            # (CUDA); the integer values are identical either way.
+            attn._stats.append(torch.bincount(bid_full[_b].long()))
             if cfg.chunking == 'cosine_learnable' and gate_sigs is not None:
                 _gs = gate_sigs[_b]
                 _gcuts = _gs[1] if _gs is not None and len(_gs) > 1 else None

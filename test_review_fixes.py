@@ -1287,7 +1287,7 @@ def t_power_gate():
 
 
 def _rec(variant, seed, fp, by_len=None, code=None, recipe='steps3000_sl512_bs12_nt8000000_lr0.0003_wd0.1_d256_L6_H8_Dh32_v8192_wu50_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee250_es128_detcpu-eager_dfdeadbeef_cscURRENT', msha='CURRENT'):
-    return {'variant': variant, 'seed': seed, 'split': 'test', 'data_fp': fp, 'by_len': by_len or {'4096': {'ppl': 30.0, 'n_tok': 16 * 4095, 'truncated': False}}, '_code': code or L.code_stamp(), 'recipe': recipe, 'manifest_sha256': msha, 'key': f'{variant}::s{seed}'}
+    return {'variant': variant, 'seed': seed, 'split': 'test', 'data_fp': fp, 'by_len': by_len or {'4096': {'ppl': 30.0, 'n_tok': 16 * 4095, 'truncated': False, 'eval_span': 4096}}, '_code': code or L.code_stamp(), 'recipe': recipe, 'manifest_sha256': msha, 'key': f'{variant}::s{seed}'}
 
 
 def _manifest_for_admission(seeds=(0, 1, 2), sig=None):
@@ -1316,18 +1316,29 @@ def t_admission_gate():
             'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False}})
         assert V12._by_len_shape_reason(_bad, 16) is not None, _bad_ln
     _ok = _rec('a_arm', 0, 'FP', by_len={4096.0: {
-        'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False}})
+        'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False,
+        'eval_span': 4096}})
     assert V12._by_len_shape_reason(_ok, 16) is None
+    # eval_span is REQUIRED: a record that cannot prove it scored the full
+    # length (field missing entirely) is not admissible — an optional check
+    # would let a hand-crafted record dodge the span gate by omission.
+    _no_span = _rec('a_arm', 0, 'FP', by_len={4096: {
+        'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False}})
+    _why = V12._by_len_shape_reason(_no_span, 16)
+    assert _why is not None and 'eval_span' in _why, _why
     # Two Python keys for one evaluated length (int and its JSON string twin)
     # make the frozen endpoint ambiguous; refusing is the only safe read.
     _dup_ln = _rec('a_arm', 0, 'FP', by_len={
-        4096: {'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False},
-        '4096': {'ppl': 31.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False}})
+        4096: {'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False,
+               'eval_span': 4096},
+        '4096': {'ppl': 31.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False,
+                 'eval_span': 4096}})
     assert V12._by_len_shape_reason(_dup_ln, 16) is not None
     # The cell's own n_seq is part of the frozen estimand; a shape-consistent
     # n_tok with a different row count must not be admitted.
     _nseq_bad = _rec('a_arm', 0, 'FP', by_len={4096: {
-        'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 8, 'truncated': False}})
+        'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 8, 'truncated': False,
+        'eval_span': 4096}})
     assert V12._by_len_shape_reason(_nseq_bad, 16) is not None
     # A synthesized reconstruction has no weights and is not an independent
     # final-test measurement; it must never enter the confirmation.
@@ -1602,6 +1613,204 @@ def t_freeze_lock():
             V12._check_or_write_freeze_lock(td, man2, 'FP')
         finally:
             del os.environ['V12_REFREEZE']
+
+
+def t_review5_js_gate_and_floor_denominator():
+    # 1) The JS hard gate is REACHABLE on the normalized scale: two disjoint
+    #    token distributions (js = ln2) hit normalized 1.0 and hard-fail at
+    #    the shipped 0.75 threshold — the historical nats-scale 0.75 gate was
+    #    dead (supremum ln2 ~= 0.693) and could never fire.
+    #    The clean-side fixture draws val from the SAME empirical distribution
+    #    as train (uniform over the same four ids, in a non-contiguous order)
+    #    so the shift gate stays quiet and only the gate under test can fire.
+    tr = np.array([7, 9, 3, 5] * 10, dtype=np.int64)
+    va_disjoint = np.array([[100, 101, 102, 103]], dtype=np.int64)
+    rep = L.audit_corpus_split(tr, va_disjoint, 200, dataset='js-gate-test',
+                               max_scan_tokens=64, sample_rows=1, strict=False)
+    assert rep['status'] == 'fail', rep
+    assert any('JS divergence' in x and 'normalized' in x for x in rep['hard_failures']), rep
+    assert rep['train_val_token_shift']['js_divergence_normalized'] == 1.0, rep
+    # Identical empirical distributions stay clean (normalized js ~ 0).
+    va_same = np.array([[5, 3, 9, 7]], dtype=np.int64)
+    rep_ok = L.audit_corpus_split(tr, va_same, 200, dataset='js-gate-test',
+                                  max_scan_tokens=64, sample_rows=1, strict=False)
+    assert not any('JS divergence' in x for x in rep_ok['hard_failures']), rep_ok
+    assert rep_ok['status'] != 'fail', rep_ok
+    # An unreachable threshold is refused as a gate defect, not silently kept.
+    for bad in ({'shift_fail': 1.5}, {'shift_fail': 0.1, 'shift_warn': 0.2}):
+        try:
+            L.audit_corpus_split(tr, va_same, 200, dataset='js-gate-test',
+                                 max_scan_tokens=64, sample_rows=1, strict=False, **bad)
+            raise AssertionError(f'dead/misordered JS thresholds must be refused: {bad}')
+        except ValueError:
+            pass
+    # 2) The ngram floor carries a MATCHED denominator alongside the
+    #    historical one: only positions with a left context (R x (L-1)) are
+    #    scored there, exactly the positions a neural LM is scored on.
+    train = np.array([0, 1, 2, 0, 1, 2, 1, 0, 2, 1], dtype=np.int64)
+    ev = np.array([[0, 1, 2, 0], [1, 2, 0, 1]], dtype=np.int64)
+    uni = L.ngram_lm_score(train, ev, 4, order=1, alpha=0.5)
+    assert uni['n_tokens'] == 8 and uni['n_tokens_matched'] == 6, uni
+    # matched nll is the historical nll with the row-first terms removed;
+    # train counts are 0->3, 1->4 (alpha=0.5, vocab=4, 10 tokens)
+    first_nll = -math.log((3 + 0.5) / 12.0) - math.log((4 + 0.5) / 12.0)
+    assert abs(uni['nll_matched'] * 6 - (uni['nll'] * 8 - first_nll)) < 1e-9, uni
+    bi = L.ngram_lm_score(train, ev, 4, order=2, alpha=0.5, interpolation=1.0)
+    assert bi['n_tokens_matched'] == 6 and math.isfinite(bi['ppl_matched_denominator']), bi
+    art = L.simple_baseline_fit(train, ev, 4)
+    assert art['best_ppl_matched'] is not None, 'the floor artifact must carry the matched-denominator PPL'
+
+
+def t_review5_dedup_attribution():
+    # test-internal duplicates are attributed to test_internal_*, never
+    # miscounted as train/val contamination (peek/snapshot are read-only).
+    d = L._DocDeduplicator()
+    d.is_duplicate('alpha document text one')
+    d.is_duplicate('beta document text two')
+    frozen = d.snapshot()
+    # an exact duplicate of an EARLIER TEST row: live object flags it, frozen
+    # (train-only) view does not -> internal, not train contamination
+    dup, kind = d.is_duplicate('alpha document text one')
+    assert dup is True and kind == 'exact'
+    fdup, _ = frozen.peek('alpha document text one')
+    assert fdup is True, 'a true train duplicate must still attribute to train'
+    # a document seen ONLY via earlier test queries attributes internally
+    d2 = L._DocDeduplicator()
+    d2.is_duplicate('train only doc')
+    frozen2 = d2.snapshot()
+    d2.is_duplicate('first test row unique')
+    dup2, kind2 = d2.is_duplicate('first test row unique')
+    assert dup2 is True and kind2 == 'exact'
+    fdup2, _ = frozen2.peek('first test row unique')
+    assert fdup2 is False, 'a duplicate of an earlier TEST row must not attribute to train'
+    # peek must not mutate: the frozen snapshot's decision is stable and the
+    # counters are untouched
+    before = dict(frozen2.stats())
+    frozen2.peek('first test row unique')
+    frozen2.peek('never seen doc')
+    assert frozen2.stats() == before
+
+
+def t_review5_freeze_lock_mirror():
+    # The git-tracked mirror makes renaming/deleting the canonical results
+    # directory non-reversible: mirror present + local lock absent -> REFUSE
+    # (V12_REFREEZE=1 proceeds and keeps the superseded history).
+    with tempfile.TemporaryDirectory() as root:
+        canon = os.path.join(root, 'results_lm_test')
+        os.makedirs(canon, exist_ok=True)
+        alt = os.path.join(root, 'results_lm_renamed')
+        _old_outdir = V12.TEST_OUTDIR
+        _old_manifest = V12.FREEZE_MANIFEST
+        V12.TEST_OUTDIR = canon
+        # redirect the mirror into the temp root so the test never touches the
+        # repo's real mirror file
+        V12.FREEZE_MANIFEST = os.path.join(root, 'confirmation_frozen.json')
+        try:
+            man = {'manifest_sha256': 'AAA', 'frozen_at': '2026-11-14',
+                   '_path': V12.FREEZE_MANIFEST}
+            lock = V12._check_or_write_freeze_lock(canon, man, 'FP', stage='accessed')
+            assert lock['manifest_sha256'] == 'AAA'
+            mirror_path = V12._freeze_lock_mirror_path()
+            assert os.path.exists(mirror_path), 'the canonical lock must be mirrored'
+            # a NON-canonical outdir never consults or writes the mirror
+            other = os.path.join(root, 'other_results')
+            os.makedirs(other, exist_ok=True)
+            V12._check_or_write_freeze_lock(other, {'manifest_sha256': 'ZZZ', '_path': V12.FREEZE_MANIFEST}, 'FP9', stage='accessed')
+            # rename the canonical dir: local lock gone, mirror remains -> refuse
+            os.rename(canon, alt)
+            try:
+                V12._check_or_write_freeze_lock(canon, man, 'FP')
+                raise AssertionError('a renamed results directory must not reset the freeze')
+            except SystemExit as e:
+                assert 'renamed' in str(e) or 'mirror' in str(e), e
+            # V12_REFREEZE=1 re-freezes consciously and records the superseded round
+            os.environ['V12_REFREEZE'] = '1'
+            try:
+                lock2 = V12._check_or_write_freeze_lock(canon, man, 'FP')
+                assert lock2.get('superseded'), lock2
+                assert any(h.get('stage') == 'refreeze-mirror' for h in lock2.get('history', [])), lock2
+            finally:
+                del os.environ['V12_REFREEZE']
+        finally:
+            V12.TEST_OUTDIR = _old_outdir
+            V12.FREEZE_MANIFEST = _old_manifest
+    # the repo-level mirror must NOT have been created by these tests
+    assert not os.path.exists(os.path.join(REPO, 'confirmation_freeze_lock.json')), \
+        'tests must never write the repo-level freeze-lock mirror'
+
+
+def t_review5_p5c_post_access_guard():
+    # P5C refuses to (re)train frozen arms once the freeze lock/mirror exists;
+    # V12_REFREEZE=1 is the explicit, loud exit.
+    with tempfile.TemporaryDirectory() as root:
+        _old_outdir = V12.TEST_OUTDIR
+        _old_manifest = V12.FREEZE_MANIFEST
+        V12.TEST_OUTDIR = os.path.join(root, 'results_lm_test')
+        V12.FREEZE_MANIFEST = os.path.join(root, 'confirmation_frozen.json')
+        try:
+            os.makedirs(V12.TEST_OUTDIR, exist_ok=True)
+            V12._p5c_post_access_guard()  # no lock yet -> silent pass
+            open(V12._freeze_lock_path(V12.TEST_OUTDIR), 'w', encoding='utf-8').write('{}')
+            try:
+                V12._p5c_post_access_guard()
+                raise AssertionError('P5C must refuse to retrain frozen arms after the first test access')
+            except SystemExit as e:
+                assert 'P5C' in str(e), e
+            os.environ['V12_REFREEZE'] = '1'
+            try:
+                V12._p5c_post_access_guard()  # explicit override passes (with a warning)
+            finally:
+                del os.environ['V12_REFREEZE']
+        finally:
+            V12.TEST_OUTDIR = _old_outdir
+            V12.FREEZE_MANIFEST = _old_manifest
+
+
+def t_review5_power_enumeration():
+    # Equal magnitudes reduce the exact enumeration to the symbol-test
+    # projection: n=10, m=4, alpha=0.05 -> only 10/10 same-sign clears the
+    # conservative Holm slot alpha/4 = 0.0125 (9/10 gives 22/1024 ~ 0.0215).
+    res = V12._power_enumeration([1.0] * 10, 'negative', 0.05, 4)
+    assert res['status'] == 'ok' and res['n'] == 10, res
+    assert res['min_same_sign_for_holm_confirmation'] == 10, res
+    # the artifact rounds the power to 6 decimals
+    assert abs(res['power_holm_conservative']['q=0.95'] - 0.95 ** 10) < 1e-6, res
+    # all-zero deltas carry no information
+    assert V12._power_enumeration([0.0] * 5, 'positive', 0.05, 4)['status'] == 'no_data'
+    # no expected sign -> power(q) is still reported but min_same_sign is None
+    res_nd = V12._power_enumeration([1.0, 2.0, 3.0], None, 0.05, 4)
+    assert res_nd['status'] == 'ok' and res_nd['min_same_sign_for_holm_confirmation'] is None, res_nd
+    # direction-aware: the all-opposite pattern (0 same-sign) rejects the
+    # two-sided test but in the WRONG direction — only the single pattern
+    # with every seed in the expected direction counts as confirming
+    # (1/1024, not 2/1024: the wrong-direction twin is excluded).
+    assert res['fraction_patterns_confirming_holm'] == 1 / 1024, res
+
+
+def t_review5_rope_kernel_guard():
+    # A rope csa/hca layer under a kernel-ENABLED process must refuse loudly:
+    # silently running the eager per-row path would stamp eager numbers with
+    # the -tk1 kernel suffix (a false kernel-vs-eager pairing).
+    class _StubCK:
+        @staticmethod
+        def kernel_enabled():
+            return True
+    cfg = V7.make_layer_cfgs_v7(1, 'csa_fixed_rope')[0]
+    model = V7.SmallGPTRoPE(64, 32, 1, 2, 16, 16, [cfg])
+    x = torch.randint(0, 64, (1, 16))
+    _old = L._CK
+    L._CK = _StubCK
+    try:
+        try:
+            model(x)
+            raise AssertionError('a rope csa layer must refuse under CSA_KERNEL=1')
+        except RuntimeError as e:
+            assert 'CSA_KERNEL' in str(e), e
+    finally:
+        L._CK = _old
+    # with the stub removed the same model runs (eager path, CPU)
+    y = model(x)
+    assert torch.isfinite(y).all(), y
 
 
 def t_p1l_recipe_signature():
@@ -2400,7 +2609,11 @@ def t_segment_uniform_stride_only_when_all_cuts():
 def t_shipped_manifest_consistency():
     with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
         v2 = json.load(f)
-    assert v2['manifest_version'] == 3
+    # v4 (2026-11-14) removed ee/es from the machine-checkable signature:
+    # they are diagnostic-eval monitoring knobs, not training-recipe identity.
+    assert v2['manifest_version'] == 4
+    assert 'ee' not in v2['binding']['training_recipe_signature']
+    assert 'es' not in v2['binding']['training_recipe_signature']
     n = len(v2['seeds'])
     m = len(v2['primary_comparisons'])
     assert n == 12 and v2['seeds'] == list(range(12))
@@ -2448,11 +2661,14 @@ def t_doc_level_analysis():
     assert d is not None and d['n_docs'] == n_doc
     assert abs(d['per_doc_delta_mean'] - (-1.0)) < 1e-9, 'per-doc delta must be a - b = -1.0'
     assert abs(d['between_doc_sd']) < 1e-9, 'constant -1.0 shift across docs -> zero between-doc spread'
-    _shape_rec = {'by_len': {'8': {'n_tok': 16 * 7, 'n_seq': 16, 'truncated': False}}}
+    _shape_rec = {'by_len': {'8': {'n_tok': 16 * 7, 'n_seq': 16, 'truncated': False,
+                                   'eval_span': 8}}}
     assert V12._by_len_shape_reason(_shape_rec, 16) is None
     _span_rec = {'by_len': {'8': {'n_tok': 16 * 7, 'n_seq': 16, 'truncated': False,
                                   'eval_span': 7}}}
     assert V12._by_len_shape_reason(_span_rec, 16) is not None
+    _nospan_rec = {'by_len': {'8': {'n_tok': 16 * 7, 'n_seq': 16, 'truncated': False}}}
+    assert V12._by_len_shape_reason(_nospan_rec, 16) is not None
     for _bad_nseq in (4.9, True, 0, -1):
         _why = V12._by_len_shape_reason(_shape_rec, _bad_nseq)
         assert _why is not None and 'n_seq' in _why, (_bad_nseq, _why)
@@ -5488,8 +5704,12 @@ def t_corpus_audit_memo_keys_validation_shape():
 def t_corpus_audit_overlap_metadata_exact():
     # The document-overlap flag is a count: a fractional/boolean value must not
     # be truncated to zero by int(0.9)==0 and attest a clean split.
-    tr = np.arange(40, dtype=np.int64)
-    va = np.array([[100, 101, 102, 103]], dtype=np.int64)
+    # The val row deliberately shares the train VOCABULARY (and the same
+    # empirical distribution, in a non-contiguous order): this test exercises
+    # the document-overlap metadata gate, and a shifted or disjoint vocabulary
+    # would (correctly) trip the now-reachable normalized-JS gate instead.
+    tr = np.array([7, 9, 3, 5] * 10, dtype=np.int64)
+    va = np.array([[5, 3, 9, 7]], dtype=np.int64)
     for bad in (0.9, True, -0.5):
         rep = L.audit_corpus_split(
             tr, va, 200, dataset='overlap-meta-test',
@@ -8434,6 +8654,12 @@ def main():
     _check('C3 admission gate refusals', t_admission_refuses)
     _check('C4 recipe signature', t_recipe_signature)
     _check('C4b P1L checkpoint recipe signature', t_p1l_recipe_signature)
+    _check('R5a review-5 guards: reachable JS gate + matched floor denominator', t_review5_js_gate_and_floor_denominator)
+    _check('R5b review-5 guards: dedup attribution (test-internal vs train)', t_review5_dedup_attribution)
+    _check('R5c review-5 guards: freeze-lock mirror survives a results-dir rename', t_review5_freeze_lock_mirror)
+    _check('R5d review-5 guards: P5C post-access retraining refused', t_review5_p5c_post_access_guard)
+    _check('R5e review-5 guards: pre-access power enumeration', t_review5_power_enumeration)
+    _check('R5f review-5 guards: rope layer refuses under CSA_KERNEL', t_review5_rope_kernel_guard)
     _check('C5 freeze lock', t_freeze_lock)
     _check('C5b final test requires parameter matching', t_finaltest_requires_parameter_matching)
     _check('C9 aggregate seed normalization', t_aggregate_seed_normalization)

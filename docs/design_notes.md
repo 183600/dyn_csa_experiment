@@ -1197,3 +1197,96 @@ token。记录现在同时写 `tokens_seen_unique_estimate`、
 `pyproject.toml`、cache/tokenizer 元数据与 `run_*.log`（存在时）。
 本快照仍是 source-only：仓库**没有**随附证据归档，这一点在 README、
 README_zh 与 `RELEASES.md` 中均已明示。
+
+## 26. 评审五（review 5，2026-11-14）：把残余的守卫缺口关死
+
+本轮不新增实验面板；统计核心（精确符号翻转 / Holm / TOST / Wilcoxon /
+功效表 / 交叉点拟合）经独立参照逐函数验证**无数学错误**，因果性与数据
+隔离（39 + 50 项检查）亦通过。修的是审计发现的守卫与协议缺口——全部
+发生在任何 test-split 访问之前，`CODE_SEMANTICS` 保持 `v11.128`（本轮
+只改守卫、披露与元数据字段，任何合法路径的测量值不变，既有记录不失效）。
+
+### 26.1 死门限与浅校验
+
+- **JS 散度硬门**（`audit_corpus_split`）：nats 尺度上界是 ln2≈0.693，
+  旧 `shift_fail=0.75` 永远不可达——「永远不会触发的门不是门」。
+  `categorical_shift_report` 现返回 `js_divergence_normalized`（js/ln2，
+  [0,1]），门限改在归一化尺度上判定，并对阈值本身做可达性校验。
+- **`load_wikitest` 命中路径**曾只与字典序第一个 train tokenizer 比对
+  全词表；现与缓存目录里的**每一个** train tokenizer 比对（与冷构建
+  路径同规则）。
+- **RoPE×内核**：`HybridAttentionRoPE.forward` 的 rope csa/hca 分支
+  永远走逐行 eager 循环，但从不检查 `CSA_KERNEL`——内核模式下该臂的
+  记录会带着 `-tk1` 内核戳而数值实为 eager（假"kernel vs eager"对照）。
+  现在拒绝运行（v12 计划本就全局拒绝 CSA_KERNEL，m0/B 档臂全部非
+  rope，无既有合法路径受影响）。
+- by-length 准入中 `eval_span` 改为**必填**：缺字段 = 无法证明评了
+  全长，不可采纳（诚实写入方 `eval_length_gen` 恒带该字段）。
+- P5T 的 bylen cell 现显式复核 checkpoint 的 (d, L, H, Dh) 与 per-arm
+  `mr` 是否等于冻结绑定值——p1l 配方字符串是注入常量，不能证明权重
+  的真实形状（探针路径早已硬拒绝，此处对齐）。
+
+### 26.2 「一次性访问」的两条旁路（本轮最重要的修复）
+
+- **目录级**：`.freeze_lock.json` 只活在 gitignore 的结果目录里，改名/
+  删除目录即静默重置冻结。锁现在**镜像到 git 管理的
+  `confirmation_freeze_lock.json`**：镜像在场而本地锁缺席 → 拒绝
+  （V12_REFREEZE=1 显式重冻结并在锁内保留 superseded 历史）；镜像与
+  本地锁身份不一致 → 拒绝。镜像应随证据提交入库。
+- **cell 级**：锁绑定计划/切片/语料，但不绑定 checkpoint 集合——
+  「看结果→挑一个 (arm, seed) 用 P5C 重训→重跑 P5T 原键覆盖」曾畅通
+  无阻。现在：P5C 在锁存在后拒绝重训冻结臂；P5T 拒绝在**不同
+  ckpt_sha256** 的权重上重测已有 cell（覆盖须 V12_REFREEZE=1，且新
+  记录携带 `replaced_prior_ckpt_sha256` 审计字段）。
+
+### 26.3 覆盖开关与加严规则的落盘披露
+
+- `V12_ALLOW_UNHEALTHY=1` 现写进 `training_health.json`
+  （`v12_allow_unhealthy_used`）、每条被放行 cell 的 bylen 记录
+  （`allow_unhealthy_override` + `health_status_override`）与
+  experiments.jsonl 事件——不再只是 stdout。
+- 实现版决策规则比清单 v3 文字**更严**（额外要求 same_init_core_fp
+  与 init_core_fp_recorded；param_matched 必须为 True 而非"非 false"）。
+  只会少确认、不会多确认，但须可见：`test_stats.json` 现携带
+  `decision_rule_applied`（清单原文 + 实现闸门清单 + 说明）。
+- 清单 **v4**（仍在任何 test 访问之前）：ee/es 移出可机检配方签名
+  （它们是诊断监控旋钮；P5C/p1l 在 P5H 所需诊断下合法携带 es=8，
+  v3 的 es=128 钉定在 p1l 路径上不可校验且与实际记录不符）；
+  tokenizer.fit 补充 8M token 上限说明。
+- `v12_supp.py power`：把清单 power_note 的义务变成可执行物——访问前
+  在冻结臂的验证集逐种子 delta 上做 2^n 符号翻转枚举（固定 |d_i|），
+  报告 Holm 保守阈值下的功效(q) 曲线与最小同向种子数，落盘
+  `p5c_power.json`；P5T 在读 test 前要求该工件在场
+  （V12_SKIP_POWER=1 为显式、落盘记录的覆盖）。
+
+### 26.4 度量口径与记账
+
+- **ngram 地板双分母**：`ngram_lm_score` 保留历史口径（含每行首
+  token，R×L），同时返回 `ppl_matched_denominator`（剔除行首 token，
+  与神经 LM 的 R×(L−1) 评分位置一致）；`methodology_audit` 的
+  beats-floor 比较改用匹配分母并标注口径，旧工件无该字段时回退并
+  标注「历史口径，地板略被抬高」。
+- **test 去重归属**：`_DocDeduplicator.snapshot()/peek()` 提供只读
+  探测；test 行之间的内部重复被剔除时计入
+  `test_internal_{exact,near}_removed`，不再误记为 train/val 污染
+  （剔除行为本身逐字节不变）。
+- **探针记录**携带 `manifest_sha256`（v12 分析侧校验一致性）；健康门
+  拒绝的 (arm, seed) 不再被探针消耗一次性访问。
+- **TimeGuard**：被 watchdog 击杀的 cell 以 `record_run(elapsed,
+  steps_done=0)` 记账真实墙钟（不动步速标定）——kill-and-retry 不再
+  系统性低估 GPU 预算。
+- 探针腐坏 ρ→种子的 1/2²⁰ 量化在冻结网格 {0, .125, .25, .5} 上无
+  碰撞（精确二进制分数）；非二进制网格扩展时需注意。
+
+### 26.5 其余健壮性
+
+`_successor_starts` 向量倍增路径补 power-of-two 不变量断言（当前探测
+长度恒为 32，满足）；`blocks_from_cosine` 的 n≤1 捷径补 `_pool_cpu`
+挂载（与 `blocks_from_cuts` 同口径）；删除死代码 `_SinkWiden` 与
+`eval_ppl` 的 `_span` 死赋值、par 的 `_num_or_none`；
+`gathered_attention_open` 的 `_soft_live` 与闭式路径同样检查
+requires_grad（前向值不变，省无谓子图）；`CSA_ADAPTIVE_MAX_TOKENS`
+网格上限在「能影响阈值取值」时（seq 超过精确上限或显式设置）进入
+run 指纹（默认主线路径指纹逐字节不变）；`holm_min_attainable_p` 的
+ldexp 溢出改为守卫返回 1.0；鞍点近似的实测误差界（p∈[0.002,0.04] 内
+≤2%）写进 docstring；内核路径 `bincount` 补 `.long()`（整数值不变）。

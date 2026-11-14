@@ -2763,8 +2763,14 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
     Used for corpora whose "features" are token ids rather than numeric
     columns.  ``reference`` must be the training split; the holdout is never
     used to define the vocabulary or the reference frequencies.  Returns
-    ``{'js_divergence', 'total_variation', 'n_reference', 'n_holdout',
-    'unseen_rate'}``.
+    ``{'js_divergence', 'js_divergence_normalized', 'total_variation',
+    'n_reference', 'n_holdout', 'unseen_rate'}``.
+
+    ``js_divergence`` is in NATS and is bounded by ln(2) ~= 0.693 (attained
+    by two disjoint distributions).  ``js_divergence_normalized`` divides by
+    ln(2) so it lives on [0, 1]; gates and thresholds should be stated on the
+    normalized scale, because a threshold above ln(2) on the nats scale can
+    never fire and is therefore not a gate at all.
 
     Categories are compared by their hashable identity rather than by a NumPy
     sort.  A mixed object column (e.g. a short string code and an integer code)
@@ -2809,7 +2815,8 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
                 'the reference distribution and report zero divergence while '
                 'every holdout category is unseen')
     if not hold:
-        return {'js_divergence': 0.0, 'total_variation': 0.0,
+        return {'js_divergence': 0.0, 'js_divergence_normalized': 0.0,
+                'total_variation': 0.0,
                 'n_reference': len(ref), 'n_holdout': 0,
                 'unseen_rate': 0.0}
 
@@ -2865,6 +2872,9 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
 
     tv = 0.5 * float(np.sum(np.abs(p - q)))
     js = 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
+    # ln(2) is the exact supremum of the (nats) JS divergence; clipping
+    # absorbs floating-point overshoot at the boundary.
+    js_norm = float(min(1.0, max(0.0, js / math.log(2.0))))
     if reference_keys:
         unseen = float(np.mean([key not in reference_keys for key in hold_keys]))
     else:
@@ -2873,6 +2883,7 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
         unseen = 1.0 if hold_keys else 0.0
     return {
         'js_divergence': js,
+        'js_divergence_normalized': js_norm,
         'total_variation': tv,
         'n_reference': int(len(ref)),
         'n_holdout': int(len(hold)),

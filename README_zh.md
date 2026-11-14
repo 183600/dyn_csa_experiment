@@ -8,7 +8,7 @@
 
 > **证据等级**：v6–v11 为探索性（在同一 validation split 上选择后观察）；只有 v12 冻结的固定分块比较是确认性。详见 `DECISION_LOG.md` 与 `docs/design_notes.md` §17/§20。
 >
-> **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.128` 是冻结清单绑定的库测量语义戳，两者故意不同号。冻结清单当前为 `manifest_version: 3`（见其 `revision.history`）；continuous-loop CI 已被有意停用，直到签署后的提交固定且 P5T 完成。
+> **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.128` 是冻结清单绑定的库测量语义戳，两者故意不同号。冻结清单当前为 `manifest_version: 4`（见其 `revision.history`；v4 移除了不可机检的 ee/es 钉定并补充了 tokenizer 拟合的 token 上限说明，仍在任何 test 访问之前）；continuous-loop CI 已被有意停用，直到签署后的提交固定且 P5T 完成。
 
 > **证据状态（引用数字前必读）**：`results_*/`、`analysis_*/`、`REPORT*.md` 有意不入库，且**没有随仓库发布证据归档**（`RELEASES.md` 尚无记录）。报告可由你自己产生的产物重建，但任何你没有重建过的报告数值都无法独立复核。只有当 `release_<tag>.tar.gz` 与清单发布到只读位置并通过 `archive_release.py verify` 时，相应主张才可审计。
 

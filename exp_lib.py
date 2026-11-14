@@ -897,6 +897,11 @@ def _successor_starts(n, nxt):
     # Starts of the monotone successor walk p -> nxt[p] (nxt[p] > p, nxt[n] = n).
     # A short prefix is walked directly; when the walk is long (dense cuts),
     # the rest is generated in doubling batches with a jump table.
+    # INVARIANT of the vectorized doubling path: the covered set is
+    # {a*j + i : i < k} only when k is a power of two (a = 2^ceil(log2 k)).
+    # The probe walk above always ends with k == _SEG_WALK_PROBE == 32 when it
+    # falls through, which satisfies it; assert so a future edit of the probe
+    # length cannot silently drop successor starts.
     starts = [0]
     p = int(nxt[0])
     left = _SEG_WALK_PROBE - 1
@@ -908,6 +913,11 @@ def _successor_starts(n, nxt):
         return np.asarray(starts, dtype=np.int64)
     k = len(starts)
     if (n - p) * k > max(_SEG_VEC_MIN, n // 8) * max(p, 1):
+        if k & (k - 1):
+            raise AssertionError(
+                f'_successor_starts: vectorized doubling path requires a power-of-two '
+                f'probe count, got k={k} (probe={_SEG_WALK_PROBE}) — block starts would '
+                'be silently dropped; fix the probe length before re-enabling this path')
         jump = nxt
         step = 1
         while step < k:
@@ -1495,6 +1505,11 @@ def blocks_from_cosine(H, tau, min_block, max_block, sim=None, return_count=Fals
     dev = H.device
     if n <= 1:
         z = torch.zeros(n, dtype=torch.long, device=dev)
+        if n == 1:
+            # Same host-count attachment as blocks_from_cuts: every non-empty
+            # block-table object carries it, so the pooling geometry cache hits
+            # on this path too instead of falling back to a defensive rebuild.
+            z._pool_cpu = ([1], 1, 0)
         return (z, 1) if return_count and n == 1 else ((z, 0) if return_count else z)
     if sim is None:
         sim = cosine_similarity_consecutive(H)
@@ -3906,20 +3921,6 @@ def _indexer_trainable(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
     return _run(H, comp_kv, last_tok)
 
 
-class _SinkWiden(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, logits, sink_logits):
-        n, H, M = logits.shape
-        z = logits.new_empty(n, H, M + 1)
-        z[..., 1:] = logits
-        z[..., 0:1] = sink_logits.view(1, -1, 1)
-        return z
-
-    @staticmethod
-    def backward(ctx, gz):
-        return (gz[..., 1:], gz[..., 0].sum(dim=0))
-
 def sink_softmax(logits, sink_logits, dim=-1):
     if dim not in (-1, logits.dim() - 1):
         raise ValueError('sink_softmax only supports the last dim')
@@ -4304,8 +4305,13 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
             logits.mul_(scale)
         # Straight-through indexer prior: its forward contribution cancels
         # exactly, so a no-grad/forward-only pass can skip it without changing
-        # any output value (the same argument the closed path uses).
-        _soft_live = (soft is not None and torch.is_grad_enabled())
+        # any output value (the same argument the closed path uses).  The
+        # requires_grad guard mirrors gathered_attention: building the dead
+        # straight-through subgraph when no input needs grad only wastes
+        # memory (forward values are identical either way).
+        _soft_live = (soft is not None and torch.is_grad_enabled() and any(
+            _t is not None and getattr(_t, 'requires_grad', False)
+            for _t in (soft, q, k_blk, v_blk, k_sw, v_sw, sink_logits)))
         attn_soft = None
         if _soft_live:
             soft_g = soft[s:e]
@@ -6758,25 +6764,37 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                 # A test tokenizer can match its own metadata and still differ
                 # from the tokenizer that defines the train id space.  Compare
                 # the full id->token maps, not just fit text or file bytes.
+                # EVERY train tokenizer file in the cache is compared (same rule
+                # as the cold path): comparing only the alphabetically first
+                # file would let a second, differing train cache pass by sort
+                # order alone.
                 try:
                     from tokenizers import Tokenizer as _Tok
                     _tv = dict(_Tok.from_file(tk_path).get_vocab())
-                    _trv = dict(_Tok.from_file(_train_toks[0]).get_vocab())
                 except Exception as _te:
                     raise RuntimeError(f'load_wikitest: could not compare the test tokenizer with the train tokenizer ({type(_te).__name__}: {_te}); rebuild the test cache') from _te
-                if _tv != _trv:
-                    raise RuntimeError('load_wikitest: the test tokenizer vocabulary is not identical to the train tokenizer vocabulary — the id spaces cannot be paired; delete the test cache and rebuild it')
+                for _ttp in _train_toks:
+                    try:
+                        _trv = dict(_Tok.from_file(_ttp).get_vocab())
+                    except Exception as _te:
+                        raise RuntimeError(f'load_wikitest: could not compare the test tokenizer with the train tokenizer ({_ttp}: {type(_te).__name__}: {_te}); rebuild the test cache') from _te
+                    if _tv != _trv:
+                        raise RuntimeError(f'load_wikitest: the test tokenizer vocabulary is not identical to the train tokenizer vocabulary ({_ttp}) — the id spaces cannot be paired; delete the test cache and rebuild it')
         else:
             if _tok_sha_now is None or not _train_toks:
                 raise RuntimeError('load_wikitest: this test cache has no tokenizer identity and no matched train tokenizer file; refusing to serve an unpaired id space — rebuild the test cache with the current loader')
             try:
                 from tokenizers import Tokenizer as _Tok
                 _tv = dict(_Tok.from_file(tk_path).get_vocab())
-                _trv = dict(_Tok.from_file(_train_toks[0]).get_vocab())
             except Exception as _te:
                 raise RuntimeError(f'load_wikitest: could not compare the test tokenizer with the train tokenizer ({type(_te).__name__}: {_te}); rebuild the test cache') from _te
-            if _tv != _trv:
-                raise RuntimeError('load_wikitest: the test tokenizer vocabulary is not identical to the train tokenizer vocabulary — the id spaces cannot be paired; delete the test cache and rebuild it')
+            for _ttp in _train_toks:
+                try:
+                    _trv = dict(_Tok.from_file(_ttp).get_vocab())
+                except Exception as _te:
+                    raise RuntimeError(f'load_wikitest: could not compare the test tokenizer with the train tokenizer ({_ttp}: {type(_te).__name__}: {_te}); rebuild the test cache') from _te
+                if _tv != _trv:
+                    raise RuntimeError(f'load_wikitest: the test tokenizer vocabulary is not identical to the train tokenizer vocabulary ({_ttp}) — the id spaces cannot be paired; delete the test cache and rebuild it')
         if np.asarray(test_ids).shape != (int(n_seqs), int(seq_len)):
             raise RuntimeError(f'load_wikitest: cached test slice shape {np.asarray(test_ids).shape} != the frozen ({int(n_seqs)}, {int(seq_len)}); the frozen slice is part of the pre-registration, so a different row count must be re-frozen explicitly')
         if _problems:
@@ -7016,28 +7034,42 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     for _r in train_rows_source:
         if isinstance(_r, str) and _r.strip():
             _test_dedup.is_duplicate(_r)
+    # Frozen train-only / validation-only views for ATTRIBUTION.  The live
+    # objects above index every queried test row, so a later test row that
+    # duplicates an earlier test row is (correctly) excluded, but the raw
+    # live-object verdict cannot tell that apart from a genuine train/val
+    # duplicate.  The frozen snapshots answer the attribution question
+    # read-only; the exclusion decision itself is unchanged.
+    _train_frozen = _test_dedup.snapshot()
+    _val_frozen = _val_only.snapshot()
     _kept_test = []
     _excluded = {'train_exact': 0, 'train_near': 0,
-                 'validation_exact': 0, 'validation_near': 0}
+                 'validation_exact': 0, 'validation_near': 0,
+                 'test_internal_exact': 0, 'test_internal_near': 0}
     for _r in _trows:
         if not isinstance(_r, str) or not _r.strip():
             continue
         _dup, _kind = _test_dedup.is_duplicate(_r)
         if _dup:
-            _excluded[f'train_{_kind}'] += 1
+            _src_dup, _ = _train_frozen.peek(_r)
+            _excluded[('train' if _src_dup else 'test_internal') + f'_{_kind}'] += 1
             continue
         _dup, _kind = _val_only.is_duplicate(_r)
         if _dup:
-            _excluded[f'validation_{_kind}'] += 1
+            _src_dup, _ = _val_frozen.peek(_r)
+            _excluded[('validation' if _src_dup else 'test_internal') + f'_{_kind}'] += 1
             continue
         _kept_test.append(_r)
     _removed_train = _excluded['train_exact'] + _excluded['train_near']
     _removed_val = _excluded['validation_exact'] + _excluded['validation_near']
-    if _removed_train or _removed_val:
+    _removed_internal = _excluded['test_internal_exact'] + _excluded['test_internal_near']
+    if _removed_train or _removed_val or _removed_internal:
         print(f'[data] test duplicate cleanup: excluded {_excluded["train_exact"]} exact '
               f'and {_excluded["train_near"]} near-duplicate documents from train, '
               f'{_excluded["validation_exact"]} exact and {_excluded["validation_near"]} '
-              f'near-duplicate documents from validation')
+              f'near-duplicate documents from validation, '
+              f'{_excluded["test_internal_exact"]} exact and {_excluded["test_internal_near"]} '
+              f'duplicates of earlier TEST rows (kept out of the panel; not train/val contamination)')
     _trows = _kept_test
     _cap_test = n_seqs * seq_len + seq_len
     _test_lengths = []
@@ -7135,6 +7167,13 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             'policy': 'test_documents_deduplicated_against_train_and_validation',
             'train_exact_removed': int(_excluded['train_exact']),
             'train_near_removed': int(_excluded['train_near']),
+            'test_internal_exact_removed': int(_excluded['test_internal_exact']),
+            'test_internal_near_removed': int(_excluded['test_internal_near']),
+            'attribution_note': ('test_internal_* counts test rows removed because they '
+                                 'duplicate an EARLIER TEST row (panel hygiene), not '
+                                 'train/val contamination; train_*/validation_* counts '
+                                 'are attributed via frozen train-only/validation-only '
+                                 'snapshots and exclude the internal duplicates'),
             'near_hamming_threshold': int(_test_dedup.near_threshold),
             'source_documents': int(len(test_rows)),
             'kept_documents': int(len(_trows)),
@@ -7449,6 +7488,38 @@ class _DocDeduplicator:
                     return True, 'near'
         self._index(h, fp_key)
         self.n_seen += 1
+        return False, None
+
+    def snapshot(self):
+        """Structural copy of the CURRENT index (same documents, fresh counters).
+
+        Used to attribute duplicates to their true source: a query against the
+        live object also INDEXES the queried document, so after a few queries
+        the live index can no longer tell "duplicate of a train document" from
+        "duplicate of an earlier queried document".  A snapshot taken before
+        the queries stays frozen and answers that question read-only.
+        """
+        clone = _DocDeduplicator(near_threshold=self.near_threshold, bands=self.bands)
+        clone.exact = set(self.exact)
+        clone.buckets = {k: list(v) for k, v in self.buckets.items()}
+        clone.n_seen = int(self.n_seen)
+        clone.n_exact_skipped = int(self.n_exact_skipped)
+        clone.n_near_skipped = int(self.n_near_skipped)
+        return clone
+
+    def peek(self, text, fp=None):
+        """Read-only duplicate probe: same decision as ``is_duplicate`` but the
+        queried document is never indexed and no counter moves."""
+        if fp is None:
+            fp = _doc_exact_fp(text)
+        fp_key = int(fp, 16) if isinstance(fp, (str, bytes)) else int(fp)
+        if fp_key in self.exact:
+            return True, 'exact'
+        h = _doc_simhash(text)
+        for key in self._bucket_keys(h):
+            for other in self.buckets.get(key, ()):
+                if _hamming64(h, other) <= self.near_threshold:
+                    return True, 'near'
         return False, None
 
     def stats(self):
@@ -8006,6 +8077,12 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
     stream), non-disjoint document ids when the cache records them, and
     materially shifted holdout token distributions.  A clean report is cached
     by the two content fingerprints, so resume phases do not rescan.
+
+    ``shift_warn`` / ``shift_fail`` are thresholds on the NORMALIZED
+    Jensen-Shannon divergence (js / ln 2, in [0, 1]).  Two disjoint token
+    distributions attain 1.0, so both defaults (0.25 warn, 0.75 fail) are
+    reachable; the historical nats-scale ``shift_fail=0.75`` was above the
+    mathematical supremum ln 2 ~= 0.693 and could never fire.
     """
     import data_guard as _DG
     tr = np.asarray(train_ids).reshape(-1)
@@ -8130,19 +8207,35 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
 
     # Training-only reference distribution; the holdout never defines it.
     if tr.size and va.size:
+        # The gate operates on the NORMALIZED JS divergence (js/ln2 in [0, 1]).
+        # A threshold above the reachable range is a gate that can never fire;
+        # validate it here so the dead-threshold defect cannot regress.
+        try:
+            _sw = float(shift_warn)
+            _sf = float(shift_fail)
+        except (TypeError, ValueError, OverflowError) as _te:
+            raise ValueError(f'shift_warn/shift_fail must be numbers, got {shift_warn!r}/{shift_fail!r}') from _te
+        if not (math.isfinite(_sw) and 0.0 <= _sw < 1.0):
+            raise ValueError(f'shift_warn={shift_warn!r} must lie in [0, 1) on the normalized JS scale (ln2-normalized; 1.0 is only attained by disjoint distributions)')
+        if not (math.isfinite(_sf) and 0.0 < _sf <= 1.0):
+            raise ValueError(f'shift_fail={shift_fail!r} must lie in (0, 1] on the normalized JS scale (ln2-normalized)')
+        if _sf <= _sw:
+            raise ValueError(f'shift_fail={_sf!r} must exceed shift_warn={_sw!r}')
         try:
             import audit_gates as _AG
             _tr_s = _AG._sample_tokens(tr, cap=200000, seed=0)
             _va_s = _AG._sample_tokens(va, cap=200000, seed=1)
             _shift = _DG.categorical_shift_report(_tr_s, _va_s)
-            _js = float(_shift.get('js_divergence', 0.0))
+            _js = float(_shift.get('js_divergence_normalized',
+                                   float(_shift.get('js_divergence', 0.0)) / math.log(2.0)))
             report['train_val_token_shift'] = _shift
-            if _js >= float(shift_fail):
+            report['train_val_token_shift_js_scale'] = 'normalized (js / ln2, in [0, 1])'
+            if _js >= _sf:
                 report['hard_failures'].append(
-                    f'train/validation token JS divergence {_js:.3f} >= {shift_fail}')
-            elif _js >= float(shift_warn):
+                    f'train/validation token JS divergence {_js:.3f} (normalized, 0-1) >= {_sf:g}')
+            elif _js >= _sw:
                 report['warnings'].append(
-                    f'train/validation token JS divergence {_js:.3f} >= {shift_warn}')
+                    f'train/validation token JS divergence {_js:.3f} (normalized, 0-1) >= {_sw:g}')
         except Exception as _se:
             report['warnings'].append(f'token-shift audit unavailable ({type(_se).__name__}: {_se})')
 
@@ -9749,6 +9842,14 @@ def _signflip_saddlepoint_p(values):
     and applying the Lugannani-Rice formula gives a much more accurate tail
     than a normal approximation while staying deterministic.
 
+    ACCURACY (measured against the exact meet-in-the-middle count at n=41-43):
+    the relative error of this approximation is at most ~2% for p in
+    [0.002, 0.04] (the practically relevant band around alpha=0.05 and the
+    Holm thresholds), ~0.2% near p~2e-5 and vanishing in the far tail; the
+    2/2^n floor clamp absorbs any downward bias.  Consumers that need a
+    certified-exact p (e.g. the frozen confirmation at n<=40) use the exact
+    branches; this approximation only serves n > 40 seed panels.
+
     Returns ``(p, method)``.  Zeros are removed because they multiply the
     number of sign assignments without changing the null distribution; the
     resulting floor ``2 / 2**m`` is the same exact-test floor.
@@ -10185,7 +10286,13 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
     exp = shift - e
     if exp > 1023:
         return 1.0
-    return float(min(1.0, math.ldexp(float(mant), exp)))
+    try:
+        # ldexp can still raise OverflowError for exp in (971, 1023] with a
+        # full-width mantissa (mant * 2^exp > float range); such a value is
+        # far above 1.0, so the clamped result is 1.0.
+        return float(min(1.0, math.ldexp(float(mant), exp)))
+    except OverflowError:
+        return 1.0
 
 
 def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
@@ -12400,7 +12507,22 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     smoothed conditional with the unigram distribution.  Row boundaries are
     respected: the first token of every evaluation row is scored by the
     unigram model, never by the previous row's last token.  The effect size is
-    token-weighted, matching the LM metric policy."""
+    token-weighted.
+
+    DENOMINATOR POLICY (two coexisting scales, both returned):
+
+    - ``ppl`` / ``nll`` / ``n_tokens`` score EVERY evaluation token including
+      each row's first token (the historical scale).  This is NOT the neural
+      LM's denominator: ``eval_ppl`` scores only positions with a left
+      context (R x (L-1) tokens), and a row-first token has no context, so
+      including it systematically inflates the baseline NLL by roughly
+      (high first-token CE) / n_tokens.
+    - ``ppl_matched_denominator`` / ``nll_matched`` / ``n_tokens_matched``
+      exclude every row's first token, i.e. they score exactly the positions
+      a from-scratch LM is scored on.  Panel-vs-floor comparisons should use
+      the matched scale (``methodology_audit`` does); the historical scale is
+      kept for continuity with previously recorded artifacts.
+    """
     ids = np.asarray(train_ids, dtype=np.int64).ravel()
     # The vocabulary is an exact positive count, not a boolean/fractional
     # coercion target.
@@ -12423,7 +12545,9 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     all_eval, prev, nxt = _ngram_eval_parts(eval_ids)
     if all_eval.size == 0:
         return {'order': int(order), 'alpha': alpha, 'interpolation': float(interpolation),
-                'n_tokens': 0, 'nll': float('nan'), 'ppl': float('nan')}
+                'n_tokens': 0, 'nll': float('nan'), 'ppl': float('nan'),
+                'n_tokens_matched': 0, 'nll_matched': float('nan'),
+                'ppl_matched_denominator': float('nan')}
     if all_eval.size and (int(all_eval.min()) < 0 or int(all_eval.max()) >= vocab_size):
         raise ValueError('ngram baseline: eval ids outside [0, vocab_size)')
     # The count tables are a pure function of (train_ids, vocab_size) and do
@@ -12436,8 +12560,22 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     log_uni = np.log(np.maximum(uni_prob, np.finfo(float).tiny))
     if order == 1:
         nll = float(-log_uni[all_eval].sum() / all_eval.size)
+        # Matched denominator: the same unigram model on every token EXCEPT
+        # the first token of each row (the positions a neural LM scores).
+        _ev_arr = np.asarray(eval_ids)
+        _mask = np.ones(all_eval.shape, dtype=bool)
+        if _ev_arr.ndim == 1:
+            _mask[0] = False
+        else:
+            _mask = _mask.reshape(-1, _ev_arr.shape[1])
+            _mask[:, 0] = False
+            _mask = _mask.reshape(-1)
+        _m_n = int(_mask.sum())
+        _m_nll = float(-log_uni[all_eval[_mask]].sum() / _m_n) if _m_n else float('nan')
         return {'order': 1, 'alpha': alpha, 'interpolation': 0.0,
-                'n_tokens': int(all_eval.size), 'nll': nll, 'ppl': float(_safe_exp_ppl(nll))}
+                'n_tokens': int(all_eval.size), 'nll': nll, 'ppl': float(_safe_exp_ppl(nll)),
+                'n_tokens_matched': _m_n, 'nll_matched': _m_nll,
+                'ppl_matched_denominator': float(_safe_exp_ppl(_m_nll)) if math.isfinite(_m_nll) else float('nan')}
     _uni, uniq, ctx, pair_counts = counts
     if isinstance(interpolation, (bool, np.bool_)):
         raise ValueError(f'interpolation must be a finite number in [0, 1], got {interpolation!r}')
@@ -12476,8 +12614,17 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
         nll_sum += float(-np.log(np.maximum(p, np.finfo(float).tiny)).sum())
     n_tokens = int(all_eval.size)
     nll = float(nll_sum / n_tokens) if n_tokens else float('nan')
+    # Matched denominator: drop every row's first token (the unigram-only
+    # positions).  For order 2 those first-column NLLs are exactly the
+    # `-log_uni[first]` term, so the matched sum is the conditional term over
+    # `prev`/`nxt` — the same R x (L-1) positions a neural LM is scored on.
+    _first_nll = float(-log_uni[first].sum())
+    _m_n = int(prev.size)
+    _m_nll = (nll_sum - _first_nll) / _m_n if _m_n else float('nan')
     return {'order': 2, 'alpha': alpha, 'interpolation': lam,
-            'n_tokens': n_tokens, 'nll': nll, 'ppl': float(_safe_exp_ppl(nll)) if math.isfinite(nll) else float('nan')}
+            'n_tokens': n_tokens, 'nll': nll, 'ppl': float(_safe_exp_ppl(nll)) if math.isfinite(nll) else float('nan'),
+            'n_tokens_matched': _m_n, 'nll_matched': float(_m_nll),
+            'ppl_matched_denominator': float(_safe_exp_ppl(_m_nll)) if math.isfinite(_m_nll) else float('nan')}
 
 def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
     """Run the declared count-model grid and select per baseline on validation."""
@@ -12509,12 +12656,16 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
                                     alpha=float(alpha), interpolation=float(lam),
                                     _counts=_shared_counts)
                 rows.append({'config': cfg, 'ppl': sc['ppl'], 'nll': sc['nll'],
-                             'n_tokens': sc['n_tokens'], 'steps': 0, 'tokens_seen': int(sc['n_tokens'])})
+                             'n_tokens': sc['n_tokens'], 'steps': 0, 'tokens_seen': int(sc['n_tokens']),
+                             'ppl_matched': sc.get('ppl_matched_denominator'),
+                             'nll_matched': sc.get('nll_matched'),
+                             'n_tokens_matched': sc.get('n_tokens_matched')})
         if not rows:
             raise RuntimeError(f'simple baseline {arm}: empty declared grid')
         best = min(rows, key=lambda r: float(r['ppl']))
         trials_by_arm[arm] = {'selected': dict(best['config']),
                               'selected_metric_value': float(best['ppl']),
+                              'selected_ppl_matched': (float(best['ppl_matched']) if isinstance(best.get('ppl_matched'), (int, float)) else None),
                               'trials': rows,
                               'order': order}
     best_arm = min(trials_by_arm, key=lambda a: float(trials_by_arm[a]['selected_metric_value']))
@@ -12544,6 +12695,12 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
         'baselines': trials_by_arm,
         'best_baseline': best_arm,
         'best_ppl': float(trials_by_arm[best_arm]['selected_metric_value']),
+        # Matched-denominator PPL of the SAME selected config (excludes every
+        # row's first token — exactly the positions a neural LM is scored on).
+        # Selection stays on the historical ``ppl`` scale so the audit's
+        # "selected is the best trial" check is unchanged; this field exists so
+        # panel-vs-floor comparisons can be made on equal denominators.
+        'best_ppl_matched': trials_by_arm[best_arm].get('selected_ppl_matched'),
         'code': code_stamp(),
     }
 
@@ -14897,6 +15054,18 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                         _comparable = False
                         report['warnings'].append(
                             'simple-baseline eval row fingerprint differs from the panel final-eval rows — the floor and the panel scored different validation documents; the beats-floor comparison is refused')
+                # The floor must be compared on the SAME denominator as the
+                # panel: the neural panel scores R x (L-1) positions, so use
+                # the matched-denominator floor (excludes row-first tokens)
+                # whenever the artifact provides it.  An old artifact without
+                # the field falls back to the historical scale, which is
+                # slightly INFLATED (row-first tokens have no context) — the
+                # fallback makes "beats the floor" easier, so it is labelled.
+                _floor_ppl = _sb.get('best_ppl_matched')
+                _floor_scale = 'matched (excludes row-first tokens; equal to the panel denominator)'
+                if not isinstance(_floor_ppl, (int, float)) or not math.isfinite(float(_floor_ppl)):
+                    _floor_ppl = _sb.get('best_ppl')
+                    _floor_scale = 'historical (includes row-first tokens; slightly inflated vs the panel scale)'
                 report['simple_baseline'].update({
                     'panel_reference_arm': _ref_key,
                     'panel_reference_ppl': float(_ref.get('ppl_primary', _ref['ppl_mean'])),
@@ -14905,8 +15074,10 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     'panel_eval_fp': (sorted(_panel_eval_fps)[:3] or None),
                     'simple_eval_fp': _sb_eval_fp,
                     'comparable_to_panel': _comparable,
-                    'panel_beats_simple_floor': (bool(float(_ref.get('ppl_primary', _ref['ppl_mean'])) < float(_sb.get('best_ppl')))
-                                                 if _comparable is True and _sb.get('best_ppl') is not None
+                    'simple_floor_ppl': (float(_floor_ppl) if isinstance(_floor_ppl, (int, float)) else None),
+                    'simple_floor_scale': _floor_scale,
+                    'panel_beats_simple_floor': (bool(float(_ref.get('ppl_primary', _ref['ppl_mean'])) < float(_floor_ppl))
+                                                 if _comparable is True and isinstance(_floor_ppl, (int, float))
                                                  else None),
                 })
                 if _comparable is False:
@@ -14917,9 +15088,9 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                         'the floor comparison is UNVERIFIABLE: panel records and/or the simple-baseline artifact lack a shared validation fingerprint; do not quote a beats-floor claim')
                 elif report['simple_baseline'].get('panel_beats_simple_floor') is False:
                     report['warnings'].append(
-                        'the panel\'s best declared-arm PPL (%.4f, %s) does not beat the tuned count-model floor (%.4f, %s) — the mechanism claim lacks the most basic baseline'
-                        % (float(_ref.get('ppl_primary', _ref['ppl_mean'])), _ref_key, float(_sb.get('best_ppl')),
-                           _sb.get('best_baseline') or 'count-model'))
+                        'the panel\'s best declared-arm PPL (%.4f, %s) does not beat the tuned count-model floor (%.4f, %s, %s) — the mechanism claim lacks the most basic baseline'
+                        % (float(_ref.get('ppl_primary', _ref['ppl_mean'])), _ref_key, float(_floor_ppl),
+                           _sb.get('best_baseline') or 'count-model', _floor_scale))
     if report['hypotheses_missing']:
         report['warnings'].append('no pre-registered hypothesis for: ' + ', '.join(sorted(set(report['hypotheses_missing']))) + ' — direction cannot be checked, so a significant result is at most measured')
 
@@ -16198,7 +16369,6 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
     # same forward pass, so block-length/boundary diagnostics come from it too.
     # A chunk is a set of independent sequences (no cross-row op in the
     # model), so capping it by token count does not change any per-row value.
-    _span = max(1, int(val_batch.shape[1]) - 1)
     chunk = _eval_adaptive_chunk(model, val_batch, device, chunk)
     was_training = model.training
     model.eval()
@@ -21116,7 +21286,22 @@ def _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch, devi
         _tk = training_knobs_fingerprint(amp_dtype=_amp_mode, eager_batch=_eb)
     _amp = _amp_mode or 'fp32'
     _ae = _adaptive_exact_limit()
-    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_tk{_tk}_amp{_amp}_eb{int(_eb)}_ae{_ae}_cs{code_stamp()}'
+    # Sampling-grid ceiling (CSA_ADAPTIVE_MAX_TOKENS): the grid it induces only
+    # affects threshold VALUES when the segmenter runs past the exact limit
+    # (n > _ae).  Record it in the fingerprint only in that case (or when the
+    # env var is explicitly set); when it is irrelevant the fingerprint string
+    # stays byte-identical to the historical form so no existing record is
+    # invalidated.
+    _ag_env = os.environ.get('CSA_ADAPTIVE_MAX_TOKENS', '').strip()
+    try:
+        _sl_i = int(cfg['seq_len'])
+    except (TypeError, ValueError, OverflowError):
+        _sl_i = 0
+    if _ag_env or _sl_i > int(_ae):
+        _ag_seg = f'_ag{_ag_env or (1 << 20)}'
+    else:
+        _ag_seg = ''
+    return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}_tk{_tk}_amp{_amp}_eb{int(_eb)}_ae{_ae}{_ag_seg}_cs{code_stamp()}'
 
 
 def _plan_run(cfg, summary_path, fp):

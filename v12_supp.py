@@ -35,6 +35,7 @@
 模式：
   python v12_supp.py smoke            # 端到端自检（微型 ckpt + 冻结清单副本）
   python v12_supp.py plan             # 零 GPU 预检：戳/实现绑定/准入/功效，不读 test
+  python v12_supp.py power            # 零 GPU：访问前功效模拟（清单 power_note 义务）
   python v12_supp.py full             # P5C -> P5MP -> P5S2 -> P5S3 -> P5T -> report
   python v12_supp.py phase P5C        # 单阶段（可断点续跑）
   python v12_supp.py analysis         # 零 GPU：确认性统计 -> analysis_v12/
@@ -210,14 +211,47 @@ def run_training_health(cfg=None):
               'note': 'diagnostic only: this gate never selects a checkpoint or changes the frozen plan',
               'cells': rows}
     out = cfg.get('out') or os.path.join(TEST_OUTDIR, 'training_health.json')
+    allow = os.environ.get('V12_ALLOW_UNHEALTHY', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    # The override must be MACHINE-READABLE in the artifacts, not a stdout-only
+    # warning: persist it on the health report itself so a later audit can see
+    # that the one-shot test access was consumed while the panel was failing.
+    report['v12_allow_unhealthy_used'] = bool(allow and report['status'] != 'pass')
+    if report['v12_allow_unhealthy_used']:
+        report['override_note'] = ('V12_ALLOW_UNHEALTHY=1 was set when this failing '
+                                   'health panel was accepted; the subsequent P5T '
+                                   'records carry allow_unhealthy_override=true')
     L.atomic_write_json(out, report, indent=2)
     print(f'[p5h] training health: {report["status"]} ({len(unhealthy)} unhealthy, {len(missing)} missing) -> {out}')
-    allow = os.environ.get('V12_ALLOW_UNHEALTHY', '').strip().lower() in ('1', 'true', 'yes', 'on')
     if report['status'] != 'pass' and not allow:
         raise SystemExit(f'[p5h] REFUSE: frozen-arm training health is not clean ({len(unhealthy)} unhealthy, {len(missing)} missing); investigate before using the one-shot test access (V12_ALLOW_UNHEALTHY=1 is the explicit override)')
     if report['status'] != 'pass':
-        print('[p5h] WARNING: V12_ALLOW_UNHEALTHY=1 — continuing despite unhealthy/missing training health')
+        print('[p5h] WARNING: V12_ALLOW_UNHEALTHY=1 — continuing despite unhealthy/missing training health (recorded in training_health.json and on every admitted P5T record)')
     return report
+
+
+def _p5c_post_access_guard():
+    """Refuse P5C (re)training once the test split has been accessed.
+
+    The freeze lock binds the plan, the test slice and the training corpus —
+    but NOT the checkpoint set.  Without this gate, one could see the test
+    results, retrain a chosen (arm, seed) via P5C (which never checks the
+    lock), and re-run P5T to overwrite that cell's measurement: selective
+    re-measurement after seeing the held-out data is selection bias by
+    construction, exactly like adding seeds after the fact."""
+    _refrz = os.environ.get('V12_REFREEZE', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    _lock_present = (os.path.exists(_freeze_lock_path(TEST_OUTDIR))
+                     or os.path.exists(_freeze_lock_mirror_path()))
+    if _lock_present and not _refrz:
+        raise SystemExit(
+            '[v12] REFUSE: phase P5C would (re)train frozen arms, but the test '
+            f'split was already accessed (freeze lock/mirror for {TEST_OUTDIR} exists). '
+            'Retraining a chosen cell after seeing test results and re-measuring it '
+            'would overwrite that cell\'s one-shot measurement — selective re-'
+            'measurement is selection bias by construction. Investigate the failing '
+            'cell and, if a conscious re-freeze is truly warranted, set V12_REFREEZE=1 '
+            '(the earlier round is then downgraded to exploratory in the plan history).')
+    if _lock_present:
+        print('[v12] WARNING: V12_REFREEZE=1 — retraining frozen arms after the first test access; the earlier confirmation round is downgraded to exploratory')
 
 
 def run_phase(name, guard, par=None):
@@ -237,6 +271,9 @@ def run_phase(name, guard, par=None):
         if pname in ('P5C', 'P5MP'):
             # the frozen seed list is the manifest's, not a hard-coded copy
             cfg = dict(cfg, seeds=_frozen_seeds())
+        if pname == 'P5C':
+            # Post-access selective-retraining guard (see the function doc).
+            _p5c_post_access_guard()
         if isinstance(_ctx, dict):
             _ctx = dict(_ctx, module='v12_supp', ckpt_install=True, ckpt_flag=False)
         if kind == 'lenphase':
@@ -940,9 +977,115 @@ def _frozen_seeds():
 
 _LOCK_NAME = '.freeze_lock.json'
 
+# (variant, seed) -> health-status string for cells whose one-shot test
+# evaluation was permitted by V12_ALLOW_UNHEALTHY=1 despite a failing/missing
+# health panel.  Populated by _training_health_gate, read by the P5T record
+# writer so the override is machine-visible on every admitted record (the
+# override must not live only in stdout, which is not an artifact).
+_UNHEALTHY_OVERRIDE_CELLS = {}
+
 
 def _freeze_lock_path(outdir):
     return os.path.join(outdir, _LOCK_NAME)
+
+
+def _freeze_lock_mirror_path():
+    """Git-tracked mirror of the freeze lock (lives next to the manifest).
+
+    The outdir lock lives inside a gitignored results directory, so renaming or
+    deleting that directory resets the freeze with no trace — exactly the
+    one-shot-access promise the lock is supposed to enforce.  The mirror is
+    meant to be COMMITTED (it is whitelisted in .gitignore), so a results-dir
+    rename cannot erase the fact that a first test access happened."""
+    return os.path.join(os.path.dirname(os.path.abspath(FREEZE_MANIFEST)) or '.',
+                        'confirmation_freeze_lock.json')
+
+
+def _is_smoke_outdir(outdir):
+    return 'smoke' in os.path.basename(os.path.abspath(outdir)).lower()
+
+
+def _mirror_active(outdir):
+    """The mirror is maintained only for the CANONICAL confirmation outdir.
+
+    Ad-hoc callers (tests, alternate result directories) must not create or
+    consult the repo-level mirror: it exists solely to make renaming/deleting
+    the ONE frozen results directory non-reversible."""
+    if _is_smoke_outdir(outdir):
+        return False
+    try:
+        _canon = os.path.abspath(TEST_OUTDIR)
+        _here = os.path.abspath(outdir)
+    except Exception:
+        return False
+    return _here == _canon
+
+
+def _write_lock_mirror(outdir, lock):
+    """Mirror the lock into the git-tracked mirror file (canonical outdir only)."""
+    if not _mirror_active(outdir):
+        return
+    try:
+        mirror = dict(lock)
+        mirror['mirror_of_outdir'] = os.path.abspath(outdir)
+        L.atomic_write_json(_freeze_lock_mirror_path(), mirror, indent=2)
+    except Exception as _me:
+        # A failed mirror write must not kill a legitimate run, but it must be
+        # visible: without the mirror, directory-rename tamper-evidence is off.
+        print(f'[v12] WARNING: could not write the freeze-lock mirror {_freeze_lock_mirror_path()} ({type(_me).__name__}: {_me}) — the directory-level tamper evidence is NOT active for this round; commit the mirror once writable')
+
+
+def _verify_lock_mirror(outdir, lock=None):
+    """Cross-check the local outdir lock against the git-tracked mirror.
+
+    Returns the mirror dict when one exists (None otherwise).  Refuses when
+    the two disagree on identity (manifest / test slice / train corpus), or
+    when the mirror proves a first access happened but the outdir lock is
+    gone (renamed/deleted results directory) — unless V12_REFREEZE=1."""
+    if not _mirror_active(outdir):
+        return None
+    mp = _freeze_lock_mirror_path()
+    if not os.path.exists(mp):
+        return None
+    try:
+        mirror = json.load(open(mp, encoding='utf-8'))
+    except Exception as e:
+        raise SystemExit(f'[v12] REFUSE: freeze-lock mirror {mp} exists but cannot be parsed ({type(e).__name__}: {e}) — the mirror is part of the one-shot-access evidence; restore it from git history or re-freeze consciously')
+    if not isinstance(mirror, dict):
+        raise SystemExit(f'[v12] REFUSE: freeze-lock mirror {mp} is valid JSON but not an object ({type(mirror).__name__}) — refusing to interpret it')
+    lp = _freeze_lock_path(outdir)
+    _refreeze = os.environ.get('V12_REFREEZE', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    if not os.path.exists(lp):
+        if not _refreeze:
+            raise SystemExit(
+                f'[v12] REFUSE: the git-tracked freeze-lock mirror {mp} records a first '
+                f'test-split access (manifest {str(mirror.get("manifest_sha256"))[:12]}…, '
+                f'locked_at={mirror.get("locked_at")}, outdir={mirror.get("mirror_of_outdir")}), but '
+                f'there is no lock in {outdir} — the results directory was renamed, deleted or '
+                f'never copied here. Renaming the results directory must not reset the freeze; '
+                f'restore the original directory or set V12_REFREEZE=1 (the earlier round is then '
+                f'downgraded to exploratory in the plan history)')
+        print('[v12] WARNING: V12_REFREEZE=1 with a mirror but no local lock — treating the mirrored round as superseded and writing a fresh lock')
+        return mirror
+    if lock is None:
+        try:
+            lock = json.load(open(lp, encoding='utf-8'))
+        except Exception:
+            return mirror
+    for _k in ('manifest_sha256', 'test_ids_fp', 'train_fp'):
+        _mv = mirror.get(_k)
+        _lv = lock.get(_k)
+        if _mv is None:
+            continue
+        if _lv is None:
+            continue
+        if _mv != _lv:
+            raise SystemExit(
+                f'[v12] REFUSE: the freeze lock in {outdir} disagrees with the git-tracked '
+                f'mirror on {_k} ({_lv!r} vs mirror {_mv!r}) — one of the two was modified '
+                f'independently. Investigate before any further test access '
+                f'(V12_REFREEZE=1 re-freezes consciously).')
+    return mirror
 
 
 def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
@@ -954,9 +1097,14 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
     与 test 切片指纹。之后的 P5T/analysis 若带着**不同的** manifest 哈希
     或不同 test 指纹运行，将被拒绝——除非显式 V12_REFREEZE=1（并大声
     打印该轮降级为探索性的警告）。``train_fp`` 一旦记录，后续训练集
-    指纹不一致同样拒绝。"""
+    指纹不一致同样拒绝。
+
+    锁同时镜像到 git 管理的 ``confirmation_freeze_lock.json``（见
+    ``_freeze_lock_mirror_path``）：结果目录被改名/删除时，镜像证明首次
+    访问发生过，冻结不会被静默重置。"""
     lp = _freeze_lock_path(outdir)
     _sha = manifest.get('manifest_sha256')
+    _mirror_prev = _verify_lock_mirror(outdir)
     if os.path.exists(lp):
         try:
             lock = json.load(open(lp, encoding='utf-8'))
@@ -1013,15 +1161,32 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
             lock['train_fp'] = train_fp
             lock['history'] = list(lock.get('history') or []) + [{'stage': 'train-fp', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'train_fp': train_fp}]
             _dirty = True
+        # Backfill the git-tracked mirror when the lock predates it (the
+        # mirror is the newer half of the tamper-evidence pair).
+        if _mirror_active(outdir) and not os.path.exists(_freeze_lock_mirror_path()):
+            lock['history'] = list(lock.get('history') or []) + [{'stage': 'mirror-backfilled', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                                  'note': 'lock predates the mirror; mirroring now'}]
+            _dirty = True
         if _dirty:
             L.atomic_write_json(lp, lock, indent=2)
+            _write_lock_mirror(outdir, lock)
             if _manifest_changed or _test_changed or _train_changed:
                 print(f'[v12] freeze lock UPDATED: {lp} (manifest {str(_sha)[:12]}…; {len(lock["superseded"])} superseded plan(s) kept)')
             else:
                 print(f'[v12] freeze lock updated with the first-access slice/train fingerprint: {lp}')
         return lock
     lock = {'manifest_sha256': _sha, 'manifest_path': os.path.abspath(manifest.get('_path') or FREEZE_MANIFEST), 'frozen_at': manifest.get('frozen_at'), 'locked_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'train_fp': train_fp, 'stage': stage, 'code_semantics': L.code_stamp(), 'history': [{'stage': stage, 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'train_fp': train_fp}], 'note': 'first test-split access: the plan may not change after this point (V12_REFREEZE=1 overrides consciously, downgrading the earlier round to exploratory)'}
+    if _mirror_prev is not None:
+        # V12_REFREEZE after a directory rename/delete: keep the superseded
+        # identity from the mirror so the exploratory history survives.
+        prev = {_k: _mirror_prev.get(_k) for _k in ('manifest_sha256', 'test_ids_fp', 'train_fp', 'locked_at', 'frozen_at')}
+        lock['superseded'] = [_mirror_prev.get('superseded'), prev] if _mirror_prev.get('superseded') else [prev]
+        lock['history'] = lock['history'] + [{'stage': 'refreeze-mirror', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                                              'note': 'local lock was absent but the git-tracked mirror proved an earlier access; that round is downgraded to exploratory',
+                                              'superseded': prev}]
+        lock['note'] = 're-frozen under V12_REFREEZE=1 after a missing local lock (mirror evidence): the earlier round is downgraded to exploratory'
     L.atomic_write_json(lp, lock, indent=2)
+    _write_lock_mirror(outdir, lock)
     print(f'[v12] freeze lock written: {lp} (manifest {_sha[:12]}…, stage {stage}, test_ids_fp {str(test_ids_fp)[:12]}…)')
     return lock
 
@@ -1031,7 +1196,11 @@ def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
     This is deliberately NOT a model-selection rule: it does not change arms,
     seeds, steps or the endpoint.  It only prevents burning the frozen test
     access on a run whose own diagnostic curve says non-finite/overfitting/
-    stalled.  `V12_ALLOW_UNHEALTHY=1` is the explicit, logged override.
+    stalled.  `V12_ALLOW_UNHEALTHY=1` is the explicit, logged override; every
+    cell admitted through the override is recorded in
+    ``_UNHEALTHY_OVERRIDE_CELLS`` and stamped on its P5T record as
+    ``allow_unhealthy_override=True`` (plus the health status), so the
+    override is auditable from the artifacts alone.
     """
     if L._as_bool_flag(cfg.get('smoke')) is True:
         return None
@@ -1041,6 +1210,7 @@ def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
         msg = f'{v} s{seed}: no training curve/health evidence in the checkpoint or its record'
         if allow:
             print(f'[p5t] WARNING: {msg}; V12_ALLOW_UNHEALTHY=1 permits the test evaluation')
+            _UNHEALTHY_OVERRIDE_CELLS[(v, L._as_seed_int(seed) if L._as_seed_int(seed) is not None else seed)] = 'unknown'
             return None
         return msg + ' — refusing to use the one-shot test access (set V12_ALLOW_UNHEALTHY=1 only with a written justification)'
     status = str(health.get('status') or 'unknown')
@@ -1048,10 +1218,12 @@ def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
         return None
     if status == 'unmonitored' and allow:
         print(f'[p5t] WARNING: {v} s{seed}: training health is unmonitored; V12_ALLOW_UNHEALTHY=1 permits the test evaluation')
+        _UNHEALTHY_OVERRIDE_CELLS[(v, L._as_seed_int(seed) if L._as_seed_int(seed) is not None else seed)] = status
         return None
     msg = f'{v} s{seed}: training health is {status!r} ({health.get("reason") or "no reason recorded"})'
     if allow:
         print(f'[p5t] WARNING: {msg}; V12_ALLOW_UNHEALTHY=1 permits the test evaluation')
+        _UNHEALTHY_OVERRIDE_CELLS[(v, L._as_seed_int(seed) if L._as_seed_int(seed) is not None else seed)] = status
         return None
     return msg + ' — refusing to use the one-shot test access'
 
@@ -1216,7 +1388,68 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         del d
         out['status'] = 'skipped_resume'
         return out
+    # Post-access selective-remeasurement guard.  A stale record whose key
+    # already carries a measurement, evaluated now on DIFFERENT weights, would
+    # silently OVERWRITE that cell's one-shot test measurement (resume's _merge
+    # writes by key).  The freeze lock pins the plan/slice/corpus but not the
+    # checkpoint set, so this is the last line of defence against
+    # retrain-a-chosen-cell-and-remeasure after the test split was read.
+    if (split != 'smoke' and isinstance(_cur, dict)
+            and (os.path.exists(_freeze_lock_path(outdir))
+                 or os.path.exists(_freeze_lock_mirror_path()))):
+        _prior_sha = _cur.get('ckpt_sha256')
+        _now_sha = _ensure_ck_sha()
+        _refrz = os.environ.get('V12_REFREEZE', '').strip().lower() in ('1', 'true', 'yes', 'on')
+        if (_now_sha is None or _prior_sha is None or _prior_sha != _now_sha) and not _refrz:
+            del d
+            raise SystemExit(
+                f'[v12] REFUSE {v} s{seed}: this cell already has a test measurement '
+                f'(ckpt_sha256={str(_prior_sha)[:12]}…) but the checkpoint on disk now hashes to '
+                f'{str(_now_sha)[:12]}… — re-measuring the same (arm, seed) on different weights '
+                'after the first test access would replace a one-shot measurement selectively '
+                '(selection bias by construction). Restore the original checkpoint, or set '
+                'V12_REFREEZE=1 to re-freeze consciously (the earlier round is downgraded to '
+                'exploratory in the plan history).')
+        if _prior_sha is not None and _now_sha is not None and _prior_sha != _now_sha:
+            print(f'[v12] WARNING: V12_REFREEZE=1 — {v} s{seed} is re-measured on different weights; the prior measurement (ckpt {str(_prior_sha)[:12]}…) is replaced and the earlier round is downgraded to exploratory')
+            out['replaced_prior_ckpt_sha256'] = _prior_sha
     _arch = (int(d.get('d', 256)), int(d.get('n_layers', 6)), int(d.get('n_heads', 8)), int(d.get('d_head', 32)))
+    # Explicit architecture / MLP-width verification against the frozen
+    # binding.  The recipe string is decoded from injected constants on the
+    # p1l path, so a matching recipe alone cannot prove the checkpoint's real
+    # shape; the probe path already hard-refuses architecture mismatches —
+    # mirror that check for the confirmatory by-length cells.
+    _bind = manifest.get('binding') or {}
+    _arch_sig = _bind.get('training_recipe_signature') or {}
+    if all(isinstance(_arch_sig.get(_k), (int, float)) and not isinstance(_arch_sig.get(_k), bool)
+           for _k in ('d', 'L', 'H', 'Dh')):
+        _want_arch = (int(_arch_sig['d']), int(_arch_sig['L']), int(_arch_sig['H']), int(_arch_sig['Dh']))
+        if _arch != _want_arch:
+            del d
+            raise SystemExit(
+                f'[v12] REFUSE {v} s{seed}: checkpoint architecture {_arch} != the frozen '
+                f'training_recipe_signature {_want_arch} — a differently shaped model cannot '
+                'enter the confirmation panel even when its recipe string matches (the p1l '
+                'recipe is decoded from injected constants, not from the weights).')
+    _want_mr = ((_bind.get('per_arm_recipe_signature') or {}).get(v) or {}).get('mr')
+    if _want_mr is not None:
+        try:
+            _want_mr = float(_want_mr)
+        except (TypeError, ValueError, OverflowError):
+            _want_mr = None
+    if _want_mr is not None:
+        _got_mr = d.get('mlp_ratio')
+        try:
+            _got_mr = float(_got_mr)
+        except (TypeError, ValueError, OverflowError):
+            _got_mr = None
+        if _got_mr is None or abs(_got_mr - _want_mr) > 1e-6:
+            del d
+            raise SystemExit(
+                f'[v12] REFUSE {v} s{seed}: checkpoint mlp_ratio {_got_mr!r} != the frozen '
+                f'per_arm_recipe_signature mr={_want_mr!r} — the parameter-matched arm contract '
+                'is part of the pre-registration and is verified from the weights, not from '
+                'the recipe string.')
     model = L.SmallGPT(int(d.get('vocab', 8192)), *_arch, d.get('train_len', 512), [copy.deepcopy(c) for c in d['cfg']], mlp_ratio=d['mlp_ratio']).to(DEVICE)
     model.load_state_dict(d.pop('sd'))
     model.eval()
@@ -1252,6 +1485,8 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         # frozen implementation binding requires `train_knobs` on every
         # record.
         _tk = _tr.get('train_knobs') or _ck_prov.get('train_knobs')
+        _ov_key = (v, L._as_seed_int(seed) if L._as_seed_int(seed) is not None else seed)
+        _ov_status = _UNHEALTHY_OVERRIDE_CELLS.get(_ov_key)
         summary[f'{v}::s{seed}'] = {'variant': v, 'seed': seed, 'params': _tr.get('params') or _ck_prov.get('params'), 'by_len': r, 'split': split, 'data_fp': _dfp, 'train_fp': _tr_train_fp, '_code': V.CKPT_CODE, 'recipe': _ck_recipe, 'manifest_sha256': _msha, 'ckpt_sha256': _ensure_ck_sha(), 'ckpt_sig': (list(_ck_sig) if _ck_sig is not None else None),
                                     'n_seq': int(test_ids.shape[0]),
                                     'train_knobs': _tk,
@@ -1261,13 +1496,194 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
                                     'init_core_fp': _tr.get('init_core_fp') or _ck_prov.get('init_core_fp'),
                                     'amp_dtype': (_tk or {}).get('amp_dtype') if isinstance(_tk, dict) else None,
                                     'amp_grad_scaler': (_tk or {}).get('amp_grad_scaler') if isinstance(_tk, dict) else None,
-                                    'eager_batch': (_tk or {}).get('eager_batch') if isinstance(_tk, dict) else None}
+                                    'eager_batch': (_tk or {}).get('eager_batch') if isinstance(_tk, dict) else None,
+                                    # Machine-readable V12_ALLOW_UNHEALTHY override
+                                    # audit trail: False on every honestly healthy
+                                    # cell, True + the failing status on overridden
+                                    # ones (see _training_health_gate).
+                                    'allow_unhealthy_override': _ov_status is not None,
+                                    'health_status_override': _ov_status,
+                                    # Post-access replacement audit trail (see the
+                                    # selective-remeasurement guard above).
+                                    'post_access_replacement': out.get('replaced_prior_ckpt_sha256') is not None,
+                                    'replaced_prior_ckpt_sha256': out.get('replaced_prior_ckpt_sha256')}
         print(f'  [p5t] {v:32s} s{seed} ' + '  '.join((f'L{k}={vv.get("ppl", float("nan")):.2f}' for k, vv in sorted(r.items()))))
         return summary
     L.locked_json_update(spath, _merge)
-    L.log_experiment_event(outdir, {'kind': 'eval', 'tracking_schema': 2, 'run_id': _ft_run_id, 'status': 'ok', 'started_at': _ft_started, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _ft_t0, 'key': f'{v}::s{seed}', 'variant': v, 'seed': int(seed), 'split': split, 'code': V.CKPT_CODE, 'manifest_sha256': _msha, 'recipe': _ck_recipe, 'ckpt_sha256': _ck_sha, 'data_fp': _dfp, 'train_fp': _tr_train_fp, 'params': _tr.get('params'), 'metrics': {'by_len': {str(k): (v2 or {}).get('ppl') for k, v2 in r.items()}}})
+    _ov_key_e = (v, L._as_seed_int(seed) if L._as_seed_int(seed) is not None else seed)
+    L.log_experiment_event(outdir, {'kind': 'eval', 'tracking_schema': 2, 'run_id': _ft_run_id, 'status': 'ok', 'started_at': _ft_started, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _ft_t0, 'key': f'{v}::s{seed}', 'variant': v, 'seed': int(seed), 'split': split, 'code': V.CKPT_CODE, 'manifest_sha256': _msha, 'recipe': _ck_recipe, 'ckpt_sha256': _ck_sha, 'data_fp': _dfp, 'train_fp': _tr_train_fp, 'params': _tr.get('params'), 'allow_unhealthy_override': _ov_key_e in _UNHEALTHY_OVERRIDE_CELLS, 'health_status_override': _UNHEALTHY_OVERRIDE_CELLS.get(_ov_key_e), 'metrics': {'by_len': {str(k): (v2 or {}).get('ppl') for k, v2 in r.items()}}})
     del d
     return out
+
+def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
+    """Exact sign-flip power enumeration on FIXED magnitudes (zero GPU).
+
+    Implements the manifest's statistics.power_note obligation: treat the
+    observed |d_i| as fixed, enumerate every 2^n sign pattern as a candidate
+    observation, compute the exact two-sided sign-flip p for each (the null
+    distribution of |sum s_i |d_i|| is the same multiset for every sign
+    convention), and report (a) power under the q-model — each seed's delta
+    falls in the pre-registered direction with probability q — using the
+    conservative Holm threshold p <= alpha/m for the smallest-p slot, and
+    (b) the minimum same-sign count among rejecting patterns.
+
+    This is a design aid computed on the VALIDATION panel before the one-shot
+    test access; it is not a guarantee and not a bound (unequal magnitudes can
+    make the exact test more or less powerful than these numbers).
+    """
+    import itertools as _it
+    n = len(deltas)
+    mags = [abs(float(x)) for x in deltas]
+    if n == 0 or all(mm == 0.0 for mm in mags):
+        return {'n': n, 'status': 'no_data'}
+    if n > 16:
+        return {'n': n, 'status': 'too_many_seeds_for_enumeration',
+                'note': 'n>16: enumeration skipped (2^n patterns); use the symbol-test projection table instead'}
+    # Null distribution of |sum s_i m_i| over all 2^n flips (same multiset for
+    # any sign convention of the magnitudes).
+    _sums = sorted(abs(sum(s_i * mags[i] for i, s_i in enumerate(signs)))
+                   for signs in _it.product((1.0, -1.0), repeat=n))
+    _total = float(len(_sums))
+    _tol = 1e-12 * max(1.0, max(_sums) if _sums else 1.0)
+    _thr_holm = float(alpha) / max(1, int(m_comparisons))
+    _thr_marginal = float(alpha)
+    exp_dir = None
+    if expected_sign == 'positive':
+        exp_dir = 1.0
+    elif expected_sign == 'negative':
+        exp_dir = -1.0
+    powers = {f'q={q:.2f}': 0.0 for q in (0.8, 0.85, 0.9, 0.95)}
+    _min_same = None
+    _n_reject_holm = 0
+    _n_reject_marginal = 0
+    for signs in _it.product((1.0, -1.0), repeat=n):
+        stat = abs(sum(s_i * mags[i] for i, s_i in enumerate(signs)))
+        # exact p: #null sums >= observed statistic (ties included, as in the
+        # exact test's "at least as extreme" rule)
+        _p = sum(1 for v in _sums if v >= stat - _tol) / _total
+        # A two-sided rejection is only a CONFIRMATION when the observed
+        # direction also matches the pre-registered sign (decision_rule's
+        # direction_ok): the all-opposite pattern rejects just as hard but in
+        # the wrong direction.  For a non-directional comparison every
+        # rejection counts.
+        _same = sum(1 for i, s_i in enumerate(signs) if exp_dir is not None and s_i == exp_dir)
+        _dir_ok = (exp_dir is None) or (_same * 2 > n)
+        _rej_h = _p <= _thr_holm and _dir_ok
+        _rej_m = _p <= _thr_marginal and _dir_ok
+        if _rej_h:
+            _n_reject_holm += 1
+        if _rej_m:
+            _n_reject_marginal += 1
+        if _rej_h and exp_dir is not None and (_min_same is None or _same < _min_same):
+            _min_same = _same
+        if exp_dir is not None:
+            for q in powers:
+                _qv = float(q.split('=')[1])
+                w = (_qv ** _same) * ((1.0 - _qv) ** (n - _same))
+                if _rej_h:
+                    powers[q] += w
+    return {
+        'n': n,
+        'status': 'ok',
+        'method': ('exact enumeration of 2^n sign patterns on fixed |d_i|; exact two-sided '
+                   'sign-flip p per pattern; a pattern counts as CONFIRMING only when it also '
+                   'matches the pre-registered direction (direction_ok); rejection at the '
+                   'conservative Holm slot p <= alpha/m; power(q) sums the q-model pattern '
+                   'weights of confirming patterns'),
+        'threshold_holm_conservative': _thr_holm,
+        'threshold_marginal_alpha': _thr_marginal,
+        'power_holm_conservative': {k: round(v, 6) for k, v in powers.items()},
+        'fraction_patterns_confirming_holm': _n_reject_holm / _total,
+        'fraction_patterns_confirming_marginal': _n_reject_marginal / _total,
+        'min_same_sign_for_holm_confirmation': _min_same,
+        'expected_sign': expected_sign,
+        'note': ('per-comparison marginal power only: cross-comparison correlation from shared '
+                 'arms/seeds is not modelled; the Holm threshold used is the conservative '
+                 'smallest-p slot alpha/m. Design aid, not a guarantee or a bound.'),
+    }
+
+
+def run_power_check(cfg=None):
+    """Pre-access power simulation on the frozen arms' VALIDATION deltas.
+
+    Fulfils the frozen manifest's statistics.power_note: BEFORE the one-shot
+    test access, enumerate sign-flips on the per-seed validation delta vector
+    (fixed |d_i|) to obtain the real power / minimum same-sign count for THIS
+    panel.  If the power is inadequate, seeds must be added and the revision
+    recorded in the manifest BEFORE touching test — discovering inadequate
+    power after the access is irreversible.
+
+    Zero GPU: reads by-length VALIDATION records from the mech/P5C summary
+    (the frozen arms trained by P3MT/P4MT/P3MTC/P5C all write there).  Writes
+    ``<outdir>/p5c_power.json`` and returns the report."""
+    cfg = dict(FINALTEST_CFG) if cfg is None else dict(cfg)
+    manifest = _load_manifest(cfg.get('manifest') or FREEZE_MANIFEST)
+    outdir = cfg['outdir']
+    os.makedirs(outdir, exist_ok=True)
+    out_path = os.path.join(outdir, 'p5c_power.json')
+    _alpha = float((manifest.get('statistics') or {}).get('alpha', 0.05))
+    _m = len(manifest.get('primary_comparisons') or [])
+    summary_path = cfg.get('mech_summary') or 'results_v10_mech/summary.json'
+    summary = {}
+    if os.path.exists(summary_path):
+        try:
+            summary = json.load(open(summary_path, encoding='utf-8'))
+        except Exception as _e:
+            raise SystemExit(f'[v12 power] REFUSE: {summary_path} exists but cannot be parsed ({type(_e).__name__}: {_e})')
+    else:
+        print(f'[v12 power] NOTE: {summary_path} not found — no validation panel yet; the artifact records a data gap (run P3MT/P4MT/P5C first for a real power read)')
+    comps = {}
+    for comp in manifest.get('primary_comparisons') or []:
+        name = comp.get('name')
+        a, b = comp.get('a'), comp.get('b')
+        try:
+            Ln = int(str(comp.get('endpoint', 'by_len.ppl@4096')).rsplit('@', 1)[-1])
+        except (TypeError, ValueError, OverflowError):
+            Ln = 4096
+        deltas = {}
+        for s in manifest.get('seeds') or []:
+            ra = summary.get(f'{a}::seed{s}') or {}
+            rb = summary.get(f'{b}::seed{s}') or {}
+            if ra.get('synthesized') or rb.get('synthesized'):
+                continue
+            pa = ((ra.get('by_len') or {}).get(Ln) or (ra.get('by_len') or {}).get(str(Ln)) or {}).get('ppl')
+            pb = ((rb.get('by_len') or {}).get(Ln) or (rb.get('by_len') or {}).get(str(Ln)) or {}).get('ppl')
+            if L.ppl_is_usable(pa) and L.ppl_is_usable(pb):
+                deltas[int(s)] = float(pa) - float(pb)
+        ordered = [deltas[s] for s in sorted(deltas)]
+        entry = {'a': a, 'b': b, 'endpoint': f'by_len.ppl@{Ln}', 'split': 'validation',
+                 'expected_sign': comp.get('expected_sign'),
+                 'n_paired_seeds': len(ordered),
+                 'seeds': sorted(deltas),
+                 'deltas': ordered}
+        entry.update(_power_enumeration(ordered, comp.get('expected_sign'), _alpha, _m))
+        if entry.get('status') == 'no_data':
+            entry['note'] = ('no paired validation by-length records for this comparison yet — '
+                             'run the frozen-arm training phases (P3MT/P4MT/P3MTC/P5C) first')
+        comps[name] = entry
+    report = {'kind': 'p5c_power', 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+              'manifest': manifest.get('manifest_sha256'),
+              'source_summary': summary_path,
+              'alpha': _alpha, 'm_comparisons': _m,
+              'status': 'ok', 'comparisons': comps,
+              'note': ('Pre-access power simulation per the manifest statistics.power_note: '
+                       'sign-flip enumeration on fixed VALIDATION |d_i| magnitudes. Inadequate '
+                       'power must be remedied by adding seeds and recording the manifest '
+                       'revision BEFORE the first test-split access.')}
+    low = [k for k, v in comps.items()
+           if v.get('power_holm_conservative') and v['power_holm_conservative'].get('q=0.80') is not None
+           and float(v['power_holm_conservative']['q=0.80']) < 0.5]
+    if low:
+        report['low_power_warnings'] = low
+    L.atomic_write_json(out_path, report, indent=2)
+    print(f'[v12 power] pre-access power artifact written: {out_path}')
+    for k, v in comps.items():
+        _pw = (v.get('power_holm_conservative') or {}).get('q=0.80')
+        print(f'  {k}: n={v.get("n_paired_seeds")} status={v.get("status")} power(q=0.80, Holm-conservative)={_pw if _pw is None else round(float(_pw), 4)} min_same_sign={v.get("min_same_sign_for_holm_confirmation")}')
+    if low:
+        print(f'[v12 power] WARNING: low power (<0.5 at q=0.80) for {low} — consider adding seeds and recording the manifest revision BEFORE the first test access')
+    return report
+
 
 def run_finaltest(cfg=None, guard=None):
     """Evaluate the FROZEN confirmation set on the held-out test split.
@@ -1344,6 +1760,43 @@ def run_finaltest(cfg=None, guard=None):
     # manifest mismatch is discovered before the one-shot access is used.
     _check_or_write_freeze_lock(outdir, manifest, None, stage='preaccess',
                                 train_fp=_want_train_fp)
+    if not _smoke:
+        # Pre-access POWER gate (the manifest statistics.power_note obligation):
+        # the sign-flip enumeration on the frozen arms' validation deltas must
+        # have been run (python v12_supp.py power, zero GPU) BEFORE the one-shot
+        # read, so inadequate power is discovered while seeds can still be added
+        # with a recorded revision — not after the access.  V12_SKIP_POWER=1 is
+        # the explicit, artifact-recorded override.
+        _power_path = os.path.join(outdir, 'p5c_power.json')
+        if not os.path.exists(_power_path):
+            if os.environ.get('V12_SKIP_POWER', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+                print('[v12] WARNING: V12_SKIP_POWER=1 — consuming the one-shot test access WITHOUT the pre-access power artifact; the override is recorded in p5c_power.json and must be justified in the decision log')
+                L.atomic_write_json(_power_path, {'kind': 'p5c_power', 'status': 'skipped',
+                                                  'v12_skip_power_used': True,
+                                                  'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                  'manifest': manifest.get('manifest_sha256'),
+                                                  'note': 'V12_SKIP_POWER=1: the pre-access power simulation was consciously skipped before the one-shot test access'})
+            else:
+                raise SystemExit(
+                    f'[v12] REFUSE: no pre-access power artifact at {_power_path} — the frozen '
+                    'manifest (statistics.power_note) requires the sign-flip enumeration on the '
+                    'validation deltas to be run BEFORE the first test-split access. Run '
+                    '`python v12_supp.py power` (zero GPU) first; if the power is inadequate, '
+                    'add seeds and record the manifest revision before touching test. '
+                    'V12_SKIP_POWER=1 is the explicit override (recorded in the artifact).')
+        else:
+            try:
+                _pow = json.load(open(_power_path, encoding='utf-8'))
+                if isinstance(_pow, dict) and _pow.get('status') == 'skipped':
+                    print('[v12] WARNING: the pre-access power artifact was SKIPPED (V12_SKIP_POWER=1) — this test access proceeds without the power simulation the manifest asks for')
+                elif isinstance(_pow, dict):
+                    for _k, _v in (_pow.get('comparisons') or {}).items():
+                        _pw = (_v.get('power_holm_conservative') or {}).get('q=0.80')
+                        print(f'  [p5t power] {_k}: n={_v.get("n_paired_seeds")} power(q=0.80)={_pw if _pw is None else round(float(_pw), 4)} min_same_sign={_v.get("min_same_sign_for_holm_confirmation")}')
+                    if _pow.get('low_power_warnings'):
+                        print(f'[v12] WARNING: the pre-access power artifact flags LOW POWER for {_pow["low_power_warnings"]} — the confirmation may be resolution-limited; this was known BEFORE the access')
+            except Exception as _pe:
+                print(f'[v12] WARNING: the pre-access power artifact exists but cannot be read ({type(_pe).__name__}: {_pe})')
     if test_ids is None:
         _t0 = time.time()
         test_ids, vocab_t, _, _ = L.load_wikitest(need, n_seqs=_nseq_clean)
@@ -1391,10 +1844,12 @@ def run_finaltest(cfg=None, guard=None):
         print(f'[p5t] NOTE: n_seqs_clean={_nseq_clean} — document-sampling uncertainty is NOT well covered at this row count; population-level claims need a larger row panel (per-doc losses are recorded in bylen.json for stratified analysis; see design_notes §20)')
     # 1) clean by-length per (arm, seed)
     _split_label = 'smoke' if _smoke else 'test'
+    _bylen_cell_status = {}
     for v in manifest['arms']:
         for seed in manifest['seeds']:
-            _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids,
-                                  split=_split_label, train_fp=_want_train_fp)
+            _cell_out = _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids,
+                                              split=_split_label, train_fp=_want_train_fp)
+            _bylen_cell_status[(v, L._as_seed_int(seed) if L._as_seed_int(seed) is not None else seed)] = ((_cell_out or {}).get('status') if isinstance(_cell_out, dict) else None)
     # 2) frozen uniform-corruption probe on the SAME test rows (secondary,
     #    descriptive-only per the manifest)
     _probe_eval = (manifest.get('eval') or {}).get('distractor_probe') or {}
@@ -1407,12 +1862,20 @@ def run_finaltest(cfg=None, guard=None):
     # The probe is measured on the SAME frozen rows as the by-length panel, so
     # an omitted probe n_seq must default to that frozen row count — not to a
     # runtime config value that could exceed it.
-    pcfg = dict(V10.PROBE, outdir=outdir, ckpt_dir=cfg['ckpt_dir'], summary=cfg['probe_summary'], variants=list(manifest['arms']), seeds=[int(s) for s in manifest['seeds']], eval_lens=[int(x) for x in (_probe_eval.get('eval_lens') or [2048, 4096])], rhos=_probe_rhos, modes={_probe_mode: _probe_rhos}, niah=None, arm_overrides={v: ['learned'] for v in V10.SCRATCH_CONTROLS}, target=int(_probe_eval.get('target', cfg.get('target', 512))), n_seq=int(_probe_eval.get('n_seq', _nseq_clean)), chunk=int(cfg.get('chunk', 4)))
+    pcfg = dict(V10.PROBE, outdir=outdir, ckpt_dir=cfg['ckpt_dir'], summary=cfg['probe_summary'], variants=list(manifest['arms']), seeds=[int(s) for s in manifest['seeds']], eval_lens=[int(x) for x in (_probe_eval.get('eval_lens') or [2048, 4096])], rhos=_probe_rhos, modes={_probe_mode: _probe_rhos}, niah=None, arm_overrides={v: ['learned'] for v in V10.SCRATCH_CONTROLS}, target=int(_probe_eval.get('target', cfg.get('target', 512))), n_seq=int(_probe_eval.get('n_seq', _nseq_clean)), chunk=int(cfg.get('chunk', 4)), manifest_sha256=manifest.get('manifest_sha256'))
     mech_summ = {}
     if os.path.exists(cfg['mech_summary']):
         mech_summ = json.load(open(cfg['mech_summary'], encoding='utf-8'))
     for v in pcfg['variants']:
         for seed in pcfg['seeds']:
+            _cell_status = _bylen_cell_status.get((v, int(seed)))
+            if _cell_status == 'skipped_unhealthy_training':
+                # The one-shot access is not spent on weights whose own curve
+                # failed the health gate: the by-length cell was refused, so a
+                # probe measurement on the same weights would describe a
+                # checkpoint that is not part of the confirmatory panel.
+                print(f'[p5t] SKIP probe {v} s{seed}: its by-length cell was refused by the training-health gate — the probe budget is not spent on excluded weights')
+                continue
             V10.run_probe_cell(pcfg, v, seed, guard=guard, val_ids=test_ids, mech_summ=mech_summ)
     # 3) confirmation statistics (zero GPU, from disk)
     return finaltest_stats(manifest=manifest, bylen_path=cfg['bylen_summary'], probe_path=cfg['probe_summary'], out=cfg.get('stats_out', 'analysis_v12/test_stats.json'))
@@ -1483,12 +1946,19 @@ def _by_len_shape_reason(rec, n_seq):
         # eval_span is the cell's own record of how many positions it
         # actually ran (the same rule as audit_length).
         _es = _c.get('eval_span')
-        if _es is not None:
-            _es_i = _record_int(_es)
-            if _es_i is None or _es_i != _ln_i:
-                return (f'by_len[{_ln_i}].eval_span={_es!r} != the requested '
-                        f'length — a shorter span under a full-length label is '
-                        'not admissible')
+        # eval_span is REQUIRED, not optional: without it a record cannot prove
+        # it scored the full length, and an optional check lets a hand-crafted
+        # record omit the field to dodge the span gate.  Honest writers always
+        # record it (run_lenphase / eval_length_gen).
+        if _es is None:
+            return (f'by_len[{_ln_i}] carries no eval_span — the cell does not '
+                    'prove it scored the requested length; only records from '
+                    'the current writer (eval_length_gen) are admissible')
+        _es_i = _record_int(_es)
+        if _es_i is None or _es_i != _ln_i:
+            return (f'by_len[{_ln_i}].eval_span={_es!r} != the requested '
+                    f'length — a shorter span under a full-length label is '
+                    'not admissible')
     return None
 
 
@@ -1835,6 +2305,12 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             why = f"train_fp {_tfp_text} does not match the frozen canonical training fingerprint {want_train_fp}"
         elif _recipe_signature(manifest, r.get('variant')) is not None and not _recipe_matches_signature(r.get('recipe'), _recipe_signature(manifest, r.get('variant'))):
             why = 'recipe does not match the frozen training_recipe signature (including the per-arm mr)'
+        elif (r.get('manifest_sha256') is not None
+              and manifest.get('manifest_sha256') is not None
+              and r.get('manifest_sha256') != manifest.get('manifest_sha256')):
+            why = (f"manifest_sha256 {str(r.get('manifest_sha256'))[:12]}… does not match the "
+                   f"frozen manifest {str(manifest.get('manifest_sha256'))[:12]}… — the probe was "
+                   'measured under a different plan')
         elif _implementation_reason(r, impl) is not None:
             why = _implementation_reason(r, impl)
         elif not L.ppl_is_usable(r.get('ppl_mean')):
@@ -2181,7 +2657,14 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         res['delta_definition'] = f'{a} - {b} (paired per seed, test split)'
         res['expected_sign'] = exp_sign
         if exp_sign in ('positive', 'negative') and math.isfinite(res.get('mean', float('nan'))):
-            res['direction_ok'] = bool((res['mean'] > 0) == (exp_sign == 'positive'))
+            # A mean of exactly 0 has no direction: treat it as NOT matching
+            # the pre-registered sign (the old `(mean > 0) == (exp == 'positive')`
+            # encoding made mean==0 spuriously satisfy expected_sign='negative').
+            if res['mean'] == 0.0:
+                res['direction_ok'] = False
+                res['direction_note'] = 'mean delta is exactly zero — no observed direction, cannot match any pre-registered sign'
+            else:
+                res['direction_ok'] = bool((res['mean'] > 0) == (exp_sign == 'positive'))
         else:
             res['direction_ok'] = None
         _doc = _doc_level_analysis(recs_a, recs_b, usable, Ln)
@@ -2231,6 +2714,23 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                           'same_init_core_fp': stats['comparisons'].get(k, {}).get('same_init_core_fp'),
                                           'init_core_fp_recorded': stats['comparisons'].get(k, {}).get('init_core_fp_recorded')}
                                       for k in _rej if k not in _conf}
+    # DISCLOSURE: the implemented decision rule is STRICTER than the manifest
+    # wording.  The manifest (v3) decision_rule is "p_holm < alpha AND direction
+    # matches AND param_matched is not false AND >= 8 complete pairs"; the
+    # implementation additionally requires `same_init_core_fp` and
+    # `init_core_fp_recorded` to be true, and interprets param_matched
+    # strictly (True, not merely "not false" — a missing params field cannot
+    # confirm).  Stricter-than-preregistered is safe (fewer confirmations) but
+    # must be visible next to every 'confirmed' list, not only in the source.
+    stats['decision_rule_applied'] = {
+        'manifest_rule': (manifest.get('statistics') or {}).get('decision_rule'),
+        'implementation_gates': ['p_holm < alpha (strict <)', 'direction_ok is True',
+                                 'param_matched is True (stricter than the manifest "not false": missing params cannot confirm)',
+                                 'same_init_core_fp is True (addition beyond the manifest rule)',
+                                 'init_core_fp_recorded is True (addition beyond the manifest rule)',
+                                 'n_effective >= min_seeds_for_confirmation'],
+        'note': 'The implemented rule is STRICTER than the pre-registered wording; it can only reduce the confirmed set, never enlarge it. A revision that intends these gates to be part of the pre-registration must record them in the manifest revision history before the first test access.',
+    }
     _m = len(manifest['primary_comparisons'])
     _n = len(manifest['seeds'])
     _fl = L.signflip_p_floor(_n)
@@ -2667,13 +3167,16 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
                 'variant': arm, 'seed': int(s), 'split': 'test',
                 'by_len': {str(Ln): {'ppl': 100.0, 'n_tok': int(_nseq) * int(Ln - 1),
                                      'n_seq': int(_nseq), 'ppl_per_seq': [100.0] * int(_nseq),
-                                     'truncated': False}
+                                     'truncated': False, 'eval_span': int(Ln)}
                            for Ln in _lens},
                 'data_fp': 'plan-test-slice-fp',
                 'train_fp': (_frozen_train_fp(m) or 'plan-train-fp'),
                 '_code': L.code_stamp(), 'manifest_sha256': m.get('manifest_sha256'),
                 'recipe': _recipe, 'train_knobs': _tk, 'n_seq': int(_nseq),
-                'params': 11089904,
+                # the real parameter count computed for this arm's frozen shape
+                # above (never a hard-coded constant): admission does not check
+                # params, but the param-matched contract reads them from here.
+                'params': (_pred[arm].get('params') if isinstance(_pred[arm].get('params'), int) else None),
             }
     try:
         admitted, _fp = _admit_confirmation_records(_records, m)
@@ -2778,7 +3281,7 @@ if __name__ == '__main__':
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
-    _MODES = ('full', 'smoke', 'plan', 'analysis', 'report', 'phase', 'finaltest')
+    _MODES = ('full', 'smoke', 'plan', 'power', 'analysis', 'report', 'phase', 'finaltest')
     if mode in ('-h', '--help', 'help'):
         print(__doc__)
         raise SystemExit(0)
@@ -2794,6 +3297,8 @@ if __name__ == '__main__':
             run_smoke()
         elif mode == 'plan':
             run_plan(sys.argv[2] if len(sys.argv) > 2 else FREEZE_MANIFEST)
+        elif mode == 'power':
+            run_power_check(dict(FINALTEST_CFG, manifest=(sys.argv[2] if len(sys.argv) > 2 else FREEZE_MANIFEST)))
         elif mode == 'analysis':
             v12_analysis()
         elif mode == 'report':

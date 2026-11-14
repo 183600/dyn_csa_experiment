@@ -1,7 +1,7 @@
 {
-  "manifest_version": 3,
+  "manifest_version": 4,
   "frozen_at": "2026-10-19",
-  "purpose": "Pre-registered confirmation plan: v6-v11 all selected methods, arms, comparisons and seeds on the SAME validation split, so their p-values are exploratory. This manifest freezes the main comparisons, endpoints, seed count and statistics BEFORE any WikiText-103 test-split evaluation, and the confirmation data (wiki.test.raw) has never been read by any earlier phase. v2: the seed count was raised 6 -> 12 and the manifest gained a machine-checkable binding block and a scope declaration; the revision was made strictly BEFORE any test-split evaluation (no P5T result has ever existed -- no results_lm_test/ record, no commit touching the test split), which is the only condition under which a pre-registration may be revised without selection bias. v3 (2026-10-19): aligned the stamp with CODE_SEMANTICS v11.128, pinned the implementation binding (all four frozen arms run the per-row RoPE loop, so eager_batch=false), pinned the per-arm mlp_ratio, disclosed the parameter-vs-compute mismatch and the decision rule, and added a zero-GPU plan self-check. Again strictly BEFORE any test-split access.",
+  "purpose": "Pre-registered confirmation plan: v6-v11 all selected methods, arms, comparisons and seeds on the SAME validation split, so their p-values are exploratory. This manifest freezes the main comparisons, endpoints, seed count and statistics BEFORE any WikiText-103 test-split evaluation, and the confirmation data (wiki.test.raw) has never been read by any earlier phase. v2: the seed count was raised 6 -> 12 and the manifest gained a machine-checkable binding block and a scope declaration; the revision was made strictly BEFORE any test-split evaluation (no P5T result has ever existed -- no results_lm_test/ record, no commit touching the test split), which is the only condition under which a pre-registration may be revised without selection bias. v3 (2026-10-19): aligned the stamp with CODE_SEMANTICS v11.128, pinned the implementation binding (all four frozen arms run the per-row RoPE loop, so eager_batch=false), pinned the per-arm mlp_ratio, disclosed the parameter-vs-compute mismatch and the decision rule, and added a zero-GPU plan self-check. Again strictly BEFORE any test-split access. v4 (2026-11-14): removed ee/es from the machine-checkable training_recipe_signature (they are diagnostic-eval monitoring knobs, not part of the training recipe; P5C/p1l records legitimately carry ee=250/es=8 when diagnostic validation is enabled, so a hard es=128 pin was both uncheckable and wrong), documented the tokenizer fit token cap alongside the 50k-row cap, and recorded the decision-rule gates the implementation adds beyond the v3 wording. Still strictly BEFORE any test-split access.",
   "code_semantics_expected": "v11.128",
   "amp_dtype_expected": "bf16",
   "eager_batch_expected": false,
@@ -31,9 +31,7 @@
       "v": 8192,
       "wu": 50,
       "cl": 0.05,
-      "dlm": 10.0,
-      "ee": 250,
-      "es": 128
+      "dlm": 10.0
     },
     "per_arm_recipe_signature": {
       "csa_fixed_rope": {
@@ -49,7 +47,7 @@
         "mr": 4.0
       }
     },
-    "training_recipe_note": "Machine-checkable subset of the run_cfg fingerprint (keys as decoded by exp_lib.run_cfg_knobs). mt/det/df/cs are deliberately NOT pinned: they bind variant/environment/data/code and are verified separately (_code stamp, data_fp, manifest sha). v3 pins the parameter-matching knob mr per arm (binding.per_arm_recipe_signature): the shared signature cannot express one value for four arms because full_rope must be widened to mr=6.76348876953125 while the three csa arms stay at mr=4. Any record whose recipe fails this signature (including the per-arm mr) is refused by the confirmation statistics entry.",
+    "training_recipe_note": "Machine-checkable subset of the run_cfg fingerprint (keys as decoded by exp_lib.run_cfg_knobs). mt/det/df/cs are deliberately NOT pinned: they bind variant/environment/data/code and are verified separately (_code stamp, data_fp, manifest sha). v3 pins the parameter-matching knob mr per arm (binding.per_arm_recipe_signature): the shared signature cannot express one value for four arms because full_rope must be widened to mr=6.76348876953125 while the three csa arms stay at mr=4. Any record whose recipe fails this signature (including the per-arm mr) is refused by the confirmation statistics entry. v4 removes ee/es from the signature: they are diagnostic-eval monitoring knobs (eval cadence / diag validation rows), not training-recipe identity. P3MT/P4MT mech records carry ee=250/es=128; P5C/p1l records carry ee=250/es=8 when diagnostic validation is enabled (P5H health monitoring requires it) — pinning es=128 was uncheckable for the p1l path and did not match its actual records. Both spellings remain recorded per record in run_cfg/train_knobs for transparency; neither influences the trained weights.",
     "training_data_fingerprint": {
       "loader": "exp_lib.load_wikitext",
       "seq_len": 512,
@@ -67,8 +65,8 @@
       "fingerprint_rule": "exp_lib._ids_fp over the flattened (n_seqs, seq_len) rows; every record must carry the same non-null data_fp; the first P5T access writes it into results_lm_test/.freeze_lock.json"
     },
     "tokenizer": {
-      "fit": "same deterministic BPE fit as load_wikitext (first <=50k TRAIN rows only, vocab 8192)",
-      "check": "load_wikitest hard-compares the full id->token vocabulary against the cached train tokenizer AND the persisted tokenizer bytes (sha256 recorded in test_meta) on every cache hit; a mismatch is a hard refusal, not a warning"
+      "fit": "same deterministic BPE fit as load_wikitext (first <=50k TRAIN rows only, additionally capped at 8M fit tokens by exp_lib.TOKENIZER_FIT_TOKENS — the effective fit corpus is the shorter of the two caps; train-prefix only, never validation/test), vocab 8192",
+      "check": "load_wikitest hard-compares the full id->token vocabulary against EVERY cached train tokenizer in the cache dir AND the persisted tokenizer bytes (sha256 recorded in test_meta) on every cache hit; a mismatch is a hard refusal, not a warning"
     },
     "checkpoint": {
       "stamp": "v11.128 (= exp_lib.CODE_SEMANTICS; records carry _code, ckpt carries code)",
@@ -181,9 +179,15 @@
         "change": "stamp aligned to CODE_SEMANTICS v11.128; eager_batch_expected set to false (all four frozen arms run the per-row RoPE loop); P5T/probe records carry train_knobs/train_objective/param_breakdown/rng_fp/n_seq; per-arm mr pinned (full_rope 6.76348876953125, csa arms 4.0); allblocks contrast declared separately; dense MLP +69% / ~1.87x FLOPs / 25%->3.1% read-fraction disclosure added; decision rule declares n_effective >= 8; power_note states that the table is a symbol-test projection, not the exact sign-flip test; p1l recipe carries the real amp/eager/determinism/train_fp and a proper arm-independent run_cfg; adaptive 2-SE health threshold; leakage gate uses reachable statistics and runs before the accessed lock; zero-GPU `v12_supp.py plan` added to CI",
         "precondition_verified": "no test-split access at revision time: results_lm_test/ and results_smoke_v12/ are absent, there is no .freeze_lock.json, no P5T result/commit exists, and v12_supp.py plan runs without calling load_wikitest",
         "ci_loop": "the continuous-loop workflow was set to disabled_manually during this revision (the in-flight run was cancelled; the two queued runs cannot start while the workflow is disabled). It must not be re-enabled until the frozen commit is signed and P5T has finished"
+      },
+      {
+        "version": 4,
+        "date": "2026-11-14",
+        "change": "removed ee/es from binding.training_recipe_signature (diagnostic-eval monitoring knobs, not training-recipe identity: P5C/p1l records carry ee=250/es=8 when the P5H-required diagnostic validation is enabled, so the v3 es=128 pin was uncheckable on the p1l path and did not match its actual records; both values remain recorded per record for transparency); documented the 8M-token cap that complements the 50k-row cap in binding.tokenizer.fit; recorded that the implemented decision rule is strictly TIGHTER than the v3 wording (additionally requires same_init_core_fp and init_core_fp_recorded, and param_matched must be true rather than merely not-false — disclosed as decision_rule_applied in test_stats.json; it can only reduce, never enlarge, the confirmed set)",
+        "precondition_verified": "no test-split access at revision time: no results_lm_test/ directory, no .freeze_lock.json and no confirmation_freeze_lock.json mirror exist in the repository or its git history, no bylen/distractor records for the test split exist anywhere in the tree, and RELEASES.md still has no evidence row (README/RELEASES attest that no P5T result has ever existed). Revision made by the review-fix pass of 2026-11-14; the repository owner attests that no external P5T run has occurred on any other machine"
       }
     ],
     "rule": "any further revision requires either (a) proof that no test-split access has occurred (git history + absent lock + absent bylen records), or (b) V12_REFREEZE=1 after access, which permanently downgrades the earlier round to exploratory in the plan history above"
   },
-  "history_note": "v1 frozen 2026-10-16 in the commit that introduced v12_supp.py; v2 revised 2026-10-17; v3 revised 2026-10-19, still before any test-split access. The test split has never been read by the codebase (earlier documentation covered only train/valid, and load_wikitext now requests split='train'/'validation' explicitly instead of materialising all three HF splits)."
+  "history_note": "v1 frozen 2026-10-16 in the commit that introduced v12_supp.py; v2 revised 2026-10-17; v3 revised 2026-10-19; v4 revised 2026-11-14, still before any test-split access. The test split has never been read by the codebase (earlier documentation covered only train/valid, and load_wikitext now requests split='train'/'validation' explicitly instead of materialising all three HF splits)."
 }

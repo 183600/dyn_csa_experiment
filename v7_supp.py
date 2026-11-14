@@ -553,6 +553,28 @@ class HybridAttentionRoPE(L.HybridAttention):
             self.last_gate_mean = None
             return self._dense_warmup_forward(x)
         if getattr(self.cfg, 'rope', False) and self.cfg.kind in ('csa', 'hca'):
+            # The kernel backend (CSA_KERNEL) has NO RoPE implementation: a
+            # rope csa/hca layer ALWAYS runs the per-row eager `_single_rope`
+            # loop.  Running it silently under a kernel-enabled process would
+            # stamp eager numbers with the `-tk1:<backend>` suffix (a false
+            # "kernel vs eager" pairing) — the exact silent-mixing defect the
+            # exp_lib dispatch refuses for non-rope layers.  Refuse loudly
+            # instead; unset CSA_KERNEL for RoPE arms (the frozen v12 plan is
+            # eager-only and refuses CSA_KERNEL globally, and the m0/B-tier
+            # arms are non-rope, so no current driver legitimately hits this).
+            if L._CK is not None and self.cfg.kind in ('csa', 'hca'):
+                try:
+                    _rope_kernel_on = L._CK.kernel_enabled()
+                except Exception:
+                    _rope_kernel_on = False
+                if _rope_kernel_on:
+                    raise RuntimeError(
+                        'HybridAttentionRoPE: CSA_KERNEL is enabled but the '
+                        'kernel/batched twin has no RoPE implementation — a '
+                        'rope csa/hca layer would silently run the eager '
+                        'per-row path while records carry the kernel stamp. '
+                        'Unset CSA_KERNEL for RoPE arms rather than mixing '
+                        'implementations inside one panel.')
             self.last_gate_mean = None
             B, T, d = x.shape
             flat = x.reshape(B * T, d)
