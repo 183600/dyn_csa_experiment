@@ -1709,8 +1709,19 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                     e[field].add(repr(value))
                     problems.append(f'{key}: L{Ln} {field} is not a scalar value ({type(value).__name__})')
 
-            _add_cell('n_tok', c.get('n_tok'))
-            _add_cell('eval_span', c.get('eval_span'))
+            def _add_int_cell(field, value):
+                # Counts are exact integers.  A canonical JSON integer string
+                # ("14") is the same measurement as its numeric twin; compare
+                # the normalised integer so the two spellings cannot be read
+                # as two different target sets.
+                if value is not None:
+                    _iv = _exact_int_scalar(value)
+                    if _iv is not None:
+                        value = _iv
+                _add_cell(field, value)
+
+            _add_int_cell('n_tok', c.get('n_tok'))
+            _add_int_cell('eval_span', c.get('eval_span'))
             _add_cell('truncated', c.get('truncated'))
             _nseq_cell = None
             if isinstance(c.get('ppl_per_seq'), list):
@@ -1720,10 +1731,10 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                     problems.append(
                         f'{key}: L{Ln} n_seq={c.get("n_seq")!r} contradicts the '
                         f'{_nseq_cell} per-document rows in ppl_per_seq')
-                _add_cell('n_seq', _nseq_cell)
+                _add_int_cell('n_seq', _nseq_cell)
             elif c.get('n_seq') is not None:
                 _nseq_cell = c.get('n_seq')
-                _add_cell('n_seq', _nseq_cell)
+                _add_int_cell('n_seq', _nseq_cell)
             else:
                 # Keep the absence in the same set as the observed counts so
                 # one record with n_seq cannot mask another record without it.
@@ -1740,22 +1751,30 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                 if isinstance(_val, (bool, np.bool_)):
                     problems.append(f'{key}: L{Ln} {_field} is a boolean, not a measurement')
                     continue
-                try:
-                    _fval = float(_val)
-                except (TypeError, ValueError, OverflowError):
-                    problems.append(
-                        f'{key}: L{Ln} {_field} is not a numeric measurement '
-                        f'({_val!r}) — unverifiable')
-                    continue
-                if not math.isfinite(_fval):
-                    problems.append(f'{key}: L{Ln} {_field} is not finite ({_val!r}) — unverifiable')
-                elif not _fval.is_integer() or abs(_fval) >= 2 ** 53:
-                    # int(4.9) would truncate the count, and a float above
-                    # 2**53 cannot represent every integer; either could
-                    # satisfy the n_tok == n_seq*(L-1) identity with corrupted
+                # Use the same canonical integer contract as the by_len keys
+                # and the full-cell identity: a malformed spelling ("014",
+                # " 14", "14.0") is not a second valid form of the same count.
+                _iv = _exact_int_scalar(_val)
+                if _iv is None or abs(_iv) >= 2 ** 53:
+                    try:
+                        _fval = float(_val)
+                    except (TypeError, ValueError, OverflowError):
+                        problems.append(
+                            f'{key}: L{Ln} {_field} is not a numeric measurement '
+                            f'({_val!r}) — unverifiable')
+                        continue
+                    if not math.isfinite(_fval):
+                        problems.append(
+                            f'{key}: L{Ln} {_field} is not finite ({_val!r}) — unverifiable')
+                        continue
+                    # int(4.9) would truncate the count, a non-canonical
+                    # spelling ("014", "14.0") is not a second valid form of
+                    # an exact integer, and a count above 2**53 cannot be
+                    # represented exactly in the downstream float reductions;
+                    # any of these could satisfy the identity with corrupted
                     # evidence.
                     problems.append(f'{key}: L{Ln} {_field} is not an integer count ({_val!r})')
-                elif _field in ('n_tok', 'n_seq', 'eval_span') and _fval <= 0:
+                elif _field in ('n_tok', 'n_seq', 'eval_span') and _iv <= 0:
                     problems.append(f'{key}: L{Ln} {_field} must be positive, got {_val!r}')
             # The complete-cell identity is n_tok == n_seq * (Ln - 1).  Equal
             # (but equally wrong) counts across arms are not a valid target

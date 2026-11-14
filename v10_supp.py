@@ -237,6 +237,16 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
     n_far = eval_len - target
     if mode not in _CORRUPT_MODES:
         raise ValueError(f'_corrupt_row: unknown corruption mode {mode!r} (expected one of {_CORRUPT_MODES})')
+    # The donor-based modes replace far context with tokens from ANOTHER
+    # sequence.  With a one-row panel every "donor" lookup wraps back to the
+    # scored row itself, so the operation is a silent no-op that would still
+    # be recorded as a corrupted condition.  Refuse the meaningless panel
+    # instead of measuring a clean row under a corruption label.
+    if mode in ('natural', 'topical', 'span', 'doc') and int(val_ids.shape[0]) < 2:
+        raise ValueError(
+            f'_corrupt_row: mode {mode!r} needs at least two validation rows '
+            f'(got {int(val_ids.shape[0])}); the only possible donor is the '
+            'scored row itself, so the corruption would be a no-op')
     # rho is a corruption FRACTION.  A boolean is a flag, not a fraction, and
     # a value outside [0,1] would either silently corrupt nothing (negative)
     # or ask rng.choice for more positions than the far context holds (>1),
@@ -301,7 +311,14 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
             _nat = (jj + max(1, val_ids.shape[0] // 2)) % val_ids.shape[0]
             _src = _topical_donor(val_ids, jj, n_far, exclude={_nat})
             if _src is None:
-                _src = _nat
+                # With no row other than the natural donor, the "topical"
+                # condition would silently become the natural condition.  It
+                # is a different scientific question, so refuse rather than
+                # record one mode under the other's name.
+                raise ValueError(
+                    'topical corruption needs a donor row other than the '
+                    f'natural donor (row {_nat}); the panel has only '
+                    f'{int(val_ids.shape[0])} row(s)')
         else:
             _src = (jj + max(1, val_ids.shape[0] // 2)) % val_ids.shape[0]
         ids[pos] = np.asarray(val_ids[_src, pos], dtype=np.int64)
@@ -758,6 +775,14 @@ def _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed, 
         raise ValueError(f'NIAH-natural: {n_pairs} query couples do not fit inside the {target}-token target zone')
     key_hi = max(4, vocab // 4)
     val_lo = 3 * vocab // 4
+    # Distractor tokens come from another validation row.  With a one-row
+    # panel the donor mapping wraps back to the scored row, so the condition
+    # would be a clean no-op recorded as distractor corruption.
+    if condition == 'distract' and int(val_ids.shape[0]) < 2:
+        raise ValueError(
+            'NIAH-natural distract needs at least two validation rows '
+            f'(got {int(val_ids.shape[0])}); the only possible donor is the '
+            'scored row itself, so the distractor would be a no-op')
     rows = np.asarray(val_ids[:n_seq, :eval_len + 1], dtype=np.int64).copy()
     q_cols = np.zeros((n_seq, n_pairs), dtype=np.int64)
     q_vals = np.zeros((n_seq, n_pairs), dtype=np.int64)

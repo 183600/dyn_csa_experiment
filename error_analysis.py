@@ -39,6 +39,28 @@ except Exception as _v7e:
     print(f'[errors] NOTE: v7_supp not importable ({type(_v7e).__name__}: {_v7e}); only built-in layer variants can be loaded')
 
 
+def _nonnegative_int(text):
+    """argparse type for row/rank counts: a negative value is not a subset."""
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f'expected a non-negative integer, got {text!r}') from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(
+            f'expected a non-negative integer, got {text!r}')
+    return value
+
+
+def _positive_int(text):
+    """argparse type for geometry/budget sizes: zero would size no tensor."""
+    value = _nonnegative_int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f'expected a positive integer, got {text!r}')
+    return value
+
+
 def _sha256(path, cap=None):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -142,13 +164,13 @@ def main(argv=None):
     ap.add_argument('--compare-ckpt', default=None, help='optional second checkpoint for paired per-token delta analysis')
     ap.add_argument('--outdir', default='analysis_errors')
     ap.add_argument('--dataset', default='wikitext', choices=['wikitext', 'fineweb'])
-    ap.add_argument('--seq-len', type=int, default=None, help='evaluation sequence length (default: checkpoint max_seq)')
-    ap.add_argument('--n-train-tokens', type=int, default=8000000)
-    ap.add_argument('--val-seqs', type=int, default=128)
-    ap.add_argument('--max-rows', type=int, default=64)
-    ap.add_argument('--top-tokens', type=int, default=80)
-    ap.add_argument('--top-sequences', type=int, default=30)
-    ap.add_argument('--chunk', type=int, default=8)
+    ap.add_argument('--seq-len', type=_positive_int, default=None, help='evaluation sequence length (default: checkpoint max_seq)')
+    ap.add_argument('--n-train-tokens', type=_positive_int, default=8000000)
+    ap.add_argument('--val-seqs', type=_positive_int, default=128)
+    ap.add_argument('--max-rows', type=_nonnegative_int, default=64)
+    ap.add_argument('--top-tokens', type=_nonnegative_int, default=80)
+    ap.add_argument('--top-sequences', type=_nonnegative_int, default=30)
+    ap.add_argument('--chunk', type=_positive_int, default=8)
     ap.add_argument('--device', default=None)
     args = ap.parse_args(argv)
     device = torch.device(args.device) if args.device else L.DEVICE

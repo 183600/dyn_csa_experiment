@@ -47,6 +47,7 @@ try:
     import audit_gates as A
     import baseline_tune as BT
     import build_report as BR
+    import error_analysis as EA
     import m0_supp as M0
     _HAVE_TORCH = True
 except Exception as _e:  # pragma: no cover
@@ -1140,6 +1141,26 @@ def t_mode_validation():
     try:
         V10._corrupt_row(_PANEL, 128, 0.5, 'uniform', 0, 1, 32)
         raise AssertionError('uniform corruption with vocab=1 must be rejected (no alternative token)')
+    except ValueError:
+        pass
+    # Donor-based modes need a second sequence: a one-row panel can only
+    # donate the scored row itself, which would silently label a clean row as
+    # corrupted.
+    _one = np.asarray(_PANEL[:1])
+    for _mode in ('natural', 'topical', 'span', 'doc'):
+        try:
+            V10._corrupt_row(_one, 128, 1.0 if _mode == 'doc' else 0.5,
+                             _mode, 0, _VOCAB, 32)
+            raise AssertionError(f'{_mode} must refuse a one-row donor panel')
+        except ValueError:
+            pass
+    # Two rows give natural/span/doc a donor, but topical's only remaining
+    # row is the natural donor itself; falling back would silently mislabel a
+    # natural-condition measurement as topical.
+    _two = np.asarray(_PANEL[:2])
+    try:
+        V10._corrupt_row(_two, 128, 0.5, 'topical', 0, _VOCAB, 32)
+        raise AssertionError('topical must refuse a panel with no non-natural donor')
     except ValueError:
         pass
     # Row/length geometry is exact-integer state.
@@ -5943,8 +5964,67 @@ def t_audit_length_exact_integer_fields():
         r3 = A.audit_length(p)
         assert r3['status'] == 'fail', r3
         assert any('not an integer count' in x for x in r3['problems']), r3
+        # A malformed spelling of an integer is not a second valid form: a
+        # single record must not pass just because float() can parse it.
+        for _bad_count in ('014', ' 14', '+14', '14.0'):
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump({'a::s0': {'by_len': {'4096': {
+                    'n_tok': _bad_count, 'eval_span': 4095, 'n_seq': 1,
+                    'truncated': False}}}}, f)
+            r4 = A.audit_length(p)
+            assert r4['status'] == 'fail', (_bad_count, r4)
+            assert any('not an integer count' in x for x in r4['problems']), (_bad_count, r4)
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {
+                'n_tok': huge, 'eval_span': 4095, 'n_seq': 1,
+                'truncated': False}}}}, f)
+        r5 = A.audit_length(p)
+        assert r5['status'] == 'fail', r5
+        assert any('not an integer count' in x for x in r5['problems']), r5
     finally:
         shutil.rmtree(td, ignore_errors=True)
+
+
+def t_error_analysis_cli_geometry():
+    # Row/rank counts may be zero (no rows) but never negative; every sizing
+    # argument is positive.  A negative --max-rows previously sliced the panel
+    # from the end instead of refusing the request.
+    import error_analysis as _EA
+    for _bad in ('-1', '1.5', 'x', ''):
+        try:
+            _EA._nonnegative_int(_bad)
+            raise AssertionError(f'nonnegative int accepted {_bad!r}')
+        except _EA.argparse.ArgumentTypeError:
+            pass
+    for _bad in ('0', '-2'):
+        try:
+            _EA._positive_int(_bad)
+            raise AssertionError(f'positive int accepted {_bad!r}')
+        except _EA.argparse.ArgumentTypeError:
+            pass
+    assert _EA._nonnegative_int('0') == 0 and _EA._positive_int('3') == 3
+
+
+def t_audit_length_integral_string_spellings_agree():
+    # The length audit accepts a canonical JSON integer spelling ("14") as an
+    # exact count.  Two arms spelling the same count as "14" and 14 therefore
+    # scored the SAME target set; comparing the raw Python values would report
+    # a disagreement that does not exist.
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'bylen.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'a::seed0': {'by_len': {'8': {
+                    'n_tok': '14', 'eval_span': '8', 'n_seq': '2',
+                    'truncated': False}}},
+                'b::seed0': {'by_len': {'8': {
+                    'n_tok': 14, 'eval_span': 8, 'n_seq': 2,
+                    'truncated': False}}},
+            }, f)
+        out = A.audit_length(path)
+        assert out['status'] == 'ok', out
+        assert out['by_length']['8']['same_scored_targets_across_records'] is True, out
+        assert out['by_length']['8']['same_n_seq_across_records'] is True, out
 
 
 def t_audit_boundary_below_baseline_fails():
@@ -7965,6 +8045,15 @@ def t_targeted_contract_edges():
             pass
         else:
             raise AssertionError(f'natural NIAH accepted malformed geometry {_kw!r}')
+    # A one-row panel cannot supply a distractor donor: the only possible
+    # source is the scored row itself, which would make the condition clean.
+    try:
+        V10._build_niah_natural(val_ids=_val[:1], eval_len=32, target=16,
+                                n_pairs=4, vocab=128, n_seq=1, seed=0,
+                                condition='distract', rho=0.5)
+        raise AssertionError('NIAH distract must refuse a one-row panel')
+    except ValueError:
+        pass
 
 
 def t_statistical_and_config_regressions():
@@ -10764,6 +10853,8 @@ def main():
     _check('L10c length audit rejects malformed cell objects', t_audit_length_malformed_cells_are_rejected)
     _check('L10c2 by-length reader requires an exact integer length', t_by_len_cells_requires_exact_length)
     _check('L10c3 length audit parses keys and counts exactly', t_audit_length_exact_integer_fields)
+    _check('L10c4 length audit treats integral string counts as one measurement', t_audit_length_integral_string_spellings_agree)
+    _check('L10c5 error-analysis CLI refuses negative geometry', t_error_analysis_cli_geometry)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
     _check('L12 length audit fails closed on missing n_seq', t_audit_length_missing_n_seq_flag)
     _check('L12b report health reader tolerates malformed histories', t_report_health_malformed_history)
