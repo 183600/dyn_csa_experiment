@@ -1179,7 +1179,11 @@ class LeakageSafePreprocessor:
                     q_lo, q_hi = -np.inf, np.inf
             else:
                 q_lo, q_hi = -np.inf, np.inf
-            clipped = np.clip(col, q_lo, q_hi) if np.isfinite(q_lo) else col
+            # A finite bound applies on its own; only an unbounded side is
+            # skipped.  transform() uses the same rule so a one-sided bound
+            # cannot make fit and transform disagree.
+            clipped = (np.clip(col, q_lo, q_hi)
+                       if (np.isfinite(q_lo) or np.isfinite(q_hi)) else col)
             # Clip observed values, then use the imputation constant verbatim.
             # transform() does exactly the same, so a callable fitted on the
             # training rows and then applied to them reproduces the fitted
@@ -1246,8 +1250,12 @@ class LeakageSafePreprocessor:
             col = _col_float64(X, j)
             col = np.where(np.isfinite(col), col, np.nan)
             lo, hi = st['clip_lo'], st['clip_hi']
-            if lo is not None and hi is not None:
-                col = np.clip(col, lo, hi)
+            # Apply each finite bound independently, matching fit(): a
+            # restored one-sided bound must not silently stop clipping.
+            if lo is not None or hi is not None:
+                col = np.clip(col,
+                              lo if lo is not None else -np.inf,
+                              hi if hi is not None else np.inf)
             col = np.where(np.isnan(col), st['fill'], col)
             if self.scale != 'none':
                 col = (col - st['center']) / st['factor']
@@ -1320,8 +1328,12 @@ def _sorted_categories(values):
         if _category_is_missing(value):
             continue
         unique.setdefault(_hashable_label(value), value)
+    # Order by the canonical value identity, not the raw Python spelling:
+    # `1` and `1.0` are the same category (`_hashable_label` compares them
+    # equal), so the learned ordinal code / one-hot column order must not
+    # change when a column is serialised with one spelling or the other.
     return sorted(unique.values(),
-                  key=lambda v: (type(v).__name__, repr(v)))
+                  key=lambda v: repr(_unhashable_identity(v)))
 
 
 def _categorical_fingerprint(X):

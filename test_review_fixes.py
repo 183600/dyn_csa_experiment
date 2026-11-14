@@ -11110,6 +11110,68 @@ def t_round19c_categorical_fingerprint_uses_encoder_identity():
         assert DG._matrix_fingerprint(x1) == DG._matrix_fingerprint(x2), (a, b)
 
 
+def t_round20_category_order_and_cap_exactness():
+    # Numerically equal categories are ONE encoder level, so the learned
+    # category order (and hence the ordinal code) must not depend on whether
+    # the column spells a value as `1` or `1.0`.
+    import data_guard as DG
+    probes = np.array([[1], [1.0], [2], [2.0]], dtype=object)
+    enc_a = DG.LeakageSafeCategoricalEncoder().fit(
+        np.array([[1], [2.0]], dtype=object))
+    enc_b = DG.LeakageSafeCategoricalEncoder().fit(
+        np.array([[1.0], [2.0]], dtype=object))
+    enc_rev = DG.LeakageSafeCategoricalEncoder().fit(
+        np.array([[2.0], [1]], dtype=object))
+    code_a = enc_a.transform(probes).ravel().tolist()
+    code_b = enc_b.transform(probes).ravel().tolist()
+    code_rev = enc_rev.transform(probes).ravel().tolist()
+    assert code_a == code_b == code_rev, (code_a, code_b, code_rev)
+    assert code_a[0] == code_a[1] and code_a[2] == code_a[3], code_a
+    assert code_a[0] != code_a[2], code_a
+
+    # A restored one-sided clip bound must still be applied (fit() applies
+    # each finite bound independently).
+    stats = {
+        'scale': 'none', 'missing': 'median', 'clip_quantiles': None,
+        'clip_z': None, 'eps': 1e-8, 'n_features_in': 1, 'n_train': 1,
+        'train_fp': 'x',
+        'features': [{'fill': 0.0, 'clip_lo': 0.0, 'clip_hi': None,
+                      'center': 0.0, 'factor': 1.0, 'mean': 0.0, 'std': 0.0,
+                      'median': 0.0, 'min': 0.0, 'max': 0.0}],
+    }
+    p = DG.LeakageSafePreprocessor.from_stats(stats)
+    out = p.transform(np.array([[-2.0], [3.0]])).ravel().tolist()
+    assert out == [0.0, 3.0], out
+
+    # TimeGuard cap fields are accounting inputs: booleans / non-finite /
+    # negative values cannot be coerced into a different budget.
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'state.json')
+        for bad in (True, float('nan'), float('inf'), -1.0):
+            try:
+                L.TimeGuard(dict(total_hours=bad, state_path=path))
+                raise AssertionError(f'TimeGuard accepted total_hours={bad!r}')
+            except ValueError:
+                pass
+        assert L.TimeGuard(dict(total_hours=2, state_path=path)).total_hours == 2.0
+
+
+def t_round20b_ngram_count_helper_requires_exact_vocab():
+    # The count-table helper is reachable directly; a boolean/fractional
+    # vocabulary must not be coerced into a different token space.
+    for bad in (True, 8.9, float('nan'), -1, 0):
+        try:
+            L._ngram_train_counts([1, 2, 1], bad)
+            raise AssertionError(f'_ngram_train_counts accepted vocab={bad!r}')
+        except (TypeError, ValueError):
+            pass
+    # The canonical integer-string spelling is accepted everywhere else
+    # (`_as_seed_int`), so it stays accepted here too.
+    uni, uniq, ctx, counts = L._ngram_train_counts([1, 2, 1], '8')
+    assert int(uni[1]) == 2 and int(uni[2]) == 1, (uni, uniq, ctx, counts)
+    assert len(uniq) == len(counts) == 2, (uniq, counts)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -11459,6 +11521,8 @@ def main():
     _check('N53 composite temporal identity + exact checkpoint geometry', t_round19_composite_identity_and_checkpoint_geometry)
     _check('N54 ngram public entry points reject float token ids', t_round19b_ngram_public_entry_points_reject_float_ids)
     _check('N55 categorical fingerprint follows encoder identity', t_round19c_categorical_fingerprint_uses_encoder_identity)
+    _check('N56 category order / one-sided clip / TimeGuard cap exactness', t_round20_category_order_and_cap_exactness)
+    _check('N57 ngram count helper requires an exact vocabulary', t_round20b_ngram_count_helper_requires_exact_vocab)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -13392,7 +13392,15 @@ def _ngram_train_counts(train_ids, vocab_size):
         # ids must be rejected, not silently remapped.
         raise TypeError(f'ngram baseline: train ids must be integers, got dtype {_raw.dtype}')
     ids = _raw.astype(np.int64, copy=False).ravel()
-    vocab_size = int(vocab_size)
+    # The vocabulary is an exact positive count, not a bool/fractional
+    # coercion target: int(True)=1 or int(8.9)=8 would build the count table
+    # for a different token space.
+    _vocab = _as_seed_int(vocab_size)
+    if _vocab is None or _vocab <= 0:
+        raise ValueError(
+            f'ngram baseline: vocab_size must be a positive integer, got '
+            f'{vocab_size!r}')
+    vocab_size = _vocab
     if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= vocab_size):
         raise ValueError('ngram baseline: train ids outside [0, vocab_size)')
     uni = np.bincount(ids, minlength=vocab_size).astype(np.float64)
@@ -21024,9 +21032,21 @@ class TimeGuard:
     BASE = (256, 6, 512, 12)
 
     def __init__(self, cap):
-        self.total_hours = float(cap['total_hours'])
-        self.margin = float(cap.get('margin', 0.93))
-        self.already = float(cap.get('already_hours', 0.0))
+        if not isinstance(cap, dict):
+            raise ValueError(f'TimeGuard cap must be an object, got {type(cap).__name__}')
+        # The cap numbers drive every later accounting decision.  Reject
+        # booleans / non-finite values instead of coercing them into a
+        # different budget (float(True)=1.0).
+        def _cap_number(name, value, *, positive=False):
+            f = _finite_scalar(value)
+            if f is None or f < 0.0 or (positive and f == 0.0):
+                raise ValueError(
+                    f'TimeGuard {name}={value!r} must be a finite '
+                    + ('positive' if positive else 'non-negative') + ' number')
+            return f
+        self.total_hours = _cap_number('total_hours', cap.get('total_hours'), positive=True)
+        self.margin = _cap_number('margin', cap.get('margin', 0.93))
+        self.already = _cap_number('already_hours', cap.get('already_hours', 0.0))
         self.state_path = cap.get('state_path', 'run_time_state.json')
         # 内核模式使用独立的状态文件：两档速率标定不可互相污染（同一
         # state 文件会把 eager 的 sps 标定用于内核单元）。
