@@ -11064,6 +11064,52 @@ def t_round19b_ngram_public_entry_points_reject_float_ids():
     assert L.ngram_lm_score([1, 2], np.array([[1, 2]]), 8)['n_tokens'] == 2
 
 
+def t_round19c_categorical_fingerprint_uses_encoder_identity():
+    # The training fingerprint must follow the SAME category identity the
+    # encoder learns from: numerically equal scalar spellings are one level,
+    # but a boolean flag is not the integer it happens to equal.
+    import data_guard as DG
+    cases_equal = [
+        (1, 1.0),
+        (0.0, -0.0),
+        (2 ** 53 + 2, float(2 ** 53 + 2)),
+        (1 + 0j, 1),
+        (1.5 + 0j, 1.5),
+    ]
+    for a, b in cases_equal:
+        xa = np.array([[a]], dtype=object)
+        xb = np.array([[b]], dtype=object)
+        assert DG._hashable_label(a) == DG._hashable_label(b), (a, b)
+        assert (DG._categorical_fingerprint(xa)
+                == DG._categorical_fingerprint(xb)), (a, b)
+        assert (DG._unhashable_identity([a])
+                == DG._unhashable_identity([b])), (a, b)
+    for a, b in ((True, 1), (False, 0), (np.bool_(True), 1)):
+        assert DG._hashable_label(a) != DG._hashable_label(b), (a, b)
+        assert (DG._categorical_fingerprint(np.array([[a]], dtype=object))
+                != DG._categorical_fingerprint(np.array([[b]], dtype=object))), (a, b)
+    # Every missing spelling is ONE missing category to the encoder, so the
+    # fingerprint must not split None / NaN / NaT into different tables.
+    _missing_fps = {
+        DG._categorical_fingerprint(np.array([[v]], dtype=object))
+        for v in (None, np.nan, np.datetime64('NaT'))
+    }
+    assert len(_missing_fps) == 1, _missing_fps
+    # A non-zero imaginary part is still a distinct complex identity.
+    assert (DG._categorical_fingerprint(np.array([[1 + 2j]], dtype=object))
+            != DG._categorical_fingerprint(np.array([[1 + 3j]], dtype=object)))
+    # The same value identity is used by exact-duplicate detection and the
+    # table fingerprint: mixed object spellings of one number are duplicates,
+    # and swapping their rows cannot change the content digest.
+    for a, b in ((1 + 0j, 1), (1.5 + 0j, 1.5),
+                 (2 ** 53 + 2, float(2 ** 53 + 2)), (True, 1)):
+        mixed = np.array([[a], [b]], dtype=object)
+        assert DG.duplicate_mask(mixed).tolist() == [False, True], (a, b)
+        x1 = np.array([[a, 'x'], [b, 'y']], dtype=object)
+        x2 = np.array([[b, 'x'], [a, 'y']], dtype=object)
+        assert DG._matrix_fingerprint(x1) == DG._matrix_fingerprint(x2), (a, b)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -11412,6 +11458,7 @@ def main():
     _check('N52 fail-closed edges: corpus/TimeGuard/seed metadata/audits/merge/kernel', t_round18_fail_closed_edge_cases)
     _check('N53 composite temporal identity + exact checkpoint geometry', t_round19_composite_identity_and_checkpoint_geometry)
     _check('N54 ngram public entry points reject float token ids', t_round19b_ngram_public_entry_points_reject_float_ids)
+    _check('N55 categorical fingerprint follows encoder identity', t_round19c_categorical_fingerprint_uses_encoder_identity)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

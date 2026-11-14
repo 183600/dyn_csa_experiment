@@ -1329,13 +1329,17 @@ def _categorical_fingerprint(X):
     arr = np.asarray(X, dtype=object)
     h.update(str(arr.shape).encode('ascii'))
     for row in arr.tolist():
-        # The encoder's category identity treats numerically equal cells as
-        # one level (`_hashable_label(1) == _hashable_label(1.0)`), so the
-        # training fingerprint must not split the same table merely because
-        # one serialisation spells an integer as a float.  Canonicalise each
-        # cell exactly like the row/fingerprint contract.
-        h.update(repr(tuple(_canonical_object_cell(v) for v in row))
-                 .encode('utf-8', errors='replace'))
+        # The fingerprint must use the SAME identity the encoder uses to learn
+        # categories (`_hashable_label`): every missing spelling (None/NaN/
+        # NaT) is one missing level, numerically equal scalars are one level
+        # (1 == 1.0, 1 == 1+0j), and a boolean is a flag distinct from the
+        # integer 1.  `_canonical_object_cell` follows the NUMERIC row-key
+        # contract instead (bool folds into int, None == NaN), so using it
+        # here let two tables with the same learned category space get
+        # different training fingerprints (and vice versa).
+        h.update(repr(tuple(
+            ('missing',) if _category_is_missing(v) else _unhashable_identity(v)
+            for v in row)).encode('utf-8', errors='replace'))
         h.update(b'\x1f')
     return h.hexdigest()[:16]
 
@@ -1736,7 +1740,18 @@ def _canonical_complex_cell(v):
             return ('nan',)
         if math.isinf(x):
             return ('inf', 1 if x > 0 else -1)
-        return ('num', 0.0 if x == 0.0 else x)
+        # Match the real-scalar identity exactly: an integral float is stored
+        # as its exact integer spelling, so a zero-imaginary complex value and
+        # its real twin produce the same canonical repr (not "1.0" vs "1").
+        if float(x).is_integer():
+            return ('num', int(x))
+        return ('num', x)
+    # Python treats a complex value with a zero imaginary part as numerically
+    # equal to its real twin (and `_group_key`/`_hashable_label` inherit that
+    # equality), so the canonical identity must fold it too.  Otherwise a
+    # composite group id or categorical category could split 1 from 1+0j.
+    if z.imag == 0.0:
+        return _part(z.real)
     return ('cplx', _part(z.real), _part(z.imag))
 
 
@@ -1806,21 +1821,20 @@ def _canonical_object_cell(v):
         return _temporal_identity(v)
     if isinstance(v, (bool, np.bool_)):
         # The row-key/fingerprint contract treats bool/int/float spellings of
-        # the same in-range number as one identity; use one float spelling so
-        # the canonical repr does not split `0` from `0.0` inside a composite.
-        return ('num', float(int(v)))
+        # the same number as one identity; one exact integer spelling keeps
+        # the canonical repr from splitting `0` from `0.0`/`0+0j`.
+        return ('num', int(v))
     if isinstance(v, (int, np.integer)):
-        iv = int(v)
-        if abs(iv) <= 2 ** 53:
-            return ('num', float(iv))
-        return ('int', iv)
+        return ('num', int(v))
     if isinstance(v, (float, np.floating)):
         f = float(v)
         if math.isnan(f):
             return ('nan',)
         if math.isinf(f):
             return ('inf', 1 if f > 0 else -1)
-        return ('num', 0.0 if f == 0.0 else f)
+        if f.is_integer():
+            return ('num', int(f))
+        return ('num', f)
     if isinstance(v, (complex, np.complexfloating)):
         return _canonical_complex_cell(v)
     if isinstance(v, tuple):
