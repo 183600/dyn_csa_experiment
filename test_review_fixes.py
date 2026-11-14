@@ -9824,7 +9824,7 @@ def t_round10_prefix_reference_honours_use_overlap():
 
 def t_round12_signal_to_noise_exact_zero():
     # A zero-variance contrast with a tiny but nonzero mean is infinite
-    # signal-to-noise, not "no effect"; the old absolute 1e-12 floor made the
+    # signal-to-noise, not "no effect"; an absolute 1e-12 floor would make the
     # reported ratio depend on the effect unit.
     fp = ('steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_'
           'dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX')

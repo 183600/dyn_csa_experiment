@@ -11200,9 +11200,8 @@ def _betacf(a, b, x):
         d = tiny
     d = 1.0 / d
     h = d
-    # 500 terms are not enough when BOTH degrees of freedom are large: the
-    # continued fraction converges slowly and the lack-of-fit tail is
-    # understated (e.g. _f_sf(1, 1e8, 1e8) was 0.511 instead of 0.5).  2000
+    # The continued fraction converges slowly when BOTH degrees of freedom are
+    # large, and truncating it early understates the lack-of-fit tail.  2000
     # covers the large-df panels the scale-up plan can reach; the
     # `abs(delta-1) < 1e-15` exit still stops the ordinary cases early.
     for m in range(1, 2000):

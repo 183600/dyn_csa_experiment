@@ -580,11 +580,12 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             inter = int(np.intersect1d(tr_s, te_s, assume_unique=True).size)
             union = int(tr_s.size + te_s.size - inter)
             jac = (inter / union) if union else 0.0
-            # Jaccard on a 4M-vs-65k shingle pair is bounded near
-            # 1.6% even when EVERY test shingle occurs in train, so a
-            # `jaccard > 0.05` threshold cannot fire.  Two reachable statistics
-            # are used instead: the fraction of TEST shingles shared with train,
-            # and the worst single test row's overlap fraction.
+            # Jaccard on a full-train-vs-test-slice shingle pair stays below
+            # any useful threshold even when EVERY test shingle occurs in
+            # train, so a `jaccard > 0.05` threshold cannot fire.  Two
+            # reachable statistics are used instead: the fraction of TEST
+            # shingles shared with train, and the worst single test row's
+            # overlap fraction.
             test_overlap = (inter / te_s.size) if te_s.size else 0.0
             max_row_overlap = None
             row_overlaps = []
