@@ -11551,7 +11551,12 @@ def _student_t_sf(t, df):
             _phi = math.exp(-0.5 * _tf * _tf) / math.sqrt(2.0 * math.pi)
             sf += (_tf * _tf * _tf + _tf) * _inv_df * 0.25 * _phi
         return float(min(1.0, max(0.0, sf)))
-    x = df / (df + t * t)
+    try:
+        x = df / (df + t * t)
+    except OverflowError:
+        # t is an exact integer beyond the binary64 range (or t*t overflows
+        # when added to a float df): the t tail is already at its limit.
+        return 0.0 if t > 0 else 1.0
     tail = 0.5 * _betai(df / 2.0, 0.5, x)
     return float(tail if t >= 0 else 1.0 - tail)
 
@@ -13435,7 +13440,15 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
       the matched scale (``methodology_audit`` does); the historical scale is
       kept for continuity with existing artifacts.
     """
-    ids = np.asarray(train_ids, dtype=np.int64).ravel()
+    _raw_train = np.asarray(train_ids)
+    if _raw_train.size and not np.issubdtype(_raw_train.dtype, np.integer):
+        # Validate BEFORE the int64 cast: casting a float id (1.9) first
+        # would silently remap it to a different valid token id, so the
+        # count-table guard would never see the malformed input.
+        raise TypeError(
+            f'ngram baseline: train ids must be integers, got dtype '
+            f'{_raw_train.dtype}')
+    ids = _raw_train.astype(np.int64, copy=False).ravel()
     # The vocabulary is an exact positive count, not a boolean/fractional
     # coercion target.
     _vocab = _as_seed_int(vocab_size)
@@ -13563,7 +13576,15 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
                 if order == 2:
                     cfg['interpolation'] = float(lam)
                 if _shared_counts is None:
-                    _shared_counts = _ngram_train_counts(np.asarray(train_ids, dtype=np.int64).ravel(), vocab_size)
+                    _raw_train = np.asarray(train_ids)
+                    if (_raw_train.size
+                            and not np.issubdtype(_raw_train.dtype, np.integer)):
+                        raise TypeError(
+                            'ngram baseline: train ids must be integers, got '
+                            f'dtype {_raw_train.dtype}')
+                    _shared_counts = _ngram_train_counts(
+                        _raw_train.astype(np.int64, copy=False).ravel(),
+                        vocab_size)
                 sc = ngram_lm_score(train_ids, eval_ids, vocab_size, order=order,
                                     alpha=float(alpha), interpolation=float(lam),
                                     _counts=_shared_counts)
@@ -16076,7 +16097,11 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     _x = _v.get('ppl_primary')
                     if isinstance(_x, (int, float)) and not isinstance(_x, (bool, np.bool_)) and math.isfinite(float(_x)):
                         return float(_x)
-                    return float(_v['ppl_mean'])
+                    _mean = _finite_scalar(_v.get('ppl_mean'))
+                    # A malformed arm summary has no finite PPL to rank; do
+                    # not crash on a missing key (and do not silently choose
+                    # it over a finite reference).
+                    return _mean if _mean is not None else float('inf')
                 _ref_key, _ref = min(_cands, key=lambda kv: _ref_ppl(kv[1]))
                 # The floor is compared against THIS reference arm, so its
                 # fingerprints must come from the records that produced that
@@ -19876,10 +19901,20 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     V = int(vocab)
     freq = None
     if train_ids is not None:
-        try:
-            freq = np.bincount(np.asarray(train_ids, dtype=np.int64).reshape(-1), minlength=V)[:V]
-        except Exception:
-            freq = None
+        _raw_train = np.asarray(train_ids)
+        if _raw_train.size and not np.issubdtype(_raw_train.dtype, np.integer):
+            # Casting a float id first (1.9 -> 1) would compute the rare-token
+            # flags from a different corpus; the diagnostic must not invent
+            # frequencies from malformed ids.
+            print(f'[analyze_errors] WARNING: train_ids have dtype '
+                  f'{_raw_train.dtype}, not an integer token type — rare-token '
+                  'statistics are omitted instead of truncated')
+        else:
+            try:
+                freq = np.bincount(_raw_train.astype(np.int64, copy=False).reshape(-1),
+                                   minlength=V)[:V]
+            except Exception:
+                freq = None
     bnd_np = np.asarray(val_bnd) if val_bnd is not None else None
     if bnd_np is not None and bnd_np.shape != vb.shape:
         print(f'[analyze_errors] WARNING: boundary mask shape {bnd_np.shape} != val_batch shape {vb.shape} — boundary-token statistics are OMITTED rather than computed from a misaligned/truncated mask')

@@ -10952,6 +10952,88 @@ def t_round18_fail_closed_edge_cases():
             pass
 
 
+def t_round19_composite_identity_and_checkpoint_geometry():
+    # Composite group ids must use the scalar group contract recursively: the
+    # same instant stored in different datetime units is ONE group.  Otherwise
+    # a whole group can be split across train/validation (leakage).
+    import data_guard as DG
+    g = np.empty(4, dtype=object)
+    g[0] = [np.datetime64('2020-01-01', 'D')]
+    g[1] = [np.timedelta64(1, 'h')]
+    g[2] = [np.datetime64('2020-01-01', 's')]
+    g[3] = [np.timedelta64(60, 'm')]
+    assert DG._group_key(g[0]) == DG._group_key(g[2]), DG._group_key(g[0])
+    assert DG._group_key(g[1]) == DG._group_key(g[3]), DG._group_key(g[1])
+    idx = DG.grouped_chronological_split_indices(
+        4, g, train_size=2, val_size=2, test_size=0)
+    assert idx['train'].tolist() == [0, 2], idx
+    assert idx['val'].tolist() == [1, 3], idx
+    assert idx['test'].size == 0, idx
+    # NaT in either unit is the same missing group, both as a scalar and
+    # inside a composite id.
+    nat = np.empty(2, dtype=object)
+    nat[0] = [np.datetime64('NaT')]
+    nat[1] = [np.timedelta64('NaT')]
+    assert DG._group_key(nat[0]) == DG._group_key(nat[1]), DG._group_key(nat[0])
+
+    # Checkpoint comparison geometry must be exact: a boolean/fractional/lossy
+    # value cannot be rounded into a different architecture and then accepted
+    # as token-aligned.
+    import error_analysis as EA
+    base = {'vocab': 100, 'd': 8, 'n_layers': 1, 'n_heads': 1, 'd_head': 8,
+            'mlp_ratio': 4.0, 'cfg': ['c'], 'train_fp': 'T', 'eval_fp': 'E',
+            'code': 'K'}
+    assert EA._compare_reason(base, dict(base), 8, max_seq_a=16,
+                              max_seq_b=16) is None
+    for _bad in (True, 8.5):
+        assert EA._compare_reason(dict(base, d=_bad), base, 8,
+                                  max_seq_a=16, max_seq_b=16) is not None
+    assert EA._compare_reason(dict(base, d=2 ** 53),
+                              dict(base, d=2 ** 53 + 1), 8,
+                              max_seq_a=16, max_seq_b=16) is not None
+    assert EA._compare_reason(base, dict(base, mlp_ratio=True), 8,
+                              max_seq_a=16, max_seq_b=16) is not None
+    assert EA._compare_reason(base, base, 8.5,
+                              max_seq_a=16, max_seq_b=16) is not None
+    assert EA._compare_reason(base, base, 8,
+                              max_seq_a=True, max_seq_b=16) is not None
+
+    # A finite-magnitude statistic beyond the float range must hit the tail
+    # limit, not crash inside df + t*t (this affects the exact t branch for
+    # df <= 1e6).
+    for _df in (1, 999999, 1_000_000, 1_000_001):
+        assert L._student_t_sf(10 ** 400, _df) == 0.0, _df
+        assert L._student_t_sf(-(10 ** 400), _df) == 1.0, _df
+        assert L.student_t_two_sided_p(10 ** 400, _df) == 0.0, _df
+
+
+def t_round19b_ngram_public_entry_points_reject_float_ids():
+    # The count-table helper rejects float ids, but the public entry points
+    # used to cast them to int64 first (1.9 -> 1), silently remapping a
+    # different token.  The guard must be reachable from the public APIs.
+    import exp_lib as L
+    for _bad_train in ([1.0, 2.0], np.array([1.0, 2.0]),
+                       np.array([[1.0, 2.0]])):
+        try:
+            L.ngram_lm_score(_bad_train, np.array([[1, 2]]), 8)
+            raise AssertionError(f'ngram_lm_score accepted float train ids {_bad_train!r}')
+        except TypeError:
+            pass
+        try:
+            L.simple_baseline_fit(_bad_train, np.array([[1, 2]]), 8)
+            raise AssertionError(f'simple_baseline_fit accepted float train ids {_bad_train!r}')
+        except TypeError:
+            pass
+    for _bad_eval in (np.array([[1.0, 2.0]]), np.array([1.0, 2.0])):
+        try:
+            L.ngram_lm_score([1, 2], _bad_eval, 8)
+            raise AssertionError(f'ngram_lm_score accepted float eval ids {_bad_eval!r}')
+        except TypeError:
+            pass
+    # Integer spellings still work and are unchanged.
+    assert L.ngram_lm_score([1, 2], np.array([[1, 2]]), 8)['n_tokens'] == 2
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -11298,6 +11380,8 @@ def main():
     _check('N50 error-analysis provenance + archive required-file symlinks', t_round17_error_compare_and_archive_fail_closed)
     _check('N51 report keeps key-only legacy variant records', t_round17_report_keeps_key_only_variant)
     _check('N52 fail-closed edges: corpus/TimeGuard/seed metadata/audits/merge/kernel', t_round18_fail_closed_edge_cases)
+    _check('N53 composite temporal identity + exact checkpoint geometry', t_round19_composite_identity_and_checkpoint_geometry)
+    _check('N54 ngram public entry points reject float token ids', t_round19b_ngram_public_entry_points_reject_float_ids)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

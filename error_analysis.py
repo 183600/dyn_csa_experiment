@@ -17,6 +17,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -111,15 +112,31 @@ def _compare_reason(meta_a, meta_b, seq_len, max_seq_a=None, max_seq_b=None):
     batch, so a shorter position table would fail after most of the work was
     done."""
     _arch = {'vocab': 8192, 'd': 256, 'n_layers': 6, 'n_heads': 8,
-             'd_head': 32, 'mlp_ratio': 4.0}
+             'd_head': 32}
     for _k, _default in _arch.items():
-        try:
-            _va = float(meta_a.get(_k, _default))
-            _vb = float(meta_b.get(_k, _default))
-        except (TypeError, ValueError, OverflowError):
-            return f'{_k} is not numeric in both checkpoints'
+        # Architecture dimensions are exact positive integer counts.  A bool,
+        # a fractional value or a value above the exact-float range must not be
+        # rounded to a different architecture and then accepted as aligned.
+        _va = L._as_seed_int(meta_a.get(_k, _default))
+        _vb = L._as_seed_int(meta_b.get(_k, _default))
+        if _va is None or _vb is None or _va <= 0 or _vb <= 0:
+            return f'{_k} is not a positive exact integer in both checkpoints'
         if _va != _vb:
             return f'architecture differs on {_k} ({_va!r} vs {_vb!r})'
+    _mr_a = meta_a.get('mlp_ratio', 4.0)
+    _mr_b = meta_b.get('mlp_ratio', 4.0)
+    if isinstance(_mr_a, (bool, np.bool_)) or isinstance(_mr_b, (bool, np.bool_)):
+        return 'mlp_ratio is a boolean flag in at least one checkpoint'
+    try:
+        _mr_a = float(_mr_a)
+        _mr_b = float(_mr_b)
+    except (TypeError, ValueError, OverflowError):
+        return 'mlp_ratio is not numeric in both checkpoints'
+    if not (math.isfinite(_mr_a) and math.isfinite(_mr_b)
+            and _mr_a > 0.0 and _mr_b > 0.0):
+        return 'mlp_ratio is not a finite positive number in both checkpoints'
+    if _mr_a != _mr_b:
+        return f'architecture differs on mlp_ratio ({_mr_a!r} vs {_mr_b!r})'
     if meta_a.get('cfg') != meta_b.get('cfg'):
         return 'layer configuration differs between the checkpoints'
     for _k in ('train_fp',):
@@ -150,26 +167,28 @@ def _compare_reason(meta_a, meta_b, seq_len, max_seq_a=None, max_seq_b=None):
         return 'unverifiable code semantics (only one checkpoint records it)'
     if _ca is not None and str(_ca) != str(_cb):
         return f'checkpoint code semantics differ ({_ca!r} vs {_cb!r})'
+    _sl = L._as_seed_int(seq_len)
+    if _sl is None or _sl <= 0:
+        return 'sequence length is not an exact positive integer'
     _msb = max_seq_b if max_seq_b is not None else meta_b.get('train_len') or meta_b.get('max_seq')
-    try:
-        _msb = int(_msb) if _msb is not None else None
-        _sl = int(seq_len)
-    except (TypeError, ValueError, OverflowError):
-        return 'sequence length is not an exact integer'
-    if _msb is not None and _sl > _msb:
-        return (f'requested seq_len={_sl} exceeds checkpoint B position-table '
-                f'capacity max_seq={_msb}')
+    if _msb is not None:
+        _msb = L._as_seed_int(_msb)
+        if _msb is None or _msb <= 0:
+            return 'checkpoint B position-table capacity is not an exact positive integer'
+        if _sl > _msb:
+            return (f'requested seq_len={_sl} exceeds checkpoint B position-table '
+                    f'capacity max_seq={_msb}')
     # A's capacity is checked symmetrically: B is run on A's validation
     # batch, but A itself is also evaluated at seq_len, so an over-capacity
     # table must be refused before either model runs.
     _msa = max_seq_a if max_seq_a is not None else meta_a.get('train_len') or meta_a.get('max_seq')
-    try:
-        _msa = int(_msa) if _msa is not None else None
-    except (TypeError, ValueError, OverflowError):
-        _msa = None
-    if _msa is not None and int(seq_len) > _msa:
-        return (f'requested seq_len={int(seq_len)} exceeds checkpoint A position-table '
-                f'capacity max_seq={_msa}')
+    if _msa is not None:
+        _msa = L._as_seed_int(_msa)
+        if _msa is None or _msa <= 0:
+            return 'checkpoint A position-table capacity is not an exact positive integer'
+        if _sl > _msa:
+            return (f'requested seq_len={_sl} exceeds checkpoint A position-table '
+                    f'capacity max_seq={_msa}')
     return None
 
 

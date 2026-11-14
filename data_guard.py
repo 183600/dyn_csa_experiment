@@ -137,7 +137,12 @@ def _unhashable_identity(value):
     if isinstance(value, (bool, np.bool_)):
         return ('bool', bool(value))
     if isinstance(value, (np.datetime64, np.timedelta64)):
-        return ('temporal', repr(value))
+        # Use the same unit-independent temporal identity as the scalar
+        # `_group_key`/row-key contract: the same instant stored as ns/us/ms
+        # is one group, and every NaT (either unit) is the one missing group.
+        if np.isnat(value):
+            return ('nat',)
+        return _temporal_identity(value)
     if isinstance(value, (int, np.integer)):
         return ('int', int(value))
     if isinstance(value, (float, np.floating)):
@@ -148,9 +153,10 @@ def _unhashable_identity(value):
             return ('inf', 1 if f > 0 else -1)
         return ('float', 0.0 if f == 0.0 else f)
     if isinstance(value, (complex, np.complexfloating)):
-        z = complex(value)
-        return ('complex', 0.0 if z.real == 0.0 else z.real,
-                0.0 if z.imag == 0.0 else z.imag)
+        # Canonicalise signed zero and missing/overflowed components exactly
+        # like the row-key/fingerprint paths, so a composite group id does not
+        # depend on the NaN payload or a -0.0 spelling.
+        return _canonical_complex_cell(value)
     if isinstance(value, (bytes, bytearray, np.bytes_)):
         return ('bytes', bytes(value))
     if isinstance(value, (str, np.str_)):
