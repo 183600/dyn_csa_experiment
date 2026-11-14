@@ -11129,8 +11129,8 @@ def t_round20_category_order_and_cap_exactness():
     assert code_a[0] == code_a[1] and code_a[2] == code_a[3], code_a
     assert code_a[0] != code_a[2], code_a
 
-    # A restored one-sided clip bound must still be applied (fit() applies
-    # each finite bound independently).
+    # A one-sided clip bound must still be applied (fit() applies each
+    # finite bound independently).
     stats = {
         'scale': 'none', 'missing': 'median', 'clip_quantiles': None,
         'clip_z': None, 'eps': 1e-8, 'n_features_in': 1, 'n_train': 1,
@@ -11143,8 +11143,8 @@ def t_round20_category_order_and_cap_exactness():
     out = p.transform(np.array([[-2.0], [3.0]])).ravel().tolist()
     assert out == [0.0, 3.0], out
 
-    # TimeGuard cap fields are accounting inputs: booleans / non-finite /
-    # negative values cannot be coerced into a different budget.
+    # TimeGuard cap fields must be exact: booleans / non-finite / negative
+    # values are rejected.
     with tempfile.TemporaryDirectory() as td:
         path = os.path.join(td, 'state.json')
         for bad in (True, float('nan'), float('inf'), -1.0):

@@ -2123,8 +2123,7 @@ def _window_attn_mask(T, window, s, e, lo, device, dtype):
     # during eval remains a normal tensor for a later training recompute.
     # NOTE: window must be >= 1 — `window == 0` yields an EMPTY lane set
     # (kpos<=qpos & kpos>qpos-0 is contradictory).  Every in-repo caller is
-    # guarded by `0 < window < T`; a debug assert is deliberately not added on
-    # this hot path.
+    # guarded by `0 < window < T`.
     key = (_dev_str(device), 'winmask', int(T), int(window), int(s), int(e), int(lo), str(dtype))
     mask = _cache_get(_WINDOW_MASK_CACHE, key)
     if mask is None:
@@ -21034,9 +21033,8 @@ class TimeGuard:
     def __init__(self, cap):
         if not isinstance(cap, dict):
             raise ValueError(f'TimeGuard cap must be an object, got {type(cap).__name__}')
-        # The cap numbers drive every later accounting decision.  Reject
-        # booleans / non-finite values instead of coercing them into a
-        # different budget (float(True)=1.0).
+        # Cap values must be exact: reject booleans / non-finite values
+        # instead of coercing them (float(True)=1.0).
         def _cap_number(name, value, *, positive=False):
             f = _finite_scalar(value)
             if f is None or f < 0.0 or (positive and f == 0.0):

@@ -1251,7 +1251,7 @@ class LeakageSafePreprocessor:
             col = np.where(np.isfinite(col), col, np.nan)
             lo, hi = st['clip_lo'], st['clip_hi']
             # Apply each finite bound independently, matching fit(): a
-            # restored one-sided bound must not silently stop clipping.
+            # one-sided bound must still clip.
             if lo is not None or hi is not None:
                 col = np.clip(col,
                               lo if lo is not None else -np.inf,
