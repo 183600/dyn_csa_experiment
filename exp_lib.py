@@ -10020,6 +10020,15 @@ def _signflip_mitm_count(d):
     the test exact (no normal approximation) for the 21-40 seed range a
     scale-up panel can reach, while the 2**20 worst-case table stays small."""
     n = int(d.size)
+    # Same exact power-of-two normalisation as the public entry point: the
+    # count is scale-invariant, and without it the half-sums overflow for
+    # effects near the float limit when the helper is called directly.
+    if n:
+        _amax = float(np.max(np.abs(d)))
+        if _amax > 0.0 and math.isfinite(_amax):
+            _, _e = math.frexp(_amax)
+            if _e:
+                d = np.ldexp(d, -_e)
     total = abs(float(d.sum()))
     # Tie tolerance must be scale-free: a fixed 1e-12 absolute slack makes
     # every sign assignment "reach" the observed sum when the effects are
@@ -10063,6 +10072,16 @@ def _signflip_saddlepoint_p(values):
     m = len(vals)
     if m == 0:
         return 1.0, 'saddlepoint'
+    # The tail is invariant under a common positive rescaling.  Dividing by an
+    # exact power of two keeps the comparison/tail values unchanged, while
+    # preventing x*x / t*T from overflowing (or underflowing to zero) when a
+    # caller supplies effects near the float limits.  `exact_signflip_p`
+    # already normalises, but the helper must be safe on its own too.
+    _amax = max(abs(x) for x in vals)
+    if _amax > 0.0 and math.isfinite(_amax):
+        _, _e = math.frexp(_amax)
+        if _e:
+            vals = [math.ldexp(x, -_e) for x in vals]
     T = abs(math.fsum(vals))
     sabs = math.fsum(abs(x) for x in vals)
     floor = min(1.0, math.ldexp(2.0, -m))
@@ -10962,6 +10981,10 @@ def tost_paired(deltas, margin, conf=0.90):
         out['note'] = ('not decidable (n<2, non-positive/non-finite margin, '
                        'or conf outside (0,1))')
         return out
+    # Keep the caller's (unscaled) margin: the reported mean/CI are converted
+    # back to the original effect unit below, so every comparison that mixes
+    # them with the margin must use this value, not the rescaled local one.
+    _margin_in = margin
     # The TOST statistic is invariant under a common positive rescaling of the
     # effects AND the margin.  Normalise by an exact power of two so a tiny or
     # huge (but finite) panel does not underflow the variance to zero / overflow
@@ -11017,7 +11040,7 @@ def tost_paired(deltas, margin, conf=0.90):
     equiv_alpha = (1.0 - float(conf)) / 2.0
     out['equiv_alpha'] = float(equiv_alpha)
     out['equivalent'] = bool(p_hi < equiv_alpha and p_lo < equiv_alpha)
-    out['ci_within_margin'] = bool(out['ci'][0] > -margin and out['ci'][1] < margin)
+    out['ci_within_margin'] = bool(out['ci'][0] > -_margin_in and out['ci'][1] < _margin_in)
     return out
 
 

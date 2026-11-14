@@ -279,6 +279,22 @@ class PoolGeometry:
             starts_prev_np = np.zeros((R, Bm), dtype=np.int64)
             max_ov = 0
         W_b = max_ov if overlap is not None else 0
+        # The geometry is transported as int32 (the kernels read int32 rows).
+        # Refuse a silently wrapped table instead of narrowing an out-of-range
+        # value: the same fail-closed rule the eager host geometry applies
+        # before it narrows positions (exp_lib._pool_*_flat).  This can only
+        # trigger for sequences/overlaps beyond the int32 index range, which
+        # the Triton path cannot represent anyway.
+        _i32 = np.iinfo(np.int32)
+        for _tbl in (counts_np, ends_np, starts_np, last_np,
+                     ov_start_np, ov_len_np, starts_prev_np, nblk_np):
+            if _tbl.size and (int(_tbl.min()) < int(_i32.min)
+                              or int(_tbl.max()) > int(_i32.max)):
+                raise ValueError(
+                    'PoolGeometry: a geometry value is outside the int32 index '
+                    f'range ({int(_tbl.min())}..{int(_tbl.max())}); refusing to '
+                    'narrow it silently (T or overlap is too large for the '
+                    'kernel transport)')
         # 8 张 int32 几何表打包进一条宿主缓冲（同样的 int32 值、
         # 同样的 int64→int32 窄化，transport only），设备侧按只读视图切分。
         flat = np.empty(7 * R * Bm + R, dtype=np.int32)

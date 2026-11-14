@@ -9700,6 +9700,15 @@ def t_review9_pool_geometry_int32_guard():
     assert L._pool_parts_flat([n - 1, 1], 2, None, n) is None
     assert L._pool_geom_flat_var([n - 1, 1], 2, 2, n, 4, 4, 4, 4) is None
     assert L._pool_geom_flat_single([n - 1, 1], 2, n, 4, 4) is None
+    # The kernel geometry transports int32 rows: an out-of-range table must
+    # be refused, not silently narrowed/wrapped.
+    import csa_kernels as _K
+    try:
+        _K.PoolGeometry([[n - 1, 1]], 0, n, torch.device('cpu'), 4)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('kernel PoolGeometry must refuse an int32-overflow table')
 
 
 def t_review9_v8_uncalibrated_source_is_not_called_calibrated():
@@ -9876,6 +9885,43 @@ def t_round11_effect_scale_invariance():
         assert math.isclose(mscaled['heterogeneity']['p'],
                             mbase['heterogeneity']['p'],
                             rel_tol=1e-12, abs_tol=1e-15), (_c, mscaled)
+
+
+def t_round11b_saddlepoint_and_tost_scale():
+    # The private saddlepoint helper must be scale-invariant on its own, not
+    # only through exact_signflip_p's normalisation: direct near-limit inputs
+    # used to overflow x*x / t*T and return a different tail.
+    rng = np.random.default_rng(43)
+    for _n in (41, 60):
+        _d = rng.normal(size=_n).tolist()
+        _base = L._signflip_saddlepoint_p(_d)
+        _base_br = BR._signflip_saddlepoint_p(_d)
+        for _c in (1e-300, 1e-100, 1e100, 1e300):
+            _a = L._signflip_saddlepoint_p([x * _c for x in _d])
+            _b = BR._signflip_saddlepoint_p([x * _c for x in _d])
+            assert abs(_a[0] - _base[0]) < 1e-12, (_n, _c, _a, _base)
+            assert abs(_b[0] - _base_br[0]) < 1e-12, (_n, _c, _b, _base_br)
+
+    # The exact MITM helper must also survive a direct near-limit call: its
+    # half-sums overflowed before the same normalisation was added.
+    for _n in (22, 30):
+        _d = rng.normal(size=_n)
+        _d = _d / np.max(np.abs(_d))
+        _ref_n = L._signflip_mitm_count(_d) / float(1 << _n)
+        _ref_br = BR._signflip_mitm_count(_d.tolist()) / float(1 << _n)
+        for _c in (1e-300, 1e300, 1e307, 1e308):
+            assert abs(L._signflip_mitm_count(_d * _c) / float(1 << _n) - _ref_n) < 1e-12, (_n, _c)
+            assert abs(BR._signflip_mitm_count((_d * _c).tolist()) / float(1 << _n) - _ref_br) < 1e-12, (_n, _c)
+
+    # `ci_within_margin` mixes the (unscaled) reported CI with the margin, so
+    # it must use the caller's margin, not the power-of-two rescaled local.
+    _cross = [0.2, 0.6, 0.1, 0.5]
+    _inside = [0.10, 0.20, 0.15, 0.12]
+    assert L.tost_paired(_cross, 0.3)['ci_within_margin'] is False
+    assert L.tost_paired(_inside, 0.3)['ci_within_margin'] is True
+    for _c in (1e-300, 1e-100, 1e100, 1e300):
+        assert L.tost_paired([x * _c for x in _cross], 0.3 * _c)['ci_within_margin'] is False, _c
+        assert L.tost_paired([x * _c for x in _inside], 0.3 * _c)['ci_within_margin'] is True, _c
 
 
 def main():
@@ -10185,6 +10231,7 @@ def main():
     _check('N18 prefix reference honours use_overlap=False', t_round10_prefix_reference_honours_use_overlap)
     _check('N19 power artifact / confirmatory geometry require exact counts', t_round10_power_artifact_requires_exact_counts)
     _check('N20 effect-unit rescaling keeps p/trend/meta summaries invariant', t_round11_effect_scale_invariance)
+    _check('N20b saddlepoint + TOST margin stay scale-invariant', t_round11b_saddlepoint_and_tost_scale)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

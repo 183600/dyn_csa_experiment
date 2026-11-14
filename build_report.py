@@ -158,6 +158,15 @@ def _signflip_mitm_count(deltas):
     import numpy as _np
     d = _np.asarray(deltas, dtype=float)
     n = int(d.size)
+    # Same exact power-of-two normalisation as the exp_lib twin: the count is
+    # scale-invariant, and without it the half-sums overflow for effects near
+    # the float limit when the helper is called directly.
+    if n:
+        _amax = float(_np.max(_np.abs(d)))
+        if _amax > 0.0 and math.isfinite(_amax):
+            _, _e = math.frexp(_amax)
+            if _e:
+                d = _np.ldexp(d, -_e)
     total = abs(float(d.sum()))
     # Same scale-free tie tolerance as exp_lib._signflip_mitm_count: an
     # absolute slack turns tiny-but-consistent effects into p=1.
@@ -192,6 +201,14 @@ def _signflip_saddlepoint_p(values):
     m = len(vals)
     if m == 0:
         return 1.0, 'saddlepoint'
+    # Same exact power-of-two normalisation as the exp_lib twin: the tail is
+    # scale-invariant, and without it x*x / t*T overflow or underflow when the
+    # helper is used directly with near-limit effects.
+    _amax = max(abs(x) for x in vals)
+    if _amax > 0.0 and math.isfinite(_amax):
+        _, _e = math.frexp(_amax)
+        if _e:
+            vals = [math.ldexp(x, -_e) for x in vals]
     T = abs(math.fsum(vals))
     sabs = math.fsum(abs(x) for x in vals)
     floor = min(1.0, math.ldexp(2.0, -m))
