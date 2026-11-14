@@ -146,8 +146,12 @@ def _load_summary(outdir):
             with open(p, encoding='utf-8') as f:
                 d = json.load(f)
         except Exception as e:
-            print(f'[open-block] WARNING: unreadable summary {p} ({type(e).__name__}: {e}); starting a fresh one')
-            return {}
+            # An existing-but-unreadable summary is corrupt evidence, not an
+            # empty panel: silently returning {} would let the next save
+            # overwrite it (and make the lost cells look like they never ran).
+            raise ValueError(
+                f'open-block summary {p} exists but cannot be parsed '
+                f'({type(e).__name__}: {e}); move it aside to start fresh') from e
         if not isinstance(d, dict):
             # Valid JSON but the wrong shape is corrupt evidence, not an empty
             # panel: silently returning {} would let the next save overwrite

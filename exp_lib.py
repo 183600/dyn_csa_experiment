@@ -4091,7 +4091,11 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     out = torch.empty_like(q)
     pos_all = _arange_cache(n, dev)
     win_idx, win_valid_all = _window_geometry(n, w, dev)
-    _MINL = _finfo_min(k_blk.dtype)
+    # The logits are produced by q @ k, so their dtype is the promoted pair.
+    # Using k_blk's dtype alone would install too weak a mask when q is wider
+    # (e.g. fp64 q against fp32 k), letting an "invalid" lane hold a finite
+    # value that can still win the softmax.
+    _MINL = _finfo_min(torch.promote_types(q.dtype, k_blk.dtype))
     # The V halves are laid out contiguously once and gathered with one
     # combined row index per chunk: the selected rows of `v_all` are exactly
     # the two gather outputs concatenated in the same order, so Vset holds
@@ -4318,7 +4322,10 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             if keep is not None:
                 soft_g = soft_g * keep
             soft_log_g = torch.log(soft_g.clamp_min(1e-12))
-            soft_log_g.masked_fill_(soft_g <= 0, _MINL)
+            # `soft_log_g` need not share the logits' dtype (a caller can pass
+            # a lower-precision prior); filling it with a wider dtype's MIN
+            # raises "cannot be converted ... overflow" in torch.
+            soft_log_g.masked_fill_(soft_g <= 0, _finfo_min(soft_log_g.dtype))
             soft_logits = logits.clone()
             soft_logits[:, :, :_nb].add_(soft_log_g[:, None, :]).clamp_min_(_MINL)
             soft_logits.masked_fill_(nvalid, _MINL)
@@ -4386,7 +4393,8 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
     q_chunk = max(1, min(int(q_chunk), max(1, int(mem_budget_bytes) // max(1, per_row * q.element_size()))))
     q_chunk = max(1, min(q_chunk, n))
     win_idx, win_valid_all = _window_geometry(n, int(w), dev)
-    _MINL = _finfo_min(k_blk.dtype)
+    # Same promoted-logit dtype rule as `gathered_attention`.
+    _MINL = _finfo_min(torch.promote_types(q.dtype, k_blk.dtype))
     out = torch.empty_like(q)
     mass = None
     if return_prefix_mass:
@@ -4445,7 +4453,7 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
         if _soft_live:
             soft_g = soft[s:e]
             s_log = torch.log(soft_g.clamp_min(1e-12))
-            s_log.masked_fill_(~valid, _MINL)
+            s_log.masked_fill_(~valid, _finfo_min(s_log.dtype))
             logits_soft = logits.clone()
             logits_soft[:, :, :K].add_(s_log[:, None, :])
             logits_soft.masked_fill_(~valid_all[:, None, :], _MINL)
@@ -8692,10 +8700,17 @@ def locked_json_read(path):
             return {}
         try:
             with open(path, encoding='utf-8') as f:
-                return json.load(f)
+                _obj = json.load(f)
         except Exception as _e:
             print(f'[resume] FATAL: {path} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to start with a silently RESET panel — move it aside to start fresh.')
             raise
+        if not isinstance(_obj, dict):
+            # Every panel/state reader keys into this object; returning a list
+            # would crash later (`.get`) instead of naming the corrupt file.
+            raise ValueError(
+                f'{path} is valid JSON but not an object ({type(_obj).__name__}); '
+                'the panel/state file is corrupt — move it aside to start fresh')
+        return _obj
     finally:
         if lock_f is not None:
             try:
@@ -8745,6 +8760,11 @@ def locked_json_update(path, mutfn, indent=2):
             except Exception as _e:
                 print(f'[resume] FATAL: {path} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with a fresh object — move it aside to start fresh.')
                 raise
+            if not isinstance(obj, dict):
+                raise ValueError(
+                    f'{path} is valid JSON but not an object ({type(obj).__name__}); '
+                    'refusing to update a corrupt panel/state file — move it aside '
+                    'to start fresh')
         rep = mutfn(obj)
         obj = obj if rep is None else rep
         atomic_write_json(path, obj, indent=indent)
@@ -11797,7 +11817,7 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
         # observations and shrink the interaction SE.  Normalise so 0 and
         # "0" (the same JSON seed) collide.
         raise ValueError('scale_interaction got duplicate seeds %r' % (ss,))
-    diff, kept = [], []
+    pairs = []
     for s, x, y in zip(ss, a, b):
         # Boolean flags are not scale effects; reject them before float()
         # turns them into 0/1 observations.
@@ -11808,9 +11828,27 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
         except (TypeError, ValueError, OverflowError):
             continue
         if math.isfinite(fx) and math.isfinite(fy):
-            diff.append(fy - fx)
-            kept.append(s)
+            pairs.append((s, fx, fy))
+    # The interaction is invariant under a common positive rescaling of both
+    # effect vectors, but raw subtraction overflows when two opposite-sign
+    # effects sit near the float limit (e.g. ~1e308 - -1e308).  Work on one
+    # exact power-of-two rescaling and undo it on the effect-unit outputs.
+    _amax = max((max(abs(fx), abs(fy)) for _s, fx, fy in pairs), default=0.0)
+    _exp = 0
+    if _amax > 0.0 and math.isfinite(_amax):
+        _, _exp = math.frexp(_amax)
+    diff = [math.ldexp(fy, -_exp) - math.ldexp(fx, -_exp)
+            for _s, fx, fy in pairs] if _exp else [fy - fx for _s, fx, fy in pairs]
+    kept = [s for s, _fx, _fy in pairs]
     st = paired_effect_stats(diff, alpha=alpha, min_n=min_n)
+    if _exp:
+        for _k in ('mean', 'std', 'sem', 'ci95_low', 'ci95_high'):
+            if st.get(_k) is not None:
+                st[_k] = _unscale_power2(st[_k], _exp)
+        st['loo_means'] = [_unscale_power2(_x, _exp) for _x in (st.get('loo_means') or [])]
+        for _k in ('ci95_paired_bootstrap', 'ci95_unpaired_bootstrap'):
+            if isinstance(st.get(_k), list):
+                st[_k] = [_unscale_power2(_x, _exp) for _x in st[_k]]
     _min_label = _valid_min_n(min_n)
     st.update({'low_label': str(low_label), 'high_label': str(high_label), 'seeds': kept,
                'convention': 'delta = effect_high - effect_low; positive = effect is larger at the higher scale',
@@ -22010,6 +22048,10 @@ def _read_summary_json(path):
         except Exception as _e:
             print(f'[resume] FATAL: {path} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
             raise
+        if not isinstance(summary, dict):
+            raise ValueError(
+                f'{path} is valid JSON but not an object ({type(summary).__name__}); '
+                'the panel summary is corrupt — move it aside to start fresh')
     return summary
 
 

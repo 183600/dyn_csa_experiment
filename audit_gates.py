@@ -214,15 +214,22 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     for _tp in _tm:
         _tmeta = _load(_tp)
         if not isinstance(_tmeta, dict):
-            if os.path.exists(_tp) and _tmeta is None:
-                _parse_failures.append(os.path.basename(_tp))
+            if os.path.exists(_tp):
+                # A valid-JSON non-object is corrupt metadata, not an absent
+                # cache: it must fail the provenance gate, not downgrade it
+                # to "not verifiable".
+                _parse_failures.append(
+                    os.path.basename(_tp) if _tmeta is None else
+                    f'{os.path.basename(_tp)} (not an object)')
             continue
         _ttag = os.path.basename(_tp)[len('test_meta_'):-len('.json')]
         for _mp in _vm:
             _mmeta = _load(_mp)
             if not isinstance(_mmeta, dict):
-                if os.path.exists(_mp) and _mmeta is None:
-                    _parse_failures.append(os.path.basename(_mp))
+                if os.path.exists(_mp):
+                    _parse_failures.append(
+                        os.path.basename(_mp) if _mmeta is None else
+                        f'{os.path.basename(_mp)} (not an object)')
                 continue
             _tv, _mv = _as_int(_tmeta.get('vocab')), _as_int(_mmeta.get('vocab'))
             _diff = []

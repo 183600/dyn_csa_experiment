@@ -2382,7 +2382,11 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
                 incomplete += 1
                 continue
             cell.append(fa - fb)
-            logs.append(math.log(fa) - math.log(fb))
+            # log(fa) - log(fb) cancels catastrophically when both PPLs are
+            # large and nearly equal; log1p keeps the relative difference.
+            _rel = (fa - fb) / fb
+            logs.append(math.log1p(_rel) if math.isfinite(_rel) and abs(_rel) < 0.5
+                        else math.log(fa) - math.log(fb))
         if not cell:
             continue
         doc_deltas.append(float(np.mean(cell)))

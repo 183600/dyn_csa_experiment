@@ -1246,6 +1246,9 @@ def _hist_by_seed(outdir, variant, raw=None):
         except Exception as e:
             print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — no curve for {variant}')
             return out
+    if not isinstance(raw, dict):
+        print(f'[stats] WARNING: {sp} is valid JSON but not an object ({type(raw).__name__}) — no curve for {variant}')
+        return out
     seen = {}
     cfg_of = {}
     for _k, r in raw.items():
@@ -1390,6 +1393,9 @@ def _tokens_per_step(outdir, fallback=None, raw=None):
         except Exception as e:
             print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — no tokens/step for this panel')
             return None
+    if not isinstance(raw, dict):
+        print(f'[stats] WARNING: {sp} is valid JSON but not an object ({type(raw).__name__}) — no tokens/step for this panel')
+        return None
     rates = []
     n_bad = 0
     for _k, r in raw.items():

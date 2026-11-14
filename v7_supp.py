@@ -2088,6 +2088,11 @@ def run_niah_phase(payload, guard=None, label=''):
         except Exception as _e:
             print(f'[resume] FATAL: {spath} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
             raise
+        if not isinstance(summary, dict):
+            raise ValueError(
+                f'{spath} is valid JSON but not an object '
+                f'({type(summary).__name__}); the panel summary is corrupt — '
+                'move it aside to start fresh')
     _mr_ref = 'csa_fixed_rope'
     for v in variants:
         mr = 4.0

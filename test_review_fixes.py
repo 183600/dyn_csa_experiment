@@ -10201,6 +10201,139 @@ def t_round13_cached_boundary_mask_is_fingerprinted():
                                     fingerprints_trusted=True) == []
 
 
+def t_round14_attention_mask_uses_logit_dtype():
+    # The invalid-lane sentinel must be the logits' (promoted q/k) dtype, not
+    # k_blk's dtype: with fp64 q and fp32 k, a float32 MIN (-3.4e38) is a
+    # *higher* logit than a valid -1e39 lane, so a future block would win the
+    # softmax instead of being masked out.
+    q = torch.tensor([[[-1e39]]], dtype=torch.float64)
+    k_blk = torch.ones((1, 1, 1), dtype=torch.float32)
+    v_blk = torch.full((1, 1, 1), 7.0, dtype=torch.float64)
+    k_sw = torch.ones((1, 1, 1), dtype=torch.float32)
+    v_sw = torch.full((1, 1, 1), 3.0, dtype=torch.float64)
+    out = L.gathered_attention(
+        q, k_blk, v_blk, torch.zeros((1, 1), dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int64), k_sw, v_sw, 1, 1.0,
+        q_chunk=1, mem_budget_bytes=1 << 20)
+    assert torch.allclose(out, torch.full((1, 1, 1), 3.0, dtype=out.dtype)), out
+
+
+def t_round14_soft_prior_dtype_mismatch_is_safe():
+    # A lower-precision prior must not raise when the logits use a wider dtype
+    # (the old mask filled a float32 tensor with the float64 MIN).
+    torch.manual_seed(14)
+    n, h, d, w, nb = 4, 2, 3, 1, 2
+    q, k, v = (torch.randn(n, h, d, dtype=torch.float64) for _ in range(3))
+    kb, vb = (torch.randn(nb, h, d, dtype=torch.float64) for _ in range(2))
+    ksw, vsw = (torch.randn(n, h, d, dtype=torch.float64) for _ in range(2))
+    topk = torch.tensor([[0, 1], [0, 1], [0, 1], [0, 1]], dtype=torch.int32)
+    last = torch.tensor([0, 0], dtype=torch.int64)
+    valid = torch.ones(n, nb, dtype=torch.bool)
+    soft = torch.rand(n, nb, dtype=torch.float32)
+    ref = L.gathered_attention(q, kb, vb, topk, last, ksw, vsw, w, 0.5,
+                               sel_valid=valid, q_chunk=2,
+                               mem_budget_bytes=1 << 20)
+    got = L.gathered_attention(q, kb, vb, topk, last, ksw, vsw, w, 0.5,
+                               soft=soft, sel_valid=valid, q_chunk=2,
+                               mem_budget_bytes=1 << 20)
+    assert torch.equal(ref, got), 'a lower-precision prior changed the forward value'
+
+
+def t_round14_scale_interaction_is_scale_invariant():
+    # Opposite-sign effects near the float limit overflow the raw subtraction;
+    # the interaction must not turn into "no data" after rescaling.
+    lo = [1e308] * 6
+    hi = [-1e308] * 6
+    base = L.scale_interaction([x * 1e-300 for x in lo],
+                               [x * 1e-300 for x in hi])
+    big = L.scale_interaction(lo, hi)
+    assert big['n'] == base['n'] == 6, (base, big)
+    assert big['significant'] == base['significant'] is True, (base, big)
+    assert math.isclose(big['mean'], base['mean'] * 1e300, rel_tol=1e-12), (base, big)
+    assert math.isclose(big['std'], base['std'] * 1e300, rel_tol=1e-12), (base, big)
+
+
+def t_round14_doc_log_ratio_keeps_tiny_relative_effects():
+    # Per-document log ratios must use the same cancellation-safe form as the
+    # panel-level paired_log_ratio.
+    hi = 1e300 * (1.0 + 1e-14)
+    lo = 1e300
+    cell = {'ppl': hi, 'ppl_per_seq': [hi, hi], 'nll_sum': 1.0, 'n_tok': 1,
+            'truncated': False, 'n_seq': 2}
+    cell_b = {'ppl': lo, 'ppl_per_seq': [lo, lo], 'nll_sum': 1.0, 'n_tok': 1,
+              'truncated': False, 'n_seq': 2}
+    rec_a = {'seed': 0, 'by_len': {4: cell}}
+    rec_b = {'seed': 0, 'by_len': {4: cell_b}}
+    res = V12._doc_level_analysis({0: rec_a}, {0: rec_b}, [0], 4)
+    _want = math.log1p((hi - lo) / lo)
+    assert res is not None and abs(res['per_doc_log_ratio_mean'] - _want) < 1e-20, (res, _want)
+    assert res['per_doc_log_ratio_mean'] > 0.0, res
+
+
+def t_round14_driver_readers_refuse_malformed_summaries():
+    import open_block_supp as OB
+    with tempfile.TemporaryDirectory() as d:
+        sp = os.path.join(d, 'summary.json')
+        with open(sp, 'w', encoding='utf-8') as f:
+            f.write('{not json')
+        try:
+            OB._load_summary(d)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('open-block accepted an unreadable summary as an empty panel')
+        with open(sp, 'w', encoding='utf-8') as f:
+            json.dump([], f)
+        try:
+            OB._load_summary(d)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('open-block accepted a non-object summary')
+        # v10 curve readers must treat valid-JSON-but-not-an-object as absent,
+        # not crash on `.items()`.
+        with open(sp, 'w', encoding='utf-8') as f:
+            json.dump([], f)
+        import v10_supp as V10
+        assert V10._hist_by_seed(d, 'csa_fixed') == {}
+        assert V10._tokens_per_step(d) is None
+
+
+def t_round14_locked_json_requires_object():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, 'state.json')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump([1, 2], f)
+        try:
+            L.locked_json_read(p)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('locked_json_read returned a list')
+        try:
+            L.locked_json_update(p, lambda obj: obj)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('locked_json_update accepted a list')
+        try:
+            L._read_summary_json(p)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('_read_summary_json accepted a list')
+
+
+def t_round14_leakage_nonobject_metadata_fails():
+    with tempfile.TemporaryDirectory() as d:
+        for name in ('meta_x.json', 'test_meta_y.json'):
+            with open(os.path.join(d, name), 'w', encoding='utf-8') as f:
+                json.dump([], f)
+        rep = A.audit_leakage(cache_dir=d)
+        assert rep['status'] == 'fail', rep
+        assert any('not an object' in p for p in rep.get('problems') or []), rep
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -10523,6 +10656,13 @@ def main():
     _check('N29 F tail converges at large dfs', t_round13_f_sf_large_degrees_of_freedom)
     _check('N30 corrupt cache meta/array is not a cache hit', t_round13_cache_probe_rejects_corrupt_meta_and_arrays)
     _check('N31 boundary mask fingerprint is checked when present', t_round13_cached_boundary_mask_is_fingerprinted)
+    _check('N32 invalid-lane sentinel uses the promoted logit dtype', t_round14_attention_mask_uses_logit_dtype)
+    _check('N33 lower-precision soft prior is safe on wide logits', t_round14_soft_prior_dtype_mismatch_is_safe)
+    _check('N34 scale interaction stays finite/invariant at the float limit', t_round14_scale_interaction_is_scale_invariant)
+    _check('N35 document log ratio keeps tiny relative effects', t_round14_doc_log_ratio_keeps_tiny_relative_effects)
+    _check('N36 driver readers reject malformed summaries', t_round14_driver_readers_refuse_malformed_summaries)
+    _check('N37 locked JSON helpers require an object', t_round14_locked_json_requires_object)
+    _check('N38 non-object cache metadata fails the leakage audit', t_round14_leakage_nonobject_metadata_fails)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

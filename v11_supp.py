@@ -682,6 +682,8 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
             _s = json.load(open(os.path.join(REPO, _outdir, 'summary.json'), encoding='utf-8'))
         except Exception:
             return None
+        if not isinstance(_s, dict):
+            return None
         _sd = {}
         for _rk, _r in _s.items():
             if isinstance(_r, dict) and 'seed' in _r and _r.get('variant') and L.ppl_is_usable(_r.get('ppl')) and (not _r.get('synthesized')):
