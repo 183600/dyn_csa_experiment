@@ -334,6 +334,40 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             out['checks']['tokenizer_vocab_identical'] = _tv_eq
             if not _tv_eq:
                 _tok_problems.append('test/train tokenizer id->token maps differ')
+            # get_vocab() is only an id->token map.  Two tokenizers with the
+            # same vocabulary but different BPE merge ranks / normalisation
+            # emit different ids for the same text.  Bind the ENCODING too:
+            # compare the id-producing configuration and an actual probe
+            # encode.  (JSON key order is irrelevant: these are parsed dicts.)
+            def _enc_sig(tok):
+                d = json.loads(tok.to_str())
+                return {k: d.get(k) for k in
+                        ('normalizer', 'pre_tokenizer', 'post_processor',
+                         'model', 'added_tokens')}
+            try:
+                _sa, _sb = _enc_sig(ta), _enc_sig(tb)
+                _cfg_eq = json.dumps(_sa, sort_keys=True) == json.dumps(_sb, sort_keys=True)
+                out['checks']['tokenizer_encoding_config_identical'] = bool(_cfg_eq)
+                if not _cfg_eq:
+                    _tok_problems.append('test/train tokenizers have the same vocabulary '
+                                         'but different encoding configuration (merges/'
+                                         'normalizer/pre-tokenizer/post-processor/added tokens)')
+            except Exception as _se:
+                out['checks']['tokenizer_encoding_config_identical'] = f'failed ({type(_se).__name__}: {_se})'
+                _tok_problems.append(f'tokenizer encoding-config comparison failed ({type(_se).__name__}: {_se})')
+            _probe_text = ('Train/test tokenizer identity probe: The quick brown fox '
+                           'jumps over 13 lazy dogs. naive cafe 12345 ab abab a b')
+            try:
+                _pa = ta.encode(_probe_text, add_special_tokens=False).ids
+                _pb = tb.encode(_probe_text, add_special_tokens=False).ids
+                _enc_eq = bool(_pa == _pb)
+                out['checks']['tokenizer_encode_probe_identical'] = _enc_eq
+                if not _enc_eq:
+                    _tok_problems.append('test/train tokenizers encode the same probe text '
+                                         f'to different ids ({_pa[:12]!r} vs {_pb[:12]!r})')
+            except Exception as _pe:
+                out['checks']['tokenizer_encode_probe_identical'] = f'failed ({type(_pe).__name__}: {_pe})'
+                _tok_problems.append(f'tokenizer encode-probe comparison failed ({type(_pe).__name__}: {_pe})')
         except Exception as e:
             out['checks']['tokenizer_vocab_identical'] = f'failed ({type(e).__name__}: {e})'
             _tok_problems.append(f'tokenizer vocab comparison failed ({type(e).__name__}: {e})')
@@ -464,14 +498,18 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             # recomputing it would let a silently modified/truncated id cache
             # pass the provenance audit.
             _fp_bad = []
-            if _tr[0] == _tr_path and train_meta.get('src_fp'):
+            # Compare the fingerprint with the file ACTUALLY paired below, not
+            # only with the canonical tag path: the unique-fallback branch may
+            # select a differently spelled tag, and skipping the hash there
+            # would bless bytes whose provenance was never checked.
+            if train_meta.get('src_fp'):
                 try:
                     _L = _import_exp_lib()
                     if str(train_meta.get('src_fp')) != _L._ids_fp(np.asarray(tr)):
                         _fp_bad.append('train src_fp does not match the train_ids content')
                 except Exception as _fe:
                     _fp_bad.append(f'train src_fp could not be recomputed ({type(_fe).__name__}: {_fe})')
-            if _te[0] == _te_path and test_meta.get('src_fp'):
+            if test_meta.get('src_fp'):
                 try:
                     _L = _import_exp_lib()
                     if str(test_meta.get('src_fp')) != _L._ids_fp(np.asarray(te)):

@@ -26,8 +26,13 @@ def make_guard():
     if not g.state.get('sps_by_class') and os.path.exists('run_time_state_v7.json'):
         try:
             st = json.load(open('run_time_state_v7.json', encoding='utf-8'))
-            g.state['sps_by_class'] = st.get('sps_by_class', {})
-            g.state['norm_sps'] = st.get('norm_sps')
+            _sbc = st.get('sps_by_class') or {}
+            _norm = st.get('norm_sps')
+            if not _sbc and _norm is None:
+                print('[v8] NOTE: run_time_state_v7.json holds no calibration data — leaving the guard uncalibrated rather than recording an empty calibration')
+                return g
+            g.state['sps_by_class'] = _sbc
+            g.state['norm_sps'] = _norm
             g._save()
             print('[v8] TimeGuard calibrated from run_time_state_v7.json')
         except Exception as _e:

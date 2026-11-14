@@ -1112,6 +1112,16 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     """
     R, T, nh, hd = q.shape
     nb = topk_idx.shape[-1]
+    if k_blk.shape[1] == 0 and nb:
+        # No compressed rows exist: block lanes are impossible (the same
+        # invariant the eager path applies).  Drop them instead of indexing an
+        # empty last_tok/k_blk table.
+        topk_idx = topk_idx[..., :0]
+        if valid is not None:
+            valid = valid[..., :0]
+        if soft is not None:
+            soft = soft[..., :0]
+        nb = 0
     M = nb + w
     dev = q.device
     dtype = q.dtype
@@ -1187,6 +1197,13 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     R, T, nh, hd = q.shape
     nb = topk_idx.shape[-1]
     Bm = k_blk.shape[1]
+    if Bm == 0 and nb:
+        topk_idx = topk_idx[..., :0]
+        if valid is not None:
+            valid = valid[..., :0]
+        if soft is not None:
+            soft = soft[..., :0]
+        nb = 0
     dev = q.device
     dtype = q.dtype
     _wdt = torch.promote_types(dtype, torch.float32)

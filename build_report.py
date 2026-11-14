@@ -597,9 +597,11 @@ def _pair_reason(ra, rb):
     fa, fb = (ra.get('run_cfg'), rb.get('run_cfg'))
     if fa is None or fb is None:
         return 'unverifiable run_cfg'
-    # A boolean is a flag, not a configuration fingerprint (mirror exp_lib).
-    if isinstance(fa, (bool, np.bool_)) or isinstance(fb, (bool, np.bool_)):
-        return 'unverifiable run_cfg (a boolean is not a configuration fingerprint)'
+    # The fingerprint is a non-empty string (mirror exp_lib); booleans,
+    # numbers, lists and dicts are malformed provenance, not a shared config.
+    if (not isinstance(fa, str) or not isinstance(fb, str)
+            or not fa or not fb):
+        return 'unverifiable run_cfg (not a non-empty configuration fingerprint string)'
     if fa != fb:
         return 'different run_cfg'
     # The run_cfg string does not carry the optimizer identity / schedule

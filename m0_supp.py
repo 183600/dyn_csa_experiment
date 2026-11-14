@@ -590,6 +590,30 @@ def _ppl_by_seed(summary, variant):
     return out
 
 
+def _records_by_seed(summary, variant):
+    """Measurable records of one arm keyed by exact integer seed.
+
+    Kept alongside `_ppl_by_seed` so the cross-scale pass can apply the
+    repository's pairing gate (`pair_reason`) before turning two numbers into
+    a paired effect; a shared seed number alone does not prove the same
+    recipe, optimizer, corpus or initialization."""
+    out = {}
+    for rec in summary.values():
+        if not isinstance(rec, dict) or rec.get('variant') != variant:
+            continue
+        if rec.get('synthesized'):
+            continue
+        if not L.ppl_is_usable(rec.get('ppl')):
+            continue
+        seed = L._as_seed_int(rec.get('seed'))
+        if seed is None:
+            continue
+        if seed in out:
+            raise ValueError(f'{variant}: duplicate measurable seed {seed}')
+        out[seed] = rec
+    return out
+
+
 def _panel_corpus_fp(summary, variant=None):
     """Corpus/tokenizer identity of one (panel, arm): the records' composite
     `data_version` (dataset + tokenizer fit + train/val fingerprints + vocab).
@@ -713,13 +737,32 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
         raw = {}
         for label, summary in sorted(summaries.items()):
             try:
-                pa, pb = _ppl_by_seed(summary, a), _ppl_by_seed(summary, b)
+                ra_by_seed = _records_by_seed(summary, a)
+                rb_by_seed = _records_by_seed(summary, b)
             except ValueError as e:
                 print(f'[m0-analysis] {name}/{label}: {e}')
                 continue
-            common = sorted(set(pa) & set(pb))
-            if len(common) < 2:
+            common = sorted(set(ra_by_seed) & set(rb_by_seed))
+            controlled = []
+            _pair_why = {}
+            for s in common:
+                _why = L.pair_reason(ra_by_seed[s], rb_by_seed[s])
+                if _why is None:
+                    controlled.append(s)
+                else:
+                    _pair_why[s] = _why
+            if _pair_why:
+                print(f'[m0-analysis] {name}/{label}: dropping seed(s) {sorted(_pair_why)} '
+                      f'that do not clear the paired-recipe gate: '
+                      f'{sorted(set(_pair_why.values()))}')
+            if len(controlled) < 2:
+                if common:
+                    print(f'[m0-analysis] {name}/{label}: fewer than 2 controlled '
+                          'paired seed(s) — the cross-scale log ratio is refused')
                 continue
+            pa = {s: float(ra_by_seed[s]['ppl']) for s in controlled}
+            pb = {s: float(rb_by_seed[s]['ppl']) for s in controlled}
+            common = controlled
             lr = L.paired_log_ratio([pa[s] for s in common], [pb[s] for s in common], seeds=common)
             try:
                 _cfp = _panel_corpus_fp(summary, a)

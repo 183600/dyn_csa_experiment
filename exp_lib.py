@@ -1635,8 +1635,15 @@ def _causal_quantile_exact(x, cols, target_block_tokens, _full_range=False):
         for c0 in range(0, nc, col_chunk):
             c1 = min(c0 + col_chunk, nc)
             cc = cols[c0:c1]
+            # Pad with NaN, not +inf: sort places NaN after every finite
+            # value, so a NaN *inside* the causal prefix lands at the same
+            # rank regardless of how many future padding entries exist.  With
+            # +inf padding, the future length shifted the prefix NaN's sorted
+            # position and broke tau_T[:T'] == tau_T'.  The quantile indices
+            # never reach the padded tail (lo <= c), so finite prefixes are
+            # unaffected.
             masked = torch.where(idx[None, None, :] <= cc[None, :, None],
-                                 xr[:, None, :], float('inf'))
+                                 xr[:, None, :], float('nan'))
             masked = masked.sort(dim=-1).values
             _lc = lo_c[c0:c1][None, :, None].expand(b, c1 - c0, 1)
             _hc = hi_c[c0:c1][None, :, None].expand(b, c1 - c0, 1)
@@ -2437,8 +2444,13 @@ def _pool_parts_flat(counts_l, B, ov, n, pad_to=1):
     try:
         B = int(B)
         n = int(n)
+        if n <= 0 or n > np.iinfo(np.int32).max:
+            # The host flat transports int32 positions; a longer sequence
+            # would silently wrap the cumulative ends.  fall back to the
+            # on-device int64 form instead of returning wrong geometry.
+            return None
         counts_np = np.asarray(counts_l, dtype=np.int32)
-        if counts_np.shape != (B,) or n <= 0:
+        if counts_np.shape != (B,):
             return None
         # The content cache exists for repeated eval passes over an identical
         # cut table.  A very wide counts row makes each key several KiB while
@@ -2523,8 +2535,10 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
         W_b = max(int(ov_hi), 0)
         pa_rows = int(pa_rows)
         pb_rows = int(pb_rows)
+        if n <= 0 or n > np.iinfo(np.int32).max:
+            return None
         counts_np = np.asarray(counts_l, dtype=np.int32)
-        if counts_np.shape != (B,) or n <= 0 or max_len <= 0 or pa_rows <= 0 or pb_rows <= 0:
+        if counts_np.shape != (B,) or max_len <= 0 or pa_rows <= 0 or pb_rows <= 0:
             return None
         _ck = ('v', counts_np.tobytes(), B, ov, n, max_len, W_b, pa_rows, pb_rows, int(pad_to)) if B <= 1024 else None
         _hit = _pool_geom_content_get(_ck)
@@ -2597,8 +2611,10 @@ def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows, pad_to=1):
         n = int(n)
         max_len = int(max_len)
         p_rows = int(p_rows)
+        if n <= 0 or n > np.iinfo(np.int32).max:
+            return None
         counts_np = np.asarray(counts_l, dtype=np.int32)
-        if counts_np.shape != (B,) or n <= 0 or max_len <= 0 or p_rows <= 0:
+        if counts_np.shape != (B,) or max_len <= 0 or p_rows <= 0:
             return None
         _ck = ('s', counts_np.tobytes(), B, n, max_len, p_rows, int(pad_to)) if B <= 1024 else None
         _hit = _pool_geom_content_get(_ck)
@@ -3939,9 +3955,40 @@ def sink_softmax(logits, sink_logits, dim=-1):
     with torch.no_grad():
         return _sink_softmax_impl(logits, sink_logits, dim).detach()
 
+def _sink_aligned(sink_logits, logits):
+    """Broadcast a sink-logit table against ``logits[..., lanes]``.
+
+    The historical internal layout is ``[rows, heads, lanes]`` with one sink
+    per head, but the helper is public and must also handle a 1-D/2-D logits
+    table or a sink vector along any non-lane axis.  A one-element sink means
+    one shared sink; otherwise a vector of length ``logits.shape[-2]`` is
+    aligned to that axis.  Anything else must already be broadcastable to
+    ``logits.shape[:-1] + (1,)``."""
+    if sink_logits is None:
+        return None
+    target = tuple(int(x) for x in logits.shape[:-1]) + (1,)
+    if sink_logits.numel() == 1:
+        return sink_logits.reshape((1,) * len(target))
+    if (sink_logits.dim() == 1 and logits.dim() >= 2
+            and int(sink_logits.numel()) == int(logits.shape[-2])):
+        return sink_logits.reshape((1,) * (logits.dim() - 2)
+                                   + (int(sink_logits.numel()), 1))
+    try:
+        return sink_logits.reshape(target)
+    except RuntimeError:
+        try:
+            torch.broadcast_shapes(tuple(sink_logits.shape), target)
+        except RuntimeError:
+            raise ValueError(
+                f'sink_logits shape {tuple(sink_logits.shape)} is not broadcastable '
+                f'to logits shape {tuple(logits.shape)} (target {target})') from None
+        return sink_logits
+
+
 def _sink_log_normalizer(logits, sink_logits):
+    _sl = _sink_aligned(sink_logits, logits)
     return torch.logaddexp(
-        sink_logits.view(1, -1, 1),
+        _sl,
         torch.logsumexp(logits, dim=-1, keepdim=True))
 
 
@@ -3955,11 +4002,12 @@ def _sink_split_softmax(logits, sink_logits, want_sink=True):
     if sink_logits is None:
         return (sink_softmax(logits, None, -1), None)
     sink_logits = _safe_nan_to_num(sink_logits, where='sink_split')
+    _sl = _sink_aligned(sink_logits, logits)
     lse = _sink_log_normalizer(logits, sink_logits)
     soft = (logits - lse).exp()
     if not want_sink:
         return (soft, None)
-    return (soft, (sink_logits.view(1, -1, 1) - lse).exp())
+    return (soft, (_sl - lse).exp())
 
 _FO_FULL_CAP_BYTES = 64 << 20
 _FO_MINL = {}
@@ -4038,6 +4086,24 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     # the same exact integers, and advanced indexing / equality comparisons on
     # them return bitwise identical values.
     topk_l = topk_idx if topk_idx.dtype in (torch.int32, torch.int64) else topk_idx.long()
+    if _nblk_rows == 0 and topk_l.shape[1]:
+        # No compressed rows exist, so every block lane is necessarily invalid
+        # (the sliding-window lanes, if any, are independent).  Indexing
+        # last_tok / k_blk in that state crashes on the empty table.  Drop the
+        # impossible lanes instead of gathering them; the window lanes remain
+        # bit-identical to the zero-column call that is already tested.
+        topk_l = topk_l[:, :0]
+        if sel_valid is not None:
+            sel_valid = sel_valid[:, :0]
+        # A width-0 soft prior is exactly "no prior"; keeping a zero-width S
+        # path would double the A-path gradient (the same invariant as the
+        # entry check at the top of this function).
+        soft = None
+        # `k_all` was skipped because the call (before dropping the impossible
+        # lanes) looked like the soft path; the hard path still needs the
+        # row-contiguous [blocks | window] table.
+        if _has_sw and k_all is None and k_stacked is None and not soft_form:
+            k_all = torch.cat([k_blk, k_sw], 0)
     # The read-everything HCA arm passes the cached arange expansion (every
     # row is exactly arange(B)): last_tok[topk_l] then gathers one identical
     # copy of last_tok per row, so the same bool table comes out of a plain
@@ -8811,8 +8877,10 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
         raise ValueError(f'batch_iter: seed must be an exact integer, got {seed!r}')
     rng = np.random.default_rng(_rng_seed)
     n = len(train_ids) - seq_len - 1
-    if n <= 0:
-        raise ValueError(f'batch_iter needs len(train_ids) > seq_len+1 to sample causal windows, got len={len(train_ids)} seq_len={seq_len}. Increase n_train_tokens or reduce seq_len.')
+    if n < 0:
+        # len == seq_len+1 still contains exactly one valid causal window
+        # (start=0, targets up to len-1); only a shorter corpus is invalid.
+        raise ValueError(f'batch_iter needs len(train_ids) >= seq_len+1 to sample a causal window, got len={len(train_ids)} seq_len={seq_len}. Increase n_train_tokens or reduce seq_len.')
     train_ids = np.asarray(train_ids)
     _narrow = _ids_narrow(train_ids)
     _devkey = _dev_str(device)
@@ -9247,10 +9315,12 @@ def pair_reason(ra, rb):
     _fa, _fb = ra.get('run_cfg'), rb.get('run_cfg')
     if _fa is None or _fb is None:
         return 'unverifiable run_cfg'
-    # A boolean is a flag, not a configuration fingerprint: True == True would
-    # otherwise pair two runs whose configuration was never recorded.
-    if isinstance(_fa, (bool, np.bool_)) or isinstance(_fb, (bool, np.bool_)):
-        return 'unverifiable run_cfg (a boolean is not a configuration fingerprint)'
+    # The fingerprint is a non-empty string (the compact recipe stamp).  A
+    # boolean, number, list or dict is malformed provenance, and equal
+    # non-string values must not pair two runs whose configuration was never
+    # recorded.
+    if not isinstance(_fa, str) or not isinstance(_fb, str) or not _fa or not _fb:
+        return 'unverifiable run_cfg (not a non-empty configuration fingerprint string)'
     if _fa != _fb:
         return 'different run_cfg'
     # Controlled-variable gate for the settings the run fingerprint does not
@@ -14075,10 +14145,12 @@ def controlled_variables_report(recs, arms):
 
     def _cfg_get(r):
         _cfg = r.get('run_cfg')
-        # A boolean is a flag, not a configuration fingerprint (same rule as
-        # pair_reason); treat it as missing so the panel is not called
-        # controlled on two malformed records.
-        return None if isinstance(_cfg, (bool, np.bool_)) else _canon_setting(_cfg)
+        # The fingerprint is a non-empty string (same rule as pair_reason);
+        # booleans, numbers, lists and dicts are malformed provenance, so they
+        # are treated as missing rather than as a controlled configuration.
+        if not isinstance(_cfg, str) or not _cfg:
+            return None
+        return _canon_setting(_cfg)
 
     def _knobs_get(r):
         _knobs = r.get('train_knobs')

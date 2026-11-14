@@ -896,6 +896,11 @@ def main():
         cfg['outdir'] = 'results_open_block_aux'
     if args.command == 'extended':
         cfg['outdir'] = 'results_open_block_extended'
+    if args.command == 'pilot':
+        # A pilot is excluded from the formal statistics; sharing the main
+        # outdir would overwrite the main seed cells with short-run records
+        # (and make the fingerprint-mixing guard reject the whole panel).
+        cfg['outdir'] = 'results_open_block_pilot'
     if args.outdir is not None:
         cfg['outdir'] = args.outdir
     run_panel(cfg, matrix, device=L.DEVICE, synthetic=False,

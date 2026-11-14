@@ -9325,6 +9325,384 @@ def t_review8_controlled_variables_rejects_boolean_descriptors():
     assert cv['run_cfg_equal'] is None, cv
 
 
+
+def t_review9_freeze_mirror_missing_local_is_not_a_reset():
+    # Nulling the local lock fields must not reset the mirrored one-shot
+    # slice/corpus binding; only an explicit V12_REFREEZE may do that.
+    with tempfile.TemporaryDirectory() as root:
+        canon = os.path.join(root, 'results_lm_test')
+        os.makedirs(canon, exist_ok=True)
+        _old_outdir, _old_manifest = V12.TEST_OUTDIR, V12.FREEZE_MANIFEST
+        V12.TEST_OUTDIR = canon
+        V12.FREEZE_MANIFEST = os.path.join(root, 'confirmation_frozen.json')
+        try:
+            man = {'manifest_sha256': 'AAA', 'frozen_at': '2026-11-14',
+                   '_path': V12.FREEZE_MANIFEST}
+            V12._check_or_write_freeze_lock(canon, man, 'FP1', stage='accessed',
+                                            train_fp='TR1')
+            lp = V12._freeze_lock_path(canon)
+            lock = json.load(open(lp, encoding='utf-8'))
+            lock['test_ids_fp'] = None
+            lock['train_fp'] = None
+            with open(lp, 'w', encoding='utf-8') as f:
+                json.dump(lock, f)
+            try:
+                V12._check_or_write_freeze_lock(canon, man, 'FP2', stage='accessed',
+                                                train_fp='TR2')
+                raise AssertionError('nulling local lock fields bypassed the mirrored slice/corpus freeze')
+            except SystemExit as e:
+                assert 'mirror' in str(e) or 'disagrees' in str(e), e
+        finally:
+            V12.TEST_OUTDIR, V12.FREEZE_MANIFEST = _old_outdir, _old_manifest
+
+
+def t_review9_preaccess_lock_is_not_test_access():
+    # A pre-access attestation must not claim/behave like a test read: P5C
+    # stays available for the seed revision the power gate may require.
+    with tempfile.TemporaryDirectory() as root:
+        canon = os.path.join(root, 'results_lm_test')
+        os.makedirs(canon, exist_ok=True)
+        _old_outdir, _old_manifest = V12.TEST_OUTDIR, V12.FREEZE_MANIFEST
+        V12.TEST_OUTDIR = canon
+        V12.FREEZE_MANIFEST = os.path.join(root, 'confirmation_frozen.json')
+        try:
+            man = {'manifest_sha256': 'AAA', 'frozen_at': '2026-11-14',
+                   '_path': V12.FREEZE_MANIFEST}
+            V12._check_or_write_freeze_lock(canon, man, None,
+                                            stage='preaccess', train_fp='TR')
+            assert V12._lock_proves_test_access(V12._freeze_lock_path(canon)) is False
+            V12._p5c_post_access_guard()  # must not raise on a pre-access lock
+            V12._check_or_write_freeze_lock(canon, man, 'FP', stage='accessed',
+                                            train_fp='TR')
+            assert V12._lock_proves_test_access(V12._freeze_lock_path(canon)) is True
+            try:
+                V12._p5c_post_access_guard()
+                raise AssertionError('P5C must refuse after the test slice is bound')
+            except SystemExit:
+                pass
+            # An ambiguous/empty lock still fails closed.
+            with open(V12._freeze_lock_path(canon), 'w', encoding='utf-8') as f:
+                f.write('{}')
+            assert V12._lock_proves_test_access(V12._freeze_lock_path(canon)) is True
+        finally:
+            V12.TEST_OUTDIR, V12.FREEZE_MANIFEST = _old_outdir, _old_manifest
+
+
+def t_review9_power_artifact_must_match_the_manifest():
+    man = {'manifest_sha256': 'M', 'seeds': [0, 1],
+           'statistics': {'alpha': 0.05},
+           'primary_comparisons': [{'name': 'c1'}, {'name': 'c2'}]}
+    good = {'status': 'ok', 'manifest': 'M', 'alpha': 0.05, 'm_comparisons': 2,
+            'comparisons': {n: {'status': 'ok', 'seeds': [0, 1],
+                                'n_paired_seeds': 2} for n in ('c1', 'c2')}}
+    assert V12._power_artifact_problem(man, good) is None
+    assert V12._power_artifact_problem(man, dict(good, manifest='OLD')) is not None
+    bad_seed = json.loads(json.dumps(good))
+    bad_seed['comparisons']['c1']['seeds'] = [0]
+    bad_seed['comparisons']['c1']['n_paired_seeds'] = 1
+    assert V12._power_artifact_problem(man, bad_seed) is not None
+    bad_status = json.loads(json.dumps(good))
+    bad_status['comparisons']['c1']['status'] = 'no_data'
+    assert V12._power_artifact_problem(man, bad_status) is not None
+    skipped = {'status': 'skipped', 'manifest': 'M'}
+    if 'V12_SKIP_POWER' in os.environ:
+        del os.environ['V12_SKIP_POWER']
+    assert V12._power_artifact_problem(man, skipped) is not None
+    os.environ['V12_SKIP_POWER'] = '1'
+    try:
+        assert V12._power_artifact_problem(man, skipped) is None
+    finally:
+        del os.environ['V12_SKIP_POWER']
+
+
+def t_review9_probe_requires_manifest_hash():
+    root = tempfile.mkdtemp()
+    try:
+        path = os.path.join(root, 'probe.json')
+        raw = {}
+        for s in (0, 1):
+            for arm, ppl in (('learned', 10.0), ('dense', 11.0)):
+                raw[f'{arm}{s}'] = {'variant': 'csa_fixed', 'seed': s, 'arm': arm,
+                                    'eval_len': 4096, 'rho': 0.5, 'mode': 'uniform',
+                                    'ppl_mean': ppl, 'probe_params': {'n_seq': 16},
+                                    'val_fp': 'F', '_code': L.code_stamp()}
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
+        man = {'arms': ['csa_fixed'], 'seeds': [0, 1], 'manifest_sha256': 'M'}
+        miss = V12._test_probe_stats(path, man, 'F')
+        assert miss['n_admitted'] == 0 and miss['n_excluded'] == 4, miss
+        for rec in raw.values():
+            rec['manifest_sha256'] = 'M'
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
+        ok = V12._test_probe_stats(path, man, 'F')
+        assert ok['n_admitted'] == 4, ok
+        man_mode = dict(man, eval={'distractor_probe': {'mode': 'mask'}})
+        wrong_mode = V12._test_probe_stats(path, man_mode, 'F')
+        assert wrong_mode['n_admitted'] == 0, wrong_mode
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_review9_open_block_pilot_uses_its_own_outdir():
+    import open_block_supp as OB
+    old = OB.run_panel
+    seen = {}
+    def _fake(cfg, matrix, **kw):
+        seen['outdir'] = cfg['outdir']
+        seen['steps'] = cfg['steps']
+        return {}
+    OB.run_panel = _fake
+    old_argv = sys.argv
+    try:
+        sys.argv = ['open_block_supp.py', 'pilot']
+        assert OB.main() == 0
+        assert seen['outdir'] == 'results_open_block_pilot' and seen['steps'] == 100, seen
+        sys.argv = ['open_block_supp.py', 'pilot', '--outdir', 'custom_pilot']
+        assert OB.main() == 0
+        assert seen['outdir'] == 'custom_pilot', seen
+    finally:
+        OB.run_panel = old
+        sys.argv = old_argv
+
+
+def t_review9_run_cfg_must_be_a_string():
+    fp = 'steps1_d8_L1_csX'
+    base = dict(variant='a', seed=0, run_cfg=fp, steps=1, tokens_seen=1,
+                ppl=10.0, train_knobs=None, data_fp='d', val_fp='v',
+                eval_fp='e', init_core_fp='i')
+    for bad in ([fp], {'fp': fp}, 1, 1.0):
+        a = dict(base, run_cfg=bad)
+        b = dict(a, variant='b')
+        _w = L.pair_reason(a, b)
+        assert _w is not None and 'run_cfg' in _w, (bad, _w)
+        _w2 = BR._pair_reason(a, b)
+        assert _w2 is not None and 'run_cfg' in _w2, (bad, _w2)
+        cv = L.controlled_variables_report({('a', '', 0): a, ('b', '', 0): b},
+                                           ['a', 'b'])
+        assert cv['run_cfg_equal'] is None, (bad, cv)
+
+
+def t_review9_leakage_src_fp_checks_fallback_file():
+    cache = tempfile.mkdtemp(prefix='leak_fallback_')
+    try:
+        train = np.arange(60, dtype=np.int64)
+        np.save(os.path.join(cache, 'train_ids_y.npy'), train)
+        test = np.stack([np.arange(100, 110), np.arange(110, 120)]).astype(np.int64)
+        np.save(os.path.join(cache, 'test_ids_x.npy'), test)
+        with open(os.path.join(cache, 'meta_v4_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 200, 'src_fp': 'deadbeef'}, f)
+        with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 200}, f)
+        out = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
+        probs = out.get('checks', {}).get('src_fp_problems') or []
+        assert any('train' in p for p in probs), out
+    finally:
+        shutil.rmtree(cache, ignore_errors=True)
+
+
+def t_review9_tokenizer_identity_checks_encoding():
+    from tokenizers import Tokenizer, models
+    cache = tempfile.mkdtemp(prefix='tok_enc_')
+    try:
+        vocab = {'[UNK]': 0, 'a': 1, 'b': 2, 'ab': 3}
+        t_merge = Tokenizer(models.BPE(vocab=vocab, merges=[('a', 'b')],
+                                       unk_token='[UNK]'))
+        t_plain = Tokenizer(models.BPE(vocab=vocab, merges=[], unk_token='[UNK]'))
+        t_merge.save(os.path.join(cache, 'tok_v4_x.json'))
+        t_plain.save(os.path.join(cache, 'test_tok_x.json'))
+        tr = np.arange(40, dtype=np.int64) % 4
+        te = np.arange(4, 8, dtype=np.int64)
+        np.save(os.path.join(cache, 'train_ids_x.npy'), tr)
+        np.save(os.path.join(cache, 'test_ids_x.npy'), te)
+        meta = {'vocab': 4, 'fit_fp': 'same', 'src_fp': L._ids_fp(tr)}
+        with open(os.path.join(cache, 'meta_v4_x.json'), 'w', encoding='utf-8') as f:
+            json.dump(meta, f)
+        tm = {'vocab': 4, 'fit_fp': 'same'}
+        with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump(tm, f)
+        out = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=4)
+        ch = out['checks']
+        assert ch.get('tokenizer_vocab_identical') is True, ch
+        assert ch.get('tokenizer_encoding_config_identical') is False, ch
+        assert ch.get('tokenizer_encode_probe_identical') is False, ch
+        assert any('encoding' in p for p in ch.get('tokenizer_problems', [])), ch
+    finally:
+        shutil.rmtree(cache, ignore_errors=True)
+
+
+def t_review9_m0_cross_scale_uses_pair_gate():
+    fp = 'steps10_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    def panel(steps_dyn=10, seeds=range(4)):
+        out = {}
+        for v, base in (('csa_dynamic', 10.0), ('csa_fixed', 10.5),
+                        ('hybrid_dynamic', 10.2), ('full_matched', 11.0),
+                        ('full_sw128_matched', 10.8)):
+            for seed in seeds:
+                out[f'{v}::seed{seed}'] = dict(
+                    variant=v, seed=seed, run_cfg=fp,
+                    steps=steps_dyn if v == 'csa_dynamic' else 10,
+                    tokens_seen=(steps_dyn if v == 'csa_dynamic' else 10) * 10,
+                    ppl=base + 0.1 * seed, params=100, train_knobs=knobs,
+                    data_fp='d', val_fp='v')
+        return out
+    tmp = tempfile.mkdtemp()
+    try:
+        bad = M0.scale_analysis({'S1': panel(steps_dyn=20, seeds=range(4)),
+                                 'S2': panel(steps_dyn=10, seeds=range(3))},
+                                outdir=tmp)
+        ent = bad['cross_scale'].get('dynamic_vs_fixed') or {}
+        assert ent.get('status') == 'single_scale_only', ent
+        good = M0.scale_analysis({'S1': panel(steps_dyn=10, seeds=range(4)),
+                                  'S2': panel(steps_dyn=10, seeds=range(3))},
+                                 outdir=tmp)
+        ent2 = good['cross_scale'].get('dynamic_vs_fixed') or {}
+        assert 'meta' in ent2 and len(ent2.get('per_scale') or {}) == 2, ent2
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_review9_error_compare_validates_token_space():
+    import error_analysis as EA
+    base = {'vocab': 100, 'd': 8, 'n_layers': 1, 'n_heads': 1, 'd_head': 8,
+            'mlp_ratio': 4.0, 'cfg': ['c'], 'train_fp': 'T', 'eval_fp': 'E',
+            'code': 'K'}
+    assert EA._compare_reason(base, dict(base), 8, max_seq_a=16, max_seq_b=16) is None
+    assert EA._compare_reason(base, dict(base, vocab=101), 8) is not None
+    assert EA._compare_reason(base, dict(base, train_fp='T2'), 8) is not None
+    assert EA._compare_reason(base, dict(base, cfg=['other']), 8) is not None
+    assert EA._compare_reason(base, dict(base), 20, max_seq_a=16, max_seq_b=16) is not None
+    assert EA._compare_reason(base, dict(base, eval_fp=None), 8) is not None
+
+
+def t_review9_sink_softmax_broadcasts_shapes():
+    torch.manual_seed(0)
+    def _ref(logits, sink):
+        _s = sink.reshape((1,) * (logits.dim() - 1) + (1,)) if sink.numel() == 1 else sink
+        if logits.dim() >= 2 and sink.dim() == 1 and sink.numel() == logits.shape[-2]:
+            _s = sink.reshape((1,) * (logits.dim() - 2) + (sink.numel(), 1))
+        full = torch.cat([logits, _s.expand(*logits.shape[:-1], 1)], dim=-1)
+        return torch.softmax(full, dim=-1)[..., :-1]
+    for shape, sshape in (((5,), (1,)), ((4, 5), (1,)), ((4, 5), (4,)),
+                          ((2, 3, 4, 5), (4,)), ((2, 3, 4, 5), (1,))):
+        logits = torch.randn(*shape)
+        sink = torch.randn(*sshape)
+        got = L.sink_softmax(logits, sink)
+        assert got.shape == logits.shape, (shape, sshape, got.shape)
+        assert torch.allclose(got, _ref(logits, sink), atol=1e-6), (shape, sshape)
+
+
+def t_review9_gathered_attention_zero_block_rows():
+    torch.manual_seed(1)
+    n, h, d, w = 5, 2, 3, 3
+    q, k, v = (torch.randn(n, h, d) for _ in range(3))
+    last = torch.empty(0, dtype=torch.long)
+    zero = torch.empty(n, 0, dtype=torch.int32)
+    ref = L.gathered_attention(q, torch.empty(0, h, d), torch.empty(0, h, d),
+                               zero, last, k, v, w, 0.5, q_chunk=2,
+                               mem_budget_bytes=1 << 20)
+    got = L.gathered_attention(q, torch.empty(0, h, d), torch.empty(0, h, d),
+                               torch.zeros(n, 2, dtype=torch.int32), last,
+                               k, v, w, 0.5, q_chunk=2,
+                               mem_budget_bytes=1 << 20)
+    assert torch.equal(got, ref), 'impossible block lanes changed the window-only result'
+    # A non-empty soft prior over impossible lanes is still "no prior": it
+    # must not add a zero-width straight-through S path (which would double
+    # the A-path gradient).
+    qg, kg, vg = (t.clone().requires_grad_(True) for t in (q, k, v))
+    soft = torch.rand(n, 2)
+    got_g = L.gathered_attention(qg, torch.empty(0, h, d), torch.empty(0, h, d),
+                                 torch.zeros(n, 2, dtype=torch.int32), last,
+                                 kg, vg, w, 0.5, soft=soft, q_chunk=2,
+                                 mem_budget_bytes=1 << 20)
+    q0, k0, v0 = (t.detach().clone().requires_grad_(True) for t in (q, k, v))
+    ref_g = L.gathered_attention(q0, torch.empty(0, h, d), torch.empty(0, h, d),
+                                 zero, last, k0, v0, w, 0.5, q_chunk=2,
+                                 mem_budget_bytes=1 << 20)
+    gout = torch.autograd.grad(got_g.sum(), (qg, kg, vg))
+    rout = torch.autograd.grad(ref_g.sum(), (q0, k0, v0))
+    for a, b in zip(gout, rout):
+        assert torch.equal(a, b), 'impossible soft lanes changed the gradient'
+
+
+def t_review9_kernel_ref_zero_block_rows():
+    import csa_kernels as CK
+    torch.manual_seed(2)
+    R, T, nh, hd, w = 1, 4, 1, 2, 2
+    q = torch.randn(R, T, nh, hd)
+    k_sw = torch.randn(R, T, nh, hd)
+    v_sw = torch.randn_like(k_sw)
+    k_blk = torch.empty(R, 0, nh, hd)
+    v_blk = torch.empty_like(k_blk)
+    last = torch.empty(R, 0, dtype=torch.long)
+    ref = CK._attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw,
+                           torch.empty(R, T, 0, dtype=torch.int32), None,
+                           last, None, None, w, 1.0)
+    got = CK._attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw,
+                           torch.zeros(R, T, 2, dtype=torch.int32), None,
+                           last, None, None, w, 1.0)
+    assert torch.equal(got, ref), 'kernel ref indexed an empty block table'
+
+
+def t_review9_adaptive_threshold_nan_prefix_is_causal():
+    x = torch.tensor([[1., 2., float('nan'), 3., 4., 5., 6., 7.,
+                       float('inf'), 9., 10., 11.]])
+    full = L.causal_adaptive_threshold(x, 1)
+    sub = L.causal_adaptive_threshold(x[:, :9], 1)
+    torch.testing.assert_close(full[:, :9], sub, rtol=0.0, atol=0.0, equal_nan=True)
+
+
+def t_review9_batch_iter_accepts_one_window():
+    ids = np.arange(33, dtype=np.int64)
+    x, y = next(L.batch_iter(ids, 32, 2, torch.device('cpu'), seed=0))
+    assert tuple(x.shape) == (2, 32) and tuple(y.shape) == (2, 32)
+    assert torch.equal(y, x + 1) and int(x.min()) == 0 and int(y.max()) == 32
+    try:
+        next(L.batch_iter(ids[:32], 32, 2, torch.device('cpu'), seed=0))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a corpus shorter than seq_len+1 must still be refused')
+
+
+def t_review9_pool_geometry_int32_guard():
+    n = 2 ** 31
+    assert L._pool_parts_flat([n - 1, 1], 2, None, n) is None
+    assert L._pool_geom_flat_var([n - 1, 1], 2, 2, n, 4, 4, 4, 4) is None
+    assert L._pool_geom_flat_single([n - 1, 1], 2, n, 4, 4) is None
+
+
+def t_review9_v8_uncalibrated_source_is_not_called_calibrated():
+    import v8_supp as V8
+    old_cwd = os.getcwd()
+    tmp = tempfile.mkdtemp()
+    try:
+        os.chdir(tmp)
+        with open('run_time_state_v7.json', 'w', encoding='utf-8') as f:
+            json.dump({'sps_by_class': {}, 'norm_sps': None}, f)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            g = V8.make_guard()
+        assert not g.state.get('sps_by_class') and g.state.get('norm_sps') is None
+        txt = buf.getvalue()
+        assert 'no calibration data' in txt and 'calibrated from' not in txt, txt
+        with open('run_time_state_v7.json', 'w', encoding='utf-8') as f:
+            json.dump({'sps_by_class': {'x': 1.0}, 'norm_sps': 2.0}, f)
+        try:
+            os.remove('run_time_state_v8.json')
+        except FileNotFoundError:
+            pass
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            g2 = V8.make_guard()
+        assert g2.state.get('sps_by_class') == {'x': 1.0}
+        assert 'calibrated from' in buf2.getvalue(), buf2.getvalue()
+    finally:
+        os.chdir(old_cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -9611,6 +9989,23 @@ def main():
     _check('M16 group status reads seed counts exactly', t_review8_classify_requires_exact_seed_count)
     _check('M17 tuned pairing rejects boolean descriptors/fingerprints', t_review8_relaxed_tuned_pairing_rejects_flags)
     _check('M18 controlled-variable audit rejects boolean descriptors', t_review8_controlled_variables_rejects_boolean_descriptors)
+    _check('N1 freeze mirror: missing local fields are not a reset', t_review9_freeze_mirror_missing_local_is_not_a_reset)
+    _check('N2 pre-access attestation is not a test access', t_review9_preaccess_lock_is_not_test_access)
+    _check('N3 power artifact binds to the current manifest/seed panel', t_review9_power_artifact_must_match_the_manifest)
+    _check('N4 probe rows require the frozen manifest hash', t_review9_probe_requires_manifest_hash)
+    _check('N5 open-block pilot has its own outdir', t_review9_open_block_pilot_uses_its_own_outdir)
+    _check('N6 run_cfg is a non-empty configuration string', t_review9_run_cfg_must_be_a_string)
+    _check('N7 leakage src_fp checks the fallback cache file', t_review9_leakage_src_fp_checks_fallback_file)
+    _check('N8 tokenizer identity checks the encoding, not only vocab', t_review9_tokenizer_identity_checks_encoding)
+    _check('N9 M0 cross-scale pairs arms through pair_reason', t_review9_m0_cross_scale_uses_pair_gate)
+    _check('N10 error comparison validates token space/geometry', t_review9_error_compare_validates_token_space)
+    _check('N11 sink softmax broadcasts 1-D/2-D/non-head sinks', t_review9_sink_softmax_broadcasts_shapes)
+    _check('N12 zero block rows + non-empty top-k stays window-only', t_review9_gathered_attention_zero_block_rows)
+    _check('N12b kernel reference zero block rows + non-empty top-k', t_review9_kernel_ref_zero_block_rows)
+    _check('N13 adaptive threshold is causal with a NaN prefix', t_review9_adaptive_threshold_nan_prefix_is_causal)
+    _check('N14 batch_iter accepts exactly one causal window', t_review9_batch_iter_accepts_one_window)
+    _check('N15 host pooling geometry refuses int32 overflow', t_review9_pool_geometry_int32_guard)
+    _check('N16 v8 does not call an empty calibration calibrated', t_review9_v8_uncalibrated_source_is_not_called_calibrated)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -80,6 +80,47 @@ def _load_model(path):
     return model, d
 
 
+def _compare_reason(meta_a, meta_b, seq_len, max_seq_a=None, max_seq_b=None):
+    """Why two checkpoints cannot be compared token-for-token (None = OK).
+
+    `compare_token_errors` pairs token positions and decoded strings, which is
+    only meaningful when both checkpoints share the token space and the model
+    geometry.  It also runs the second model on the first model's validation
+    batch, so a shorter position table would fail after most of the work was
+    done."""
+    _arch = {'vocab': 8192, 'd': 256, 'n_layers': 6, 'n_heads': 8,
+             'd_head': 32, 'mlp_ratio': 4.0}
+    for _k, _default in _arch.items():
+        try:
+            _va = float(meta_a.get(_k, _default))
+            _vb = float(meta_b.get(_k, _default))
+        except (TypeError, ValueError, OverflowError):
+            return f'{_k} is not numeric in both checkpoints'
+        if _va != _vb:
+            return f'architecture differs on {_k} ({_va!r} vs {_vb!r})'
+    if meta_a.get('cfg') != meta_b.get('cfg'):
+        return 'layer configuration differs between the checkpoints'
+    for _k in ('train_fp', 'eval_fp'):
+        _va, _vb = meta_a.get(_k), meta_b.get(_k)
+        if (_va is None) != (_vb is None):
+            return f'unverifiable {_k} (only one checkpoint records it)'
+        if _va is not None and str(_va) != str(_vb):
+            return f'the checkpoints were measured on different {_k} slices'
+    _ca, _cb = meta_a.get('code'), meta_b.get('code')
+    if _ca is not None and _cb is not None and str(_ca) != str(_cb):
+        return f'checkpoint code semantics differ ({_ca!r} vs {_cb!r})'
+    _msb = max_seq_b if max_seq_b is not None else meta_b.get('train_len') or meta_b.get('max_seq')
+    try:
+        _msb = int(_msb) if _msb is not None else None
+        _sl = int(seq_len)
+    except (TypeError, ValueError, OverflowError):
+        return 'sequence length is not an exact integer'
+    if _msb is not None and _sl > _msb:
+        return (f'requested seq_len={_sl} exceeds checkpoint B position-table '
+                f'capacity max_seq={_msb}')
+    return None
+
+
 def _roundtrip(d):
     return json.loads(json.dumps(d, default=str))
 
@@ -132,6 +173,14 @@ def main(argv=None):
     paired = None
     if args.compare_ckpt:
         model_b, meta_b = _load_model(args.compare_ckpt)
+        _why = _compare_reason(meta, meta_b, seq_len,
+                               max_seq_a=getattr(model, 'max_seq', None),
+                               max_seq_b=getattr(model_b, 'max_seq', None))
+        if _why is not None:
+            raise SystemExit(f'[errors] REFUSE: --compare-ckpt is not a token-aligned '
+                             f'comparison: {_why}. Compare checkpoints from the same '
+                             'tokenizer/evaluation slice and geometry (e.g. two arms '
+                             'from the same run panel).')
         model_b.to(device)
         paired = L.compare_token_errors(model, model_b, val_batch, vocab, device,
                                         tokenizer=tok, top_n=args.top_tokens, chunk=args.chunk)

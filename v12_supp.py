@@ -229,6 +229,36 @@ def run_training_health(cfg=None):
     return report
 
 
+def _lock_proves_test_access(path):
+    """True when a freeze-lock file shows a test-split access.
+
+    A pre-access attestation (``stage='preaccess'`` and no bound test slice)
+    is NOT evidence that the held-out split was read: the power gate can
+    legitimately abort after writing it, and the protocol explicitly requires
+    adding seeds / revising the manifest before any test access.  An
+    unparseable or ambiguous lock still fails closed as an access."""
+    if not os.path.exists(path):
+        return False
+    try:
+        lock = json.load(open(path, encoding='utf-8'))
+    except Exception:
+        return True
+    if not isinstance(lock, dict):
+        return True
+    if lock.get('test_ids_fp') is not None:
+        return True
+    _stage = str(lock.get('stage') or '').strip().lower()
+    if _stage not in ('preaccess', 'pre-access', 'pre_access'):
+        return True
+    for _h in lock.get('history') or []:
+        if not isinstance(_h, dict):
+            return True
+        _hs = str(_h.get('stage') or '').strip().lower()
+        if _h.get('test_ids_fp') is not None or _hs in ('accessed', 'refreeze-test-fp'):
+            return True
+    return False
+
+
 def _p5c_post_access_guard():
     """Refuse P5C (re)training once the test split has been accessed.
 
@@ -237,10 +267,14 @@ def _p5c_post_access_guard():
     results, retrain a chosen (arm, seed) via P5C (which never checks the
     lock), and re-run P5T to overwrite that cell's measurement: selective
     re-measurement after seeing the held-out data is selection bias by
-    construction, exactly like adding seeds after the fact."""
+    construction, exactly like adding seeds after the fact.  A pre-access
+    attestation is not an access and must not block the pre-access revision
+    the protocol requires."""
     _refrz = os.environ.get('V12_REFREEZE', '').strip().lower() in ('1', 'true', 'yes', 'on')
-    _lock_present = (os.path.exists(_freeze_lock_path(TEST_OUTDIR))
-                     or os.path.exists(_freeze_lock_mirror_path()))
+    _lock_present = (_lock_proves_test_access(_freeze_lock_path(TEST_OUTDIR))
+                     or _lock_proves_test_access(_freeze_lock_mirror_path()))
+    if not _lock_present:
+        return
     if _lock_present and not _refrz:
         raise SystemExit(
             '[v12] REFUSE: phase P5C would (re)train frozen arms, but the test '
@@ -1083,15 +1117,21 @@ def _verify_lock_mirror(outdir, lock=None):
         _mv = mirror.get(_k)
         _lv = lock.get(_k)
         if _mv is None:
+            # The mirror predates the two-phase binding (or a failed mirror
+            # write left the key absent); a more specific local value can be
+            # backfilled, but it may never contradict a mirrored identity.
             continue
-        if _lv is None:
-            continue
-        if _mv != _lv:
+        if _lv != _mv:
+            if _refreeze:
+                print(f'[v12] WARNING: V12_REFREEZE=1 — the local lock disagrees with '
+                      f'the git-tracked mirror on {_k} ({_lv!r} vs {_mv!r}); the '
+                      'mirrored round must be reported as exploratory')
+                continue
             raise SystemExit(
                 f'[v12] REFUSE: the freeze lock in {outdir} disagrees with the git-tracked '
                 f'mirror on {_k} ({_lv!r} vs mirror {_mv!r}) — one of the two was modified '
-                f'independently. Investigate before any further test access '
-                f'(V12_REFREEZE=1 re-freezes consciously).')
+                f'independently (a missing local value is NOT a reset). Investigate before '
+                f'any further test access (V12_REFREEZE=1 re-freezes consciously).')
     return mirror
 
 
@@ -1703,6 +1743,71 @@ def run_power_check(cfg=None):
     return report
 
 
+def _power_artifact_problem(manifest, power):
+    """Why a ``p5c_power.json`` artifact cannot certify THIS frozen panel.
+
+    The artifact is the evidence that the pre-access power simulation was run
+    for the exact manifest and seed list that is about to consume the one-shot
+    test slice.  A leftover artifact from an earlier revision, an empty/failed
+    enumeration, or a different comparison family satisfies nothing."""
+    if not isinstance(power, dict):
+        return f'the artifact is not a JSON object ({type(power).__name__})'
+    _status = power.get('status')
+    _skip_now = os.environ.get('V12_SKIP_POWER', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    if _status == 'skipped':
+        if not _skip_now:
+            return ('the artifact records a V12_SKIP_POWER=1 override, but the '
+                    'override is not active for this run')
+        return None
+    if _status != 'ok':
+        return f"artifact status is {_status!r}, not 'ok' (the power simulation did not complete)"
+    _sha = manifest.get('manifest_sha256')
+    if power.get('manifest') != _sha:
+        return (f"manifest sha256 {str(power.get('manifest'))[:12]}… does not match "
+                f"the frozen manifest {str(_sha)[:12]}… (stale artifact from another plan)")
+    _stat = manifest.get('statistics') or {}
+    try:
+        _alpha = float(_stat.get('alpha', 0.05))
+        _m = len(manifest.get('primary_comparisons') or [])
+        _p_alpha = float(power.get('alpha'))
+        _p_m = int(power.get('m_comparisons'))
+    except (TypeError, ValueError, OverflowError):
+        return 'artifact alpha/m_comparisons is malformed'
+    if not (math.isfinite(_p_alpha) and abs(_p_alpha - _alpha) <= 1e-12):
+        return f'artifact alpha {_p_alpha!r} differs from the frozen alpha {_alpha!r}'
+    if _p_m != _m:
+        return f'artifact family size {_p_m} differs from the frozen {_m}'
+    _comps = power.get('comparisons')
+    if not isinstance(_comps, dict) or not _comps:
+        return 'artifact has no comparison entries'
+    _names = [str(c.get('name')) for c in (manifest.get('primary_comparisons') or [])]
+    if set(_comps) != set(_names):
+        return (f'artifact comparisons {sorted(_comps)} do not match the frozen '
+                f'family {sorted(_names)}')
+    _seeds = sorted({int(s) for s in (manifest.get('seeds') or [])})
+    for _name in _names:
+        _entry = _comps.get(_name)
+        if not isinstance(_entry, dict):
+            return f'{_name}: entry is not an object'
+        if _entry.get('status') != 'ok':
+            return f"{_name}: power status is {_entry.get('status')!r}, not 'ok'"
+        try:
+            _eseeds = sorted({int(s) for s in (_entry.get('seeds') or [])})
+        except (TypeError, ValueError, OverflowError):
+            return f'{_name}: artifact seed list is malformed'
+        if _eseeds != _seeds:
+            return (f'{_name}: artifact seeds {_eseeds} do not match the frozen '
+                    f'seed list {_seeds}')
+        try:
+            _n = int(_entry.get('n_paired_seeds'))
+        except (TypeError, ValueError, OverflowError):
+            return f'{_name}: n_paired_seeds is malformed'
+        if _n != len(_seeds):
+            return (f'{_name}: artifact has {_n} paired seed(s), the frozen panel '
+                    f'has {len(_seeds)}')
+    return None
+
+
 def run_finaltest(cfg=None, guard=None):
     """Evaluate the FROZEN confirmation set on the held-out test split.
 
@@ -1774,10 +1879,6 @@ def run_finaltest(cfg=None, guard=None):
         run_training_health({'manifest': cfg.get('manifest') or FREEZE_MANIFEST,
                              'ckpt_dir': cfg.get('ckpt_dir') or FINALTEST_CFG['ckpt_dir'],
                              'out': os.path.join(outdir, 'training_health.json')})
-    # Write the pre-access attestation BEFORE reading the held-out split, so a
-    # manifest mismatch is discovered before the one-shot access is used.
-    _check_or_write_freeze_lock(outdir, manifest, None, stage='preaccess',
-                                train_fp=_want_train_fp)
     if not _smoke:
         # Pre-access POWER gate (the manifest statistics.power_note obligation):
         # the sign-flip enumeration on the frozen arms' validation deltas must
@@ -1785,6 +1886,11 @@ def run_finaltest(cfg=None, guard=None):
         # read, so inadequate power is discovered while seeds can still be added
         # with a recorded revision — not after the access.  V12_SKIP_POWER=1 is
         # the explicit, artifact-recorded override.
+        #
+        # This gate runs BEFORE the pre-access lock is written: a failed power
+        # check legitimately requires a manifest revision and added seeds, and
+        # writing the lock first would falsely record a test access (and block
+        # the P5C retraining that revision needs).
         _power_path = os.path.join(outdir, 'p5c_power.json')
         if not os.path.exists(_power_path):
             if os.environ.get('V12_SKIP_POWER', '').strip().lower() in ('1', 'true', 'yes', 'on'):
@@ -1805,16 +1911,32 @@ def run_finaltest(cfg=None, guard=None):
         else:
             try:
                 _pow = json.load(open(_power_path, encoding='utf-8'))
-                if isinstance(_pow, dict) and _pow.get('status') == 'skipped':
-                    print('[v12] WARNING: the pre-access power artifact was SKIPPED (V12_SKIP_POWER=1) — this test access proceeds without the power simulation the manifest asks for')
-                elif isinstance(_pow, dict):
-                    for _k, _v in (_pow.get('comparisons') or {}).items():
-                        _pw = (_v.get('power_holm_conservative') or {}).get('q=0.80')
-                        print(f'  [p5t power] {_k}: n={_v.get("n_paired_seeds")} power(q=0.80)={_pw if _pw is None else round(float(_pw), 4)} min_same_sign={_v.get("min_same_sign_for_holm_confirmation")}')
-                    if _pow.get('low_power_warnings'):
-                        print(f'[v12] WARNING: the pre-access power artifact flags LOW POWER for {_pow["low_power_warnings"]} — the confirmation may be resolution-limited; this was known BEFORE the access')
             except Exception as _pe:
-                print(f'[v12] WARNING: the pre-access power artifact exists but cannot be read ({type(_pe).__name__}: {_pe})')
+                raise SystemExit(
+                    f'[v12] REFUSE: the pre-access power artifact {_power_path} exists but '
+                    f'cannot be read ({type(_pe).__name__}: {_pe}) — a confirmation run cannot '
+                    'proceed on an unreadable power attestation (fix it or set the explicit '
+                    'V12_SKIP_POWER=1 override)')
+            _pow_why = _power_artifact_problem(manifest, _pow)
+            if _pow_why is not None:
+                raise SystemExit(
+                    f'[v12] REFUSE: the pre-access power artifact {_power_path} does not '
+                    f'certify this frozen panel: {_pow_why}. Re-run `python v12_supp.py power` '
+                    'for the current manifest/seed list before touching the one-shot test '
+                    'split (V12_SKIP_POWER=1 is the explicit, recorded override).')
+            if _pow.get('status') == 'skipped':
+                print('[v12] WARNING: the pre-access power artifact was SKIPPED (V12_SKIP_POWER=1) — this test access proceeds without the power simulation the manifest asks for')
+            else:
+                for _k, _v in (_pow.get('comparisons') or {}).items():
+                    _pw = (_v.get('power_holm_conservative') or {}).get('q=0.80')
+                    print(f'  [p5t power] {_k}: n={_v.get("n_paired_seeds")} power(q=0.80)={_pw if _pw is None else round(float(_pw), 4)} min_same_sign={_v.get("min_same_sign_for_holm_confirmation")}')
+                if _pow.get('low_power_warnings'):
+                    print(f'[v12] WARNING: the pre-access power artifact flags LOW POWER for {_pow["low_power_warnings"]} — the confirmation may be resolution-limited; this was known BEFORE the access')
+    # Write the pre-access attestation only AFTER every zero-GPU gate passed,
+    # and still BEFORE reading the held-out split, so a manifest mismatch is
+    # discovered before the one-shot access is used.
+    _check_or_write_freeze_lock(outdir, manifest, None, stage='preaccess',
+                                train_fp=_want_train_fp)
     if test_ids is None:
         _t0 = time.time()
         test_ids, vocab_t, _, _ = L.load_wikitest(need, n_seqs=_nseq_clean)
@@ -2282,6 +2404,8 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
     exp_code = L.code_stamp()
     impl = _frozen_implementation(manifest)
     want_train_fp = _frozen_train_fp(manifest)
+    _want_probe_mode = str((((manifest.get('eval') or {}).get('distractor_probe')
+                            or {}).get('mode') or 'uniform'))
     _require_train_fp = _train_fp_required(manifest) or any(
         # A malformed truthy/falsey value still declares an intended binding;
         # presence, not truthiness, decides whether a descriptor is required.
@@ -2307,6 +2431,9 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             why = _geom_why
         elif r.get('variant') not in arms:
             why = f"variant {r.get('variant')!r} is not one of the frozen arms"
+        elif str(r.get('mode', 'uniform')) != _want_probe_mode:
+            why = (f"probe mode {r.get('mode', 'uniform')!r} is not the frozen "
+                   f"{_want_probe_mode!r} corruption mode")
         elif _seed_i is None or _seed_i not in seeds:
             why = f"seed {r.get('seed')!r} is outside the frozen whitelist"
         elif L._content_fp_text(r.get('val_fp')) != slice_fp:
@@ -2323,12 +2450,13 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             why = f"train_fp {_tfp_text} does not match the frozen canonical training fingerprint {want_train_fp}"
         elif _recipe_signature(manifest, r.get('variant')) is not None and not _recipe_matches_signature(r.get('recipe'), _recipe_signature(manifest, r.get('variant'))):
             why = 'recipe does not match the frozen training_recipe signature (including the per-arm mr)'
-        elif (r.get('manifest_sha256') is not None
-              and manifest.get('manifest_sha256') is not None
+        elif (manifest.get('manifest_sha256') is not None
               and r.get('manifest_sha256') != manifest.get('manifest_sha256')):
+            # A missing hash is not a match: legacy/hand-edited probe rows
+            # must not enter evidence for this freeze revision.
             why = (f"manifest_sha256 {str(r.get('manifest_sha256'))[:12]}… does not match the "
                    f"frozen manifest {str(manifest.get('manifest_sha256'))[:12]}… — the probe was "
-                   'measured under a different plan')
+                   'measured under a different plan (or carries no plan hash)')
         elif _implementation_reason(r, impl) is not None:
             why = _implementation_reason(r, impl)
         elif not L.ppl_is_usable(r.get('ppl_mean')):
