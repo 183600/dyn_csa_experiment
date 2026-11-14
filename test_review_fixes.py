@@ -9133,6 +9133,198 @@ def t_review7_load_wikitest_local_path_needs_no_datasets():
                 sys.modules['datasets'] = old_ds
 
 
+
+def t_review8_pair_train_knobs_descriptor_type():
+    # `train_knobs` is a structured descriptor.  Two equal booleans/lists mean
+    # neither record carries one; they must not pair as if controlled.
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    base = dict(variant='a', seed=0, run_cfg=fp, steps=1, tokens_seen=1, ppl=10.0)
+    knobs = dict(L.training_knobs())
+    ok = dict(base, train_knobs=knobs)
+    assert L.pair_reason(ok, dict(ok, variant='b')) is None
+    assert BR._pair_reason(ok, dict(ok, variant='b')) is None
+    for bad in (True, False, [1, 2], 'knobs', 1):
+        a = dict(base, train_knobs=bad)
+        b = dict(base, variant='b', train_knobs=bad)
+        why = L.pair_reason(a, b)
+        assert why is not None and 'unverifiable train_knobs' in why, (bad, why)
+        why2 = BR._pair_reason(a, b)
+        assert why2 is not None and 'unverifiable train_knobs' in why2, (bad, why2)
+    # One-sided presence is still unverifiable (and not accidentally a type
+    # complaint that hides the real reason).
+    a = dict(base, train_knobs=knobs)
+    b = dict(base, variant='b')
+    assert 'only one record' in (L.pair_reason(a, b) or '')
+    assert 'only one record' in (BR._pair_reason(a, b) or '')
+    # One dict and one boolean is not a shared descriptor either.
+    assert 'unverifiable train_knobs' in (L.pair_reason(a, dict(base, variant='b', train_knobs=True)) or '')
+    assert 'unverifiable train_knobs' in (BR._pair_reason(a, dict(base, variant='b', train_knobs=True)) or '')
+
+
+def t_review8_g0_certificate_requires_boolean_flags():
+    cert = {'status': 'pass', 'numeric_pass': True, 'benchmark_pass': True,
+            'training_tost_pass': True, 'code_semantics': L.CODE_SEMANTICS,
+            'kernel_stamp': L._kernel_stamp()}
+    assert L._g0_mismatch(cert) is None, L._g0_mismatch(cert)
+    # NumPy booleans are real booleans.
+    assert L._g0_mismatch(dict(cert, numeric_pass=np.bool_(True))) is None
+    # Truthy non-booleans are not evidence that a check passed.
+    for key in ('numeric_pass', 'benchmark_pass', 'training_tost_pass'):
+        for bad in ('false', 'true', 'yes', 1, 2, None, [], {}):
+            why = L._g0_mismatch(dict(cert, **{key: bad}))
+            assert why is not None and 'did not pass' in why, (key, bad, why)
+
+
+def t_review8_js_norm_handles_missing_normalized_field():
+    import data_guard as DG
+    import audit_gates as A
+    X = np.arange(12, dtype=float).reshape(6, 2)
+    y = [0, 0, 0, 1, 1, 1]
+    old = DG.categorical_shift_report
+    try:
+        DG.categorical_shift_report = lambda *_a, **_k: {
+            'js_divergence_normalized': None, 'js_divergence': None,
+            'total_variation': 0.0, 'n_reference': 1, 'n_holdout': 1,
+            'unseen_rate': 0.0}
+        rep = DG.data_quality_report(X, y=y, train_idx=[0, 1, 2],
+                                     val_idx=[3, 4, 5], fail_on_label_shift=True,
+                                     shift_threshold=0.5)
+        assert rep['status'] == 'fail', rep
+        assert any('label shift' in m for m in rep.get('hard_failures', [])), rep
+    finally:
+        DG.categorical_shift_report = old
+    # audit_gates must fall back to nats/ln2 when only the raw value is present,
+    # and must fail closed (not crash) when neither value is usable.
+    old_rep = DG.categorical_shift_report
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tag = 'tiny'
+        np.save(os.path.join(td, f'train_ids_{tag}.npy'), np.arange(40, dtype=np.int64))
+        np.save(os.path.join(td, f'val_batch_{tag}.npy'),
+                np.arange(100, 108, dtype=np.int64).reshape(2, 4))
+        with open(os.path.join(td, f'meta_{tag}.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 108, 'seq_len': 4, 'split_strategy': 'ordered',
+                       'shuffle_at_split': False, 'tokenizer_fit_split': 'train'}, f)
+        try:
+            DG.categorical_shift_report = lambda *_a, **_k: {
+                'js_divergence_normalized': None, 'js_divergence': None,
+                'total_variation': 0.0, 'n_reference': 1, 'n_holdout': 1,
+                'unseen_rate': 0.0}
+            out = A.audit_split_discipline(cache_dirs=[td], min_shift_tokens=1)
+            assert out['status'] == 'fail', out
+            assert any('cannot be evaluated' in w for w in out['warnings']), out['warnings']
+            DG.categorical_shift_report = lambda *_a, **_k: {
+                'js_divergence': math.log(2.0),
+                'total_variation': 1.0, 'n_reference': 1, 'n_holdout': 1,
+                'unseen_rate': 1.0}
+            out2 = A.audit_split_discipline(cache_dirs=[td], min_shift_tokens=1)
+            sh = out2['caches'][os.path.abspath(td)]['corpora'][tag]['train_val_shift']
+            assert sh['js_scale'].startswith('normalized'), sh
+            assert any('normalized' in w for w in out2['warnings']), out2['warnings']
+        finally:
+            DG.categorical_shift_report = old_rep
+
+
+def t_review8_fuse_masks_numpy_sampled_baseline():
+    import fuse_analysis as FA
+    old_rec, old_layers = FA.rec, FA.layers_of
+    try:
+        FA.layers_of = lambda *_a, **_k: ['L0_dyn']
+        FA.rec = lambda *_a, **_k: {'ppl': 10.0, 'stats': {'L0_dyn': {
+            'bnd_rand': 0.5, 'bnd_excess': 0.1,
+            'bnd_rand_exact': np.bool_(False)}}}
+        FA.per_seed_layer.cache_clear()
+        layers, M = FA.per_seed_layer('x', 'bnd_rand', (0,))
+        assert layers == ['L0_dyn'] and np.all(np.isnan(M)), M
+        _, M2 = FA.per_seed_layer('x', 'bnd_excess', (0,))
+        assert np.all(np.isnan(M2)), M2
+        FA.rec = lambda *_a, **_k: {'ppl': 10.0, 'stats': {'L0_dyn': {
+            'bnd_rand': 0.5, 'bnd_rand_exact': True}}}
+        FA.per_seed_layer.cache_clear()
+        _, M3 = FA.per_seed_layer('x', 'bnd_rand', (0,))
+        assert np.allclose(M3, 0.5), M3
+        FA.rec = lambda *_a, **_k: {'ppl': 10.0, 'stats': {'L0_dyn': {
+            'bnd_rand': np.float32(0.25), 'bnd_rand_exact': True}}}
+        FA.per_seed_layer.cache_clear()
+        _, M4 = FA.per_seed_layer('x', 'bnd_rand', (0,))
+        assert np.allclose(M4, 0.25), M4
+    finally:
+        FA.rec, FA.layers_of = old_rec, old_layers
+        FA.per_seed_layer.cache_clear()
+
+
+
+
+def t_review8_classify_requires_exact_seed_count():
+    base = {'controlled': True, 'significant_global': True,
+            'within_seed_noise': False, 'param_controlled': True,
+            'p_exact_signflip': 0.01, 'p_holm_component': 0.01}
+    # Boolean/fractional seed counts are not powered observations.
+    for bad_n in (True, False, 2.5, '2.5'):
+        e = dict(base, n=bad_n)
+        st = L._classify_group_status([e], min_n=2, alpha=0.05, m_family=1)
+        assert st == 'underpowered', (bad_n, st)
+    # An exact two-seed count is powered and can reach the verified tier.
+    assert L._classify_group_status([dict(base, n=2)], min_n=2, alpha=0.05,
+                                    m_family=1) == 'verified'
+    # The resolution floor must read n_nonzero exactly too; a boolean must not
+    # silently bypass the resolution-limited label.
+    e = dict(base, n=2, n_nonzero=True, within_seed_noise=False,
+             significant_global=False, p_holm_component=None)
+    assert L._classify_group_status([e], min_n=2, alpha=0.05,
+                                    m_family=1) == 'resolution_limited'
+
+
+
+def t_review8_relaxed_tuned_pairing_rejects_flags():
+    # The tuned-arm pairing rule is a separate gate; it must not become a back
+    # door for boolean descriptors/fingerprints that the strict rule rejects.
+    base = dict(variant='a', seed=0, steps=1, tokens_seen=1,
+                data_fp='d', val_fp='v', eval_fp='e',
+                train_knobs=dict(L.training_knobs()), params=100)
+    tuned = {'a': 'grid', 'b': 'grid'}
+    assert BT._relaxed_pair_reason(base, dict(base, variant='b'), tuned) is None
+    for bad in (True, False, [1, 2], 'knobs'):
+        a = dict(base, train_knobs=bad)
+        b = dict(a, variant='b')
+        why = BT._relaxed_pair_reason(a, b, tuned)
+        assert why is not None and 'train_knobs' in why, (bad, why)
+    for bad in (True, np.bool_(False)):
+        a = dict(base, eval_fp=bad)
+        b = dict(a, variant='b')
+        why = BT._relaxed_pair_reason(a, b, tuned)
+        assert why is not None and 'eval_fp' in why, (bad, why)
+    a = dict(base, train_knobs=dict(L.training_knobs()))
+    b = dict(base, variant='b', train_knobs=True)
+    why = BT._relaxed_pair_reason(a, b, tuned)
+    assert why is not None and 'train_knobs' in why, why
+
+
+
+def t_review8_controlled_variables_rejects_boolean_descriptors():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    def rec(v, tk):
+        return {'variant': v, 'seed': 0, 'ppl': 10.0, 'run_cfg': fp,
+                'train_knobs': tk}
+    recs = {('a', '', 0): rec('a', True), ('b', '', 0): rec('b', True)}
+    cv = L.controlled_variables_report(recs, ['a', 'b'])
+    assert cv['train_knobs_equal'] is None, cv
+    assert cv['controlled'] is None, cv
+    recs = {('a', '', 0): rec('a', True), ('b', '', 0): rec('b', False)}
+    cv = L.controlled_variables_report(recs, ['a', 'b'])
+    assert cv['train_knobs_equal'] is None, cv
+    # Real, equal object descriptors remain controlled on that field.
+    k = dict(L.training_knobs())
+    recs = {('a', '', 0): rec('a', k), ('b', '', 0): rec('b', dict(k))}
+    cv = L.controlled_variables_report(recs, ['a', 'b'])
+    assert cv['train_knobs_equal'] is True, cv
+    # A boolean run_cfg is not a configuration identity either.
+    recs = {('a', '', 0): dict(rec('a', k), run_cfg=True),
+            ('b', '', 0): dict(rec('b', k), run_cfg=True)}
+    cv = L.controlled_variables_report(recs, ['a', 'b'])
+    assert cv['run_cfg_equal'] is None, cv
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -9412,6 +9604,13 @@ def main():
     _check('M9 v12 frozen decision rule fails closed on malformed inputs', t_review7_frozen_rule_malformed_inputs)
     _check('M10 label-shift gate uses normalized JS', t_review7_label_shift_uses_normalized_js)
     _check('M11 load_wikitest local/cache path needs no datasets', t_review7_load_wikitest_local_path_needs_no_datasets)
+    _check('M12 train_knobs must be an object descriptor on both sides', t_review8_pair_train_knobs_descriptor_type)
+    _check('M13 G0 certificate pass flags must be real booleans', t_review8_g0_certificate_requires_boolean_flags)
+    _check('M14 normalized JS gate fails closed instead of crashing', t_review8_js_norm_handles_missing_normalized_field)
+    _check('M15 fuse analysis masks a NumPy sampled baseline flag', t_review8_fuse_masks_numpy_sampled_baseline)
+    _check('M16 group status reads seed counts exactly', t_review8_classify_requires_exact_seed_count)
+    _check('M17 tuned pairing rejects boolean descriptors/fingerprints', t_review8_relaxed_tuned_pairing_rejects_flags)
+    _check('M18 controlled-variable audit rejects boolean descriptors', t_review8_controlled_variables_rejects_boolean_descriptors)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

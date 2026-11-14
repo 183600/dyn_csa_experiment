@@ -2623,9 +2623,27 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             # threshold above ln(2) is a gate that can never fire, and it makes
             # the same threshold mean two different things between the numeric
             # shift checks and this categorical one.
-            _jsn = float(_sh.get('js_divergence_normalized',
-                                 float(_sh.get('js_divergence', 0.0)) / math.log(2.0)))
-            if _jsn > shift_threshold:
+            _jsn = None
+            for _js_key, _js_denom in (('js_divergence_normalized', 1.0),
+                                       ('js_divergence', math.log(2.0))):
+                _js_v = _sh.get(_js_key)
+                if isinstance(_js_v, (bool, np.bool_)):
+                    continue
+                try:
+                    _js_f = float(_js_v)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(_js_f):
+                    _jsn = _js_f / _js_denom
+                    break
+            if _jsn is None:
+                _msg = (f'{name} label shift: normalized JS divergence is '
+                        'unavailable — the shift gate cannot be evaluated')
+                if fail_on_label_shift:
+                    hard_failures.append(_msg)
+                else:
+                    warnings.append(_msg)
+            elif _jsn > shift_threshold:
                 _msg = (f'{name} label shift: normalized JS divergence '
                         f"{_jsn:.3f} > {shift_threshold}")
                 if fail_on_label_shift:

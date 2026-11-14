@@ -715,6 +715,10 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     fam = []
     for n in prim_names:
         p = results[n].get('p_exact_signflip')
+        if isinstance(p, (bool, np.bool_)):
+            # A flag is not a probability; float(False) would become p=0 and
+            # slip through the Holm family as the strongest possible result.
+            p = float('nan')
         try:
             p = float(p)
         except (TypeError, ValueError, OverflowError):
@@ -734,7 +738,9 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
         e = _cell_efficiency(cell['record'])
         if e is not None:
             efficiency[f'{v}::seed{s}'] = e
-    _prim_n = [int(results[n].get('n') or 0) for n in prim_names if results[n].get('n')]
+    _prim_n = [L._as_seed_int(results[n].get('n')) for n in prim_names
+               if L._as_seed_int(results[n].get('n')) is not None]
+    _prim_n = [n for n in _prim_n if n > 0]
     # The family's finest attainable p is set by the best-resolved (largest-n)
     # comparison, not the smallest one.
     _prim_n_max = max(_prim_n) if _prim_n else 0

@@ -1197,12 +1197,29 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 tr_tok.size >= int(min_shift_tokens) and
                 va_tok.size >= int(min_shift_tokens))
             def _js_norm(report):
-                return float(report.get('js_divergence_normalized',
-                                        float(report.get('js_divergence', 0.0)) / math.log(2.0)))
+                # Read the normalized field first without evaluating a fallback
+                # eagerly: `get(key, float(report.get(...)))` converts the raw
+                # value even when the normalized key exists (and crashes on an
+                # explicit None).  A malformed/absent reading returns None so
+                # the caller can fail closed instead of crashing.
+                for _key, _denom in (('js_divergence_normalized', 1.0),
+                                     ('js_divergence', math.log(2.0))):
+                    _v = report.get(_key)
+                    if isinstance(_v, (bool, np.bool_)):
+                        continue
+                    try:
+                        _f = float(_v)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if math.isfinite(_f):
+                        return _f / _denom
+                return None
             jsv = _js_norm(rec['train_val_shift'])
             rec['train_val_shift']['js_scale'] = 'normalized (js / ln2, in [0, 1])'
             if rec['train_val_shift']['reliable']:
-                if jsv >= float(js_fail):
+                if jsv is None:
+                    _fail(f'{cd}/{tag}: train/val normalized JS divergence is absent or not finite — the distribution-shift gate cannot be evaluated')
+                elif jsv >= float(js_fail):
                     _warn(f'{cd}/{tag}: train/val token JS divergence {jsv:.3f} (normalized) >= {js_fail} — material distribution shift')
                 elif jsv >= float(js_warn):
                     _warn(f'{cd}/{tag}: train/val token JS divergence {jsv:.3f} (normalized) >= {js_warn}')
@@ -1217,7 +1234,9 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 jst = _js_norm(rec['train_test_shift'])
                 rec['train_test_shift']['js_scale'] = 'normalized (js / ln2, in [0, 1])'
                 if rec['train_test_shift']['reliable']:
-                    if jst >= float(js_fail):
+                    if jst is None:
+                        _fail(f'{cd}/{tag}: train/test normalized JS divergence is absent or not finite — the distribution-shift gate cannot be evaluated')
+                    elif jst >= float(js_fail):
                         _warn(f'{cd}/{tag}: train/test token JS divergence {jst:.3f} (normalized) >= {js_fail} — material distribution shift')
                     elif jst >= float(js_warn):
                         _warn(f'{cd}/{tag}: train/test token JS divergence {jst:.3f} (normalized) >= {js_warn}')

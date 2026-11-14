@@ -139,11 +139,16 @@ def per_seed_layer(variant, key, seeds):
         for j, lk in enumerate(layers):
             _cell = st.get(lk)
             if isinstance(_cell, dict):
-                v = _cell.get(key, np.nan)
-                if not isinstance(v, (int, float)) or isinstance(v, bool):
-                    v = np.nan
-                if key in ('bnd_rand', 'bnd_excess') and _cell.get('bnd_rand_exact') is False:
-                    if isinstance(v, (int, float)) and np.isfinite(v):
+                # Accept NumPy scalars as well as Python numbers (records are
+                # JSON floats on disk, but in-memory panels often carry
+                # np.float32).  Booleans are flags, not measurements.
+                _v = L._finite_scalar(_cell.get(key))
+                v = np.nan if _v is None else _v
+                _exact = _cell.get('bnd_rand_exact')
+                if (key in ('bnd_rand', 'bnd_excess')
+                        and isinstance(_exact, (bool, np.bool_))
+                        and not bool(_exact)):
+                    if np.isfinite(v):
                         n_sampled += 1
                     v = np.nan
                 M[i, j] = v

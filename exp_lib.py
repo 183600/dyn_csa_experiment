@@ -658,17 +658,26 @@ G0_OVERRIDE_ENV = 'CSA_ALLOW_UNVERIFIED_EAGER'
 def g0_certificate_path():
     return os.environ.get(G0_CERT_ENV) or DEFAULT_G0_CERT
 
+def _g0_pass_flag(value):
+    """A certificate pass flag must be an actual boolean True.
+
+    A JSON string ("false"), a non-zero number or any other truthy object is
+    not evidence that the corresponding check passed.  Accept both Python and
+    NumPy booleans (the writer stores Python bools; a caller may round-trip a
+    legacy object through NumPy)."""
+    return isinstance(value, (bool, np.bool_)) and bool(value)
+
 def _g0_mismatch(cert):
     """Return the first reason the certificate does not certify THIS tree."""
     if not isinstance(cert, dict):
         return 'certificate is not a JSON object'
     if cert.get('status') != 'pass':
         return f"certificate status is {cert.get('status')!r}, not 'pass'"
-    if not cert.get('numeric_pass'):
+    if not _g0_pass_flag(cert.get('numeric_pass')):
         return 'operator/model numeric equivalence did not pass'
-    if not cert.get('benchmark_pass'):
+    if not _g0_pass_flag(cert.get('benchmark_pass')):
         return 'G0 kernel/eager certificate did not pass (CUDA+triton required)'
-    if not cert.get('training_tost_pass'):
+    if not _g0_pass_flag(cert.get('training_tost_pass')):
         return 'training-level TOST equivalence did not pass'
     if str(cert.get('code_semantics')) != str(CODE_SEMANTICS):
         return f"code semantics {cert.get('code_semantics')!r} != current {CODE_SEMANTICS!r}"
@@ -9257,8 +9266,14 @@ def pair_reason(ra, rb):
     # both-absent keeps the permissive path.
     if (_ka is None) != (_kb is None):
         return 'unverifiable train_knobs (only one record carries the optimizer / lr-schedule / augmentation descriptor)'
-    if _ka is not None and _ka != _kb:
-        return 'different train_knobs (optimizer / lr schedule / grad-clip / augmentation / precision)'
+    if _ka is not None:
+        # The descriptor is a mapping.  Two identical booleans/lists are not a
+        # shared optimizer/schedule setting: both records simply failed to
+        # record one, and True == True would otherwise take the permissive path.
+        if not isinstance(_ka, dict) or not isinstance(_kb, dict):
+            return 'unverifiable train_knobs (the descriptor is not an object)'
+        if _ka != _kb:
+            return 'different train_knobs (optimizer / lr schedule / grad-clip / augmentation / precision)'
     # Precision / implementation mode are also recorded at the top level on
     # newer records.  Compare them explicitly (the descriptor above already
     # covers records that carry it) so an fp32-vs-bf16 or row-loop-vs-batched
@@ -14059,10 +14074,17 @@ def controlled_variables_report(recs, arms):
     _totals = {a: sum(1 for (v, _t, _s) in recs if v == a) for a in arms}
 
     def _cfg_get(r):
-        return _canon_setting(r.get('run_cfg'))
+        _cfg = r.get('run_cfg')
+        # A boolean is a flag, not a configuration fingerprint (same rule as
+        # pair_reason); treat it as missing so the panel is not called
+        # controlled on two malformed records.
+        return None if isinstance(_cfg, (bool, np.bool_)) else _canon_setting(_cfg)
 
     def _knobs_get(r):
-        return _canon_setting(r.get('train_knobs'))
+        _knobs = r.get('train_knobs')
+        # The descriptor is an object.  Equal booleans/lists carry no optimizer
+        # or schedule settings, so they are unverifiable, not controlled.
+        return _canon_setting(_knobs) if isinstance(_knobs, dict) else None
 
     def _hp_get(r, k):
         hp = r.get('hyperparams')
@@ -14414,7 +14436,13 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
     usable = [e for e in entries if e.get('controlled') and (not require_param_match or e.get('param_controlled') is True)]
     if not usable:
         return 'unverified'
-    powered = [e for e in usable if int(e.get('n') or 0) >= int(min_n)]
+    def _entry_n(entry):
+        # Seed counts are exact integers.  `int(True) == 1` would make a
+        # boolean flag look like a one-seed powered contrast; a malformed count
+        # is treated as zero, never as a pass.
+        _n = _as_seed_int(entry.get('n'))
+        return _n if _n is not None else 0
+    powered = [e for e in usable if _entry_n(e) >= int(min_n)]
     # The n floor is a precondition for every positive verdict: a liberal
     # alpha cannot turn an underpowered contrast into a 'verified' one.
     if not powered:
@@ -14440,10 +14468,11 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
         # set by the nonzero pair count.  Using the declared n here would claim
         # a finer p grid than the test actually has and hide a resolution
         # ceiling behind 'noise_level'.
-        _n_eff = e.get('n_nonzero')
+        _n_eff = _as_seed_int(e.get('n_nonzero'))
         if _n_eff is None:
-            _n_eff = e.get('n')
-        fl = holm_min_attainable_p(_n_eff or 0, m_family, alpha)
+            _n_eff = _as_seed_int(e.get('n'))
+        fl = holm_min_attainable_p(_n_eff if _n_eff is not None else 0,
+                                   m_family, alpha)
         if math.isfinite(fl) and fl > alpha:
             return 'resolution_limited'
     # Powered, at least one non-noise contrast, resolution floor below alpha,
@@ -14965,7 +14994,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 lists['significant'].append(comp)
             if any(e.get('significant') for e in entries if e.get('controlled')):
                 lists['nominally_significant'].append(comp)
-            if any(int(e.get('n') or 0) >= int(min_n) and e.get('controlled') for e in entries):
+            if any((_as_seed_int(e.get('n')) or 0) >= int(min_n) and e.get('controlled') for e in entries):
                 # `lists['measured']` doubles as the descriptive tier "has a
                 # controlled, powered contrast" (see the printed report line),
                 # so a component whose exclusive status is already 'measured'

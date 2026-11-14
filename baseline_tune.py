@@ -412,8 +412,13 @@ def _relaxed_pair_reason(a, b, tuned_arms):
                 return f'{k} differs ({_ta[:12]!r} vs {_tb[:12]!r})'
     # The evaluation slice is part of the measurement identity even when the
     # training corpus matches; a one-sided or differing eval_fp is not paired.
-    _ea = L._content_fp_text(a.get('eval_fp'))
-    _eb = L._content_fp_text(b.get('eval_fp'))
+    _ra, _rb = a.get('eval_fp'), b.get('eval_fp')
+    if isinstance(_ra, (bool, np.bool_)) or isinstance(_rb, (bool, np.bool_)):
+        # A boolean is a flag, not an evaluation-slice identity.  Both-boolean
+        # would otherwise collapse to the absent-vs-absent permissive path.
+        return 'unverifiable eval_fp (a boolean is not an evaluation-slice fingerprint)'
+    _ea = L._content_fp_text(_ra)
+    _eb = L._content_fp_text(_rb)
     if (_ea is None) != (_eb is None):
         return 'unverifiable eval_fp (only one record carries the evaluation-slice fingerprint)'
     if _ea is not None and _ea != _eb:
@@ -425,8 +430,12 @@ def _relaxed_pair_reason(a, b, tuned_arms):
     ka, kb = a.get('train_knobs'), b.get('train_knobs')
     if (ka is None) != (kb is None):
         return 'unverifiable train_knobs (only one record carries the optimizer/schedule/augmentation descriptor)'
-    if ka is not None and ka != kb:
-        return 'different train_knobs (optimizer / LR-schedule / grad-clip / augmentation)'
+    if ka is not None:
+        # The descriptor is an object; equal booleans/lists carry no settings.
+        if not isinstance(ka, dict) or not isinstance(kb, dict):
+            return 'unverifiable train_knobs (the descriptor is not an object)'
+        if ka != kb:
+            return 'different train_knobs (optimizer / LR-schedule / grad-clip / augmentation)'
     # Seed equality does not imply initialization equality: different
     # architectures consume different amounts of RNG.  The shared-trunk digest
     # is the machine check that the paired seeded arms actually started equal.

@@ -609,8 +609,14 @@ def _pair_reason(ra, rb):
     _ka, _kb = (ra.get('train_knobs'), rb.get('train_knobs'))
     if (_ka is None) != (_kb is None):
         return 'unverifiable train_knobs (only one record carries the optimizer / lr-schedule / augmentation descriptor)'
-    if _ka is not None and _ka != _kb:
-        return 'different train_knobs (optimizer / lr schedule / grad-clip / augmentation / precision)'
+    if _ka is not None:
+        # Mirror exp_lib.pair_reason: the descriptor must be an object.  Two
+        # equal booleans/lists mean neither record carries a real descriptor,
+        # not that the two runs share one.
+        if not isinstance(_ka, dict) or not isinstance(_kb, dict):
+            return 'unverifiable train_knobs (the descriptor is not an object)'
+        if _ka != _kb:
+            return 'different train_knobs (optimizer / lr schedule / grad-clip / augmentation / precision)'
     for _k in ('amp_dtype', 'amp_grad_scaler', 'eager_batch'):
         _pa, _pb = (_k in ra), (_k in rb)
         if _pa != _pb:
