@@ -143,6 +143,28 @@ def _fold_backup_into_aggregate(adir):
         for _f in ('ppl_median', 'ppl_iqr', 'ppl_ci95_seed_t',
                    'ppl_ci95_doc_bootstrap', 'ppl_ci_seed_doc_combined'):
             lentry[_f] = None
+        # Seed-averaged secondary fields and the PPL curve must describe the
+        # SAME seed union as the recovered mean.  When every live seed is in
+        # the snapshot, the snapshot's fields describe the union exactly;
+        # otherwise the union has no reconstructable curve/mean and stale
+        # live-subset values must be removed instead of sitting next to the
+        # headline mean.
+        _live_only = set(sm_l) - set(sm_b)
+        _dependent = ('ppl_curve', 'avg_dyn_block_len', 'avg_block_len',
+                      'boundary_f1_dyn', 'boundary_excess_dyn',
+                      'delta_logit_mean')
+        if _live_only:
+            for _f in _dependent:
+                lentry.pop(_f, None)
+            lentry['seed_averaged_fields'] = ('withheld_after_seed_recovery '
+                                              '(snapshot and live seed sets differ)')
+        else:
+            for _f in _dependent:
+                if _f in bentry:
+                    lentry[_f] = bentry[_f]
+                else:
+                    lentry.pop(_f, None)
+            lentry['seed_averaged_fields'] = 'snapshot_union'
         recovered[key] = sorted(missing)
     if recovered:
         L.atomic_write_json(agg_path, merged, indent=2)
@@ -405,10 +427,16 @@ def merge_long_aggregate(adir, snapshot_agg):
                 _vo, _vn = (sentry.get(_f), fentry.get(_f))
                 _vn_ok = isinstance(_vn, (int, float)) and (not isinstance(_vn, bool)) and math.isfinite(_vn)
                 _vo_ok = isinstance(_vo, (int, float)) and (not isinstance(_vo, bool)) and math.isfinite(_vo)
-                if not _vn_ok:
-                    continue
                 if _fresh_covers:
-                    sentry[_f] = _vn
+                    # The fresh entry covers the whole union, so a field it
+                    # does not report is unavailable (not the snapshot's
+                    # live-subset value).
+                    if _vn_ok:
+                        sentry[_f] = _vn
+                    else:
+                        sentry.pop(_f, None)
+                elif not _vn_ok:
+                    continue
                 elif _overlap_warn:
                     # The snapshot mean still includes the overlapping seeds,
                     # so a weighted blend with the fresh mean (which also
@@ -425,6 +453,8 @@ def merge_long_aggregate(adir, snapshot_agg):
             if _fresh_covers:
                 if _cn:
                     sentry['ppl_curve'] = _cn
+                else:
+                    sentry.pop('ppl_curve', None)
             elif _co and _cn and not _overlap_warn:
                 _cm = {}
                 for _pt in _co:

@@ -122,14 +122,33 @@ def _compare_reason(meta_a, meta_b, seq_len, max_seq_a=None, max_seq_b=None):
             return f'architecture differs on {_k} ({_va!r} vs {_vb!r})'
     if meta_a.get('cfg') != meta_b.get('cfg'):
         return 'layer configuration differs between the checkpoints'
-    for _k in ('train_fp', 'eval_fp'):
+    for _k in ('train_fp',):
         _va, _vb = meta_a.get(_k), meta_b.get(_k)
         if (_va is None) != (_vb is None):
             return f'unverifiable {_k} (only one checkpoint records it)'
         if _va is not None and str(_va) != str(_vb):
             return f'the checkpoints were measured on different {_k} slices'
+
+    def _eval_slice_fp(meta):
+        # Older checkpoints persist the same evaluation-slice fingerprint as
+        # `val_fp`; current ones call it `eval_fp`.  Treat the two spellings as
+        # one identity so a one-sided/mismatched slice cannot slip through.
+        for _name in ('eval_fp', 'val_fp'):
+            if meta.get(_name) is not None:
+                return _name, meta.get(_name)
+        return None, None
+
+    _ka, _va = _eval_slice_fp(meta_a)
+    _kb, _vb = _eval_slice_fp(meta_b)
+    if (_va is None) != (_vb is None):
+        return 'unverifiable evaluation-slice fingerprint (only one checkpoint records it)'
+    if _va is not None and str(_va) != str(_vb):
+        return (f'the checkpoints were measured on different evaluation slices '
+                f'({_ka}={_va!r} vs {_kb}={_vb!r})')
     _ca, _cb = meta_a.get('code'), meta_b.get('code')
-    if _ca is not None and _cb is not None and str(_ca) != str(_cb):
+    if (_ca is None) != (_cb is None):
+        return 'unverifiable code semantics (only one checkpoint records it)'
+    if _ca is not None and str(_ca) != str(_cb):
         return f'checkpoint code semantics differ ({_ca!r} vs {_cb!r})'
     _msb = max_seq_b if max_seq_b is not None else meta_b.get('train_len') or meta_b.get('max_seq')
     try:

@@ -257,9 +257,13 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
         print(f'[archive] REFUSE: result dir(s) {_unsafe} resolve outside the repository — archive members must stay repo-relative')
         return 1
     _required = ['DECISION_LOG.md', 'RELEASES.md', 'confirmation_frozen.json']
-    _missing = [f for f in _required if not os.path.exists(os.path.join(REPO, f))]
+    # `_collect` only packs regular, repo-local files.  A symlink (even to an
+    # outside target) or a directory would satisfy os.path.exists but never
+    # enter the archive, so the release would silently omit its provenance.
+    _missing = [f for f in _required
+                if not _file_inside_repo(os.path.join(REPO, f))]
     if _missing:
-        print(f'[archive] REFUSE: formal release is missing required provenance file(s): {_missing}')
+        print(f'[archive] REFUSE: formal release is missing (or has a non-regular/out-of-repo) required provenance file(s): {_missing}')
         return 1
     # Provenance files alone are not an evidence release.  _collect always
     # adds them, so the later `not files` guard could never fire when every

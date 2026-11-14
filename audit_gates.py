@@ -307,14 +307,24 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     out['checks']['test_src_fp'] = test_meta.get('src_fp')
     _train_fit_fp = train_meta.get('fit_fp')
     _test_fit_fp = test_meta.get('fit_fp')
-    if not (_train_fit_fp and _test_fit_fp):
+    _fit_fp_ok = (isinstance(_train_fit_fp, str) and bool(_train_fit_fp.strip())
+                  and isinstance(_test_fit_fp, str) and bool(_test_fit_fp.strip()))
+    if not _fit_fp_ok:
         # The fit-corpus fingerprint is the binding proof that the tokenizer
-        # never saw valid/test text.  A missing one is unverified provenance,
-        # not a clean pass.
-        out['checks']['fit_fp_provenance'] = 'not_verified (train and/or test fit_fp is missing)'
+        # never saw valid/test text.  A missing, boolean or numeric value is
+        # unverified provenance, not a clean pass (True == True is not a
+        # corpus identity).
+        out['checks']['fit_fp_provenance'] = (
+            'not_verified (train and/or test fit_fp is missing or not a string)')
         out['status'] = 'warnings'
-        out['note'] = ('tokenizer fit-corpus provenance (fit_fp) is missing on at least '
-                       'one side; tokenizer/split provenance cannot be independently verified')
+        out['note'] = ('tokenizer fit-corpus provenance (fit_fp) is missing or malformed on '
+                       'at least one side; tokenizer/split provenance cannot be independently verified')
+    elif _train_fit_fp != _test_fit_fp:
+        out['checks']['fit_fp_provenance'] = (
+            f'not_verified (train {_train_fit_fp!r} != test {_test_fit_fp!r})')
+        out['status'] = 'fail'
+        out['note'] = ('the train and test caches record different tokenizer fit-corpus '
+                       'fingerprints; the id spaces cannot be paired')
     else:
         out['checks']['fit_fp_provenance'] = 'verified (train and test fit_fp agree)'
     _test_vocab_int = _as_int(test_meta.get('vocab'))
@@ -605,9 +615,33 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                         row_overlaps.append(_row_frac)
                 if row_overlaps:
                     max_row_overlap = float(max(row_overlaps))
-            _max_shingle_ov = float(os.environ.get('CSA_MAX_TEST_SHINGLE_OVERLAP', 0.25))
-            _max_row_ov = float(os.environ.get('CSA_MAX_TEST_ROW_OVERLAP', 0.50))
-            _viol = bool((test_overlap > _max_shingle_ov)
+            def _overlap_threshold(name, default):
+                # An overlap fraction lives on [0, 1].  A NaN comparison is
+                # always false and a threshold above 1 can never fire, so a
+                # malformed environment override would silently disable the
+                # leakage gate.
+                raw = os.environ.get(name)
+                if raw is None:
+                    return float(default)
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError, OverflowError):
+                    raise ValueError(
+                        f'{name}={raw!r} is not a number on the [0,1] overlap '
+                        'scale') from None
+                if not (math.isfinite(value) and 0.0 <= value <= 1.0):
+                    raise ValueError(
+                        f'{name}={raw!r} must be a finite fraction in [0,1]')
+                return value
+
+            _max_shingle_ov = _overlap_threshold('CSA_MAX_TEST_SHINGLE_OVERLAP', 0.25)
+            _max_row_ov = _overlap_threshold('CSA_MAX_TEST_ROW_OVERLAP', 0.50)
+            # With fewer than k tokens in every row (or an empty side) no
+            # shingle exists and the overlap is not measurable; reporting the
+            # default zero would claim a clean audit that never ran.
+            _measurable = bool(te_s.size and tr_s.size)
+            _viol = bool((not _measurable)
+                         or (test_overlap > _max_shingle_ov)
                          or (max_row_overlap is not None and max_row_overlap > _max_row_ov))
             out['checks']['doc_overlap'] = {
                 'shingle_k': int(shingle),
@@ -618,6 +652,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                 'test_rows_scanned_fraction': round(float(te_frac), 6),
                 'test_shingles': int(te_s.size),
                 'train_shingles': int(tr_s.size),
+                'measurable': _measurable,
                 'shared_shingles': inter,
                 'jaccard': jac,
                 'test_shingle_overlap': test_overlap,
@@ -642,13 +677,21 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             }
             if _viol:
                 out['status'] = 'fail'
-                out['note'] = (f'train/test document overlap exceeds the frozen policy '
-                               f'(test-shingle overlap {test_overlap:.4f} > {_max_shingle_ov}, '
-                               f'max row overlap {max_row_overlap} > {_max_row_ov}) — '
-                               'confirmation claims are UNAVAILABLE until the '
-                               'near-duplicate evaluation documents are excluded '
-                               '(or an explicit overlap-excluded sensitivity '
-                               'analysis is reported).')
+                if not _measurable:
+                    out['note'] = (
+                        'train/test overlap is NOT measurable: one side has no '
+                        f'{int(shingle)}-token shingle (train_shingles={int(tr_s.size)}, '
+                        f'test_shingles={int(te_s.size)}) — a clean overlap claim '
+                        'is unavailable; use a shingle length no longer than the '
+                        'shortest row and rebuild/audit the cache')
+                else:
+                    out['note'] = (f'train/test document overlap exceeds the frozen policy '
+                                   f'(test-shingle overlap {test_overlap:.4f} > {_max_shingle_ov}, '
+                                   f'max row overlap {max_row_overlap} > {_max_row_ov}) — '
+                                   'confirmation claims are UNAVAILABLE until the '
+                                   'near-duplicate evaluation documents are excluded '
+                                   '(or an explicit overlap-excluded sensitivity '
+                                   'analysis is reported).')
         else:
             out['checks']['doc_overlap'] = 'npy caches absent'
             if out['status'] == 'ok':
@@ -924,6 +967,15 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 continue
             rec['train_shape'] = list(tr.shape)
             rec['val_shape'] = list(va.shape)
+            if np.asarray(va).ndim != 2:
+                # A flat validation array is not a sequence batch.  Treating it
+                # as one giant row skips both the within-validation duplicate
+                # scan and the per-sequence train/val overlap check, so the
+                # split contract has not actually been audited.
+                rec['status'] = 'fail'
+                _fail(f'{cd}/{tag}: validation batch is not 2-D '
+                      f'(shape {list(np.asarray(va).shape)}) — row-level split '
+                      'isolation cannot be audited')
             rec['declared_split_strategy'] = meta.get('split_strategy') or 'unrecorded'
             rec['shuffle_at_split'] = meta.get('shuffle_at_split')
             rec['tokenizer_fit_split'] = meta.get('tokenizer_fit_split')

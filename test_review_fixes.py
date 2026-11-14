@@ -10603,6 +10603,201 @@ def t_round15_distribution_helpers_reject_boolean_arguments():
     assert L._f_sf(1.0, 3.0, np.bool_(True)) is None
 
 
+def t_round16_f_sf_and_trend_fail_closed():
+    # NaN is not an F statistic: the tail probability must be unavailable, not
+    # the smallest possible p-value.
+    assert L._f_sf(float('nan'), 3.0, 7.0) is None
+    assert L._f_sf(float('inf'), 3.0, 7.0) == 0.0
+    assert L._f_sf(float('-inf'), 3.0, 7.0) == 1.0
+    # The documented 0-D degenerate input returns a 0-D threshold, not shape (1,).
+    assert L.causal_adaptive_threshold(torch.tensor(0.3), 4).shape == torch.Size([])
+    # A paired exact reject can coexist with a huge seed spread.  The trend
+    # verdict must inherit paired_effect_stats' within-noise label.
+    pts = [{'label': 'A', 'scale': 1.0, 'effects': [0] * 6, 'seeds': list(range(6))},
+           {'label': 'B', 'scale': 10.0, 'effects': [1, 1, 1, 1, 1, 100],
+            'seeds': list(range(6))},
+           {'label': 'C', 'scale': 100.0, 'effects': [2, 2, 2, 2, 2, 200],
+            'seeds': list(range(6))}]
+    r = L.scaling_trend(pts, min_seeds=3, min_points=3)
+    assert r['paired']['within_seed_noise'] is True, r['paired']
+    assert r['within_seed_noise'] is True and r['significant'] is False, r
+    assert r['verdict'] != 'effect_increases_with_scale', r['verdict']
+    # Pooling underpowered scale points is not a common-effect claim.
+    mpts = [{'label': f'S{i}', 'scale': 10.0 ** i, 'effects': [0.1, 0.12],
+             'seeds': [0, 1]} for i in range(4)]
+    m = L.meta_analyze_effects(mpts, min_seeds=3)
+    assert m['n_underpowered_points'] == 4, m
+    assert m['poolable'] is False, m
+    # An exact sign-flip p below its attainable floor is internally
+    # inconsistent, not the strongest possible result.
+    st = {'n': 12, 'n_nonzero': 0, 'mean': 1.0, 'std': 0.1,
+          'p_exact_signflip': 0.0, 'p_holm': 0.0}
+    assert L.reportable_claim(st)['allowed'] is False, st
+    st2 = {'n': 100, 'n_nonzero': 6, 'mean': 1.0, 'std': 0.1,
+           'p_exact_signflip': 0.001, 'p_holm': 0.001}
+    assert L.reportable_claim(st2)['allowed'] is False, st2
+    st3 = {'n': 6, 'n_nonzero': 6, 'mean': 1.0, 'std': 0.1,
+           'p_exact_signflip': 0.03125, 'p_holm': 0.03125}
+    assert L.reportable_claim(st3)['allowed'] is True, st3
+
+
+def t_round16_leakage_overlap_gate_fails_closed():
+    cache = tempfile.mkdtemp(prefix='leak_gate_')
+    old_s, old_r = (os.environ.get('CSA_MAX_TEST_SHINGLE_OVERLAP'),
+                    os.environ.get('CSA_MAX_TEST_ROW_OVERLAP'))
+    try:
+        train = np.arange(60, dtype=np.int64)
+        test = np.stack([np.arange(0, 30), np.arange(30, 60)]).astype(np.int64)
+        np.save(os.path.join(cache, 'train_ids_x.npy'), train)
+        np.save(os.path.join(cache, 'test_ids_x.npy'), test)
+        with open(os.path.join(cache, 'meta_v4_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000, 'src_fp': 'train', 'fit_fp': 'f'}, f)
+        with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000, 'src_fp': 'test', 'fit_fp': 'f'}, f)
+        os.environ['CSA_MAX_TEST_SHINGLE_OVERLAP'] = 'nan'
+        bad = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
+        assert bad['status'] == 'fail', bad
+        assert 'failed' in str(bad['checks'].get('doc_overlap')), bad
+        os.environ.pop('CSA_MAX_TEST_SHINGLE_OVERLAP', None)
+        # A shingle longer than every test row is not a zero-overlap result.
+        short = A.audit_leakage(cache_dir=cache, shingle=40, max_rows_shingled=10)
+        ov = short['checks']['doc_overlap']
+        assert ov['measurable'] is False and ov['status'] == 'fail', ov
+        # A boolean fit fingerprint is not a corpus identity.
+        with open(os.path.join(cache, 'meta_v4_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000, 'src_fp': 'train', 'fit_fp': True}, f)
+        with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000, 'src_fp': 'test', 'fit_fp': True}, f)
+        fpbad = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
+        assert fpbad['checks']['fit_fp_provenance'].startswith('not_verified'), fpbad
+    finally:
+        for _k, _v in (('CSA_MAX_TEST_SHINGLE_OVERLAP', old_s),
+                       ('CSA_MAX_TEST_ROW_OVERLAP', old_r)):
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+        shutil.rmtree(cache, ignore_errors=True)
+
+
+def t_round16_split_audit_rejects_flat_validation():
+    with tempfile.TemporaryDirectory() as d:
+        tag = 'tiny'
+        tr = np.arange(40, dtype=np.int64)
+        va = np.arange(8, dtype=np.int64)
+        np.save(os.path.join(d, f'train_ids_{tag}.npy'), tr)
+        np.save(os.path.join(d, f'val_batch_{tag}.npy'), va)
+        with open(os.path.join(d, f'meta_{tag}.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 40, 'seq_len': 8, 'split_strategy': 'ordered',
+                       'shuffle_at_split': False,
+                       'tokenizer_fit_split': 'train'}, f)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['status'] == 'fail', rec
+        assert any('not 2-D' in w for w in out['warnings']), out
+
+
+def t_round16_seed_recovery_keeps_seed_averaged_fields_consistent():
+    import run_gapfill as RG
+    with tempfile.TemporaryDirectory() as td:
+        agg_path = os.path.join(td, 'aggregate.json')
+        base = {'variant': 'a', 'run_cfg': 'CFG_SAME'}
+        live = {'a': dict(base, seeds=[0], ppls=[5.0], n_seeds=1,
+                          ppl_mean=5.0, ppl_std=0.0,
+                          ppl_curve=[[10, 5.0]], avg_dyn_block_len=1.0)}
+        bak = {'a': dict(base, seeds=[0, 1], ppls=[5.0, 7.0], n_seeds=2,
+                         ppl_mean=6.0, ppl_std=math.sqrt(2.0),
+                         ppl_curve=[[10, 6.0]], avg_dyn_block_len=2.0)}
+        L.atomic_write_json(agg_path, live, indent=2)
+        L.atomic_write_json(agg_path + '.v6bak', bak, indent=2)
+        RG._fold_backup_into_aggregate(td)
+        m = json.load(open(agg_path, encoding='utf-8'))['a']
+        assert m['seeds'] == [0, 1] and m['ppl_mean'] == 6.0, m
+        assert m['ppl_curve'] == [[10, 6.0]] and m['avg_dyn_block_len'] == 2.0, m
+        assert m['seed_averaged_fields'] == 'snapshot_union', m
+        # A live-only seed makes the union larger than the snapshot: the
+        # snapshot curve/secondary means cannot describe it.
+        live2 = {'a': dict(base, seeds=[0, 2], ppls=[5.0, 9.0], n_seeds=2,
+                           ppl_mean=7.0, ppl_std=math.sqrt(8.0),
+                           ppl_curve=[[10, 7.0]], avg_dyn_block_len=3.0)}
+        L.atomic_write_json(agg_path, live2, indent=2)
+        L.atomic_write_json(agg_path + '.v6bak', bak, indent=2)
+        RG._fold_backup_into_aggregate(td)
+        m2 = json.load(open(agg_path, encoding='utf-8'))['a']
+        assert m2['seeds'] == [0, 1, 2], m2
+        assert 'ppl_curve' not in m2 and 'avg_dyn_block_len' not in m2, m2
+        # Fresh-covers-union merges must not retain snapshot-only curve/secondary
+        # fields when the fresh entry reports none.
+        fresh = {'h': {'variant': 'h', 'run_cfg': 'CFG_SAME', 'seeds': [0, 1],
+                       'ppls': [10.0, 12.0], 'n_seeds': 2,
+                       'ppl_mean': 11.0, 'ppl_std': math.sqrt(2.0)}}
+        snap = {'h': {'variant': 'h', 'run_cfg': 'CFG_SAME', 'seeds': [0, 1],
+                      'ppls': [10.0, 12.0], 'n_seeds': 2,
+                      'ppl_mean': 11.0, 'ppl_std': math.sqrt(2.0),
+                      'ppl_curve': [[10, 99.0]], 'avg_dyn_block_len': 9.0}}
+        L.atomic_write_json(agg_path, fresh, indent=2)
+        RG.merge_long_aggregate(td, snap)
+        mh = json.load(open(agg_path, encoding='utf-8'))['h']
+        assert 'ppl_curve' not in mh and 'avg_dyn_block_len' not in mh, mh
+
+
+def t_round17_error_compare_and_archive_fail_closed():
+    import error_analysis as EA
+    base = {'vocab': 100, 'd': 8, 'n_layers': 1, 'n_heads': 1, 'd_head': 8,
+            'mlp_ratio': 4.0, 'cfg': ['c'], 'train_fp': 'T', 'eval_fp': 'E',
+            'code': 'K'}
+    # One-sided code/eval provenance is unverifiable, like one-sided train_fp.
+    assert EA._compare_reason(base, {k: v for k, v in base.items() if k != 'code'},
+                              8, max_seq_a=16, max_seq_b=16) is not None
+    assert EA._compare_reason(base, {k: v for k, v in base.items() if k != 'eval_fp'},
+                              8, max_seq_a=16, max_seq_b=16) is not None
+    # v7 checkpoints call the same evaluation slice `val_fp`.
+    a = {k: v for k, v in base.items() if k != 'eval_fp'}
+    a['val_fp'] = 'V1'
+    b = dict(a)
+    assert EA._compare_reason(a, b, 8, max_seq_a=16, max_seq_b=16) is None
+    assert EA._compare_reason(a, dict(a, val_fp='V2'), 8,
+                              max_seq_a=16, max_seq_b=16) is not None
+
+    import archive_release as AR
+    root = tempfile.mkdtemp()
+    old_repo = AR.REPO
+    try:
+        repo = os.path.join(root, 'repo')
+        os.makedirs(repo)
+        for n in ('RELEASES.md', 'confirmation_frozen.json'):
+            with open(os.path.join(repo, n), 'w', encoding='utf-8') as f:
+                f.write('x')
+        outside = os.path.join(root, 'outside_log.md')
+        with open(outside, 'w', encoding='utf-8') as f:
+            f.write('outside')
+        os.symlink(outside, os.path.join(repo, 'DECISION_LOG.md'))
+        os.makedirs(os.path.join(repo, 'results_x'))
+        with open(os.path.join(repo, 'results_x', 'payload.txt'), 'w',
+                  encoding='utf-8') as f:
+            f.write('payload')
+        AR.REPO = repo
+        assert AR.cmd_make('v1', ['results_x'], outdir='arch') == 1
+    finally:
+        AR.REPO = old_repo
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_round17_report_keeps_key_only_variant():
+    # A legacy by-length record may name its arm only in the summary key.
+    # The table must include it instead of emitting an empty variant list.
+    rec = {'csa_fixed::seed0': {
+        'seed': 0, '_code': BR._CUR_CS, 'run_cfg': 'CFG',
+        'by_len': {'512': {'ppl': 10.0, 'truncated': False},
+                   '4096': {'ppl': 20.0, 'truncated': False}}}}
+    BR._LOADED[('summary', 'results_len')] = rec
+    try:
+        txt = BR.sec_p1l()
+    finally:
+        BR._LOADED.pop(('summary', 'results_len'), None)
+    assert 'csa_fixed' in txt and 'PPL@4096' in txt and '20.0' in txt, txt[:800]
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -10942,6 +11137,12 @@ def main():
     _check('N43 structural geometry counts are exact integers', t_round15_structural_geometry_counts_are_exact)
     _check('N44 corpus-audit metadata must be an object', t_round15_corpus_audit_meta_must_be_object)
     _check('N45 distribution helpers reject boolean args', t_round15_distribution_helpers_reject_boolean_arguments)
+    _check('N46 F-tail NaN + trend within-noise + meta seed floor', t_round16_f_sf_and_trend_fail_closed)
+    _check('N47 overlap gate rejects NaN thresholds / unmeasurable shingles', t_round16_leakage_overlap_gate_fails_closed)
+    _check('N48 split audit rejects a flat validation batch', t_round16_split_audit_rejects_flat_validation)
+    _check('N49 seed recovery keeps seed-averaged fields consistent', t_round16_seed_recovery_keeps_seed_averaged_fields_consistent)
+    _check('N50 error-analysis provenance + archive required-file symlinks', t_round17_error_compare_and_archive_fail_closed)
+    _check('N51 report keeps key-only legacy variant records', t_round17_report_keeps_key_only_variant)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

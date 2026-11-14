@@ -1683,8 +1683,9 @@ def causal_adaptive_threshold(sim, target_block_tokens):
     target_block_tokens = _target
     # A 0-D similarity is the T=1 degenerate case; normalise it to one row so
     # the shape[-1] access below does not raise IndexError (the returned value
-    # is squeezed back to the caller's 0-D shape at the end).
-    if sim.dim() == 0:
+    # is restored to the caller's 0-D shape at the end).
+    _scalar_input = sim.dim() == 0
+    if _scalar_input:
         sim = sim.reshape(1)
     if sim.numel() == 0:
         # Preserve the caller's shape: an empty batch [0, n] or a zero-width
@@ -1742,6 +1743,8 @@ def causal_adaptive_threshold(sim, target_block_tokens):
             out = torch.cat([pre_vals, sv[:, pos]], dim=1)
         out[:, 0] = float('-inf')
     out = out.to(sim.device)
+    if _scalar_input:
+        return out.reshape(())
     return out.squeeze(0) if squeeze else out
 
 
@@ -6982,14 +6985,26 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                         'test cache metadata does not attest document-disjoint '
                         'train/validation/test groups')
                 _shared = {'train': 0, 'validation': 0}
-                for _dp in _glob2.glob(os.path.join(cache_dir, 'train_doc_ids_v5_*.npy')):
+                _train_doc_paths = sorted(
+                    _glob2.glob(os.path.join(cache_dir, 'train_doc_ids_v5_*.npy')))
+                _val_doc_paths = sorted(
+                    _glob2.glob(os.path.join(cache_dir, 'val_doc_ids_*.npy')))
+                if not _train_doc_paths or not _val_doc_paths:
+                    # The test metadata claims whole-document isolation, but
+                    # without both paired sidecars the intersection cannot be
+                    # recomputed.  An empty glob is not a zero overlap.
+                    _problems.append(
+                        'test cache attests document isolation but the paired '
+                        'train/validation document-id sidecars are missing — the '
+                        'train/test and val/test intersections cannot be verified')
+                for _dp in _train_doc_paths:
                     try:
                         _shared['train'] += int(np.intersect1d(
                             np.load(_dp), test_doc_ids, assume_unique=False).size)
                     except Exception as _de:
                         _problems.append(
                             f'train document-id sidecar unreadable ({os.path.basename(_dp)}: {_de})')
-                for _dp in _glob2.glob(os.path.join(cache_dir, 'val_doc_ids_*.npy')):
+                for _dp in _val_doc_paths:
                     try:
                         _shared['validation'] += int(np.intersect1d(
                             np.load(_dp), test_doc_ids, assume_unique=False).size)
@@ -7015,16 +7030,31 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         for _mp in _glob2.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
             try:
                 _mt = json.load(open(_mp, encoding='utf-8'))
-            except Exception:
-                continue
+            except Exception as _me:
+                raise RuntimeError(
+                    f'load_wikitest: {_mp} cannot be parsed '
+                    f'({type(_me).__name__}: {_me}) — the train cache metadata '
+                    'is corrupt, so the test tokenizer identity cannot be '
+                    'paired; rebuild the cache') from _me
             if not isinstance(_mt, dict):
                 raise RuntimeError(
                     f'load_wikitest: {_mp} is {type(_mt).__name__}, not a JSON '
                     'object — the train cache metadata is corrupt, so the test '
                     'tokenizer identity cannot be paired; rebuild the cache')
-            if _mt.get('fit_fp'):
-                _train_fit_fps.add(_mt['fit_fp'])
-        if _train_fit_fps and meta.get('fit_fp') not in _train_fit_fps:
+            _mt_fit = _mt.get('fit_fp')
+            if _mt_fit is not None and (not isinstance(_mt_fit, str) or not _mt_fit.strip()):
+                raise RuntimeError(
+                    f'load_wikitest: {_mp} has a non-string/empty fit_fp '
+                    f'({_mt_fit!r}); a boolean or number is not a corpus '
+                    'fingerprint — rebuild the cache')
+            if _mt_fit:
+                _train_fit_fps.add(_mt_fit)
+        _test_fit = meta.get('fit_fp')
+        if _test_fit is not None and (not isinstance(_test_fit, str) or not _test_fit.strip()):
+            _problems.append(
+                f'test cache fit_fp {_test_fit!r} is not a non-empty string '
+                'fingerprint')
+        if _train_fit_fps and _test_fit not in _train_fit_fps:
             raise RuntimeError(
                 'load_wikitest: the cached test split was tokenised with a fit '
                 f"corpus fingerprint {meta.get('fit_fp')!r} that is absent from "
@@ -7130,8 +7160,11 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     for _mp in _glob.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
         try:
             _mobj = json.load(open(_mp, encoding='utf-8'))
-        except Exception:
-            continue
+        except Exception as _me:
+            raise RuntimeError(
+                f'load_wikitest: {_mp} cannot be parsed '
+                f'({type(_me).__name__}: {_me}) — the train cache metadata is '
+                'corrupt; rebuild the cache') from _me
         if not isinstance(_mobj, dict):
             raise RuntimeError(
                 f'load_wikitest: {_mp} is {type(_mobj).__name__}, not a JSON '
@@ -7223,8 +7256,11 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     for _mp in _glob.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
         try:
             _mt = json.load(open(_mp, encoding='utf-8'))
-        except Exception:
-            continue
+        except Exception as _me:
+            raise RuntimeError(
+                f'load_wikitest: {_mp} cannot be parsed '
+                f'({type(_me).__name__}: {_me}) — the train cache metadata is '
+                'corrupt; rebuild the cache') from _me
         if not isinstance(_mt, dict):
             raise RuntimeError(
                 f'load_wikitest: {_mp} is {type(_mt).__name__}, not a JSON '
@@ -10073,6 +10109,8 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     # by the number of NONZERO pairs.  Fall back to n when the stats dict
     # lacks that field.
     _n_eff_raw = stats.get('n_nonzero', n)
+    _n_eff_explicit = 'n_nonzero' in stats and stats.get('n_nonzero') is not None
+    _n_eff_valid = False
     if isinstance(_n_eff_raw, (bool, np.bool_)):
         # A boolean is malformed provenance, not a nonzero-pair count.  Use the
         # declared n for the reported floor but fail the claim closed: silently
@@ -10092,6 +10130,8 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             out['reasons'].append(
                 f'n_nonzero {_n_eff_raw!r} is not an exact integer in [0, n={n}]')
             _n_eff = n
+        else:
+            _n_eff_valid = True
     out['p_floor'] = signflip_p_floor(_n_eff) if _n_eff > 0 else None
     if n < _min_n:
         out['reasons'].append(f'n={n} < min_n={_min_n}: the exact-test p floor is {out["p_floor"]:.3g} > alpha' if out['p_floor'] is not None else f'n={n} < min_n={_min_n}')
@@ -10104,6 +10144,22 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
         out['reasons'].append(f'raw p {_praw!r} is not a probability in [0,1]')
     elif not (_praw < _alpha):
         out['reasons'].append(f'raw p {_praw:.3g} is not < alpha={_alpha}')
+    # An exact sign-flip p cannot be smaller than its attainable floor.  A
+    # caller that explicitly declares the nonzero-pair count and an exact p
+    # has supplied internally inconsistent evidence; accepting p=0 (or a p
+    # below 2/2^k) would let a malformed artifact make the strongest claim.
+    if (_n_eff_explicit and _n_eff_valid and _praw is not None
+            and stats.get('p_exact_signflip') is not None
+            and math.isfinite(_praw)):
+        if _n_eff == 0:
+            if _praw < 1.0:
+                out['reasons'].append(
+                    'exact sign-flip p < 1 with zero nonzero pairs (the test '
+                    'has no sign to flip)')
+        elif out['p_floor'] is not None and _praw < out['p_floor']:
+            out['reasons'].append(
+                f'exact sign-flip p {_praw:.3g} is below the attainable floor '
+                f'{out["p_floor"]:.3g} for n_nonzero={_n_eff}')
     if require_holm:
         _ph = out['p_holm']
         if _ph is None:
@@ -11374,8 +11430,15 @@ def _f_sf(f, df1, df2):
         return None
     if not (df1 > 0.0 and df2 > 0.0):
         return None
-    if f != f or f == float('inf'):
+    if f != f:
+        # NaN is not a statistic; the other tail helpers return NaN/None for
+        # it.  Mapping it to p=0 would turn a failed fit into the strongest
+        # possible evidence.
+        return None
+    if f == float('inf'):
         return 0.0
+    if f == float('-inf'):
+        return 1.0
     try:
         if f <= 0.0:
             return 1.0
@@ -11917,14 +11980,20 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     _pi = ([mu_re - _tc_pi * math.sqrt(tau2 + se_re ** 2),
             mu_re + _tc_pi * math.sqrt(tau2 + se_re ** 2)]
            if math.isfinite(_tc_pi) else None)
+    _n_underpowered = int(sum(1 for r in usable if r.get('underpowered')))
     out.update({'fixed_effect': {'mean': mu_fe, 'se': float(math.sqrt(1.0 / sw)), 'ci': [mu_fe - _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw), mu_fe + _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw)]},
                 'random_effects': {'mean': mu_re, 'se': se_re, 'ci': [mu_re - tc * se_re, mu_re + tc * se_re]},
                 'heterogeneity': {'Q': q, 'df': int(df), 'p': p_q, 'I2_percent': i2, 'tau2': tau2,
                                   'method': 'Cochran Q + DerSimonian-Laird tau^2'},
                 'prediction_interval': _pi,
                 'prediction_interval_df': (int(_pi_df) if math.isfinite(_tc_pi) else None),
-                'poolable': bool(len(usable) >= 3 and df > 0 and i2 <= 50.0 and (not math.isfinite(p_q) or p_q >= alpha)),
-                'note': 'poolable requires >=3 scales, I2<=50% and a non-significant Q; otherwise report per-scale effects only'})
+                'n_underpowered_points': _n_underpowered,
+                'poolable': bool(len(usable) >= 3 and df > 0 and i2 <= 50.0
+                                 and (not math.isfinite(p_q) or p_q >= alpha)
+                                 and _n_underpowered == 0),
+                'note': ('poolable requires >=3 scales, every contributing scale at '
+                         'min_seeds, I2<=50% and a non-significant Q; otherwise report '
+                         'per-scale effects only')})
     out['status'] = 'ok'
     return _unscale_effect_fields(out, _effect_exp)
 
@@ -12252,8 +12321,15 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     underpowered = (bool(paired.get('underpowered')) if paired_primary
                     else _unpaired_underpowered)
     too_few_scales = k < int(min_points)
+    # The paired exact test can reject while the per-seed slopes are smaller
+    # than their own spread (e.g. one huge slope plus five near-zero ones).
+    # `paired_effect_stats` already classifies that as within-seed noise; the
+    # trend verdict must not promote the same evidence to "significant".
+    within_seed_noise = (bool(paired.get('within_seed_noise'))
+                         if paired_primary else False)
     sig = bool(p_primary is not None and math.isfinite(float(p_primary)) and float(p_primary) < alpha
-               and not resolution_limited and not underpowered and not too_few_scales)
+               and not resolution_limited and not underpowered and not too_few_scales
+               and not within_seed_noise)
     het = het_for_verdict
     heterogeneous = bool(float(het.get('I2_percent') or 0.0) > 75.0 or (isinstance(het.get('p'), float) and math.isfinite(het['p']) and het['p'] < alpha))
     # Direction must come from the same slope that carries the inference.  The
@@ -12267,6 +12343,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     out['significant'] = sig
     out['resolution_limited'] = resolution_limited
     out['underpowered'] = underpowered
+    out['within_seed_noise'] = within_seed_noise
     out['direction_slope'] = direction_slope
     if heterogeneous:
         verdict = 'heterogeneous_trend'

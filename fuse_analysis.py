@@ -365,6 +365,10 @@ def main(argv=None):
             probe['p_ppl'] = float(p_ppl) if p_ppl is not None else None
             probe['n'] = int(len(d_f1))
             probe['n_ppl'] = int(len(d_ppl))
+            # Zero deltas do not add sign-flip resolution; the report's floor
+            # must use the same nonzero-pair count as the exact test.
+            probe['n_eff_f1'] = int(np.count_nonzero(d_f1))
+            probe['n_eff_ppl'] = int(np.count_nonzero(d_ppl))
         else:
             probe['x_d_f1'] = float(d_f1.mean()) if len(d_f1) else None
             probe['x_sd_f1'] = float(sample_std(d_f1)) if len(d_f1) > 1 else None
@@ -611,6 +615,8 @@ def main(argv=None):
     lines.append('\n## 机制结论（与上方计算结果一致）\n')
     _n_p = probe.get('n')
     _n_pp = probe.get('n_ppl')
+    _n_p_eff = probe.get('n_eff_f1', _n_p)
+    _n_pp_eff = probe.get('n_eff_ppl', _n_pp)
     _f1_d, _f1_p = (probe.get('d_f1'), probe.get('p_f1'))
     _ppl_d, _ppl_p = (probe.get('d_ppl'), probe.get('p_ppl'))
     # F1 and PPL are two displayed tests in one family.  Use the repo's
@@ -619,22 +625,22 @@ def main(argv=None):
     # "significant".
     _fuse_holm = L.holm_adjust([('f1', _f1_p), ('ppl', _ppl_p)])
 
-    def _fuse_gate(_key, _n, _mean, _std, _p):
+    def _fuse_gate(_key, _n, _n_eff, _mean, _std, _p):
         _ph = (_fuse_holm.get(_key) or {}).get('p_holm')
         return bool(L.reportable_claim(
-            {'n': _n, 'mean': _mean, 'std': _std,
+            {'n': _n, 'n_nonzero': _n_eff, 'mean': _mean, 'std': _std,
              'p_exact_signflip': _p, 'p_holm': _ph},
             family_size=2, min_n=6, require_holm=True)['allowed'])
 
-    _f1_sig = _fuse_gate('f1', _n_p, _f1_d, probe.get('sd_f1'), _f1_p)
-    _ppl_sig = _fuse_gate('ppl', _n_pp, _ppl_d, probe.get('sd_ppl'), _ppl_p)
+    _f1_sig = _fuse_gate('f1', _n_p, _n_p_eff, _f1_d, probe.get('sd_f1'), _f1_p)
+    _ppl_sig = _fuse_gate('ppl', _n_pp, _n_pp_eff, _ppl_d, probe.get('sd_ppl'), _ppl_p)
     _blk_stable = bool(_blk) and _blk_max <= 0.01
     if _f1_d is None:
         _c1 = f'1. **边界 F1 的同面板配对差未测量**（n={_n_p or 0} 的可用配对不足），本节不对 F1 方向作断言。\n'
     elif _f1_sig:
         _c1 = f'1. **同面板配对下 fuse 显著改变了边界 F1**：hybrid 栈按 seed 配对（n={_n_p}），ΔF1 = **{_pv('d_f1')}**（±{_psd('sd_f1')}），p(exact) = **{_pv('p_f1', '{:.3f}')}** < 0.05——「F1 差不稳固」的读法在本轮产物上不成立。\n'
     else:
-        _f1_floor = L.signflip_p_floor(_n_p) if isinstance(_n_p, int) and _n_p > 0 else float('nan')
+        _f1_floor = L.signflip_p_floor(_n_p_eff) if isinstance(_n_p_eff, int) and _n_p_eff > 0 else float('nan')
         _f1_floor_txt = f'p 值打在 n={_n_p} 的分辨率下限上，不能排除是噪声' if _f1_p is not None and math.isfinite(_f1_floor) and (abs(_f1_p - _f1_floor) < 1e-12) else f'p={_pv('p_f1', '{:.3f}')}，高于 n={_n_p or '?'} 的分辨率下限 {_f1_floor:.3f}，不能排除是噪声'
         _x_f1 = probe.get('x_d_f1')
         if _x_f1 is None or not np.isfinite(_x_f1):
@@ -647,7 +653,7 @@ def main(argv=None):
     elif _ppl_sig:
         _c3 = f'3. **PPL 存在可分辨的差异**：同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')} < 0.05），「PPL 不变」的读法在本轮产物上不成立。\n'
     else:
-        _ppl_floor = L.signflip_p_floor(_n_pp) if isinstance(_n_pp, int) and _n_pp > 0 else float('nan')
+        _ppl_floor = L.signflip_p_floor(_n_pp_eff) if isinstance(_n_pp_eff, int) and _n_pp_eff > 0 else float('nan')
         _ppl_floor_txt = f'配对符号翻转 p 值打在 n={_n_pp} 的分辨率下限上，任何差异不能排除是种子噪声' if _ppl_p is not None and math.isfinite(_ppl_floor) and (abs(_ppl_p - _ppl_floor) < 1e-12) else f'配对符号翻转 p={_pv('p_ppl', '{:.3f}')}，高于 n={_n_pp or '?'} 的分辨率下限 {_ppl_floor:.3f}，任何差异不能排除是种子噪声'
         _x_ppl = probe.get('x_d_ppl_csa')
         _x_ppl_txt = f'，跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL' if _x_ppl is not None and np.isfinite(_x_ppl) else '，跨面板纯 CSA 对比未测量'

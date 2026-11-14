@@ -1760,10 +1760,26 @@ def run_power_check(cfg=None):
         for s in manifest.get('seeds') or []:
             ra = summary.get(f'{a}::seed{s}') or {}
             rb = summary.get(f'{b}::seed{s}') or {}
-            if ra.get('synthesized') or rb.get('synthesized'):
+            if (not isinstance(ra, dict) or not isinstance(rb, dict)
+                    or ra.get('synthesized') or rb.get('synthesized')):
                 continue
-            pa = ((ra.get('by_len') or {}).get(Ln) or (ra.get('by_len') or {}).get(str(Ln)) or {}).get('ppl')
-            pb = ((rb.get('by_len') or {}).get(Ln) or (rb.get('by_len') or {}).get(str(Ln)) or {}).get('ppl')
+            # The pre-access power read must use the same code semantics as
+            # the frozen plan.  A stale record from an earlier code stamp can
+            # carry a different measurement definition even when its PPL is
+            # numerically usable.
+            if ra.get('_code') != V.CKPT_CODE or rb.get('_code') != V.CKPT_CODE:
+                continue
+            ca = ((ra.get('by_len') or {}).get(Ln)
+                  or (ra.get('by_len') or {}).get(str(Ln)) or {})
+            cb = ((rb.get('by_len') or {}).get(Ln)
+                  or (rb.get('by_len') or {}).get(str(Ln)) or {})
+            if not isinstance(ca, dict) or not isinstance(cb, dict):
+                continue
+            # A truncated cell did not evaluate the frozen endpoint length;
+            # its PPL cannot certify power at that length.
+            if ca.get('truncated') is not False or cb.get('truncated') is not False:
+                continue
+            pa, pb = ca.get('ppl'), cb.get('ppl')
             if L.ppl_is_usable(pa) and L.ppl_is_usable(pb):
                 deltas[int(s)] = float(pa) - float(pb)
         ordered = [deltas[s] for s in sorted(deltas)]
