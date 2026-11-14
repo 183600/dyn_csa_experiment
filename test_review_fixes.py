@@ -10002,6 +10002,205 @@ def t_round11b_saddlepoint_and_tost_scale():
         assert L.tost_paired([x * _c for x in _inside], 0.3 * _c)['ci_within_margin'] is True, _c
 
 
+
+def t_round13_kernel_soft_invalid_lane_gradients():
+    # A row whose usable soft lanes are all zero must not send S-path
+    # gradients to non-causal blocks (the kernel reference must match eager).
+    import csa_kernels as CK
+    torch.manual_seed(13)
+    R, T, nh, hd, w, nb = 1, 2, 1, 2, 0, 2
+    q = torch.randn(R, T, nh, hd, dtype=torch.float64)
+    k_blk = torch.randn(R, nb, nh, hd, dtype=torch.float64)
+    v_blk = torch.randn_like(k_blk)
+    k_sw = torch.empty(R, T, nh, hd, dtype=torch.float64)
+    v_sw = torch.empty_like(k_sw)
+    topk = torch.tensor([[[0, 1], [0, 1]]])
+    last = torch.tensor([[0, 1]])
+    sel = torch.ones(R, T, nb, dtype=torch.bool)
+    soft = torch.tensor([[[1.0, 0.5], [0.0, 0.5]]], dtype=torch.float64)
+
+    def _eager():
+        qg = q[0].clone().requires_grad_(True)
+        kg = k_blk[0].clone().requires_grad_(True)
+        vg = v_blk[0].clone().requires_grad_(True)
+        sg = soft[0].clone().requires_grad_(True)
+        out = L.gathered_attention(qg, kg, vg, topk[0], last[0], None, None,
+                                   w, 0.5, soft=sg, sel_valid=sel[0], q_chunk=1)
+        wgt = torch.arange(1, out.numel() + 1, dtype=out.dtype).view_as(out)
+        g = torch.autograd.grad((out * wgt).sum(), (qg, kg, vg, sg))
+        return out.detach(), g
+
+    def _kernel():
+        qg = q.clone().requires_grad_(True)
+        kg = k_blk.clone().requires_grad_(True)
+        vg = v_blk.clone().requires_grad_(True)
+        sg = soft.clone().requires_grad_(True)
+        out = CK.gathered_attention_kernel(
+            qg, kg, vg, topk, last, k_sw, v_sw, w, 0.5,
+            soft=sg, sel_valid=sel, impl='ref')
+        wgt = torch.arange(1, out.numel() + 1, dtype=out.dtype).view_as(out)
+        g = torch.autograd.grad((out * wgt).sum(), (qg, kg, vg, sg))
+        return out.detach(), g
+
+    out_e, g_e = _eager()
+    out_k, g_k = _kernel()
+    assert torch.equal(out_e, out_k[0]), 'kernel soft forward changed'
+    for name, a, b in zip(('q', 'k', 'v', 'soft'), g_e, g_k):
+        assert torch.allclose(a.reshape_as(b), b, atol=1e-12, rtol=0.0), (
+            f'kernel {name} gradient disagrees with eager on an all-zero soft row')
+    assert not bool(g_k[3][0, 1, 1]), 'non-causal block received a soft gradient'
+
+
+def t_round13_paired_log_ratio_no_cancellation():
+    a = 1e300 * (1.0 + 1e-14)
+    r = L.paired_log_ratio([a], [1e300])
+    _want = math.log1p((a - 1e300) / 1e300)
+    assert r['n'] == 1 and abs(r['effects'][0] - _want) < 1e-20, (r, _want)
+    assert r['effects'][0] > 0.0, r
+    # Ordinary ratios keep the same value as the plain log difference.
+    for x, y in ((3.0, 2.0), (2.0, 3.0), (1.0, 1.0)):
+        assert abs(L.paired_log_ratio([x], [y])['effects'][0]
+                   - (math.log(x) - math.log(y))) < 1e-12
+
+
+def t_round13_seed_t_ci_scale_invariance():
+    vals = [0.9e200, 1.0e200, 1.1e200]
+    ci = L._seed_t_ci(vals)
+    assert ci is not None and all(math.isfinite(x) for x in ci), ci
+    base = L._seed_t_ci([0.9, 1.0, 1.1])
+    for c in (1e-200, 1e-12, 1e12, 1e200):
+        got = L._seed_t_ci([x * c for x in (0.9, 1.0, 1.1)])
+        assert got is not None and all(math.isfinite(x) for x in got), (c, got)
+        assert abs(got[0] / c - base[0]) < 1e-9 and abs(got[1] / c - base[1]) < 1e-9, (c, got, base)
+
+
+def t_round13_power_refuses_nonfinite_deltas():
+    for bad in ([float('nan'), 1.0], [float('inf'), 1.0], [1.0, float('-inf')]):
+        r = V12._power_enumeration(bad, 'positive', 0.05, 4)
+        assert r['status'] != 'ok', (bad, r)
+        assert 'power_holm_conservative' not in r, (bad, r)
+
+
+def t_round13_corpus_shift_none_normalized_is_a_failure():
+    import data_guard as DG
+    orig = DG.categorical_shift_report
+    DG.categorical_shift_report = lambda a, b, **k: {
+        'js_divergence_normalized': None, 'js_divergence': None}
+    try:
+        tr = np.arange(10, dtype=np.int64)
+        va = np.arange(10, 20, dtype=np.int64).reshape(1, -1)
+        rep = L.audit_corpus_split(tr, va, 100, dataset='wikitext')
+        assert rep['status'] != 'ok', rep
+        assert any('shift' in w for w in rep.get('warnings', [])), rep
+    finally:
+        DG.categorical_shift_report = orig
+
+
+def t_round13_malformed_artifacts_fail_closed():
+    with tempfile.TemporaryDirectory() as d:
+        good = os.path.join(d, 'good')
+        bad = os.path.join(d, 'bad')
+        os.makedirs(good)
+        os.makedirs(bad)
+        with open(os.path.join(good, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::seed0': {'variant': 'a', 'seed': 0, 'ppl': 10.0,
+                                    'error': None}}, f)
+        with open(os.path.join(bad, 'summary.json'), 'w', encoding='utf-8') as f:
+            f.write('{bad json')
+        out = A.audit_failures([good])
+        panel = out['panels'][good]
+        assert panel['errors_by_arm'] == {} and panel['ok_by_arm'] == {'a': 1}, out
+        for fn in (A.audit_attribution, A.audit_boundary, A.audit_failures,
+                   A.audit_efficiency_pairs):
+            assert fn([bad])['status'] == 'fail', fn.__name__
+        with open(os.path.join(bad, 'bylen.json'), 'w', encoding='utf-8') as f:
+            f.write('{bad json')
+        assert A.audit_length(os.path.join(bad, 'bylen.json'))['status'] == 'fail'
+        assert A.audit_fairness(os.path.join(bad, 'summary.json'))['status'] == 'fail'
+        cache = os.path.join(d, 'cache')
+        os.makedirs(cache)
+        with open(os.path.join(cache, 'meta_x.json'), 'w', encoding='utf-8') as f:
+            f.write('{bad')
+        with open(os.path.join(cache, 'test_meta_y.json'), 'w', encoding='utf-8') as f:
+            f.write('{bad')
+        assert A.audit_leakage(cache_dir=cache)['status'] == 'fail'
+
+
+def t_round13_stamped_name_stays_in_outdir():
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, 'panel')
+        os.makedirs(out)
+        for bad in ('../escaped.json', os.path.join(d, 'abs.json'), 'a/b.json'):
+            try:
+                L.stamped_analysis('x', {}, outdir=out, name=bad, event=False)
+                raise AssertionError(f'unsafe artifact name accepted: {bad!r}')
+            except ValueError:
+                pass
+        assert not os.path.exists(os.path.join(d, 'escaped.json'))
+        L.stamped_analysis('x', {}, outdir=out, name='ok.json', event=False)
+        assert os.path.exists(os.path.join(out, 'ok.json'))
+
+
+def t_round13_tuning_rejects_duplicate_seed_aliases():
+    r = L.tuning_selection_stability([
+        {'config': {'lr': 1}, 'seed_ppls': {0: 1.0, '0': 100.0, 1: 1.0, 2: 1.0}},
+        {'config': {'lr': 2}, 'seed_ppls': {0: 50.0, 1: 50.0, 2: 50.0}},
+    ])
+    assert r['status'] != 'ok', r
+    assert 'duplicate' in r['reason'].lower(), r
+
+
+
+
+def t_round13_f_sf_large_degrees_of_freedom():
+    # The incomplete-beta continued fraction needs more than 500 terms when
+    # both dfs are huge; F(1; N, N) has upper tail 0.5 by symmetry.
+    for df in (1e6, 1e8):
+        got = L._f_sf(1.0, df, df)
+        assert got is not None and abs(got - 0.5) < 1e-5, (df, got)
+    # Ordinary df still match the exact beta identity direction.
+    assert 0.0 < L._f_sf(2.0, 3.0, 7.0) < 1.0
+
+
+
+def t_round13_cache_probe_rejects_corrupt_meta_and_arrays():
+    with tempfile.TemporaryDirectory() as d:
+        good = os.path.join(d, 'good.npy')
+        np.save(good, np.arange(4, dtype=np.int32))
+        meta = os.path.join(d, 'meta.json')
+        with open(meta, 'w', encoding='utf-8') as f:
+            json.dump([], f)
+        ok, why = L._cache_files_loadable((good,), meta)
+        assert not ok and 'not an object' in why, (ok, why)
+        with open(meta, 'w', encoding='utf-8') as f:
+            json.dump({}, f)
+        ok, why = L._cache_files_loadable((good,), meta)
+        assert ok, why
+        bad = os.path.join(d, 'bad.npy')
+        with open(bad, 'wb') as f:
+            f.write(b'not an npy')
+        ok, why = L._cache_files_loadable((bad,), meta)
+        assert not ok and 'unreadable' in why, (ok, why)
+
+
+
+def t_round13_cached_boundary_mask_is_fingerprinted():
+    tr = np.arange(8, dtype=np.int64)
+    va = np.arange(8, 16, dtype=np.int64).reshape(1, -1)
+    bnd = np.zeros_like(va, dtype=bool)
+    meta = {'vocab': 32, 'val_bnd_fp': L._ids_fp(
+        np.ascontiguousarray(np.asarray(bnd, dtype=np.uint8)))}
+    assert L._cached_split_problems(meta, tr, va, bnd, 32, seq_len=8,
+                                    fingerprints_trusted=True) == []
+    bad = dict(meta, val_bnd_fp='0' * 16)
+    assert L._cached_split_problems(bad, tr, va, bnd, 32, seq_len=8,
+                                    fingerprints_trusted=True), \
+        'a swapped boundary mask passed the cache check'
+    # Cache entries that predate the field stay readable (no false rebuild).
+    assert L._cached_split_problems({'vocab': 32}, tr, va, bnd, 32, seq_len=8,
+                                    fingerprints_trusted=True) == []
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -10313,6 +10512,17 @@ def main():
     _check('N20b saddlepoint + TOST margin stay scale-invariant', t_round11b_saddlepoint_and_tost_scale)
     _check('N20c power enumeration stays scale-invariant', t_round12_power_enumeration_scale_invariance)
     _check('N20d signal-to-noise treats only exact zero as no effect', t_round12_signal_to_noise_exact_zero)
+    _check('N21 kernel soft path masks non-causal lanes', t_round13_kernel_soft_invalid_lane_gradients)
+    _check('N22 paired log ratio keeps tiny relative effects', t_round13_paired_log_ratio_no_cancellation)
+    _check('N23 seed-t CI is finite and scale-invariant', t_round13_seed_t_ci_scale_invariance)
+    _check('N24 power enumeration refuses non-finite deltas', t_round13_power_refuses_nonfinite_deltas)
+    _check('N25 corpus shift with no normalized value is not a pass', t_round13_corpus_shift_none_normalized_is_a_failure)
+    _check('N26 malformed audit artifacts fail closed', t_round13_malformed_artifacts_fail_closed)
+    _check('N27 stamped analysis keeps its artifact inside outdir', t_round13_stamped_name_stays_in_outdir)
+    _check('N28 tuning stability rejects duplicate seed aliases', t_round13_tuning_rejects_duplicate_seed_aliases)
+    _check('N29 F tail converges at large dfs', t_round13_f_sf_large_degrees_of_freedom)
+    _check('N30 corrupt cache meta/array is not a cache hit', t_round13_cache_probe_rejects_corrupt_meta_and_arrays)
+    _check('N31 boundary mask fingerprint is checked when present', t_round13_cached_boundary_mask_is_fingerprinted)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

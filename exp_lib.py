@@ -5959,6 +5959,31 @@ def _array_file_path(arr):
         return None
     return fn if same else None
 
+def _cache_files_loadable(paths, meta_path=None):
+    """True when every cache payload can be opened and the meta is an object.
+
+    A cache file that exists but is truncated/corrupt is not a cache hit: the
+    loaders must rebuild it rather than raise (numpy) or crash on `.get`
+    (JSON that parsed to a list).  mmap-mode probes avoid reading whole
+    arrays just to validate the header.
+    """
+    if meta_path is not None:
+        try:
+            with open(meta_path, encoding='utf-8') as _f:
+                _meta = json.load(_f)
+        except Exception as _e:
+            return False, f'{os.path.basename(meta_path)} unreadable ({type(_e).__name__}: {_e})'
+        if not isinstance(_meta, dict):
+            return False, f'{os.path.basename(meta_path)} is {type(_meta).__name__}, not an object'
+    for _p in paths:
+        try:
+            _a = np.load(_p, mmap_mode='r')
+            del _a
+        except Exception as _e:
+            return False, f'{os.path.basename(_p)} unreadable ({type(_e).__name__}: {_e})'
+    return True, None
+
+
 def _cache_file_sigs(paths):
     """size+mtime+ctime+inode signature for the files a cache entry is built from.
 
@@ -6212,6 +6237,11 @@ def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=N
             problems.append(f'validation sequence length {vb.shape[1]} != requested {seq_len}')
     if np.asarray(val_bnd).shape != vb.shape:
         problems.append(f'validation boundary mask shape {np.asarray(val_bnd).shape} != {vb.shape}')
+    _bnd_fp = meta.get('val_bnd_fp')
+    if _bnd_fp is not None:
+        _bnd_arr = np.ascontiguousarray(np.asarray(val_bnd, dtype=np.uint8))
+        if not isinstance(_bnd_fp, str) or _bnd_fp != _ids_fp(_bnd_arr):
+            problems.append('validation boundary mask does not match the fingerprint in the meta file')
     if (not fingerprints_trusted and 'val_fp' in meta
             and meta.get('val_fp') != _ids_fp(vb.reshape(-1))):
         problems.append('validation id fingerprint does not match the meta file')
@@ -6295,7 +6325,11 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     me_path = os.path.join(cache_dir, f'meta_{tag}.json')
     trd_path = os.path.join(cache_dir, f'train_doc_ids_{tag}.npy')
     vad_path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
-    if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
+    _cache_ready, _cache_why = _cache_files_loadable(
+        (tr_path, va_path, vp_path), me_path)
+    if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))) and not _cache_ready:
+        print(f'[data] WARNING: cached token-id files exist but are not usable ({_cache_why}) — REBUILDING them')
+    if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))) and _cache_ready:
         _sig_paths = {'train': tr_path, 'val': va_path,
                       'bnd': vp_path, 'meta': me_path}
         # Document-id sidecars are part of the cache identity and are checked
@@ -6325,6 +6359,14 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                                            ranges_trusted=_fast)
         if meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget':
             _problems.append('cache does not attest the frozen train-prefix tokenizer fit')
+        if meta.get('tokenizer_fit_docs_in_train_prefix') is not True:
+            _problems.append(
+                'cache does not attest that the tokenizer fit docs are inside '
+                'the training prefix')
+        if _as_seed_int(meta.get('tokenizer_fit_max_rows')) != 50000:
+            _problems.append(
+                f"cache tokenizer fit max rows {meta.get('tokenizer_fit_max_rows')!r} "
+                'does not match the current protocol (50000); rebuild the corpus cache')
         # The fit cap is a function of the CURRENT code constant and the
         # requested budget; the cache tag pins the budget (cap{n_train_tokens})
         # but NOT TOKENIZER_FIT_TOKENS, so a cache built under a different
@@ -6595,6 +6637,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         'vocab': vocab,
         'src_fp': _ids_fp(train_ids),
         'val_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)),
+        'val_bnd_fp': _ids_fp(np.ascontiguousarray(np.asarray(val_bnd, dtype=np.uint8))),
         'fit_fp': fit_fp,
         'file_sigs': _file_sigs,
         'id_range': {'train': _array_id_range(train_ids), 'val': _array_id_range(val_batch)},
@@ -6750,7 +6793,10 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     td_path = os.path.join(cache_dir, f'test_doc_ids_{tag}.npy')
     me_path = os.path.join(cache_dir, f'test_meta_{tag}.json')
     tk_path = os.path.join(cache_dir, f'test_tok_{tag}.json')
-    if all((os.path.exists(p) for p in (te_path, tb_path, me_path))):
+    _cache_ready, _cache_why = _cache_files_loadable((te_path, tb_path), me_path)
+    if all((os.path.exists(p) for p in (te_path, tb_path, me_path))) and not _cache_ready:
+        print(f'[data] WARNING: cached TEST token-id files exist but are not usable ({_cache_why}) — REBUILDING them')
+    if all((os.path.exists(p) for p in (te_path, tb_path, me_path))) and _cache_ready:
         _sig_paths = {'test': te_path, 'bnd': tb_path, 'meta': me_path}
         if os.path.exists(td_path):
             _sig_paths['test_doc_ids'] = td_path
@@ -6800,6 +6846,11 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             _problems.append('test id fingerprint does not match the test meta file')
         if np.asarray(test_bnd).shape != np.asarray(test_ids).shape:
             _problems.append(f'test boundary mask shape {np.asarray(test_bnd).shape} != {np.asarray(test_ids).shape}')
+        _tbnd_fp = meta.get('test_bnd_fp')
+        if _tbnd_fp is not None:
+            _tbnd_arr = np.ascontiguousarray(np.asarray(test_bnd, dtype=np.uint8))
+            if not isinstance(_tbnd_fp, str) or _tbnd_fp != _ids_fp(_tbnd_arr):
+                _problems.append('test boundary mask does not match the fingerprint in the meta file')
         if _meta_declares_shuffle(meta.get('shuffle_at_split')):
             _problems.append('metadata records a shuffled split')
         if meta.get('tokenizer_fit_split') not in (None, 'train'):
@@ -6991,12 +7042,20 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             _mobj = json.load(open(_mp, encoding='utf-8'))
         except Exception:
             continue
+        if not isinstance(_mobj, dict):
+            raise RuntimeError(
+                f'load_wikitest: {_mp} is {type(_mobj).__name__}, not a JSON '
+                'object — the train cache metadata is corrupt; rebuild the cache')
         _train_meta_objs.append(_mobj)
         _train_meta_paths.append(_mp)
-    _caps = {int(_m['tokenizer_fit_token_cap']) for _m in _train_meta_objs
-             if _m.get('tokenizer_fit_token_cap') is not None}
-    _maxrows = {int(_m['tokenizer_fit_max_rows']) for _m in _train_meta_objs
-                if _m.get('tokenizer_fit_max_rows') is not None}
+    # Exact-integer protocol fields: a boolean/fractional spelling is
+    # malformed metadata, not a different cap that may be silently truncated.
+    _caps = {_c for _m in _train_meta_objs
+             for _c in (_as_seed_int(_m.get('tokenizer_fit_token_cap')),)
+             if _c is not None}
+    _maxrows = {_r for _m in _train_meta_objs
+                for _r in (_as_seed_int(_m.get('tokenizer_fit_max_rows')),)
+                if _r is not None}
     if len(_caps) == 1:
         _fit_cap = _caps.pop()
     if len(_maxrows) == 1:
@@ -7076,10 +7135,10 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             _mt = json.load(open(_mp, encoding='utf-8'))
         except Exception:
             continue
-        _mv = _mt.get('vocab')
+        _mv = _as_seed_int(_mt.get('vocab'))
         if _mv is None:
-            continue
-        if int(_mv) != int(vocab):
+            raise RuntimeError(f'load_wikitest: cached train corpus vocab in {_mp} is not a positive exact integer — the splits cannot be paired; delete wt103_cache/ and rebuild both')
+        if _mv != int(vocab):
             raise RuntimeError(f'load_wikitest: the freshly fitted tokenizer (vocab={vocab}) disagrees with the cached train corpus (vocab={_mv} in {_mp}) — the splits cannot be paired; delete wt103_cache/ and rebuild both')
     if not _train_meta_objs:
         raise RuntimeError('load_wikitest: no train/validation meta exists in the cache directory — build (or copy) the frozen train cache FIRST; the test tokenizer and the dedup index are functions of that train split, and touching test before it exists cannot be audited')
@@ -7320,6 +7379,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         'tokenizer_vocab_sha256': hashlib.sha256(json.dumps(dict(tok.get_vocab()), sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest(),
         'file_sigs': _file_sigs,
         'id_range': {'test': _array_id_range(test_batch)},
+        'test_bnd_fp': _ids_fp(np.ascontiguousarray(np.asarray(test_bnd, dtype=np.uint8))),
         'split_strategy': 'official_dataset_test_split_near_duplicate_filtered',
         'shuffle_at_split': False,
         'tokenizer_fit_split': 'train',
@@ -7845,8 +7905,15 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
     me_path = os.path.join(cache_dir, f'meta_{tag}.json')
     trd_path = os.path.join(cache_dir, f'train_doc_ids_{tag}.npy')
     vad_path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
-    if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path,
-                                        trd_path, vad_path))):
+    _cache_ready, _cache_why = _cache_files_loadable(
+        (tr_path, va_path, vp_path, trd_path, vad_path), me_path)
+    if (all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path,
+                                        trd_path, vad_path)))
+            and not _cache_ready):
+        print(f'[data] WARNING: cached FineWeb token-id files exist but are not usable ({_cache_why}) — REBUILDING them')
+    if (all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path,
+                                        trd_path, vad_path)))
+            and _cache_ready):
         _sig = _memo_file_sig({'train': tr_path, 'val': va_path, 'bnd': vp_path,
                                'meta': me_path, 'train_doc_ids': trd_path,
                                'val_doc_ids': vad_path})
@@ -8132,6 +8199,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             'vocab': vocab,
             'src_fp': _ids_fp(train_ids),
             'val_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)),
+            'val_bnd_fp': _ids_fp(np.ascontiguousarray(np.asarray(val_bnd, dtype=np.uint8))),
             'file_sigs': _file_sigs,
             'id_range': {'train': _array_id_range(train_ids), 'val': _array_id_range(val_batch)},
             'doc_ids': {
@@ -8394,8 +8462,20 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
             _tr_s = _AG._sample_tokens(tr, cap=200000, seed=0)
             _va_s = _AG._sample_tokens(va, cap=200000, seed=1)
             _shift = _DG.categorical_shift_report(_tr_s, _va_s)
-            _js = float(_shift.get('js_divergence_normalized',
-                                   float(_shift.get('js_divergence', 0.0)) / math.log(2.0)))
+            # Do not evaluate the nats fallback unless the normalized field is
+            # absent: dict.get's default is eager, so a present-but-None
+            # normalized value would raise and silently downgrade a failed
+            # shift gate to a warning.
+            _js_norm = _shift.get('js_divergence_normalized')
+            if _js_norm is None:
+                _js_raw = _shift.get('js_divergence')
+                if _js_raw is None:
+                    raise ValueError(
+                        'categorical shift report has neither a normalized '
+                        'nor a nats JS divergence; the gate cannot be evaluated')
+                _js = float(_js_raw) / math.log(2.0)
+            else:
+                _js = float(_js_norm)
             report['train_val_token_shift'] = _shift
             report['train_val_token_shift_js_scale'] = 'normalized (js / ln2, in [0, 1])'
             if _js >= _sf:
@@ -8776,7 +8856,17 @@ def stamped_analysis(kind, payload, *, outdir=None, name=None, event=True):
     rec['code'] = code_stamp()
     rec['provenance'] = code_provenance()
     if outdir is not None and name:
-        path = os.path.join(outdir, name)
+        # `name` is a single artifact component, not an arbitrary path: an
+        # absolute or ../-containing name would write outside the requested
+        # outdir (and could overwrite another panel's record).
+        _name = os.fspath(name)
+        if (not isinstance(_name, str) or not _name or _name in ('.', '..')
+                or os.path.basename(_name) != _name
+                or os.path.isabs(_name)):
+            raise ValueError(
+                f'stamped_analysis: name={name!r} must be a single file name '
+                'inside outdir (no directory separators or absolute paths)')
+        path = os.path.join(outdir, _name)
         atomic_write_json(path, rec)
         if event:
             log_experiment_event(outdir, {'kind': 'analysis', 'tracking_schema': 2, 'artifact': name, 'created_at': rec['created_at'], 'code': rec['code'], 'label': kind, 'status': 'ok'})
@@ -11110,7 +11200,12 @@ def _betacf(a, b, x):
         d = tiny
     d = 1.0 / d
     h = d
-    for m in range(1, 500):
+    # 500 terms are not enough when BOTH degrees of freedom are large: the
+    # continued fraction converges slowly and the lack-of-fit tail is
+    # understated (e.g. _f_sf(1, 1e8, 1e8) was 0.511 instead of 0.5).  2000
+    # covers the large-df panels the scale-up plan can reach; the
+    # `abs(delta-1) < 1e-15` exit still stops the ordinary cases early.
+    for m in range(1, 2000):
         m2 = 2 * m
         aa = m * (b - m) * x / ((qam + m2) * (a + m2))
         d = 1.0 + aa * d
@@ -11324,7 +11419,16 @@ def paired_log_ratio(with_values, without_values, seeds=None):
         if not (math.isfinite(fa) and math.isfinite(fb) and fa > 0.0 and fb > 0.0):
             dropped.append(s)
             continue
-        effects.append(float(math.log(fa) - math.log(fb)))
+        # log(fa) - log(fb) cancels catastrophically when both PPLs are large
+        # and the effect is small; log1p((fa-fb)/fb) keeps the relative
+        # difference.  For a large relative change the plain log difference is
+        # already stable (and avoids an overflow in (fa-fb)/fb).
+        _rel = (fa - fb) / fb
+        if math.isfinite(_rel) and abs(_rel) < 0.5:
+            effect = math.log1p(_rel)
+        else:
+            effect = math.log(fa) - math.log(fb)
+        effects.append(float(effect))
         kept.append(s)
     return {'effects': effects, 'seeds': kept, 'n': len(effects), 'n_dropped': len(dropped), 'dropped_seeds': dropped,
             'convention': 'effect = log(with) - log(without); positive = with arm has higher PPL (worse)'}
@@ -13864,6 +13968,13 @@ def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'
             # of the comparison set keeps every trial's mean over the SAME
             # draws instead of silently averaging different panels.
             if f is not None:
+                if seed in m:
+                    # 0 and "0" (or 2 and "2.0") name the same search seed;
+                    # silently overwriting would drop one draw and make the
+                    # leave-one-out means depend on key spelling.
+                    return {'status': 'unavailable',
+                            'reason': (f'seed_ppls contains duplicate seed '
+                                       f'identities after normalisation ({seed!r})')}
                 m[seed] = f
         seed_maps.append(m)
     common = set(seed_maps[0])
@@ -20933,6 +21044,15 @@ def _seed_t_ci(ppls, alpha=0.05):
     n = int(v.size)
     if n < 2:
         return None
+    # The interval is invariant under a common positive rescaling, but
+    # squaring raw PPLs overflows once they approach the binary64 limit.  Work
+    # on a power-of-two-normalised panel and map the bounds back exactly.
+    _scale_e = 0
+    _amax = float(np.max(np.abs(v)))
+    if _amax > 0.0 and math.isfinite(_amax):
+        _, _scale_e = math.frexp(_amax)
+        if _scale_e:
+            v = np.ldexp(v, -_scale_e)
     mu = float(v.mean())
     sd = float(v.std(ddof=1))
     try:
@@ -20942,6 +21062,13 @@ def _seed_t_ci(ppls, alpha=0.05):
     if not math.isfinite(tc):
         return None
     half = tc * sd / math.sqrt(n)
+    if _scale_e:
+        def _back(x):
+            try:
+                return math.ldexp(x, _scale_e)
+            except OverflowError:
+                return float('-inf') if x < 0 else float('inf')
+        return [_back(mu - half), _back(mu + half)]
     return [mu - half, mu + half]
 
 def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):

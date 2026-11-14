@@ -210,14 +210,19 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
         return _exact_int_scalar(value)
     _pairs = []
     _mismatch = []
+    _parse_failures = []
     for _tp in _tm:
         _tmeta = _load(_tp)
         if not isinstance(_tmeta, dict):
+            if os.path.exists(_tp) and _tmeta is None:
+                _parse_failures.append(os.path.basename(_tp))
             continue
         _ttag = os.path.basename(_tp)[len('test_meta_'):-len('.json')]
         for _mp in _vm:
             _mmeta = _load(_mp)
             if not isinstance(_mmeta, dict):
+                if os.path.exists(_mp) and _mmeta is None:
+                    _parse_failures.append(os.path.basename(_mp))
                 continue
             _tv, _mv = _as_int(_tmeta.get('vocab')), _as_int(_mmeta.get('vocab'))
             _diff = []
@@ -254,6 +259,13 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             return out
         _pairs = _pref
     if not _pairs:
+        if _parse_failures:
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                'cache metadata exists but cannot be parsed: ' +
+                ', '.join(sorted(set(_parse_failures))) +
+                ' — tokenizer/split provenance cannot be audited')
+            return out
         if _mismatch and len(_tm) == 1 and len(_vm) == 1:
             # A present-but-different tokenizer/vocab identity is a failed
             # provenance check, not an absent cache.  With exactly one pair of
@@ -1403,8 +1415,13 @@ def audit_attribution(outdirs=None):
     _missing_panels = []
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
-        summ = _load(os.path.join(d, 'summary.json'))
+        _sp = os.path.join(d, 'summary.json')
+        summ = _load(_sp)
         if summ is None:
+            if os.path.exists(_sp):
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: summary.json exists but cannot be parsed — the block attribution cannot be audited')
             continue
         if not isinstance(summ, dict):
             out['status'] = 'fail'
@@ -1520,8 +1537,13 @@ def audit_boundary(outdirs=None):
     import numpy as np
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
-        summ = _load(os.path.join(d, 'summary.json'))
+        _sp = os.path.join(d, 'summary.json')
+        summ = _load(_sp)
         if summ is None:
+            if os.path.exists(_sp):
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: summary.json exists but cannot be parsed — boundary alignment cannot be audited')
             continue
         if not isinstance(summ, dict):
             out['status'] = 'fail'
@@ -1610,6 +1632,10 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
     逐文档行数 n_seq 跨臂一致。若某臂对不同目标集评分，跨臂比较无效。"""
     raw = _load(bylen_path)
     if raw is None:
+        if os.path.exists(bylen_path):
+            out = {'status': 'fail', 'problems': [f'{bylen_path} exists but cannot be parsed — the length cells cannot be audited']}
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+            return out
         out = {'status': 'not_verifiable_locally', 'note': f'{bylen_path} absent — P5T has not run; the same checks apply to results_v10_mech/summary.json by_len panels'}
         print(json.dumps(out, ensure_ascii=False))
         return out
@@ -1792,6 +1818,13 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
     单独调参会在此被点名，而不是混进「方法效果」里。"""
     summ = _load(summary_path)
     if summ is None:
+        if os.path.exists(summary_path):
+            out = {'status': 'fail', 'arms': {}, 'controlled_variables': None,
+                   'seed_coverage': {},
+                   'problems': [f'{summary_path} exists but cannot be parsed — the frozen-arm records cannot be audited'],
+                   'warnings': [], 'tuning': {}}
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+            return out
         out = {'status': 'not_verifiable_locally', 'note': f'{summary_path} absent — needs the training records of the frozen arms'}
         print(json.dumps(out, ensure_ascii=False))
         return out
@@ -1933,8 +1966,13 @@ def audit_failures(outdirs=None):
     out = {'status': 'ok', 'panels': {}}
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
-        summ = _load(os.path.join(d, 'summary.json'))
+        _sp = os.path.join(d, 'summary.json')
+        summ = _load(_sp)
         if summ is None:
+            if os.path.exists(_sp):
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: summary.json exists but cannot be parsed — failures cannot be audited')
             continue
         if not isinstance(summ, dict):
             out['status'] = 'fail'
@@ -1950,11 +1988,11 @@ def audit_failures(outdirs=None):
             if not isinstance(_v, str) or not _v:
                 continue
             v = _v
-            if 'error' in r or r.get('status') in ('error', 'failed'):
+            if r.get('error') is not None or r.get('status') in ('error', 'failed'):
                 by_arm.setdefault(v, []).append(str(r.get('error') or r.get('status'))[:80])
             elif L.ppl_is_usable(r.get('ppl')) and not r.get('synthesized'):
                 n_ok[v] = n_ok.get(v, 0) + 1
-        if by_arm:
+        if by_arm or n_ok:
             out['panels'][d] = {'errors_by_arm': {v: len(e) for v, e in by_arm.items()}, 'ok_by_arm': n_ok, 'error_samples': {v: e[:2] for v, e in by_arm.items()}}
     if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
@@ -2180,8 +2218,13 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
     """规模核算（零 GPU）：每面板 6ND 估算 + 已记账实测秒数。"""
     out = {'status': 'ok', 'panels': {}}
     for d, v, steps in panels:
-        summ = _load(os.path.join(d, 'summary.json'))
+        _sp = os.path.join(d, 'summary.json')
+        summ = _load(_sp)
         if summ is None:
+            if os.path.exists(_sp):
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: summary.json exists but cannot be parsed — the allocation cannot be reconciled')
             out['panels'][d] = 'not present locally'
             continue
         if not isinstance(summ, dict):
@@ -2290,6 +2333,11 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
         out['panels'][d] = {'params': p0, 'steps': _steps, 'tokens': tok, 'estimate': est}
     for sf in state_files:
         st = _load(sf)
+        if st is None and os.path.exists(sf):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{sf}: TimeGuard state exists but cannot be parsed — the run ledger cannot be reconciled')
+            continue
         if st is not None:
             if not isinstance(st, dict):
                 out['status'] = 'fail'
@@ -2428,8 +2476,13 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
            'tolerance': tolerance,
            'note': 'measured prefill only; no KV cache in this model; analytic FLOPs are never substituted for timing'}
     for d in dirs:
-        summ = _load(os.path.join(d, 'summary.json'))
+        _sp = os.path.join(d, 'summary.json')
+        summ = _load(_sp)
         if summ is None:
+            if os.path.exists(_sp):
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: summary.json exists but cannot be parsed — efficiency pairs cannot be audited')
             continue
         if not isinstance(summ, dict):
             out['status'] = 'fail'

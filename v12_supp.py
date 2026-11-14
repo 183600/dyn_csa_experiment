@@ -1593,6 +1593,13 @@ def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
     mags = [abs(float(x)) for x in deltas]
     if n == 0 or all(mm == 0.0 for mm in mags):
         return {'n': n, 'status': 'no_data'}
+    # A NaN/Inf magnitude would make every comparison false and silently
+    # report status='ok' with zero power.  Refuse the corrupted panel instead
+    # of certifying an artifact from it.
+    if any(not math.isfinite(mm) for mm in mags):
+        return {'n': n, 'status': 'invalid_data',
+                'note': 'non-finite paired delta(s) — the power simulation '
+                        'cannot be computed from a corrupted panel'}
     # The enumeration and its tie tolerance are invariant under a common
     # positive rescaling of the magnitudes, and the power/fraction fields must
     # be too.  Normalise by an exact power of two before building the null

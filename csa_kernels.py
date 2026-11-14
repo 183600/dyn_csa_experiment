@@ -1330,6 +1330,17 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                     lam = lam.masked_fill(soft_c <= 0, MINL)
                     zS = zA.clone()
                     zS[:, :, :nb] = (zA[:, :, :nb] + lam).clamp_min(MINL)
+                    # The S path must keep the same validity/causality mask as
+                    # the A path (the eager soft_logits is masked after adding
+                    # the prior).  Lanes whose pre-clamp value is already at
+                    # MINL are constants in the eager graph (masked_fill /
+                    # clamp_min), so they must not carry a derivative either.
+                    # Without this, a row whose usable soft lanes are all zero
+                    # leaves every lane at MINL and the uniform softmax sends
+                    # q/K/dsoft gradients to non-causal blocks.
+                    zS.masked_fill_(~lane_ok, MINL)
+                    s_live = lane_ok.clone()
+                    s_live[:, :, :nb] &= (soft_c > 0)
                 if sink_v is None:
                     P_A = torch.softmax(zA, dim=-1)
                     P_A_f = P_A * (anyrow[:, :, None] if anyrow is not None else 1.0)
@@ -1359,6 +1370,8 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                         if GS is not None:
                             acc = acc + (-(P_sinkS * GS)).sum(dim=(0, 1))
                         dsink[h] += acc.to(dtype)
+                if dzS is not None:
+                    dzS = dzS * s_live
                 dz = dzA if dzS is None else dzA + dzS
                 if dq is not None:
                     _dq = torch.einsum('rtm,rtmd->rtd', dz, Kl)
@@ -1368,7 +1381,10 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                 if dsoft is not None and dzS is not None:
                     dl = dzS[:, :, :nb]
                     sf = soft_c
-                    dsoft[:, t0:t1, :] += torch.where(sf >= 1e-12, dl / sf.clamp_min(1e-12), torch.zeros_like(dl)).to(dtype)
+                    _live_b = s_live[:, :, :nb]
+                    dsoft[:, t0:t1, :] += torch.where(
+                        _live_b & (sf >= 1e-12),
+                        dl / sf.clamp_min(1e-12), torch.zeros_like(dl)).to(dtype)
                 if need_dkb or need_dksw:
                     dkl = torch.einsum('rtm,rtd->rtmd', dz, qh)
                     if scale != 1.0:
