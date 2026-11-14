@@ -2430,20 +2430,42 @@ def _frozen_rule_confirms(holm_entry, comp, alpha, n_seeds_fallback=8):
     fallback call this ONE implementation so they cannot drift apart again.
     """
     _ph = (holm_entry or {}).get('p_holm') if isinstance(holm_entry, dict) else None
+    # A boolean is a flag, not a probability (float(False) == 0.0 would be the
+    # strongest possible p); alpha is likewise a real level, not a flag.
+    if isinstance(_ph, (bool, np.bool_)) or isinstance(alpha, (bool, np.bool_)):
+        return False
     try:
-        if _ph is None or not math.isfinite(float(_ph)) or float(_ph) >= alpha:
-            return False
+        _a = float(alpha)
+        _p = None if _ph is None else float(_ph)
     except (TypeError, ValueError, OverflowError):
+        return False
+    if not (math.isfinite(_a) and 0.0 < _a < 1.0):
+        return False
+    if _p is None or not math.isfinite(_p) or _p >= _a:
         return False
     comp = comp if isinstance(comp, dict) else {}
-    if comp.get('direction_ok') is not True:
+    _dir = comp.get('direction_ok')
+    if not isinstance(_dir, (bool, np.bool_)) or not bool(_dir):
         return False
-    if comp.get('param_matched') is False:
-        return False
-    try:
-        _n = int(comp.get('n_effective') or comp.get('n') or 0)
-        _floor = int(comp.get('min_seeds_for_confirmation') or n_seeds_fallback)
-    except (TypeError, ValueError, OverflowError):
+    _pm = comp.get('param_matched')
+    # `is not False` in the manifest means True or unverifiable None; a
+    # measured False blocks.  Accept NumPy booleans (the other statistics
+    # helpers do, and `np.bool_ is False` is False), but refuse any other type
+    # instead of letting a truthy string through.
+    if _pm is not None:
+        if not isinstance(_pm, (bool, np.bool_)) or not bool(_pm):
+            return False
+    # An explicitly measured pair count is used verbatim; only a MISSING field
+    # falls back.  `or` would turn a measured 0 (or False) into a different
+    # count, and int(12.9) would round a fractional count UP to a valid seed
+    # floor.  Exact integer contract, matching the rest of the statistics.
+    _n_raw = comp.get('n_effective') if comp.get('n_effective') is not None else comp.get('n')
+    _floor_raw = (comp.get('min_seeds_for_confirmation')
+                  if comp.get('min_seeds_for_confirmation') is not None
+                  else n_seeds_fallback)
+    _n = L._as_seed_int(_n_raw)
+    _floor = L._as_seed_int(_floor_raw)
+    if _n is None or _floor is None or _floor < 1 or _n < 1:
         return False
     return _n >= _floor
 

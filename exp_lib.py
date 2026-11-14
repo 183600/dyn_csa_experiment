@@ -6614,7 +6614,6 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     用于调参/早停的验证集。缓存命中会校验内容指纹、tokenizer 拟合来源和
     去重元数据；train 语料被更换时应删除整个 wt103_cache/，否则 test 缓存
     不会跟随重建——这是显式记录的边界，不是静默的失效路径。"""
-    from datasets import load_dataset
     cache_dir = _wt_cache_dir(cache_dir)
     os.makedirs(cache_dir, exist_ok=True)
     tag = f'v2_sl{seq_len}_v{vocab_size}_ns{n_seqs}'
@@ -6873,6 +6872,10 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             train_rows_source = _read_raw_rows(_f)
             break
     if train_rows_source is None:
+        # The Hub client is imported ONLY on the network path: a cached test
+        # split or the WT103_RAW_TXT local-dump fallback must work without
+        # `datasets` installed.
+        from datasets import load_dataset
         for repo in ('Salesforce/wikitext', 'wikitext'):
             try:
                 # TRAIN split only, for the frozen tokenizer fit.  Never reuse
@@ -6957,6 +6960,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             print(f'[data] local wikitext-103 VALIDATION split at {_f} ({len(val_rows_source)} rows)')
             break
     if val_rows_source is None:
+        from datasets import load_dataset
         for repo in ('Salesforce/wikitext', 'wikitext'):
             try:
                 ds_val = load_dataset(repo, 'wikitext-103-raw-v1', split='validation', cache_dir=cache_dir)
@@ -7037,6 +7041,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             break
     if test_rows is None:
         last_err = None
+        from datasets import load_dataset
         for repo in ('Salesforce/wikitext', 'wikitext'):
             try:
                 # Only the TEST split: never materialise train/validation here.
@@ -9230,9 +9235,14 @@ PAIR_STEP_KEYS = ('steps', 'tokens_seen')
 def pair_reason(ra, rb):
     if not isinstance(ra, dict) or not isinstance(rb, dict):
         return 'a record is not a dict'
-    if ra.get('run_cfg') is None or rb.get('run_cfg') is None:
+    _fa, _fb = ra.get('run_cfg'), rb.get('run_cfg')
+    if _fa is None or _fb is None:
         return 'unverifiable run_cfg'
-    if ra.get('run_cfg') != rb.get('run_cfg'):
+    # A boolean is a flag, not a configuration fingerprint: True == True would
+    # otherwise pair two runs whose configuration was never recorded.
+    if isinstance(_fa, (bool, np.bool_)) or isinstance(_fb, (bool, np.bool_)):
+        return 'unverifiable run_cfg (a boolean is not a configuration fingerprint)'
+    if _fa != _fb:
         return 'different run_cfg'
     # Controlled-variable gate for the settings the run fingerprint does not
     # carry (optimizer identity / betas / eps, LR-schedule shape, grad-clip,

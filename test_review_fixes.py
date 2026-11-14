@@ -8991,6 +8991,148 @@ def t_v12_frozen_rule_helper():
     assert V12._frozen_rule_confirms({'p_holm': True}, ok_comp, 0.05) is False
 
 
+
+def t_review7_report_pair_boolean_fingerprints():
+    # The zero-GPU report builder is a twin of exp_lib.pair_reason: a boolean
+    # on BOTH sides must not collapse to the absent-vs-absent permissive path.
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    base = dict(variant='a', seed=0, run_cfg=fp, steps=1, tokens_seen=1, ppl=10.0)
+    for k in ('data_fp', 'val_fp', 'eval_fp', 'init_core_fp'):
+        why = BR._pair_reason(dict(base, **{k: True}),
+                              dict(base, variant='b', **{k: True}))
+        assert why is not None and 'unverifiable' in why and k in why, (k, why)
+        ok = BR._pair_reason(dict(base, **{k: 'abc'}),
+                             dict(base, variant='b', **{k: 'abc'}))
+        assert ok is None, (k, ok)
+    # run_cfg is a configuration fingerprint too, not a boolean flag.
+    _nofp = dict(base, run_cfg=True)
+    why = BR._pair_reason(_nofp, dict(_nofp, variant='b'))
+    assert why is not None and 'unverifiable run_cfg' in why, why
+    why = L.pair_reason(_nofp, dict(_nofp, variant='b'))
+    assert why is not None and 'unverifiable run_cfg' in why, why
+
+
+def t_review7_frozen_rule_malformed_inputs():
+    ok_holm = {'p_holm': 0.001}
+    ok_comp = {'direction_ok': True, 'param_matched': True,
+               'n_effective': 12, 'min_seeds_for_confirmation': 8}
+    assert V12._frozen_rule_confirms(ok_holm, ok_comp, 0.05) is True
+    # Boolean flags are not probabilities/counts; a measured zero must not fall
+    # back to another count, and a fractional count must not be rounded up.
+    for holm in ({'p_holm': False}, {'p_holm': True}, {'p_holm': float('nan')}):
+        assert V12._frozen_rule_confirms(holm, ok_comp, 0.05) is False, holm
+    for n in (0, False, True, float('nan'), 12.9):
+        comp = dict(ok_comp, n_effective=n, n=12)
+        assert V12._frozen_rule_confirms(ok_holm, comp, 0.05) is False, (n, comp)
+    for a in (True, False, 0, 1, -0.1, float('nan')):
+        assert V12._frozen_rule_confirms(ok_holm, ok_comp, a) is False, a
+    # A zero/negative declared floor must not make confirmation trivial.
+    assert V12._frozen_rule_confirms(ok_holm, {'direction_ok': True,
+                                               'param_matched': True,
+                                               'n_effective': 1,
+                                               'min_seeds_for_confirmation': 0},
+                                     0.05) is False
+    # NumPy booleans are booleans; a truthy string is not a flag.
+    assert V12._frozen_rule_confirms(
+        ok_holm, dict(ok_comp, direction_ok=np.bool_(True),
+                      param_matched=np.bool_(True)), 0.05) is True
+    assert V12._frozen_rule_confirms(
+        ok_holm, dict(ok_comp, direction_ok=True,
+                      param_matched=np.bool_(False)), 0.05) is False
+    assert V12._frozen_rule_confirms(
+        ok_holm, dict(ok_comp, direction_ok='yes'), 0.05) is False
+    assert V12._frozen_rule_confirms(
+        ok_holm, dict(ok_comp, param_matched='no'), 0.05) is False
+    # The declared floor still works and a missing field falls back explicitly.
+    assert V12._frozen_rule_confirms(ok_holm, {'direction_ok': True,
+                                               'param_matched': None,
+                                               'n_effective': 8}, 0.05, 8) is True
+    assert V12._frozen_rule_confirms(ok_holm, {'direction_ok': True,
+                                               'param_matched': None,
+                                               'n': 8}, 0.05, 8) is True
+
+
+def t_review7_label_shift_uses_normalized_js():
+    import data_guard as DG
+    X = np.arange(12, dtype=float).reshape(6, 2)
+    y = [0, 0, 0, 1, 1, 1]
+    # Disjoint label distributions: raw nats JS == ln2 ~= 0.693 is below a 0.7
+    # threshold, but the normalized value is exactly 1.0 and must fire.
+    rep = DG.data_quality_report(X, y=y, train_idx=[0, 1, 2],
+                                 val_idx=[3, 4, 5], fail_on_label_shift=True,
+                                 shift_threshold=0.7)
+    assert rep['status'] == 'fail', rep
+    assert any('label shift' in m for m in rep.get('hard_failures', [])), rep
+    sh = rep['checks']['label_distribution_shift_vs_train']['val']
+    assert sh['js_divergence_normalized'] == 1.0, sh
+    # A below-threshold normalized shift must not hard-fail.
+    y2 = [0, 0, 0, 0, 0, 1]
+    rep2 = DG.data_quality_report(X, y=y2, train_idx=[0, 1, 2],
+                                  val_idx=[3, 4, 5], fail_on_label_shift=True,
+                                  shift_threshold=0.9)
+    assert not any('label shift' in m for m in rep2.get('hard_failures', [])), rep2
+    # audit_split_discipline uses the same normalized scale and refuses a
+    # threshold that no distribution can reach.
+    import audit_gates as A
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tag = 'tiny'
+        np.save(os.path.join(td, f'train_ids_{tag}.npy'), np.arange(40, dtype=np.int64))
+        np.save(os.path.join(td, f'val_batch_{tag}.npy'),
+                np.arange(100, 108, dtype=np.int64).reshape(2, 4))
+        with open(os.path.join(td, f'meta_{tag}.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 108, 'seq_len': 4, 'split_strategy': 'ordered',
+                       'shuffle_at_split': False, 'tokenizer_fit_split': 'train'}, f)
+        out = A.audit_split_discipline(cache_dirs=[td], min_shift_tokens=1)
+        sh = out['caches'][os.path.abspath(td)]['corpora'][tag]['train_val_shift']
+        assert sh['js_divergence_normalized'] == 1.0 and sh['js_scale'].startswith('normalized'), sh
+        assert any('normalized' in w for w in out['warnings']), out['warnings']
+        for bad in ({'js_fail': 1.5}, {'js_fail': 0.1, 'js_warn': 0.2},
+                    {'js_warn': True}):
+            try:
+                A.audit_split_discipline(cache_dirs=[td], **bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'audit accepted unreachable JS thresholds {bad}')
+
+
+def t_review7_load_wikitest_local_path_needs_no_datasets():
+    # A cold build from local dumps must not require the HF Hub client.  Block
+    # the module: the build may fail later for a missing train cache, but the
+    # failure must not be the entry-point import.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        raw = os.path.join(td, 'raw')
+        cache = os.path.join(td, 'cache')
+        os.makedirs(raw)
+        os.makedirs(cache)
+        for name in ('wiki.train.raw', 'wiki.valid.raw', 'wiki.test.raw'):
+            with open(os.path.join(raw, name), 'w', encoding='utf-8') as fh:
+                fh.write('\n'.join(f'line {i} of a tiny local corpus.' for i in range(20)))
+        old_raw = os.environ.get('WT103_RAW_TXT')
+        old_ds = sys.modules.get('datasets')
+        sys.modules['datasets'] = None
+        os.environ['WT103_RAW_TXT'] = raw
+        try:
+            try:
+                L.load_wikitest(8, vocab_size=64, n_seqs=2, cache_dir=cache)
+            except Exception as e:  # noqa: BLE001 - the later refusal is expected
+                assert type(e).__name__ != 'ImportError', e
+                assert 'datasets' not in str(e), e
+            else:
+                raise AssertionError('expected the build to stop at the missing train cache')
+        finally:
+            if old_raw is None:
+                os.environ.pop('WT103_RAW_TXT', None)
+            else:
+                os.environ['WT103_RAW_TXT'] = old_raw
+            if old_ds is None:
+                sys.modules.pop('datasets', None)
+            else:
+                sys.modules['datasets'] = old_ds
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -9266,6 +9408,10 @@ def main():
     _check('M5 report accepts integral-float length spellings', t_sec_p1l_accepts_integral_float_spelling)
     _check('M6 driver paired contrasts carry param-control disclosure', t_driver_paired_param_disclosure)
     _check('M7 v12 frozen decision rule helper (single implementation)', t_v12_frozen_rule_helper)
+    _check('M8 report pair_reason refuses boolean fingerprints on both sides', t_review7_report_pair_boolean_fingerprints)
+    _check('M9 v12 frozen decision rule fails closed on malformed inputs', t_review7_frozen_rule_malformed_inputs)
+    _check('M10 label-shift gate uses normalized JS', t_review7_label_shift_uses_normalized_js)
+    _check('M11 load_wikitest local/cache path needs no datasets', t_review7_load_wikitest_local_path_needs_no_datasets)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

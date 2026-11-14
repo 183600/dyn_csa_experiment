@@ -2618,9 +2618,16 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                 continue
             _sh = categorical_shift_report(_train_lab, _hold_lab)
             label_shift[name] = _sh
-            if _sh['js_divergence'] > shift_threshold:
-                _msg = (f'{name} label shift: JS divergence '
-                        f"{_sh['js_divergence']:.3f} > {shift_threshold}")
+            # Compare on the ln2-normalized scale (js/ln2 in [0,1]), exactly
+            # like the corpus-shift gate.  A raw-nats comparison against a
+            # threshold above ln(2) is a gate that can never fire, and it makes
+            # the same threshold mean two different things between the numeric
+            # shift checks and this categorical one.
+            _jsn = float(_sh.get('js_divergence_normalized',
+                                 float(_sh.get('js_divergence', 0.0)) / math.log(2.0)))
+            if _jsn > shift_threshold:
+                _msg = (f'{name} label shift: normalized JS divergence '
+                        f"{_jsn:.3f} > {shift_threshold}")
                 if fail_on_label_shift:
                     hard_failures.append(_msg)
                 else:

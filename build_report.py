@@ -597,6 +597,9 @@ def _pair_reason(ra, rb):
     fa, fb = (ra.get('run_cfg'), rb.get('run_cfg'))
     if fa is None or fb is None:
         return 'unverifiable run_cfg'
+    # A boolean is a flag, not a configuration fingerprint (mirror exp_lib).
+    if isinstance(fa, (bool, np.bool_)) or isinstance(fb, (bool, np.bool_)):
+        return 'unverifiable run_cfg (a boolean is not a configuration fingerprint)'
     if fa != fb:
         return 'different run_cfg'
     # The run_cfg string does not carry the optimizer identity / schedule
@@ -618,16 +621,25 @@ def _pair_reason(ra, rb):
     # count.  Mirrors exp_lib.pair_reason (a mixed-cap cache rebuild must never
     # be averaged into one paired delta).
     for _k in ('data_fp', 'val_fp', 'eval_fp'):
-        _pa = _content_fp_text(ra.get(_k))
-        _pb = _content_fp_text(rb.get(_k))
+        _ra, _rb = ra.get(_k), rb.get(_k)
+        # A boolean is a flag, not a corpus / evaluation-slice identity, so
+        # both-boolean must be refused instead of collapsing to the
+        # absent-vs-absent permissive path.  Mirrors exp_lib.pair_reason.
+        if isinstance(_ra, (bool, np.bool_)) or isinstance(_rb, (bool, np.bool_)):
+            return f'unverifiable {_k} (a boolean is not a corpus / evaluation-slice fingerprint)'
+        _pa = _content_fp_text(_ra)
+        _pb = _content_fp_text(_rb)
         if (_pa is None) != (_pb is None):
             return f'unverifiable {_k} (only one record carries the corpus / evaluation-slice fingerprint)'
         if _pa is not None and _pa != _pb:
             return f'different {_k} ({_pa[:12]}… vs {_pb[:12]}…)'
     # Matched initialization: equal seeds/geometry do not prove the two arms
     # started from the same shared trunk.  Mirror exp_lib.pair_reason.
-    _ia = _content_fp_text(ra.get('init_core_fp'))
-    _ib = _content_fp_text(rb.get('init_core_fp'))
+    _ra, _rb = ra.get('init_core_fp'), rb.get('init_core_fp')
+    if isinstance(_ra, (bool, np.bool_)) or isinstance(_rb, (bool, np.bool_)):
+        return 'unverifiable init_core_fp (a boolean is not a matched-initialization digest)'
+    _ia = _content_fp_text(_ra)
+    _ib = _content_fp_text(_rb)
     if (_ia is None) != (_ib is None):
         return 'unverifiable init_core_fp (only one record carries the matched-initialization digest)'
     if _ia is not None and _ia != _ib:

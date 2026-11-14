@@ -797,6 +797,22 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
     if cache_dirs is None:
         cache_dirs = [os.path.join(REPO, 'wt103_cache'),
                       os.path.join(REPO, 'fineweb_cache')]
+    # JS thresholds live on the ln2-NORMALIZED scale (js/ln2 in [0,1]), the
+    # same scale the corpus hard gate uses.  A raw-nats threshold above ln(2)
+    # can never fire; validate reachability instead of keeping a dead gate.
+    if isinstance(js_warn, (bool, np.bool_)) or isinstance(js_fail, (bool, np.bool_)):
+        raise ValueError('js_warn/js_fail must be numbers on the normalized JS scale')
+    try:
+        js_warn = float(js_warn)
+        js_fail = float(js_fail)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('js_warn/js_fail must be numbers on the normalized JS scale') from None
+    if not (math.isfinite(js_warn) and 0.0 <= js_warn < 1.0):
+        raise ValueError(f'js_warn={js_warn!r} must lie in [0, 1) on the normalized JS scale')
+    if not (math.isfinite(js_fail) and 0.0 < js_fail <= 1.0):
+        raise ValueError(f'js_fail={js_fail!r} must lie in (0, 1] on the normalized JS scale')
+    if js_fail <= js_warn:
+        raise ValueError(f'js_fail={js_fail!r} must exceed js_warn={js_warn!r}')
     out = {'status': 'ok', 'caches': {}, 'warnings': []}
 
     def _fail(msg):
@@ -1180,12 +1196,16 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             rec['train_val_shift']['reliable'] = bool(
                 tr_tok.size >= int(min_shift_tokens) and
                 va_tok.size >= int(min_shift_tokens))
-            jsv = rec['train_val_shift']['js_divergence']
+            def _js_norm(report):
+                return float(report.get('js_divergence_normalized',
+                                        float(report.get('js_divergence', 0.0)) / math.log(2.0)))
+            jsv = _js_norm(rec['train_val_shift'])
+            rec['train_val_shift']['js_scale'] = 'normalized (js / ln2, in [0, 1])'
             if rec['train_val_shift']['reliable']:
                 if jsv >= float(js_fail):
-                    _warn(f'{cd}/{tag}: train/val token JS divergence {jsv:.3f} >= {js_fail} — material distribution shift')
+                    _warn(f'{cd}/{tag}: train/val token JS divergence {jsv:.3f} (normalized) >= {js_fail} — material distribution shift')
                 elif jsv >= float(js_warn):
-                    _warn(f'{cd}/{tag}: train/val token JS divergence {jsv:.3f} >= {js_warn}')
+                    _warn(f'{cd}/{tag}: train/val token JS divergence {jsv:.3f} (normalized) >= {js_warn}')
             else:
                 _warn(f'{cd}/{tag}: train/val distribution shift not estimable from {va_tok.size} holdout tokens (need >= {min_shift_tokens})')
             if te is not None:
@@ -1194,12 +1214,13 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 rec['train_test_shift']['reliable'] = bool(
                     tr_tok.size >= int(min_shift_tokens) and
                     te_tok.size >= int(min_shift_tokens))
-                jst = rec['train_test_shift']['js_divergence']
+                jst = _js_norm(rec['train_test_shift'])
+                rec['train_test_shift']['js_scale'] = 'normalized (js / ln2, in [0, 1])'
                 if rec['train_test_shift']['reliable']:
                     if jst >= float(js_fail):
-                        _warn(f'{cd}/{tag}: train/test token JS divergence {jst:.3f} >= {js_fail} — material distribution shift')
+                        _warn(f'{cd}/{tag}: train/test token JS divergence {jst:.3f} (normalized) >= {js_fail} — material distribution shift')
                     elif jst >= float(js_warn):
-                        _warn(f'{cd}/{tag}: train/test token JS divergence {jst:.3f} >= {js_warn}')
+                        _warn(f'{cd}/{tag}: train/test token JS divergence {jst:.3f} (normalized) >= {js_warn}')
                 else:
                     _warn(f'{cd}/{tag}: train/test distribution shift not estimable from {te_tok.size} test tokens (need >= {min_shift_tokens})')
             # A warning is a property of this corpus, not only of the global
