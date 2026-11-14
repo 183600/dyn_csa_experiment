@@ -10389,6 +10389,18 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     if _min_n is None:
         # Force the underpowered branch without trying int(nan).
         _min_n = n + 1
+    # The whole contrast (mean/std/CI/d_z, and the binary within-noise
+    # decision) is invariant under a common positive rescaling of the effect
+    # unit.  Raw squares overflow to inf / underflow to zero near the float
+    # limits, which flips `within_seed_noise` and therefore `significant`.
+    # Work on an exact power-of-two rescaling and undo it for the effect-unit
+    # outputs (an exact round-trip for normal-magnitude panels).
+    _amax = float(np.max(np.abs(d)))
+    _exp = 0
+    if _amax > 0.0 and math.isfinite(_amax):
+        _, _exp = math.frexp(_amax)
+        if _exp:
+            d = np.ldexp(d, -_exp)
     mean = float(d.mean())
     std = float(d.std(ddof=1)) if n > 1 else 0.0
     sem = float(std / math.sqrt(n)) if n > 1 else float('nan')
@@ -10458,6 +10470,15 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     _assumption = ('exact sign-flip is valid as a sign test under symmetric paired differences; '
                    'same seed does NOT randomise the arm, and architecture-induced RNG/training '
                    'differences are part of the arm. p is SEED-level, never token-level.')
+    if _exp:
+        mean = _unscale_power2(mean, _exp)
+        std = _unscale_power2(std, _exp)
+        sem = _unscale_power2(sem, _exp)
+        ci_lo = _unscale_power2(ci_lo, _exp)
+        ci_hi = _unscale_power2(ci_hi, _exp)
+        loo_means = [_unscale_power2(_x, _exp) for _x in loo_means]
+        if isinstance(_paired_ci, list):
+            _paired_ci = [_unscale_power2(_x, _exp) for _x in _paired_ci]
     return {'n': n, 'n_nonzero': n_nonzero, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict,
             'unit': 'seed', 'assumption': _assumption, 'sign_counts': _sign,
             'p_wilcoxon': _wil.get('p'), 'p_wilcoxon_method': _wil.get('method'),
@@ -10941,6 +10962,17 @@ def tost_paired(deltas, margin, conf=0.90):
         out['note'] = ('not decidable (n<2, non-positive/non-finite margin, '
                        'or conf outside (0,1))')
         return out
+    # The TOST statistic is invariant under a common positive rescaling of the
+    # effects AND the margin.  Normalise by an exact power of two so a tiny or
+    # huge (but finite) panel does not underflow the variance to zero / overflow
+    # it to inf; the reported mean and CI are converted back below.
+    _amax = max(float(np.max(np.abs(d))), abs(margin))
+    _exp = 0
+    if _amax > 0.0 and math.isfinite(_amax):
+        _, _exp = math.frexp(_amax)
+        if _exp:
+            d = np.ldexp(d, -_exp)
+            margin = math.ldexp(margin, -_exp)
     mean = float(d.mean())
     sd = float(d.std(ddof=1))
     df = n - 1
@@ -10962,6 +10994,9 @@ def tost_paired(deltas, margin, conf=0.90):
         out['note'] = 't critical unavailable; fell back to the normal critical value'
     out['t_critical'] = float(tc)
     out['ci'] = [mean - tc * se, mean + tc * se]
+    if _exp:
+        out['mean'] = _unscale_power2(out['mean'], _exp)
+        out['ci'] = [_unscale_power2(_x, _exp) for _x in out['ci']]
     if se <= 1e-300:
         # Degenerate zero-variance sample.  At the margin boundary the exact
         # t limit is P(T >= 0) = 0.5, not 0: equality cannot be declared
@@ -11404,6 +11439,109 @@ def _scale_corpus_binding(pts):
     return out
 
 
+def _scale_effects_power2(pts):
+    """Rescale every effect by one exact power of two and return the exponent.
+
+    The scale meta-analysis/trend estimators are invariant under a common
+    positive rescaling of the effect unit (log10 vs ln vs percent), but their
+    intermediate variances/squares overflow or underflow if the caller's
+    effects sit near the float limits.  A power-of-two multiplier is exact, so
+    normal-magnitude panels are bit-unchanged while tiny/huge panels stay
+    computable; the caller multiplies the effect-unit outputs back by 2**e.
+    """
+    _amax = 0.0
+    for p in pts:
+        for _x in p.get('effects') or ():
+            _ax = abs(float(_x))
+            if math.isfinite(_ax) and _ax > _amax:
+                _amax = _ax
+    if not (_amax > 0.0 and math.isfinite(_amax)):
+        return pts, 0
+    _, _e = math.frexp(_amax)
+    if _e == 0:
+        return pts, 0
+    out = []
+    for p in pts:
+        q = dict(p)
+        q['effects'] = [math.ldexp(float(x), -_e) for x in (p.get('effects') or ())]
+        out.append(q)
+    return out, int(_e)
+
+
+def _unscale_power2(value, exponent, power=1):
+    """Multiply a finite effect-unit number back by (2**exponent)**power."""
+    if value is None or exponent == 0:
+        return value
+    try:
+        return math.ldexp(float(value), int(exponent) * int(power))
+    except (OverflowError, TypeError, ValueError):
+        try:
+            return math.copysign(float('inf'), float(value))
+        except (TypeError, ValueError):
+            return value
+
+
+def _unscale_effect_fields(out, exponent):
+    """Undo ``_scale_effects_power2`` on the effect-unit fields of a report."""
+    if not exponent:
+        return out
+    for _row in out.get('per_point') or ():
+        for _k in ('mean', 'std', 'se'):
+            if _row.get(_k) is not None:
+                _row[_k] = _unscale_power2(_row[_k], exponent)
+        if isinstance(_row.get('ci'), list):
+            _row['ci'] = [_unscale_power2(_x, exponent) for _x in _row['ci']]
+    for _key in ('fixed_effect', 'random_effects'):
+        _blk = out.get(_key)
+        if isinstance(_blk, dict):
+            for _k in ('mean', 'se'):
+                if _blk.get(_k) is not None:
+                    _blk[_k] = _unscale_power2(_blk[_k], exponent)
+            if isinstance(_blk.get('ci'), list):
+                _blk['ci'] = [_unscale_power2(_x, exponent) for _x in _blk['ci']]
+    if isinstance(out.get('prediction_interval'), list):
+        out['prediction_interval'] = [
+            _unscale_power2(_x, exponent) for _x in out['prediction_interval']]
+    _het = out.get('heterogeneity')
+    if isinstance(_het, dict) and _het.get('tau2') is not None:
+        _het['tau2'] = _unscale_power2(_het['tau2'], exponent, power=2)
+    _wls = out.get('wls')
+    if isinstance(_wls, dict):
+        for _k in ('slope', 'intercept', 'se'):
+            if _wls.get(_k) is not None:
+                _wls[_k] = _unscale_power2(_wls[_k], exponent)
+        if isinstance(_wls.get('ci'), list):
+            _wls['ci'] = [_unscale_power2(_x, exponent) for _x in _wls['ci']]
+    _paired = out.get('paired')
+    if isinstance(_paired, dict):
+        for _k in ('slope_mean', 'slope_std', 'se'):
+            if _paired.get(_k) is not None:
+                _paired[_k] = _unscale_power2(_paired[_k], exponent)
+        if isinstance(_paired.get('ci'), list):
+            _paired['ci'] = [_unscale_power2(_x, exponent) for _x in _paired['ci']]
+        if isinstance(_paired.get('per_seed_slopes'), dict):
+            _paired['per_seed_slopes'] = {
+                _s: _unscale_power2(_v, exponent)
+                for _s, _v in _paired['per_seed_slopes'].items()}
+    _inter = out.get('interaction_extremes')
+    if isinstance(_inter, dict):
+        for _k in ('mean', 'std', 'sem', 'ci95_low', 'ci95_high'):
+            if _inter.get(_k) is not None:
+                _inter[_k] = _unscale_power2(_inter[_k], exponent)
+        if isinstance(_inter.get('loo_means'), list):
+            _inter['loo_means'] = [
+                _unscale_power2(_x, exponent) for _x in _inter['loo_means']]
+        for _k in ('ci95_paired_bootstrap', 'ci95_unpaired_bootstrap'):
+            if isinstance(_inter.get(_k), list):
+                _inter[_k] = [_unscale_power2(_x, exponent) for _x in _inter[_k]]
+    _hpaired = out.get('heterogeneity_paired')
+    if isinstance(_hpaired, dict) and _hpaired.get('tau2') is not None:
+        _hpaired['tau2'] = _unscale_power2(_hpaired['tau2'], exponent, power=2)
+    if out.get('direction_slope') is not None:
+        out['direction_slope'] = _unscale_power2(out['direction_slope'], exponent)
+    return out
+
+
 def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     """跨规模的随机效应元分析（DerSimonian-Laird）+ 异质性诊断。
 
@@ -11432,6 +11570,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                 'convention': 'input effects are scale-free; positive = with arm worse (higher PPL)'}
     alpha, min_seeds = _alpha, _min_seeds
     pts = _scale_points(points)
+    pts, _effect_exp = _scale_effects_power2(pts)
     labels = [p['label'] for p in pts]
     if len(set(labels)) != len(labels):
         # Two rows with the same label are two estimates of the SAME scale
@@ -11470,11 +11609,11 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         out.update({'status': 'refused_corpus_mismatch', 'poolable': False,
                     'note': out['corpus_binding']['refusal_reason']
                             + ' — per-scale effects are reported; pooled estimates are withheld'})
-        return out
+        return _unscale_effect_fields(out, _effect_exp)
     if not usable:
         out.update({'status': 'insufficient_within_scale_replication', 'poolable': False,
                     'note': 'every scale point has n<2 or zero within-scale variance; no random-effects weights can be formed'})
-        return out
+        return _unscale_effect_fields(out, _effect_exp)
     w = np.asarray([1.0 / (r['se'] ** 2) for r in usable], dtype=float)
     y = np.asarray([r['mean'] for r in usable], dtype=float)
     sw = float(w.sum())
@@ -11509,7 +11648,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                 'poolable': bool(len(usable) >= 3 and df > 0 and i2 <= 50.0 and (not math.isfinite(p_q) or p_q >= alpha)),
                 'note': 'poolable requires >=3 scales, I2<=50% and a non-significant Q; otherwise report per-scale effects only'})
     out['status'] = 'ok'
-    return out
+    return _unscale_effect_fields(out, _effect_exp)
 
 
 def scale_interaction(low_effects, high_effects, *, low_label='low', high_label='high', seeds=None, alpha=0.05, min_n=3):
@@ -11593,6 +11732,11 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     for p in pts:
         if len(set(p['seeds'])) != len(p['seeds']):
             raise ValueError('scale point %r has duplicate seeds %r' % (p['label'], p['seeds']))
+    # Keep the estimator invariant under a pure change of effect unit even
+    # when the effects sit near the float limits (tiny/huge log-ratios): the
+    # lack-of-fit numerator and denominator would otherwise both overflow to
+    # inf and turn a resolution-limited ladder into a fake heterogeneous one.
+    pts, _effect_exp = _scale_effects_power2(pts)
     out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'min_points': int(min_points),
            'n_points': len(pts), 'labels': labels,
            'scales': [p['scale'] for p in pts],
@@ -11844,7 +11988,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     out['benefit_grows_with_scale'] = (bool(sig and direction_slope < 0) if not heterogeneous else None)
     if too_few_scales:
         out['note'] = 'fewer than min_points=%d scales: slope is descriptive even if the exact test rejects' % int(min_points)
-    return out
+    return _unscale_effect_fields(out, _effect_exp)
 
 
 def scale_ladder_audit(tiers, *, policy=None, tolerance=None):

@@ -9805,6 +9805,79 @@ def t_round10_power_artifact_requires_exact_counts():
     assert not L._is_confirmatory_cfg({'d': 512.5, 'seeds': [0, 1]})
 
 
+def t_round11_effect_scale_invariance():
+    # A pure change of effect unit (log10 -> ln -> percent, or a near-limit
+    # rescaling) must not change a p-value, a trend verdict or a
+    # random-effects summary.  Raw squares used to overflow/underflow at the
+    # float limits while the report still printed a finite-looking answer.
+    rng = np.random.default_rng(41)
+    for _c in (1e-300, 1e300):
+        for n in (6, 21, 41):
+            d = (rng.normal(size=n) * _c).tolist()
+            a = L.exact_signflip_p(d)
+            b = BR.exact_signflip(d)
+            v = V7.exact_sign_permutation(d)
+            assert abs(a['p'] - b['p_exact_signflip']) < 1e-12, (_c, n, a, b)
+            assert abs(a['p'] - v['p_exact_signflip']) < 1e-12, (_c, n, a, v)
+            assert math.isfinite(v['mean']) and math.isfinite(v['std']), (_c, n, v)
+
+    pts = [{'label': str(i), 'scale': 10.0 ** i,
+            'effects': rng.normal(size=4).tolist(),
+            'seeds': list(range(4)), 'corpus_fp': 'x', 'vocab': 100}
+           for i in range(4)]
+    base = L.scaling_trend(pts)
+    assert base['verdict'] in ('resolution_limited', 'no_detectable_trend',
+                                'effect_increases_with_scale', 'effect_decreases_with_scale',
+                                'heterogeneous_trend'), base
+    for _c in (1e-300, 1e-100, 1e100, 1e300):
+        scaled = L.scaling_trend([
+            dict(p, effects=[e * _c for e in p['effects']]) for p in pts])
+        assert scaled['verdict'] == base['verdict'], (_c, base['verdict'], scaled['verdict'])
+        for _k in ('p', 'I2_percent'):
+            assert math.isclose(base['heterogeneity'][_k], scaled['heterogeneity'][_k],
+                                rel_tol=1e-12, abs_tol=1e-15), (_c, _k, base, scaled)
+        assert math.isclose(scaled['direction_slope'], base['direction_slope'] * _c,
+                            rel_tol=1e-12), (_c, scaled['direction_slope'])
+
+    # The paired-contrast verdict itself must not flip with the effect unit.
+    _pd = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    _pref = L.paired_effect_stats(_pd, min_n=3)
+    for _c in (1e-300, 1e-100, 1e100, 1e300):
+        _ps = L.paired_effect_stats([x * _c for x in _pd], min_n=3)
+        assert _ps['significant'] == _pref['significant'] is True, (_c, _pref, _ps)
+        assert _ps['within_seed_noise'] == _pref['within_seed_noise'] is False, (_c, _pref, _ps)
+        assert math.isclose(_ps['mean'], _pref['mean'] * _c, rel_tol=1e-12), (_c, _ps['mean'])
+        assert math.isclose(_ps['std'], _pref['std'] * _c, rel_tol=1e-12), (_c, _ps['std'])
+
+    # TOST must scale the effects and the pre-registered margin together.
+    _td = [0.1, 0.2, 0.15, 0.12]
+    _tref = L.tost_paired(_td, 0.3)
+    for _c in (1e-300, 1e-100, 1e100, 1e300):
+        _ts = L.tost_paired([x * _c for x in _td], 0.3 * _c)
+        assert _ts['equivalent'] is _tref['equivalent'] is True, (_c, _tref, _ts)
+        assert math.isclose(_ts['p_tost'], _tref['p_tost'], rel_tol=1e-12), (_c, _ts)
+        assert math.isclose(_ts['mean'], _tref['mean'] * _c, rel_tol=1e-12), (_c, _ts)
+        for _x, _y in zip(_ts['ci'], _tref['ci']):
+            assert math.isclose(_x, _y * _c, rel_tol=1e-12), (_c, _ts, _tref)
+
+    mpts = [{'label': str(i), 'scale': 10.0 ** i,
+             'effects': rng.normal(size=4).tolist(),
+             'seeds': list(range(4)), 'corpus_fp': 'x', 'vocab': 100}
+            for i in range(3)]
+    mbase = L.meta_analyze_effects(mpts)
+    assert mbase['status'] == 'ok' and mbase['n_usable'] == 3, mbase
+    for _c in (1e-300, 1e-100, 1e100, 1e300):
+        mscaled = L.meta_analyze_effects([
+            dict(p, effects=[e * _c for e in p['effects']]) for p in mpts])
+        assert mscaled['status'] == 'ok' and mscaled['n_usable'] == 3, (_c, mscaled)
+        assert math.isclose(mscaled['random_effects']['mean'],
+                            mbase['random_effects']['mean'] * _c,
+                            rel_tol=1e-12), (_c, mscaled)
+        assert math.isclose(mscaled['heterogeneity']['p'],
+                            mbase['heterogeneity']['p'],
+                            rel_tol=1e-12, abs_tol=1e-15), (_c, mscaled)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -10111,6 +10184,7 @@ def main():
     _check('N17 no-B-lane pooling is total (sorted or unsorted ids)', t_round10_pool_without_b_lane)
     _check('N18 prefix reference honours use_overlap=False', t_round10_prefix_reference_honours_use_overlap)
     _check('N19 power artifact / confirmatory geometry require exact counts', t_round10_power_artifact_requires_exact_counts)
+    _check('N20 effect-unit rescaling keeps p/trend/meta summaries invariant', t_round11_effect_scale_invariance)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

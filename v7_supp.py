@@ -1712,39 +1712,36 @@ def exact_sign_permutation(deltas):
         return res
     if n == 0:
         return _extras({'n': 0, 'mean': float('nan'), 'std': float('nan'), 'p_exact_signflip': float('nan'), 'n_flips': 0, 'n_dropped': n_dropped}, d, n)
-    obs = abs(d.mean())
-    if n > 20:
-        # exp_lib keeps the test exact via meet-in-the-middle through n=40
-        # (and uses a deterministic saddlepoint tail, never a random
-        # Monte-Carlo draw, beyond that).  Do not label a sampled p-value as
-        # an exact sign-flip p.
-        _r = L.exact_signflip_p(d)
-        # Zero deltas multiply the number of sign assignments without
-        # changing the null distribution, so the attainable floor is 2/2**m
-        # with m the number of NONZERO deltas — not 2/2**n.  This applies to
-        # the saddlepoint AND the exact/MITM paths (both include the zeros in
-        # the 2**n count but the all-same-sign mass is 2**z times larger).
-        _m_nonzero = int(np.count_nonzero(d))
-        return _extras({'n': n, 'mean': float(d.mean()),
-                        'std': float(d.std(ddof=1)) if n > 1 else 0.0,
-                        'p_exact_signflip': float(_r['p']),
-                        'n_flips': (int(1 << n) if _r.get('method', '').startswith('exact') else 0),
-                        'method': _r.get('method'),
-                        'n_dropped': n_dropped}, d, n, floor_n=_m_nonzero)
-    cnt = 0
-    total = 1 << n
-    # Scale-free tie slack, matching exp_lib.exact_signflip_p: a fixed
-    # absolute slack makes tiny consistent effects report p=1.
-    _tol_mean = 1e-12 * float(np.abs(d).sum()) / n
-    bitpos = np.arange(n, dtype=np.int64)[None, :]
-    step = max(1, min(total, (1 << 24) // max(n, 1)))
-    for off in range(0, total, step):
-        bs = min(step, total - off)
-        masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
-        flips = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
-        cnt += int((np.abs((flips * d[None, :]).mean(1)) >= obs - _tol_mean).sum())
-    p = float(cnt / total)
-    return _extras({'n': n, 'mean': float(d.mean()), 'std': float(d.std(ddof=1)) if n > 1 else 0.0, 'p_exact_signflip': p, 'n_flips': int(total), 'n_dropped': n_dropped}, d, n, floor_n=int(np.count_nonzero(d)))
+    # One exact implementation for every n: exp_lib enumerates n<=20,
+    # meet-in-the-middle to n=40 and uses a deterministic saddlepoint tail
+    # beyond that.  Delegating avoids a second copy whose arithmetic can drift
+    # (and lets exp_lib's power-of-two normalisation keep tiny/huge effects
+    # from overflowing the variance while the p stays exact).
+    _r = L.exact_signflip_p(d)
+    _m_nonzero = int(np.count_nonzero(d))
+    # Effect-unit mean/std: compute on a power-of-two rescaling and undo it, so
+    # a finite panel near the float limits does not turn a finite std into inf
+    # (or a finite mean into 0/-inf) as raw squares do.
+    _amax = float(np.max(np.abs(d))) if d.size else 0.0
+    _e = 0
+    if _amax > 0.0 and math.isfinite(_amax):
+        _, _e = math.frexp(_amax)
+    _ds = np.ldexp(d, -_e) if _e else d
+
+    def _unscale(v):
+        if not _e:
+            return float(v)
+        try:
+            return math.ldexp(float(v), _e)
+        except OverflowError:
+            return math.copysign(float('inf'), float(v))
+    _mu = _unscale(_ds.mean())
+    _sd = _unscale(_ds.std(ddof=1)) if n > 1 else 0.0
+    return _extras({'n': n, 'mean': _mu, 'std': _sd,
+                    'p_exact_signflip': float(_r['p']),
+                    'n_flips': (int(1 << n) if _r.get('method', '').startswith('exact') else 0),
+                    'method': _r.get('method'),
+                    'n_dropped': n_dropped}, d, n, floor_n=_m_nonzero)
 
 def flops_analysis(outdir='analysis_v7', seq_lens=None):
     os.makedirs(outdir, exist_ok=True)

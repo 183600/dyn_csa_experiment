@@ -263,19 +263,39 @@ def exact_signflip(deltas):
     n = len(deltas)
     if n == 0:
         return None
+    # The test is invariant to a common positive scale.  Normalise by an exact
+    # power of two before any square/sum, exactly like exp_lib.exact_signflip_p;
+    # otherwise effects near the float limits overflow the MITM/saddlepoint
+    # arithmetic (or underflow the variance to zero) while the audit still
+    # reports a finite answer.
+    _amax = max(abs(float(d)) for d in deltas)
+    _exp = 0
+    if _amax > 0.0 and math.isfinite(_amax):
+        _, _exp = math.frexp(_amax)
+        if _exp:
+            deltas = [math.ldexp(float(d), -_exp) for d in deltas]
     mu = sum(deltas) / n
     std = (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0
+
+    def _unscale(v):
+        if not _exp:
+            return v
+        try:
+            return math.ldexp(float(v), _exp)
+        except OverflowError:
+            return math.copysign(float('inf'), float(v))
+    _mu, _std = _unscale(mu), _unscale(std)
     if 20 < n <= 40:
         try:
             _cnt = _signflip_mitm_count(deltas)
-            return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': _cnt / (1 << n), 'method': 'exact-mitm'}
+            return {'n': n, 'mean': _mu, 'std': _std, 'p_exact_signflip': _cnt / (1 << n), 'method': 'exact-mitm'}
         except ImportError:
             pass
     if n > 40:
         # Same deterministic tail as exp_lib: no random MC draw, and the
         # variance is the sign-flip null variance sum(d_i**2).
         _p, _method = _signflip_saddlepoint_p(deltas)
-        return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': _p, 'method': _method}
+        return {'n': n, 'mean': _mu, 'std': _std, 'p_exact_signflip': _p, 'method': _method}
     # Compare the SIGNED-MEAN statistic exactly as exp_lib.exact_signflip_p
     # does.  Scaling the threshold to the raw sum (or to abs(sum) - eps*sum)
     # is algebraically equivalent but rounds differently near the tolerance:
@@ -307,8 +327,7 @@ def exact_signflip(deltas):
             s = sum((d if mask >> i & 1 else -d for i, d in enumerate(deltas))) / n
             if abs(s) >= _obs - _tol_mean:
                 cnt += 1
-    mu = sum(deltas) / n
-    return {'n': n, 'mean': mu, 'std': (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0, 'p_exact_signflip': cnt / (1 << n), 'method': 'exact'}
+    return {'n': n, 'mean': _mu, 'std': _std, 'p_exact_signflip': cnt / (1 << n), 'method': 'exact'}
 
 def _measurable(r):
     if not isinstance(r, dict):
