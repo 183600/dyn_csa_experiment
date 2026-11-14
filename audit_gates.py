@@ -706,7 +706,12 @@ def _sidecar_fp(arr):
         part = a[off:off + step]
         if _canon is not None and part.dtype != _canon:
             part = part.astype(_canon, copy=False)
-        elif not part.flags.c_contiguous:
+        # astype(copy=False) preserves a Fortran/negative/sliced layout, and
+        # memoryview.cast only accepts C-contiguous views.  Normalise AFTER the
+        # dtype canonicalisation (a non-contiguous int32 view took the first
+        # branch and skipped this in the old elif) so the digest stays
+        # byte-identical to exp_lib._ids_fp for every layout.
+        if not part.flags.c_contiguous:
             part = np.ascontiguousarray(part)
         h.update(memoryview(part).cast('B'))
     return h.hexdigest()[:16]

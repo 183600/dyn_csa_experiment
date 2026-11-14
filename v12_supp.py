@@ -1531,6 +1531,7 @@ def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
     test access; it is not a guarantee and not a bound (unequal magnitudes can
     make the exact test more or less powerful than these numbers).
     """
+    import bisect as _bisect
     import itertools as _it
     n = len(deltas)
     mags = [abs(float(x)) for x in deltas]
@@ -1556,18 +1557,30 @@ def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
     _min_same = None
     _n_reject_holm = 0
     _n_reject_marginal = 0
+    # A non-directional comparison has no pre-registered sign, so its power is
+    # the average over the two possible true directions.  The rejecting set is
+    # symmetric under flipping every sign, so computing it with the positive
+    # reference and accepting either observed direction is that average
+    # (flipping all signs maps the set onto itself and swaps the q-weights).
+    _power_dir = 1.0 if exp_dir is None else exp_dir
     for signs in _it.product((1.0, -1.0), repeat=n):
-        stat = abs(sum(s_i * mags[i] for i, s_i in enumerate(signs)))
+        _signed = sum(s_i * mags[i] for i, s_i in enumerate(signs))
+        stat = abs(_signed)
         # exact p: #null sums >= observed statistic (ties included, as in the
-        # exact test's "at least as extreme" rule)
-        _p = sum(1 for v in _sums if v >= stat - _tol) / _total
+        # exact test's "at least as extreme" rule).  _sums is sorted, so use
+        # binary search: the previous linear scan made this O(4**n) and would
+        # hang long before the advertised n<=16 ceiling (2**16 patterns).
+        _p = (len(_sums) - _bisect.bisect_left(_sums, stat - _tol)) / _total
         # A two-sided rejection is only a CONFIRMATION when the observed
         # direction also matches the pre-registered sign (decision_rule's
         # direction_ok): the all-opposite pattern rejects just as hard but in
-        # the wrong direction.  For a non-directional comparison every
-        # rejection counts.
-        _same = sum(1 for i, s_i in enumerate(signs) if exp_dir is not None and s_i == exp_dir)
-        _dir_ok = (exp_dir is None) or (_same * 2 > n)
+        # the wrong direction.  Direction is the SIGN OF THE WEIGHTED SUM, not
+        # a same-sign majority: with unequal |d_i| a pattern can have a
+        # positive majority and a negative mean (or vice versa), and the real
+        # decision rule looks at the mean.  For a non-directional comparison
+        # every rejection counts.
+        _same = sum(1 for s_i in signs if s_i == _power_dir)
+        _dir_ok = (exp_dir is None) or (_signed * exp_dir > 0.0)
         _rej_h = _p <= _thr_holm and _dir_ok
         _rej_m = _p <= _thr_marginal and _dir_ok
         if _rej_h:
@@ -1576,12 +1589,10 @@ def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
             _n_reject_marginal += 1
         if _rej_h and exp_dir is not None and (_min_same is None or _same < _min_same):
             _min_same = _same
-        if exp_dir is not None:
+        if _rej_h:
             for q in powers:
                 _qv = float(q.split('=')[1])
-                w = (_qv ** _same) * ((1.0 - _qv) ** (n - _same))
-                if _rej_h:
-                    powers[q] += w
+                powers[q] += (_qv ** _same) * ((1.0 - _qv) ** (n - _same))
     return {
         'n': n,
         'status': 'ok',

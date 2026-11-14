@@ -263,7 +263,6 @@ def exact_signflip(deltas):
     n = len(deltas)
     if n == 0:
         return None
-    obs = abs(sum(deltas))
     mu = sum(deltas) / n
     std = (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0
     if 20 < n <= 40:
@@ -277,34 +276,36 @@ def exact_signflip(deltas):
         # variance is the sign-flip null variance sum(d_i**2).
         _p, _method = _signflip_saddlepoint_p(deltas)
         return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': _p, 'method': _method}
+    # Compare the SIGNED-MEAN statistic exactly as exp_lib.exact_signflip_p
+    # does.  Scaling the threshold to the raw sum (or to abs(sum) - eps*sum)
+    # is algebraically equivalent but rounds differently near the tolerance:
+    # with tiny deltas the two forms can report different p-values for the
+    # same data, so the report builder would disagree with the audit.
     try:
         import numpy as _np
     except ImportError:
         _np = None
+    _sum_abs = sum(abs(d) for d in deltas)
     if _np is not None:
         _total = 1 << n
         _darr = _np.asarray(deltas, dtype=float)
-        _thr = obs - 1e-12 * float(_np.abs(_darr).sum())
-        _ebnd = n * 2.220446049250313e-16 * float(_np.abs(_darr).sum())
+        _obs = abs(float(_darr.mean()))
+        _tol_mean = 1e-12 * float(_np.abs(_darr).sum()) / n
         _bitpos = _np.arange(n, dtype=_np.int64)
         _step = max(1, min(_total, (1 << 24) // max(n, 1)))
         cnt = 0
         for _off in range(0, _total, _step):
             _masks = _np.arange(_off, min(_off + _step, _total), dtype=_np.int64)
             _signs = (((_masks[:, None] >> _bitpos) & 1) * 2 - 1).astype(float)
-            _s = _np.abs((_signs * _darr[None, :]).sum(1))
-            _near = _np.abs(_s - _thr) <= _ebnd
-            cnt += int((_s[~_near] >= _thr).sum())
-            for _m in _masks[_near].tolist():
-                s = sum((d if _m >> i & 1 else -d for i, d in enumerate(deltas)))
-                if abs(s) >= _thr:
-                    cnt += 1
+            _s = _np.abs((_signs * _darr[None, :]).mean(1))
+            cnt += int((_s >= _obs - _tol_mean).sum())
     else:
         cnt = 0
-        _slack = 1e-12 * sum(abs(d) for d in deltas)
+        _obs = abs(sum(deltas) / n)
+        _tol_mean = 1e-12 * _sum_abs / n
         for mask in range(1 << n):
-            s = sum((d if mask >> i & 1 else -d for i, d in enumerate(deltas)))
-            if abs(s) >= obs - _slack:
+            s = sum((d if mask >> i & 1 else -d for i, d in enumerate(deltas))) / n
+            if abs(s) >= _obs - _tol_mean:
                 cnt += 1
     mu = sum(deltas) / n
     return {'n': n, 'mean': mu, 'std': (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0, 'p_exact_signflip': cnt / (1 << n), 'method': 'exact'}
@@ -2019,6 +2020,17 @@ def holm_adjust(named_pvals, alpha=0.05):
     """Holm step-down over the report's displayed family (local copy: this
     builder intentionally does not import torch/exp_lib).  Missing/invalid
     p-values keep a dummy p=1 slot so the family size is not silently shrunk."""
+    # Same alpha contract as exp_lib.holm_adjust: a boolean/out-of-range level
+    # would silently change every rejection decision.
+    if isinstance(alpha, (bool, np.bool_)):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
+    try:
+        _a = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}') from None
+    if not (math.isfinite(_a) and 0.0 < _a < 1.0):
+        raise ValueError(f'alpha must be in (0,1), got {alpha!r}')
+    alpha = _a
     items = []
     _seen = set()
     for k, v in (named_pvals if named_pvals is not None else []):

@@ -792,6 +792,13 @@ def t_exact_signflip_at_scale():
     # exp_lib; a 1e-12 sum threshold can disagree near the decision boundary.
     assert abs(BR.exact_signflip(d)['p_exact_signflip'] - got) < 1e-15, (
         BR.exact_signflip(d)['p_exact_signflip'], got)
+    # Tiny deltas sit on the tie-tolerance boundary where abs(sum) - eps*sum
+    # and the signed-mean threshold round differently.  The report builder is
+    # the zero-GPU twin of exp_lib, so the two must agree exactly here too.
+    for _d in ([0.2, 1e-13, 1e-13, -0.2, 1e-13, 0.2, 1e-13, 1e-13],
+               [1e-13, -2e-13, 2e-13, 0.0, -1e-13],
+               [0.3, -0.1, 1e-14, -0.2, 1e-14, 0.1]):
+        assert BR.exact_signflip(_d)['p_exact_signflip'] == L.exact_signflip_p(_d)['p'], _d
 
 
 def t_signflip_saddlepoint_large_n():
@@ -1780,11 +1787,45 @@ def t_review5_power_enumeration():
     # no expected sign -> power(q) is still reported but min_same_sign is None
     res_nd = V12._power_enumeration([1.0, 2.0, 3.0], None, 0.05, 4)
     assert res_nd['status'] == 'ok' and res_nd['min_same_sign_for_holm_confirmation'] is None, res_nd
+    # A non-directional comparison still has a defined power: the rejecting
+    # set is symmetric under a global sign flip, so either true direction
+    # gives the same number.  Reporting all zeros made every such comparison
+    # look underpowered.
+    res_nd10 = V12._power_enumeration([1.0] * 10, None, 0.05, 4)
+    assert res_nd10['power_holm_conservative']['q=0.95'] > 0.5, res_nd10
+    # n=16 is the documented enumeration ceiling.  The null-tail lookup must
+    # be logarithmic; the old linear scan made this O(4**n) and effectively
+    # hung at the ceiling (seed panels are expected to grow).
+    _res16 = V12._power_enumeration([1.0] * 16, 'positive', 0.05, 4)
+    assert _res16['status'] == 'ok' and _res16['power_holm_conservative']['q=0.95'] > 0.0, _res16
     # direction-aware: the all-opposite pattern (0 same-sign) rejects the
     # two-sided test but in the WRONG direction — only the single pattern
     # with every seed in the expected direction counts as confirming
     # (1/1024, not 2/1024: the wrong-direction twin is excluded).
     assert res['fraction_patterns_confirming_holm'] == 1 / 1024, res
+    # Unequal magnitudes: confirmation depends on the sign of the WEIGHTED
+    # mean, not on a same-sign majority.  Here the pattern
+    # (-100, +1, ..., +1) has 9/10 same-sign entries but a negative mean, so
+    # it must not be counted as a confirming positive effect.
+    import bisect as _bisect
+    import itertools as _it
+    _mag = [100.0] * 6 + [1.0] * 7
+    _null = sorted(abs(sum(_s * _m for _s, _m in zip(_signs, _mag)))
+                   for _signs in _it.product((1.0, -1.0), repeat=len(_mag)))
+    _tol = 1e-12 * max(1.0, max(_null))
+    _want_nd = 0
+    _wrong_majority = 0
+    for _signs in _it.product((1.0, -1.0), repeat=len(_mag)):
+        _signed = sum(_s * _m for _s, _m in zip(_signs, _mag))
+        _p = (len(_null) - _bisect.bisect_left(_null, abs(_signed) - _tol)) / len(_null)
+        _same = sum(1 for _s in _signs if _s > 0)
+        if _p <= 0.05 and _signed > 0:
+            _want_nd += 1
+        if _p <= 0.05 and _signed < 0 and _same * 2 > len(_mag):
+            _wrong_majority += 1
+    assert _wrong_majority > 0, 'fixture must contain a wrong-direction majority pattern'
+    _res_dir = V12._power_enumeration(_mag, 'positive', 0.05, 1)
+    assert abs(_res_dir['fraction_patterns_confirming_holm'] - _want_nd / len(_null)) < 1e-12, _res_dir
 
 
 def t_review5_rope_kernel_guard():
@@ -3569,6 +3610,14 @@ def t_audit_sidecar_fp_matches_exp_lib():
     assert A._sidecar_fp(hi) == L._ids_fp(hi)
     assert A._sidecar_fp(hi2) == L._ids_fp(hi2)
     assert A._sidecar_fp(hi) != A._sidecar_fp(hi2)
+    # A non-C-contiguous view (transpose/slice/negative stride) is the same
+    # logical token array.  The audit must hash it exactly like exp_lib; a
+    # dtype-canonicalising branch used to skip the layout normalisation.
+    _base = np.arange(6 * 7, dtype=np.int64).reshape(6, 7)
+    for _dt in (np.int8, np.uint16, np.int32):
+        _b = (_base % 100).astype(_dt)
+        for _view in (_b[:, ::2], _b.T, _b[::-1], _b[:, ::-1]):
+            assert A._sidecar_fp(_view) == L._ids_fp(_view), (np.dtype(_dt).name, _view.strides)
 
 
 def t_data_version_identity():
@@ -6177,6 +6226,16 @@ def t_boolean_pvalues_are_not_probabilities():
         assert BR._sig_gate({'n': 12, 'mean': -1.0, 'std': 0.1,
                              'p_exact_signflip': bad, 'p_holm': 0.02},
                             register=False) is False
+    # The report's Holm twin must reject the same malformed alpha levels as
+    # exp_lib instead of coercing a boolean/out-of-range level.
+    for _bad_a in (True, False, np.bool_(True), 0, 1, 2, -0.1, float('nan'), 'x'):
+        for _fn in (L.holm_adjust, BR.holm_adjust):
+            try:
+                _fn([('a', 0.01)], alpha=_bad_a)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'{_fn.__module__}.holm_adjust accepted alpha={_bad_a!r}')
     # Boolean measurements are not seed counts/effects either.
     assert L.reportable_claim({'n': True, 'mean': -1.0, 'std': 0.1,
                                'p_exact_signflip': 0.01, 'p_holm': 0.02})['allowed'] is False
