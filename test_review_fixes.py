@@ -10219,8 +10219,7 @@ def t_round14_attention_mask_uses_logit_dtype():
 
 
 def t_round14_soft_prior_dtype_mismatch_is_safe():
-    # A lower-precision prior must not raise when the logits use a wider dtype
-    # (the old mask filled a float32 tensor with the float64 MIN).
+    # A lower-precision prior must not raise when the logits use a wider dtype.
     torch.manual_seed(14)
     n, h, d, w, nb = 4, 2, 3, 1, 2
     q, k, v = (torch.randn(n, h, d, dtype=torch.float64) for _ in range(3))
