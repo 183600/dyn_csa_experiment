@@ -203,8 +203,8 @@ def synthesize_long_summary():
         _real = sorted({_num_or_none(r.get('seed')) for r in summary.values() if isinstance(r, dict) and r.get('variant') == real_v and (r.get('seed') is not None)} - {None})
         _exp_tok = _LONG_STEPS * int(L.RUN_LONG['batch_size']) * int(L.RUN_LONG['seq_len'])
         _ts = _num_or_none(e.get('tokens_seen'))
-        if _ts is not None and _ts != _exp_tok:
-            print(f"[synth] REFUSING to synthesize `{v}`: the aggregate's tokens_seen={_ts} does not match the current long recipe ({_LONG_STEPS} steps x {int(L.RUN_LONG['batch_size'])} x {int(L.RUN_LONG['seq_len'])} = {_exp_tok} tokens) — the snapshot was produced under a different configuration and reconstructing under the current step count would misattribute it.  Re-run the panel; only this variant is skipped.")
+        if _ts is None or _ts != _exp_tok:
+            print(f"[synth] REFUSING to synthesize `{v}`: the aggregate's tokens_seen={_ts!r} does not certify the current long recipe ({_LONG_STEPS} steps x {int(L.RUN_LONG['batch_size'])} x {int(L.RUN_LONG['seq_len'])} = {_exp_tok} tokens) — a missing count cannot prove the snapshot used this configuration, and reconstructing under the current step count would misattribute it.  Re-run the panel; only this variant is skipped.")
             _cfg_refused.append(v)
             continue
         if _seeds is None or len(_seeds) != len(_ppls):

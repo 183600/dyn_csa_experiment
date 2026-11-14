@@ -544,6 +544,7 @@ def per_seed_records(outdir):
     s = summary(outdir)
     _legacy_ok = _legacy_warm_tags_cached(outdir)
     out = collections.defaultdict(dict)
+    _ambiguous = set()
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
             _sv = r['seed']
@@ -562,8 +563,17 @@ def per_seed_records(outdir):
                 continue
             _slot = out[_v]
             _tk = (_tag_of(r, _k, _legacy_ok), _sd)
+            if (_v, _tk) in _ambiguous:
+                print(f'[report] ambiguous (variant, protocol, seed) = ({r['variant']!r}, {_tk[0]!r}, {_sd}) in {outdir}: more than two measurable records found; the whole slot stays excluded from pairing (key {_k!r})')
+                continue
             if _tk in _slot:
-                print(f'[report] ambiguous (variant, protocol, seed) = ({r['variant']!r}, {_tk[0]!r}, {_sd}) in {outdir}: two measurable records found; keeping the FIRST (key {_k!r} ignored for pairing)')
+                # Two measurable records for one (variant, protocol, seed)
+                # make the value ambiguous.  Keeping the first would make the
+                # report depend on dict insertion order (and could pair a
+                # stale record while _agg_entry refuses the same stale code).
+                print(f'[report] ambiguous (variant, protocol, seed) = ({r['variant']!r}, {_tk[0]!r}, {_sd}) in {outdir}: two measurable records found (keys {_k!r} and an earlier one); the slot is EXCLUDED from pairing rather than choosing an order-dependent winner')
+                _slot.pop(_tk, None)
+                _ambiguous.add((_v, _tk))
                 continue
             _slot[_tk] = r
     out = dict(out)

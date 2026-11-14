@@ -2254,7 +2254,9 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                 if (ok if ok else cells) and len(ok if ok else cells) < len(rows):
                     print(f'[v10 report] {v} L{Ln}: the column mean covers {len(ok if ok else cells)}/{len(rows)} seeds — the rest hold no usable cell at this length (error/truncated cell), so the column is a sub-seed mean')
                 if ok:
-                    return (float(np.mean([c['ppl'] for c in ok])), False)
+                    # A mean over a strict subset is not a complete column:
+                    # mark it partial so the rendered cell carries `~` too.
+                    return (float(np.mean([c['ppl'] for c in ok])), len(ok) != len(rows))
                 return (float(np.mean([c['ppl'] for c in cells])), True) if cells else (float('nan'), False)
 
             def _paired_ratio(rows=rows):
@@ -2293,7 +2295,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                 _ratio = f'×{_pr:.2f}' if _pr is not None and np.isfinite(_pr) else '—'
             A(f'| `{v}` | {_fmt_cell(512)} | {_fmt_cell(2048)} | {_fmt_cell(4096)} | {_ratio} |')
         A('')
-        A('> 后缀 `~` 表示该列**只有位置受限（abs-PE）的截断 cell**：它是在比列名更短的 span 上评出来的分数，**不是**长上下文测量值。任何 `~` 行不可用于「外推是否稳健」的结论。')
+        A('> 后缀 `~` 表示该列**不是完整的非截断测量**：它可能只含位置受限（abs-PE）的截断 cell（在比列名更短的 span 上评出的分数），也可能只有部分 seed 在该长度有可用 cell；都**不是**完整的长上下文测量值。任何 `~` 行不可用于「外推是否稳健」的结论。')
         A('')
         if _stale_vars:
             A('> **⚠ 陈旧记录已排除**：' + '、'.join(f'`{x}`' for x in sorted(_stale_vars)) +

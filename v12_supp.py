@@ -1098,6 +1098,14 @@ def _verify_lock_mirror(outdir, lock=None):
     lp = _freeze_lock_path(outdir)
     _refreeze = os.environ.get('V12_REFREEZE', '').strip().lower() in ('1', 'true', 'yes', 'on')
     if not os.path.exists(lp):
+        # Only a mirror that PROVES a read of the held-out split blocks the
+        # run.  A pre-access attestation is written before the one-shot read
+        # and can legitimately survive an aborted power/leakage gate; it must
+        # not force V12_REFREEZE (which would falsely downgrade the round).
+        if not _lock_proves_test_access(mp):
+            print(f'[v12] NOTE: the git-tracked mirror {mp} is a pre-access attestation only; '
+                  f'writing a fresh lock in {outdir} without downgrading the plan')
+            return None
         if not _refreeze:
             raise SystemExit(
                 f'[v12] REFUSE: the git-tracked freeze-lock mirror {mp} records a first '
@@ -1846,6 +1854,14 @@ def run_finaltest(cfg=None, guard=None):
     need = max([int(x) for x in ((manifest.get('eval') or {}).get('by_length_ppl') or cfg['eval_lens'])]) + 1
     _nseq_clean = int((manifest.get('eval') or {}).get('n_seqs_clean') or cfg.get('n_seq', 16))
     test_ids = cfg.get('test_ids')
+    if _smoke and test_ids is None:
+        # Smoke bypasses the plan/health/power/leakage gates, so it must never
+        # fall through to the real held-out split: without an injected slice a
+        # `smoke=True` typo would silently consume the one-shot test access
+        # (and stamp its records as non-confirmatory only afterwards).
+        raise SystemExit(
+            '[v12] REFUSE: smoke mode requires caller-supplied test_ids; a '
+            'smoke run must never read the frozen held-out test split')
     if test_ids is not None:
         # A caller-supplied slice is ONLY a plumbing smoke input.  In normal
         # mode the test split must come from load_wikitest, otherwise a

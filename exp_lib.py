@@ -1681,6 +1681,11 @@ def causal_adaptive_threshold(sim, target_block_tokens):
             f'causal_adaptive_threshold: target_block_tokens='
             f'{target_block_tokens!r} must be an exact integer >= 1')
     target_block_tokens = _target
+    # A 0-D similarity is the T=1 degenerate case; normalise it to one row so
+    # the shape[-1] access below does not raise IndexError (the returned value
+    # is squeezed back to the caller's 0-D shape at the end).
+    if sim.dim() == 0:
+        sim = sim.reshape(1)
     if sim.numel() == 0:
         # Preserve the caller's shape: an empty batch [0, n] or a zero-width
         # row must not turn into a flat length-0 tensor.
@@ -3988,11 +3993,20 @@ def _sink_aligned(sink_logits, logits):
         return sink_logits.reshape(target)
     except RuntimeError:
         try:
-            torch.broadcast_shapes(tuple(sink_logits.shape), target)
+            _broadcast = torch.broadcast_shapes(tuple(sink_logits.shape), target)
         except RuntimeError:
             raise ValueError(
                 f'sink_logits shape {tuple(sink_logits.shape)} is not broadcastable '
                 f'to logits shape {tuple(logits.shape)} (target {target})') from None
+        # Broadcasting to `target` is required; broadcasting both sides to a
+        # WIDER shape (e.g. [1, lanes] -> [..., lanes]) would silently use the
+        # sink as a per-lane bias instead of one sink column.
+        if tuple(_broadcast) != tuple(target):
+            raise ValueError(
+                f'sink_logits shape {tuple(sink_logits.shape)} broadcasts to '
+                f'{tuple(_broadcast)}, not the sink target {target} for logits '
+                f'shape {tuple(logits.shape)}; the last axis must be a single '
+                'sink column')
         return sink_logits
 
 
@@ -4015,10 +4029,12 @@ def _sink_split_softmax(logits, sink_logits, want_sink=True):
     sink_logits = _safe_nan_to_num(sink_logits, where='sink_split')
     _sl = _sink_aligned(sink_logits, logits)
     lse = _sink_log_normalizer(logits, sink_logits)
-    soft = (logits - lse).exp()
+    # A +inf/-inf logit makes logits-lse non-finite; sanitize exactly like the
+    # public sink_softmax path instead of returning NaN attention weights.
+    soft = _safe_nan_to_num((logits - lse).exp(), where='sink_split')
     if not want_sink:
         return (soft, None)
-    return (soft, (_sl - lse).exp())
+    return (soft, _safe_nan_to_num((_sl - lse).exp(), where='sink_split'))
 
 _FO_FULL_CAP_BYTES = 64 << 20
 _FO_MINL = {}
@@ -4051,6 +4067,14 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     # softmax logits.  A width-0 prior is therefore exactly "no prior".
     if soft is not None and int(getattr(soft, 'shape', ())[-1]) == 0:
         soft = None
+    if (k_sw is None) != (v_sw is None):
+        raise ValueError(
+            'gathered_attention: k_sw and v_sw must both be tensors or both '
+            'be None (the window lane needs both)')
+    if int(w) > 0 and k_sw is None:
+        raise ValueError(
+            'gathered_attention: w>0 requires the window tensors k_sw/v_sw; '
+            'pass w=0 when there is no local window')
     if mem_budget_bytes is None:
         mem_budget_bytes = _attn_transient_budget(dev)
     if mem_budget_bytes is None:
@@ -4346,6 +4370,13 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
     # path's gradient.  Treat it as "no prior".
     if soft is not None and int(getattr(soft, 'shape', ())[-1]) == 0:
         soft = None
+    if k_sw is None or v_sw is None:
+        # The open-block window lane (and singleton prefix candidates) index
+        # the local token table; there is no "window width without tensors"
+        # spelling on this path.
+        raise ValueError(
+            'gathered_attention_open requires the window tensors k_sw/v_sw '
+            '(use w=0 only with an actual empty window table)')
     if mem_budget_bytes is None:
         mem_budget_bytes = _attn_transient_budget(dev)
     if mem_budget_bytes is None:
@@ -6916,12 +6947,20 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                     raise RuntimeError(f'load_wikitest: the test tokenizer vocabulary is not identical to the train tokenizer vocabulary ({_ttp}) — the id spaces cannot be paired; delete the test cache and rebuild it')
         if np.asarray(test_ids).shape != (int(n_seqs), int(seq_len)):
             raise RuntimeError(f'load_wikitest: cached test slice shape {np.asarray(test_ids).shape} != the frozen ({int(n_seqs)}, {int(seq_len)}); the frozen slice is part of the pre-registration, so a different row count must be re-frozen explicitly')
+        # The train loader validates its cache vocab through
+        # _cached_split_problems; the test cache must apply the same exact
+        # contract instead of returning a malformed meta value as the model's
+        # vocabulary size.
+        _test_vocab = _as_seed_int(meta.get('vocab'))
+        if _test_vocab is None or _test_vocab <= 0:
+            _problems.append(
+                f"cache vocab {meta.get('vocab')!r} is not a positive exact integer")
         if _problems:
             _cache_warning('WikiText test split', _problems)
         else:
             if not _fast:
-                _validate_token_ids(test_ids, meta['vocab'], 'cached test_ids')
-            out = (test_ids, meta['vocab'], None, test_bnd)
+                _validate_token_ids(test_ids, _test_vocab, 'cached test_ids')
+            out = (test_ids, _test_vocab, None, test_bnd)
             _memo_put(_WT103_TEST_MEMO, _mkey, out, _WT103_TEST_MEMO_CAP)
             return out
     # cold build: resolve the train tokenizer FIRST, then touch the test rows.
@@ -9688,8 +9727,15 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     # Using the smallest n here overstated the floor and could call a family
     # resolution-limited even when its best-resolved comparison can reject.
     _fam_n = max(_ns_floor) if _ns_floor else (max(_ns) if _ns else None)
-    _fam_floor = (holm_min_attainable_p(_fam_n, _m, alpha)
-                  if _fam_n is not None and _fam_n > 0 else None)
+    if _ns_floor and _fam_n == 0:
+        # Every tested contrast has zero nonzero pairs, so the exact p is
+        # always 1 and no comparison can reject.  That is a real resolution
+        # ceiling; holm_min_attainable_p(0, ...) deliberately returns NaN, so
+        # handle the all-zero family explicitly instead of hiding it.
+        _fam_floor = 1.0
+    else:
+        _fam_floor = (holm_min_attainable_p(_fam_n, _m, alpha)
+                      if _fam_n is not None and _fam_n > 0 else None)
     _fam_limited = bool(_fam_floor is not None and math.isfinite(_fam_floor) and _fam_floor > alpha)
     if _fam_limited:
         print(f'[stats] WARNING: family {family!r} has m={_m} declared comparisons and n_nonzero_max={_fam_n} seeds — '
@@ -9821,6 +9867,12 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     # lacks that field.
     _n_eff_raw = stats.get('n_nonzero', n)
     if isinstance(_n_eff_raw, (bool, np.bool_)):
+        # A boolean is malformed provenance, not a nonzero-pair count.  Use the
+        # declared n for the reported floor but fail the claim closed: silently
+        # falling back would let a garbage field turn a blocked claim into an
+        # allowed one.
+        out['reasons'].append(
+            f'n_nonzero {_n_eff_raw!r} is a boolean flag, not a nonzero-pair count')
         _n_eff = n
     elif _n_eff_raw is None:
         _n_eff = n
@@ -10103,6 +10155,15 @@ def exact_signflip_p(deltas):
     n_dropped = len(d_in) - n
     if n == 0:
         return {'n': 0, 'p': float('nan'), 'n_dropped': n_dropped, 'method': 'none'}
+    # The test is invariant to a common positive scale.  Rescaling by an exact
+    # power of two keeps the sign-assignment comparison unchanged (the mantissas
+    # are untouched) while preventing overflow of sum(|d|) / fsum for very large
+    # finite effects and underflow for very small ones.
+    _amax = float(np.max(np.abs(d)))
+    if _amax > 0.0:
+        _m, _e = math.frexp(_amax)
+        if _e != 0:
+            d = np.ldexp(d, -_e)
     obs = abs(float(d.mean()))
     if n <= _SIGNFLIP_ENUM_MAX_N:
         total = 1 << n
@@ -10788,11 +10849,12 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
         # Holm rejects at p_holm <= alpha, so the planning helper must use the
         # same inclusive boundary.  A strict '<' would report a plan as
         # impossible at the exact boundary that holm_adjust accepts.
-        # Compare via alpha/p: a family size above the float range would make
-        # an int->float conversion overflow.
+        # Compare in log space: alpha/p overflows to inf when p is a
+        # subnormal tail probability, which would accept an arbitrarily large
+        # family (m*p is still far above alpha).  math.log accepts a huge int.
         if p <= 0.0:
             return True
-        return m <= (a + 1e-15) / p
+        return math.log(m) + math.log(p) <= math.log(a + 1e-15)
 
     # p(k) decreases monotonically as k grows, so "clears the gate" is a
     # suffix of [0, n].  Binary search finds its left edge.
@@ -20751,7 +20813,13 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     # a (0, 0) column and dilute the effective document count.  Same rule as
     # _combined_seed_doc_ci / _nll_doc_ci; the eval rows are shared across
     # seeds, so the union test is exact.
-    _keep = ntok_mat.sum(axis=0) > 0
+    _pos = ntok_mat > 0
+    if (_pos.any(axis=0) & (~_pos).any(axis=0)).any():
+        # One seed scored a row that another seed reports zero tokens for:
+        # the per-document token roster is inconsistent, so the NLL of the
+        # zero-token side would be counted against a zero denominator.
+        return None
+    _keep = _pos.any(axis=0)
     nll_mat = nll_mat[:, _keep]
     ntok_mat = ntok_mat[:, _keep]
     R = int(nll_mat.shape[1])
@@ -20843,11 +20911,17 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     if isinstance(rows, list):
         nll_mat = np.stack([a for a, _ in rows], axis=0)          # [S, R]
         ntok_mat = np.stack([b for _, b in rows], axis=0)          # [S, R]
+        _pos = ntok_mat > 0
+        if (_pos.any(axis=0) & (~_pos).any(axis=0)).any():
+            # The eval rows must be shared across seeds; a row scored by one
+            # seed and zero-token for another is an inconsistent roster, not
+            # a (0, 0) document the union test may simply drop.
+            rows = None
         keep = ntok_mat.sum(axis=0) > 0
         n_dropped = int((~keep).sum())
         nll_mat = nll_mat[:, keep]
         ntok_mat = ntok_mat[:, keep]
-        if not np.isfinite(nll_mat).all() or not np.isfinite(ntok_mat).all() or (ntok_mat < 0).any():
+        if rows is not None and (not np.isfinite(nll_mat).all() or not np.isfinite(ntok_mat).all() or (ntok_mat < 0).any()):
             rows = None
     out = {'status': 'unverifiable', 'n_seeds': len(_recs), 'n_docs': None,
            'n_docs_dropped_zero_token': None,
@@ -20874,9 +20948,12 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     # values are ``per_tok`` itself.
     seed_logppl = None
     if rows is not None:
-        per_tok = nll_mat.sum(axis=1) / np.maximum(ntok_mat.sum(axis=1), 1e-30)
-        # CE == 0 (PPL == 1) is a valid measurement.
-        ok = np.isfinite(per_tok) & (per_tok >= 0)
+        _seed_ntok = ntok_mat.sum(axis=1)
+        per_tok = nll_mat.sum(axis=1) / np.maximum(_seed_ntok, 1e-30)
+        # CE == 0 (PPL == 1) is a valid measurement, but a seed with NO scored
+        # token has no measurement at all; max(0, 1e-30) must not turn it into
+        # a valid CE of 0.
+        ok = np.isfinite(per_tok) & (per_tok >= 0) & (_seed_ntok > 0)
         if ok.sum() == S and S >= 2:
             lp = per_tok
             seed_logppl = lp
@@ -21034,7 +21111,10 @@ def aggregate(summary, *, outdir=None):
     # evaluation sets that happen to share a run_cfg.
     _fp_conflicts = {}
     for (v, tag), recs in per_variant.items():
-        for _k in ('data_fp', 'val_fp'):
+        # `eval_fp` is part of the content identity exactly like data_fp/val_fp
+        # (pair_reason requires both-present equality on all three).  Skipping
+        # it here would pool seeds measured on different evaluation slices.
+        for _k in ('data_fp', 'val_fp', 'eval_fp'):
             _vals = sorted({str(r.get(_k)) for r in recs
                             if r.get(_k) is not None and str(r.get(_k)) != ''})
             if len(_vals) > 1:

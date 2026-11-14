@@ -217,6 +217,8 @@ class HybridAttentionRoPE(L.HybridAttention):
 
     def _single_rope(self, x, pre=None, gate_sig=None, pre_blocks=None):
         cfg = self.cfg
+        self.last_boundary_logp = None
+        self.last_boundary_decisions = 0
         T = x.shape[0]
         nh, hd = (self.nh, self.hd)
         scale = 1.0
@@ -232,7 +234,13 @@ class HybridAttentionRoPE(L.HybridAttention):
         gate_mean = None
         if cfg.chunking == 'cosine_learnable':
             if gate_sig is not None:
-                gate, gl = gate_sig
+                # `reinforce` gate tuples carry the score-function log-prob as
+                # a third element; discard it silently loses the boundary
+                # training term on the RoPE path.
+                gate, gl = gate_sig[0], gate_sig[1]
+                if len(gate_sig) > 2:
+                    self.last_boundary_logp = gate_sig[2]
+                    self.last_boundary_decisions = int(gate.numel())
             else:
                 fused = pre['fused'] if pre is not None and 'fused' in pre else self._fuse(x.detach())
                 sim = L.cosine_similarity_consecutive(fused)
@@ -242,7 +250,16 @@ class HybridAttentionRoPE(L.HybridAttention):
                     prefix_mean = torch.cumsum(sim, 0) / L._range_cache(1, sim.numel() + 1, x.device)
                     tau = prefix_mean + self.delta_logit
                     gate = torch.sigmoid((tau - sim) / max(cfg.temperature, 0.001))
-                    hard_b = gate.detach() > L._HALF
+                    if getattr(cfg, 'boundary_policy', 'threshold') == 'reinforce' and torch.is_grad_enabled():
+                        # Mirror exp_lib._single's score-function path so the
+                        # RoPE twin trains the same sampled boundary policy.
+                        _logits = torch.logit(gate.clamp(1e-7, 1 - 1e-7))
+                        hard_b = torch.bernoulli(gate).bool()
+                        self.last_boundary_logp = -F.binary_cross_entropy_with_logits(
+                            _logits, hard_b.to(gate.dtype), reduction='sum')
+                        self.last_boundary_decisions = int(gate.numel())
+                    else:
+                        hard_b = gate.detach() > L._HALF
                     # numpy view — same booleans as the .tolist() form
                     gl = hard_b.cpu().numpy()
             if gate is None:
@@ -606,16 +623,19 @@ class HybridAttentionRoPE(L.HybridAttention):
             # for any batch size (design notes §6.1): the inherited batched
             # _gate_signals is bit-identical to the per-row _gate_signal calls
             if self.cfg.chunking == 'cosine_learnable':
-                _raw, _gbool = self._gate_signals(x, pre_all)
+                _gs = self._gate_signals(x, pre_all)
+                _raw, _gbool = _gs[0], _gs[1]
                 if all((_r is not None for _r in _raw)):
                     if _gbool is not None and L._device_segment_enabled(x.device):
-                        gate_sigs = [(_r[0], _g) for _r, _g in zip(_raw, _gbool.unbind(0))]
+                        gate_sigs = [(tuple(_r) if len(_r) == 3 else (_r[0], _g))
+                                     for _r, _g in zip(_raw, _gbool.unbind(0))]
                         pre_blocks = L._device_blocks_from_gate_bool(
                             T, _gbool, self.cfg.min_block, self.cfg.max_block, x.device,
                             want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
                     else:
                         _gl = _gbool.cpu().numpy()
-                        gate_sigs = [(_r[0], _g) for _r, _g in zip(_raw, _gl)]
+                        gate_sigs = [(tuple(_r) if len(_r) == 3 else (_r[0], _g))
+                                     for _r, _g in zip(_raw, _gl)]
                         # same batched block geometry as exp_lib.HybridAttention.forward;
                         # every value identical to the per-row form
                         pre_blocks = L._hoist_blocks_from_cuts(T, _gl, self.cfg.min_block, self.cfg.max_block, x.device, want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
@@ -628,12 +648,27 @@ class HybridAttentionRoPE(L.HybridAttention):
             # exp_lib.HybridAttention.forward (design notes §6.1).
             outs = torch.empty(B, T, x.shape[-1], device=x.device, dtype=x.dtype)
             gates = []
+            _blp_rows = []
+            _bdec_rows = 0
             for b in range(B):
                 pre = pres[b]
                 o, g = self._single_rope(x[b], pre=pre, gate_sig=None if gate_sigs is None else gate_sigs[b], pre_blocks=None if pre_blocks is None else pre_blocks[b])
                 outs[b] = o
                 if g is not None:
                     gates.append(g)
+                _lp = getattr(self, 'last_boundary_logp', None)
+                if _lp is not None:
+                    _blp_rows.append(_lp)
+                    _bdec_rows += int(getattr(self, 'last_boundary_decisions', 0) or 0)
+            if _blp_rows:
+                _lp_tot = _blp_rows[0]
+                for _lp in _blp_rows[1:]:
+                    _lp_tot = _lp_tot + _lp
+                self.last_boundary_logp = _lp_tot
+                self.last_boundary_decisions = int(_bdec_rows)
+            else:
+                self.last_boundary_logp = None
+                self.last_boundary_decisions = 0
             if not gates:
                 self.last_gate_mean = None
             else:

@@ -48,7 +48,8 @@ for _stream in (sys.stdout, sys.stderr):
 REPO = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DIRS = ['results_lm_test', 'analysis_v12']
 _CKPT_EXTS = ('.pt', '.ckpt', '.pth', '.safetensors')
-ENV_FILES = ['confirmation_frozen.json', 'DECISION_LOG.md', 'RELEASES.md', 'requirements.txt',
+ENV_FILES = ['confirmation_frozen.json', 'confirmation_freeze_lock.json',
+            'DECISION_LOG.md', 'RELEASES.md', 'requirements.txt',
             'requirements.lock', 'pyproject.toml',
             # data/cache provenance: a tokenizer or cache that changes the ids
             # must be visible in the archive, not only in a local directory.
