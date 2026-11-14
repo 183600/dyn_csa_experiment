@@ -2317,6 +2317,17 @@ def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n
         # the non-empty path.
         return (Xa[:0], torch.empty(0, dtype=torch.long, device=dev), 0)
     B = int(n_blocks) if n_blocks is not None else _n_blocks_cached(block_ids)
+    # The documented "no B lane" spelling is (Xb, Zb) == (None, None) (e.g. an
+    # HCA arm).  The A-only pooling is exactly `pool_blocks_single`; delegating
+    # here also avoids indexing the absent B tensors when the block ids need a
+    # sort (a one-sided pair is malformed and refused rather than ignored).
+    if Xb is None or Zb is None:
+        if Xb is not None or Zb is not None:
+            raise ValueError(
+                'pool_variable_blocks: Xb and Zb must both be tensors or both '
+                'be None (the previous-block overlap lane needs both)')
+        return pool_blocks_single(Xa, Za, B_pos_a, block_ids,
+                                  n_blocks=B, monotonic=monotonic)
     order, _ident = ((_arange_cache(block_ids.numel(), block_ids.device), True) if monotonic else _block_order(block_ids, n))
     if _ident:
         Xas, Xbs, Zas, Zbs = (Xa, Xb, Za, Zb)
@@ -3392,7 +3403,7 @@ def causal_prefix_pool(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
 
 def causal_prefix_pool_reference(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
                                  *, n_blocks=None, scope='full_prefix', window=128,
-                                 window_start=None):
+                                 window_start=None, use_overlap=True):
     """Per-query, numerically stable reference for `causal_prefix_pool`.
 
     This is deliberately simple and loops over queries; it is the oracle the
@@ -3419,7 +3430,7 @@ def causal_prefix_pool_reference(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
         zs = [Za[u].float() + B_pos_a[min(u - int(geo['start_of_token'][tt].item()), cap_a - 1)].float() for u in idx]
         xs = [Xa[u].float() for u in idx]
         b = int(geo['block_of_token'][tt].item())
-        if (str(scope) == 'full_prefix' and overlap is not None
+        if (use_overlap and str(scope) == 'full_prefix' and overlap is not None
                 and int(overlap) > 0 and b > 0
                 and Xb is not None and Zb is not None):
             ps, pend = int(starts[b - 1]), int(starts[b - 1]) + int(counts[b - 1])
@@ -21809,8 +21820,13 @@ def _is_confirmatory_cfg(cfg):
                 return _flag
             print(f'[run] WARNING: {_k}={cfg.get(_k)!r} is not a boolean flag — ignoring it (the panel mode is inferred from its geometry)')
             break
+    # A width is an exact structural integer: int(True) == 1 and
+    # int(512.9) == 512 would infer a different (confirmatory) geometry from a
+    # malformed config.  The seed axis itself is normalised once in `run`.
+    _d = _as_seed_int(cfg.get('d', 256))
+    if _d is None:
+        return False
     try:
-        _d = int(cfg.get('d', 256))
         _nseeds = len(cfg.get('seeds') or [])
     except (TypeError, ValueError, OverflowError):
         return False

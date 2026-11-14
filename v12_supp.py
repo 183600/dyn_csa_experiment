@@ -1766,13 +1766,20 @@ def _power_artifact_problem(manifest, power):
         return (f"manifest sha256 {str(power.get('manifest'))[:12]}… does not match "
                 f"the frozen manifest {str(_sha)[:12]}… (stale artifact from another plan)")
     _stat = manifest.get('statistics') or {}
+    _raw_alpha, _raw_palpha = _stat.get('alpha', 0.05), power.get('alpha')
+    if isinstance(_raw_alpha, (bool, np.bool_)) or isinstance(_raw_palpha, (bool, np.bool_)):
+        return 'artifact alpha/m_comparisons is malformed (a boolean is not a level)'
     try:
-        _alpha = float(_stat.get('alpha', 0.05))
+        _alpha = float(_raw_alpha)
         _m = len(manifest.get('primary_comparisons') or [])
-        _p_alpha = float(power.get('alpha'))
-        _p_m = int(power.get('m_comparisons'))
+        _p_alpha = float(_raw_palpha)
     except (TypeError, ValueError, OverflowError):
         return 'artifact alpha/m_comparisons is malformed'
+    # Both family sizes are exact positive counts: int(True) == 1 and
+    # int(4.9) == 4 would let an artifact from a different plan pass.
+    _p_m = L._as_seed_int(power.get('m_comparisons'))
+    if _p_m is None or _p_m <= 0:
+        return 'artifact alpha/m_comparisons is malformed (m_comparisons is not an exact positive integer)'
     if not (math.isfinite(_p_alpha) and abs(_p_alpha - _alpha) <= 1e-12):
         return f'artifact alpha {_p_alpha!r} differs from the frozen alpha {_alpha!r}'
     if _p_m != _m:
@@ -1784,23 +1791,27 @@ def _power_artifact_problem(manifest, power):
     if set(_comps) != set(_names):
         return (f'artifact comparisons {sorted(_comps)} do not match the frozen '
                 f'family {sorted(_names)}')
-    _seeds = sorted({int(s) for s in (manifest.get('seeds') or [])})
+    _seed_raw = manifest.get('seeds') or []
+    _seed_vals = [L._as_seed_int(s) for s in _seed_raw]
+    if not _seed_vals or any(s is None for s in _seed_vals):
+        return 'artifact/frozen seed list is malformed (not exact integers)'
+    _seeds = sorted(set(_seed_vals))
     for _name in _names:
         _entry = _comps.get(_name)
         if not isinstance(_entry, dict):
             return f'{_name}: entry is not an object'
         if _entry.get('status') != 'ok':
             return f"{_name}: power status is {_entry.get('status')!r}, not 'ok'"
-        try:
-            _eseeds = sorted({int(s) for s in (_entry.get('seeds') or [])})
-        except (TypeError, ValueError, OverflowError):
+        _es_raw = _entry.get('seeds') or []
+        _es_vals = [L._as_seed_int(s) for s in _es_raw]
+        if not _es_vals or any(s is None for s in _es_vals):
             return f'{_name}: artifact seed list is malformed'
+        _eseeds = sorted(set(_es_vals))
         if _eseeds != _seeds:
             return (f'{_name}: artifact seeds {_eseeds} do not match the frozen '
                     f'seed list {_seeds}')
-        try:
-            _n = int(_entry.get('n_paired_seeds'))
-        except (TypeError, ValueError, OverflowError):
+        _n = L._as_seed_int(_entry.get('n_paired_seeds'))
+        if _n is None or _n <= 0:
             return f'{_name}: n_paired_seeds is malformed'
         if _n != len(_seeds):
             return (f'{_name}: artifact has {_n} paired seed(s), the frozen panel '

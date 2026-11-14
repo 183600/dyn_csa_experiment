@@ -9703,6 +9703,79 @@ def t_review9_v8_uncalibrated_source_is_not_called_calibrated():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def t_round10_pool_without_b_lane():
+    # The documented "no B lane" spelling (Xb = Zb = None, overlap None/0)
+    # must not index the absent overlap tensors.  It is exactly the A-only
+    # pooling, for monotonic and unsorted block-id rows.
+    n, Fd = 9, 3
+    g = torch.Generator().manual_seed(13)
+    Xa = torch.randn(n, Fd, generator=g)
+    Za = torch.randn(n, Fd, generator=g)
+    Ba = torch.randn(8, Fd, generator=g)
+    bid = torch.tensor([0, 0, 1, 1, 2, 2, 2, 3, 3])
+    for b in (bid, bid[torch.randperm(n, generator=g)]):
+        for ov in (None, 0):
+            comp, last, B = L.pool_variable_blocks(
+                Xa, None, Za, None, b, Ba, Ba, ov)
+            ref, ref_last, ref_B = L.pool_blocks_single(Xa, Za, Ba, b)
+            assert B == ref_B == 4
+            assert torch.equal(last, ref_last)
+            assert torch.allclose(comp, ref, atol=1e-6)
+    # A one-sided pair is malformed, never silently treated as "no B lane".
+    try:
+        L.pool_variable_blocks(Xa, torch.randn(n, Fd), Za, None, bid, Ba, Ba, 0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('one-sided Xb/Zb pair was accepted')
+
+
+def t_round10_prefix_reference_honours_use_overlap():
+    # The oracle and the optimized implementation must agree on the
+    # no-overlap configuration as well as the overlap one.
+    n, Fd = 12, 3
+    g = torch.Generator().manual_seed(17)
+    bid, _hon, _counts = L._segment(
+        n, [False, False, True, False, False, True, False, False, False,
+            True, False], 2, 6)
+    bid = torch.as_tensor(bid)
+    Xa = torch.randn(n, Fd, generator=g)
+    Xb = torch.randn(n, Fd, generator=g)
+    Za = torch.randn(n, Fd, generator=g)
+    Zb = torch.randn(n, Fd, generator=g)
+    Ba = torch.randn(8, Fd, generator=g)
+    Bb = torch.randn(8, Fd, generator=g)
+    for use_ov in (True, False):
+        got = L.causal_prefix_pool(Xa, Xb, Za, Zb, bid, Ba, Bb, 3,
+                                   use_overlap=use_ov)
+        ref = L.causal_prefix_pool_reference(
+            Xa, Xb, Za, Zb, bid, Ba, Bb, (3 if use_ov else None),
+            use_overlap=use_ov)
+        assert torch.allclose(got, ref, atol=1e-6), (use_ov, (got - ref).abs().max())
+
+
+def t_round10_power_artifact_requires_exact_counts():
+    man = {'manifest_sha256': 'abc', 'statistics': {'alpha': 0.05},
+           'primary_comparisons': [{'name': 'x'}], 'seeds': [0, 1, 2]}
+    good = {'status': 'ok', 'manifest': 'abc', 'alpha': 0.05,
+            'm_comparisons': 1,
+            'comparisons': {'x': {'status': 'ok', 'seeds': [0, 1, 2],
+                                  'n_paired_seeds': 3}}}
+    assert V12._power_artifact_problem(man, good) is None
+    for _bad in (dict(good, m_comparisons=True),
+                 dict(good, m_comparisons=1.5),
+                 dict(good, comparisons={'x': {'status': 'ok', 'seeds': [0, 1, 2],
+                                               'n_paired_seeds': True}}),
+                 dict(good, comparisons={'x': {'status': 'ok',
+                                               'seeds': [0.5, 1, 2],
+                                               'n_paired_seeds': 3}})):
+        assert V12._power_artifact_problem(man, _bad) is not None, _bad
+    # Panel geometry is an exact structural count for the confirmatory label.
+    assert L._is_confirmatory_cfg({'d': 512, 'seeds': [0, 1]})
+    assert not L._is_confirmatory_cfg({'d': True, 'seeds': [0, 1]})
+    assert not L._is_confirmatory_cfg({'d': 512.5, 'seeds': [0, 1]})
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -10006,6 +10079,9 @@ def main():
     _check('N14 batch_iter accepts exactly one causal window', t_review9_batch_iter_accepts_one_window)
     _check('N15 host pooling geometry refuses int32 overflow', t_review9_pool_geometry_int32_guard)
     _check('N16 v8 does not call an empty calibration calibrated', t_review9_v8_uncalibrated_source_is_not_called_calibrated)
+    _check('N17 no-B-lane pooling is total (sorted or unsorted ids)', t_round10_pool_without_b_lane)
+    _check('N18 prefix reference honours use_overlap=False', t_round10_prefix_reference_honours_use_overlap)
+    _check('N19 power artifact / confirmatory geometry require exact counts', t_round10_power_artifact_requires_exact_counts)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
