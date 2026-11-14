@@ -1672,9 +1672,8 @@ def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
         _signed = sum(s_i * mags[i] for i, s_i in enumerate(signs))
         stat = abs(_signed)
         # exact p: #null sums >= observed statistic (ties included, as in the
-        # exact test's "at least as extreme" rule).  _sums is sorted, so use
-        # binary search; a linear scan would be O(4**n) and hang long before
-        # the advertised n<=16 ceiling (2**16 patterns).
+        # exact test's "at least as extreme" rule).  _sums is sorted, so the
+        # tail count is located with a binary search.
         _p = (len(_sums) - _bisect.bisect_left(_sums, stat - _tol)) / _total
         # A two-sided rejection is only a CONFIRMATION when the observed
         # direction also matches the pre-registered sign (decision_rule's

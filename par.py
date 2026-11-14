@@ -611,7 +611,7 @@ def run_jobs(jobs, ctx, phase_label="phase"):
                         # merged the summary and refunded its TimeGuard
                         # booking.  So a VALID pre-existing result means the
                         # measurement completed and the process is merely
-                        # hanging in interpreter/CUDA teardown: adopt that
+                        # still exiting through interpreter/CUDA teardown: adopt that
                         # result instead of overwriting it with
                         # watchdog_timeout, and do NOT re-book the elapsed
                         # seconds (the child's own record_run already booked

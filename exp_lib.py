@@ -21151,9 +21151,9 @@ class TimeGuard:
         """Lift the calibrated per-step floor after a dispatcher-watchdog kill
         (par.py).  A cell killed at `elapsed_seconds` demonstrably needs MORE
         than that for `steps` steps, so its true sps exceeds elapsed/steps.
-        Lifting the floor to the kill time itself makes the next bound ~3.45x
-        larger, so the retry window grows geometrically until a healthy cell
-        fits; a truly hung cell is still killed on every attempt, just
+        Lifting the floor to the kill time itself makes the next bound
+        larger, so the retry window grows until a healthy cell fits; a cell
+        that never finishes is still killed on every attempt, just
         later."""
         if not steps or int(steps) <= 0 or not float(elapsed_seconds) > 0:
             return
