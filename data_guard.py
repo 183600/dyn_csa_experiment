@@ -104,12 +104,15 @@ class _UnhashableKey:
 
     def __init__(self, value):
         self.type_name = type(value).__name__
-        # Mappings must not depend on insertion order: two records carrying
-        # the same config in a different key order are the same identity.
+        # Use the same value identity the scalar `_group_key` contract uses
+        # INSIDE composite containers: -0.0 == 0.0, NaNs are one missing
+        # value, mappings ignore insertion order.  Serialising the raw object
+        # with json/repr made [0.0] and [-0.0] (or {'x': 0.0} and
+        # {'x': -0.0}) different groups, so the same group could be split
+        # across train/test without the leakage check firing.
         try:
-            self.text = json.dumps(value, sort_keys=True, separators=(',', ':'),
-                                   default=repr)
-        except (TypeError, ValueError):
+            self.text = repr(_unhashable_identity(value))
+        except Exception:
             self.text = repr(value)
 
     def __hash__(self):
@@ -122,6 +125,53 @@ class _UnhashableKey:
 
     def __repr__(self):
         return f'_UnhashableKey({self.type_name!r}, {self.text!r})'
+
+
+def _unhashable_identity(value):
+    """Canonical identity for a composite (unhashable) group/label value.
+
+    Mirrors ``_group_key``'s scalar contract recursively: bool stays distinct
+    from int, ``-0.0`` folds to ``0.0``, every NaN is one missing value, and
+    mapping insertion order cannot change the identity.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return ('bool', bool(value))
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        return ('temporal', repr(value))
+    if isinstance(value, (int, np.integer)):
+        return ('int', int(value))
+    if isinstance(value, (float, np.floating)):
+        f = float(value)
+        if math.isnan(f):
+            return ('nan',)
+        if math.isinf(f):
+            return ('inf', 1 if f > 0 else -1)
+        return ('float', 0.0 if f == 0.0 else f)
+    if isinstance(value, (complex, np.complexfloating)):
+        z = complex(value)
+        return ('complex', 0.0 if z.real == 0.0 else z.real,
+                0.0 if z.imag == 0.0 else z.imag)
+    if isinstance(value, (bytes, bytearray, np.bytes_)):
+        return ('bytes', bytes(value))
+    if isinstance(value, (str, np.str_)):
+        return ('str', str(value))
+    if isinstance(value, tuple):
+        return ('tuple', tuple(_unhashable_identity(x) for x in value))
+    if isinstance(value, list):
+        return ('list', tuple(_unhashable_identity(x) for x in value))
+    if isinstance(value, dict):
+        _items = sorted(
+            ((_unhashable_identity(k), _unhashable_identity(v))
+             for k, v in value.items()), key=lambda kv: repr(kv[0]))
+        return ('dict', tuple(_items))
+    if isinstance(value, (set, frozenset)):
+        return ('set', tuple(sorted((_unhashable_identity(x) for x in value),
+                                    key=repr)))
+    try:
+        hash(value)
+    except TypeError:
+        return ('unhashable', type(value).__name__, repr(value))
+    return ('obj', type(value).__name__, value)
 
 
 # ---------------------------------------------------------------------------

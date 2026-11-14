@@ -4168,8 +4168,15 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     # The logits are produced by q @ k, so their dtype is the promoted pair.
     # Using k_blk's dtype alone would install too weak a mask when q is wider
     # (e.g. fp64 q against fp32 k), letting an "invalid" lane hold a finite
-    # value that can still win the softmax.
-    _MINL = _finfo_min(torch.promote_types(q.dtype, k_blk.dtype))
+    # value that can still win the softmax.  The window/stacked K tables feed
+    # the same logits, so a wider k_sw (or k_stacked) can likewise push a
+    # valid logit below a narrower sentinel.
+    _mask_dtype = torch.promote_types(q.dtype, k_blk.dtype)
+    if k_sw is not None:
+        _mask_dtype = torch.promote_types(_mask_dtype, k_sw.dtype)
+    if k_stacked is not None:
+        _mask_dtype = torch.promote_types(_mask_dtype, k_stacked.dtype)
+    _MINL = _finfo_min(_mask_dtype)
     # The V halves are laid out contiguously once and gathered with one
     # combined row index per chunk: the selected rows of `v_all` are exactly
     # the two gather outputs concatenated in the same order, so Vset holds
@@ -4467,8 +4474,14 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
     q_chunk = max(1, min(int(q_chunk), max(1, int(mem_budget_bytes) // max(1, per_row * q.element_size()))))
     q_chunk = max(1, min(q_chunk, n))
     win_idx, win_valid_all = _window_geometry(n, int(w), dev)
-    # Same promoted-logit dtype rule as `gathered_attention`.
-    _MINL = _finfo_min(torch.promote_types(q.dtype, k_blk.dtype))
+    # Same promoted-logit dtype rule as `gathered_attention`.  The prefix
+    # candidate table (or the singleton table) can be wider than k_blk, and
+    # it participates in the same logits, so include it in the sentinel dtype.
+    _mask_dtype = torch.promote_types(q.dtype, k_blk.dtype)
+    _mask_dtype = torch.promote_types(_mask_dtype, k_sw.dtype)
+    if prefix_k is not None:
+        _mask_dtype = torch.promote_types(_mask_dtype, prefix_k.dtype)
+    _MINL = _finfo_min(_mask_dtype)
     out = torch.empty_like(q)
     mass = None
     if return_prefix_mass:
@@ -8181,8 +8194,10 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             def _write_train_pairs(pairs):
                 nonlocal buf, n_train_total, _marks
                 if not pairs:
-                    return False
-                for (doc_id, _), enc in zip(pairs, tok.encode_batch([d for _, d in pairs])):
+                    return False, []
+                _pairs = list(pairs)
+                for _i, ((doc_id, _), enc) in enumerate(
+                        zip(_pairs, tok.encode_batch([d for _, d in _pairs]))):
                     buf.extend(enc.ids)
                     buf.append(eos_id)
                     train_doc_ids.append(int(_doc_id_u64(doc_id)))
@@ -8194,15 +8209,20 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                             _marks = n_train_total >> 26
                             print(f'    [train] {n_train_total} tokens')
                     if n_train_total + len(buf) >= cap_train:
-                        return True
-                return n_train_total + len(buf) >= cap_train
+                        # The rest of this batch was never emitted.  Hand it
+                        # back so the validation stream can start at the next
+                        # unemitted document instead of silently skipping the
+                        # remainder of a 4096-document read.
+                        return True, _pairs[_i + 1:]
+                return n_train_total + len(buf) >= cap_train, []
 
             # The tokenizer-fit documents are the PREFIX of the training
             # stream, not a separate region: the tokenizer sees exactly the
             # documents the model's first tokens come from.
-            stop = _write_train_pairs(fit_pairs)
+            stop, _fit_leftover = _write_train_pairs(fit_pairs)
             del fit_text, fit_pairs
             gc.collect()
+            train_leftover = []
             while not stop:
                 docs = list(itertools.islice(rows, 4096))
                 if not docs:
@@ -8216,7 +8236,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                         _skipped['train'][_kind] += 1
                     else:
                         pairs.append((doc_id, doc))
-                stop = _write_train_pairs(pairs)
+                stop, train_leftover = _write_train_pairs(pairs)
             if buf:
                 _disk_ids_chunk(buf, disk_dt, vocab).tofile(fh)
                 n_train_total += len(buf)
@@ -8243,18 +8263,26 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                         return True
                 return n_val_total + len(buf) >= cap_val
 
+            # Documents consumed from the train batch after the token cap was
+            # reached were never emitted to train and are the immediately
+            # following (contiguous) holdout, so start validation from them.
+            _pending_val = list(train_leftover)
             stop = False
             while not stop:
-                docs = list(itertools.islice(rows, 4096))
-                if not docs:
-                    break
-                pairs = []
-                for doc_id, doc in docs:
-                    _dup, _kind = _dedup.is_duplicate(doc, fp=doc_id)
-                    if _dup:
-                        _skipped['validation'][_kind] += 1
-                    else:
-                        pairs.append((doc_id, doc))
+                if _pending_val:
+                    pairs = _pending_val
+                    _pending_val = []
+                else:
+                    docs = list(itertools.islice(rows, 4096))
+                    if not docs:
+                        break
+                    pairs = []
+                    for doc_id, doc in docs:
+                        _dup, _kind = _dedup.is_duplicate(doc, fp=doc_id)
+                        if _dup:
+                            _skipped['validation'][_kind] += 1
+                        else:
+                            pairs.append((doc_id, doc))
                 stop = _write_val_pairs(pairs)
             if buf:
                 _disk_ids_chunk(buf, disk_dt, vocab).tofile(fh)
@@ -10588,14 +10616,17 @@ def wilcoxon_signed_rank_p(deltas):
     n = int(d.size)
     if n == 0:
         return {'p': float('nan'), 'method': 'none', 'n_nonzero': 0}
-    _tol = 1e-12 * max(float(np.max(np.abs(d))), 1e-300)
     order = np.argsort(np.abs(d))
     ranks = np.empty(n, dtype=float)
     _abs = np.abs(d)[order]
     i = 0
     while i < n:
         j = i + 1
-        while j < n and abs(_abs[j] - _abs[i]) <= _tol:
+        # Compare each candidate against the CURRENT value with a relative
+        # tolerance.  A single tolerance scaled by the panel maximum let one
+        # huge outlier collapse every ordinary value into one tied rank.
+        while j < n and abs(_abs[j] - _abs[i]) <= 1e-12 * max(
+                float(_abs[i]), float(_abs[j])):
             j += 1
         ranks[order[i:j]] = (i + j + 1) / 2.0  # average rank (1-based)
         i = j
@@ -11498,7 +11529,18 @@ def _student_t_sf(t, df):
     # Above this cutoff the t/normal Edgeworth expansion is accurate and
     # stable for very large df.
     if df == float('inf') or df > 1e6:
-        sf = 0.5 * math.erfc(t / math.sqrt(2.0))
+        # t can be an arbitrary-precision integer whose float conversion
+        # overflows.  Resolve that case by its limit instead of raising: the
+        # upper tail at +inf is 0 and at -inf is 1.
+        try:
+            _tf = float(t)
+        except OverflowError:
+            return 0.0 if t > 0 else 1.0
+        if _tf == float('inf'):
+            return 0.0
+        if _tf == float('-inf'):
+            return 1.0
+        sf = 0.5 * math.erfc(_tf / math.sqrt(2.0))
         try:
             _inv_df = 1.0 / df
         except (OverflowError, ZeroDivisionError):
@@ -11506,8 +11548,8 @@ def _student_t_sf(t, df):
         if _inv_df:
             # F_t(x) = Phi(x) - (x^3+x)/(4df) phi(x) + O(df^-2), so the
             # upper tail gets the opposite-signed correction (heavier tail).
-            _phi = math.exp(-0.5 * t * t) / math.sqrt(2.0 * math.pi)
-            sf += (t * t * t + t) * _inv_df * 0.25 * _phi
+            _phi = math.exp(-0.5 * _tf * _tf) / math.sqrt(2.0 * math.pi)
+            sf += (_tf * _tf * _tf + _tf) * _inv_df * 0.25 * _phi
         return float(min(1.0, max(0.0, sf)))
     x = df / (df + t * t)
     tail = 0.5 * _betai(df / 2.0, 0.5, x)
@@ -11516,10 +11558,21 @@ def _student_t_sf(t, df):
 
 def student_t_two_sided_p(t, df):
     """双侧 Student t 检验 p 值（小样本斜率/交互推断用）。"""
+    if isinstance(t, (bool, np.bool_)):
+        # A flag is not a t statistic; float(True)==1.0 would report the p of
+        # a test the caller never specified.
+        return float('nan')
     try:
         _t = abs(float(t))
-    except (TypeError, ValueError, OverflowError):
+    except OverflowError:
+        # An arbitrary-precision integer beyond the float range is still a
+        # valid (infinite-magnitude) statistic: fail closed to p=0, not NaN.
         _t = float('inf')
+    except (TypeError, ValueError):
+        # A string/None/object is malformed evidence.  Mapping it to +inf
+        # (the previous behaviour) silently produced the strongest possible
+        # p=0.
+        return float('nan')
     # Keep df as an exact integer; converting it to float can overflow even
     # though _student_t_sf can handle it exactly.
     sf = _student_t_sf(_t, df)
@@ -11566,7 +11619,9 @@ def chi2_sf(x, df):
     if x == float('inf'):
         return 0.0
     if x == float('-inf'):
-        return float('nan')
+        # P(chi2_df >= x) = 1 for every x <= 0, and -inf is the limit of that
+        # region, exactly as _f_sf/_student_t_sf return 1.0 there.
+        return 1.0
     if isinstance(x, float) and not math.isfinite(x):
         return float('nan')
     if x <= 0.0:
@@ -13327,7 +13382,12 @@ SIMPLE_BASELINE_POLICY = {
 
 def _ngram_train_counts(train_ids, vocab_size):
     """Return (unigram counts, bigram key counts, bigram context counts)."""
-    ids = np.asarray(train_ids, dtype=np.int64).ravel()
+    _raw = np.asarray(train_ids)
+    if _raw.size and not np.issubdtype(_raw.dtype, np.integer):
+        # A float id (1.9) would truncate to a DIFFERENT token id; malformed
+        # ids must be rejected, not silently remapped.
+        raise TypeError(f'ngram baseline: train ids must be integers, got dtype {_raw.dtype}')
+    ids = _raw.astype(np.int64, copy=False).ravel()
     vocab_size = int(vocab_size)
     if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= vocab_size):
         raise ValueError('ngram baseline: train ids outside [0, vocab_size)')
@@ -13341,7 +13401,10 @@ def _ngram_train_counts(train_ids, vocab_size):
     return uni, uniq, ctx, counts
 
 def _ngram_eval_parts(eval_ids):
-    arr = np.asarray(eval_ids, dtype=np.int64)
+    _raw = np.asarray(eval_ids)
+    if _raw.size and not np.issubdtype(_raw.dtype, np.integer):
+        raise TypeError(f'ngram baseline: eval ids must be integers, got dtype {_raw.dtype}')
+    arr = _raw.astype(np.int64, copy=False)
     if arr.ndim == 1:
         return arr, arr[:-1], arr[1:]
     if arr.ndim == 2:
@@ -13594,6 +13657,15 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
     missing = sorted(declared_arms - set(baselines))
     if missing:
         problems.append(f'missing simple-baseline evidence for arms {missing}')
+    extra = sorted(set(baselines) - declared_arms)
+    if extra:
+        # An undeclared arm was never part of the equal-search comparison;
+        # letting it become best_baseline would quote an unsearched config as
+        # the verified floor.
+        problems.append(
+            f'baselines contains arm(s) {extra} that the declared search '
+            'protocol does not contain — equal-search evidence cannot cover '
+            'an undeclared arm')
     n_tokens_by_arm = {}
     selected_values = {}
     selected_matched = {}
@@ -13706,7 +13778,7 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
     data = artifact.get('data')
     if not isinstance(data, dict):
         data = {}
-    if not data.get('val_fp'):
+    if _content_fp_text(data.get('val_fp')) is None:
         warnings.append('artifact has no validation fingerprint — the panel comparison cannot verify it used the same validation slice')
     best_name = None
     if selected_values:
@@ -14665,12 +14737,22 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         final_min_seed_count = min(len(v) for v in final_seed_coverage.values())
         if not final_seed_coverage_equal:
             problems.append('final records do not cover the same seeds in every arm — the paired comparison would silently use different n per arm')
-        # The tuned comparison is its own family (method vs each other arm).
-        _final_family_floor = signflip_min_n_for_holm(max(1, len(arms) - 1), 0.05)
+        # The tuned comparison is its own family, but the family is the
+        # DECLARED per-group contrasts (method vs each other arm inside its
+        # parameter-matching group), not len(arms)-1 across all groups.
+        _m_tuned = 0
+        for _g in (protocol.get('arm_groups') or []):
+            _ga = [a for a in (list(_g.get('arms') or []) if isinstance(_g, dict) else [])
+                   if a in arms]
+            if len(_ga) > 1:
+                _m_tuned += len(_ga) - 1
+        if _m_tuned <= 0:
+            _m_tuned = max(1, len(arms) - 1)
+        _final_family_floor = signflip_min_n_for_holm(_m_tuned, 0.05)
         if final_min_seed_count < 3:
             warnings.append(f'only {final_min_seed_count} final seed(s) per arm — the reporting floor for a key experiment is 3; treat the tuned contrast as descriptive')
         elif _final_family_floor is not None and final_min_seed_count < _final_family_floor:
-            warnings.append(f'{final_min_seed_count} final seeds per arm cannot reach a Holm-corrected p<0.05 for {max(1, len(arms) - 1)} tuned contrast(s) (needs n>={_final_family_floor}); the tuned contrast is resolution-limited, not a null')
+            warnings.append(f'{final_min_seed_count} final seeds per arm cannot reach a Holm-corrected p<0.05 for {_m_tuned} tuned contrast(s) (needs n>={_final_family_floor}); the tuned contrast is resolution-limited, not a null')
     # Coverage: an arm is covered either by its own tuned record or by the arm
     # whose recipe it inherits (allocation-matched intervention controls).
     _inherits = protocol.get('inherits_tuning') or {}
@@ -15902,9 +15984,14 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         for _arm in _panel_arms:
             _ref = _cov.get(_arm, _arm)
             _sel = _sel_cfg.get(_ref) or _sel_cfg.get(_arm)
-            _hps = [r.get('hyperparams') for (v, _t, _s), r in recs.items()
-                    if v == _arm and isinstance(r, dict) and isinstance(r.get('hyperparams'), dict)]
-            if not isinstance(_sel, dict) or not _hps:
+            _arm_recs = [r for (v, _t, _s), r in recs.items()
+                         if v == _arm and isinstance(r, dict)]
+            _hps = [r.get('hyperparams') for r in _arm_recs]
+            # A record with no hyperparameters is missing evidence, not an
+            # implicit match: dropping it let an arm with 7 matching records
+            # and 1 unverifiable record certify the tuned baseline.
+            if (not isinstance(_sel, dict) or not _arm_recs
+                    or any(not isinstance(h, dict) for h in _hps)):
                 _panel_cfg_ok[_arm] = False
                 continue
             _ok = True
@@ -15981,7 +16068,16 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             if _base_cands:
                 _cands = _base_cands
             if _cands:
-                _ref_key, _ref = min(_cands, key=lambda kv: float(kv[1]['ppl_mean']))
+                def _ref_ppl(_v):
+                    # The floor is compared against ppl_primary, so pick the
+                    # reference on the SAME statistic; a token-count-weighted
+                    # pooled PPL can rank arms differently from the arithmetic
+                    # mean.
+                    _x = _v.get('ppl_primary')
+                    if isinstance(_x, (int, float)) and not isinstance(_x, (bool, np.bool_)) and math.isfinite(float(_x)):
+                        return float(_x)
+                    return float(_v['ppl_mean'])
+                _ref_key, _ref = min(_cands, key=lambda kv: _ref_ppl(kv[1]))
                 # The floor is compared against THIS reference arm, so its
                 # fingerprints must come from the records that produced that
                 # arm (same variant and protocol), not from an unrelated arm
@@ -15992,8 +16088,13 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                              if v == _ref_v and str(t or '') == _ref_t]
                 if not _ref_recs:
                     _ref_recs = list(recs.values())
-                _panel_val_fps = {r.get('val_fp') for r in _ref_recs if r.get('val_fp')}
-                _panel_eval_fps = {r.get('eval_fp') for r in _ref_recs if r.get('eval_fp')}
+                # A boolean/empty flag is not a validation fingerprint (the
+                # same contract assert_shared_validation_fp/pair_reason use);
+                # `if r.get('val_fp')` would admit True as a shared identity.
+                _panel_val_fps = {_t for r in _ref_recs
+                                  if (_t := _content_fp_text(r.get('val_fp')))}
+                _panel_eval_fps = {_t for r in _ref_recs
+                                   if (_t := _content_fp_text(r.get('eval_fp')))}
                 _sb_data = _sb.get('data') or {}
                 # `cache_val_fp` is the full validation cache fingerprint (the
                 # one panel records carry); `val_fp`/`eval_fp` describe the
@@ -16001,8 +16102,9 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 # for the comparability gate, but additionally require the
                 # EXACT eval-row fingerprint when both sides carry it — a
                 # 128-row floor and a 512-row panel PPL are different samples.
-                _sb_val_fp = _sb_data.get('cache_val_fp') or _sb_data.get('val_fp')
-                _sb_eval_fp = _sb_data.get('eval_fp')
+                _sb_val_fp = (_content_fp_text(_sb_data.get('cache_val_fp'))
+                              or _content_fp_text(_sb_data.get('val_fp')))
+                _sb_eval_fp = _content_fp_text(_sb_data.get('eval_fp'))
                 _comparable = None
                 if _sb_val_fp and _panel_val_fps:
                     _comparable = _sb_val_fp in _panel_val_fps
@@ -16025,7 +16127,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     _floor_scale = 'historical (includes row-first tokens; slightly inflated vs the panel scale)'
                 report['simple_baseline'].update({
                     'panel_reference_arm': _ref_key,
-                    'panel_reference_ppl': float(_ref.get('ppl_primary', _ref['ppl_mean'])),
+                    'panel_reference_ppl': _ref_ppl(_ref),
                     'panel_reference_protocol': _ref.get('protocol'),
                     'panel_val_fp': (sorted(_panel_val_fps)[:3] or None),
                     'panel_eval_fp': (sorted(_panel_eval_fps)[:3] or None),
@@ -16033,7 +16135,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     'comparable_to_panel': _comparable,
                     'simple_floor_ppl': (float(_floor_ppl) if isinstance(_floor_ppl, (int, float)) else None),
                     'simple_floor_scale': _floor_scale,
-                    'panel_beats_simple_floor': (bool(float(_ref.get('ppl_primary', _ref['ppl_mean'])) < float(_floor_ppl))
+                    'panel_beats_simple_floor': (bool(_ref_ppl(_ref) < float(_floor_ppl))
                                                  if _comparable is True and isinstance(_floor_ppl, (int, float))
                                                  else None),
                 })
@@ -21783,9 +21885,15 @@ def aggregate(summary, *, outdir=None):
         # `eval_fp` is part of the content identity exactly like data_fp/val_fp
         # (pair_reason requires both-present equality on all three).  Skipping
         # it here would pool seeds measured on different evaluation slices.
+        # A MISSING/blank/non-text fingerprint is its own identity class, not
+        # an absent constraint: dropping it from the set let one record with
+        # `val_fp='A'` pool with another that carries no fingerprint at all,
+        # which is exactly the one-sided-pair hole pair_reason refuses.
         for _k in ('data_fp', 'val_fp', 'eval_fp'):
-            _vals = sorted({str(r.get(_k)) for r in recs
-                            if r.get(_k) is not None and str(r.get(_k)) != ''})
+            _vals = sorted({
+                str(r.get(_k)) if (r.get(_k) is not None
+                                   and str(r.get(_k)) != '') else '<missing>'
+                for r in recs})
             if len(_vals) > 1:
                 _fp_conflicts.setdefault((v, tag), {})[_k] = _vals
     if _fp_conflicts:
@@ -22461,10 +22569,17 @@ def _plan_run(cfg, summary_path, fp):
             _drop_is_stale = False
             if key in summary and 'ppl' in summary.get(key, {}):
                 old = summary[key]
+                # A completed cell must identify the seed it was run with.
+                # A record whose `seed` is missing/malformed is invisible to
+                # read_panel/aggregate (they require an exact seed id), so
+                # treating a matching run_cfg as "already completed" would
+                # report the cell as measured while silently omitting it from
+                # every table — and resume would never repair it.
+                _old_seed = _as_seed_int(old.get('seed'))
+                _want_seed = _as_seed_int(seed)
                 _identity_bad = (
                     (old.get('variant') is not None and old.get('variant') != v)
-                    or (old.get('seed') is not None
-                        and _as_seed_int(old.get('seed')) != _as_seed_int(seed)))
+                    or _old_seed != _want_seed)
                 if _identity_bad:
                     _drop_msg = (f'[resume] {key} holds a record whose own '
                                  f'variant/seed ({old.get("variant")!r}/{old.get("seed")!r}) '

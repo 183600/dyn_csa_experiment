@@ -964,6 +964,10 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 rec['error'] = f'{type(e).__name__}: {e}'
                 _fail(f'{cd}/{tag}: cache unreadable ({rec["error"]})')
                 cache['corpora'][tag] = rec
+                # This branch `continue`s before the per-cache propagation
+                # below, so the enclosing cache record must be failed here or
+                # it would still read "ok" while its corpus failed.
+                cache['status'] = 'fail'
                 continue
             rec['train_shape'] = list(tr.shape)
             rec['val_shape'] = list(va.shape)
@@ -2352,6 +2356,7 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
         # panel-level total is derived from every record the same way.
         _tok_vals_set = set()
         _tok_bad = []
+        _tok_missing = 0
         for _r, _p in _valid:
             _raw_tok = _r.get('tokens_seen')
             if _raw_tok is not None:
@@ -2367,11 +2372,22 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
             if (_si is not None and _si > 0 and _bi is not None and _bi > 0
                     and _qi is not None and _qi > 0):
                 _tok_vals_set.add(_si * _bi * _qi)
+            else:
+                # No measured token count and no derivable geometry for THIS
+                # record.  Silently skipping it made the audit depend on JSON
+                # order: when the first record happened to be complete the
+                # panel reported "ok" while a later unauditable record was
+                # ignored; reversing the key order reported "fail".
+                _tok_missing += 1
         _tok_vals = sorted(_tok_vals_set)
         _param_vals = sorted({_p for _r, _p in _valid})
         _conflict = []
         if _tok_bad:
             _conflict.append(f'invalid tokens_seen values {_tok_bad}')
+        if _tok_missing:
+            _conflict.append(
+                f'{_tok_missing} record(s) carry neither tokens_seen nor a '
+                'positive steps/batch/seq allocation')
         if len(_param_vals) > 1:
             _conflict.append(f'params {_param_vals}')
         if steps is None and len(_step_vals) > 1:

@@ -526,6 +526,11 @@ def _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
     L, W = geom.max_len, geom.W_b
     has_b = Xb is not None and W > 0
     assert Za.shape[-1] == c, 'pool 语义要求 X 与 Z 同宽（kv_dim）'
+    if T == 0:
+        # No tokens means no readable lanes: every block's compressed value is
+        # the empty-lane softmax result (nan_to_num -> 0).  Returning zeros
+        # directly avoids a -1 gather into a zero-length dimension.
+        return torch.zeros((R, Bm, c), device=dev, dtype=dtype)
     # 每个块列都被下方的分块循环恰好写一次，故直接 empty。
     comp = torch.empty((R, Bm, c), device=dev, dtype=dtype)
     jA = torch.arange(L, device=dev)
@@ -597,6 +602,12 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     gXb = torch.zeros_like(Xb) if (need_xb and Xb is not None) else None
     gZb = torch.zeros_like(Zb) if (need_zb and Zb is not None) else None
     gBpa = torch.zeros_like(B_pos_a) if need_bpa else None
+    if T == 0:
+        # Empty sequence: the forward holds no readable lane, so every input
+        # gradient is the same zero-shaped tensor autograd would return and
+        # there is nothing to gather.
+        gBpb = torch.zeros_like(B_pos_b) if need_bpb else None
+        return gXa, gXb, gZa, gZb, gBpa, gBpb
     jA = torch.arange(L, device=dev)
     g_a, av_all = geom.gather_geom()
     pos_a = jA.clamp(max=int(B_pos_a.shape[0]) - 1)
