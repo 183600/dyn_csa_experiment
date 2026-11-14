@@ -1637,11 +1637,9 @@ def _causal_quantile_exact(x, cols, target_block_tokens, _full_range=False):
             cc = cols[c0:c1]
             # Pad with NaN, not +inf: sort places NaN after every finite
             # value, so a NaN *inside* the causal prefix lands at the same
-            # rank regardless of how many future padding entries exist.  With
-            # +inf padding, the future length shifted the prefix NaN's sorted
-            # position and broke tau_T[:T'] == tau_T'.  The quantile indices
-            # never reach the padded tail (lo <= c), so finite prefixes are
-            # unaffected.
+            # rank regardless of how many future padding entries exist
+            # (tau_T[:T'] == tau_T').  The quantile indices never reach the
+            # padded tail (lo <= c), so finite prefixes are unaffected.
             masked = torch.where(idx[None, None, :] <= cc[None, :, None],
                                  xr[:, None, :], float('nan'))
             masked = masked.sort(dim=-1).values
@@ -8184,8 +8182,8 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
     ``shift_warn`` / ``shift_fail`` are thresholds on the NORMALIZED
     Jensen-Shannon divergence (js / ln 2, in [0, 1]).  Two disjoint token
     distributions attain 1.0, so both defaults (0.25 warn, 0.75 fail) are
-    reachable; the historical nats-scale ``shift_fail=0.75`` was above the
-    mathematical supremum ln 2 ~= 0.693 and could never fire.
+    reachable; a nats-scale threshold of 0.75 would exceed the mathematical
+    supremum ln 2 ~= 0.693 and could never fire.
     """
     import data_guard as _DG
     tr = np.asarray(train_ids).reshape(-1)

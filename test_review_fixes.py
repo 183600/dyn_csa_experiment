@@ -1635,8 +1635,8 @@ def t_freeze_lock():
 def t_review5_js_gate_and_floor_denominator():
     # 1) The JS hard gate is REACHABLE on the normalized scale: two disjoint
     #    token distributions (js = ln2) hit normalized 1.0 and hard-fail at
-    #    the shipped 0.75 threshold — the historical nats-scale 0.75 gate was
-    #    dead (supremum ln2 ~= 0.693) and could never fire.
+    #    the shipped 0.75 threshold.  A nats-scale 0.75 threshold would be
+    #    unreachable (supremum ln2 ~= 0.693) and could never fire.
     #    The clean-side fixture draws val from the SAME empirical distribution
     #    as train (uniform over the same four ids, in a non-contiguous order)
     #    so the shift gate stays quiet and only the gate under test can fire.

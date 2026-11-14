@@ -1737,10 +1737,10 @@ def flops_analysis(outdir='analysis_v7', seq_lens=None):
     cross = next((r['seq_len'] for r in rows if r['csa_over_dense'] < 1.0), None)
     if cross is None:
         print('[flops] NOTE: under this accounting CSA does not fall below dense in analytic FLOPs at any tested length — no crossover exists in this config; reporting None.')
-    # The analytic crossover is a quotable claim (it reaches REPORT_v7.md and
-    # the README table), so the artifact carries the code/git provenance and a
-    # ledger entry like every measured panel — an unstamped json could not be
-    # told apart from one regenerated after a formula change.
+    # The analytic crossover is a quotable claim, so the artifact carries the
+    # code/git provenance and a ledger entry like every measured panel — an
+    # unstamped json could not be told apart from one regenerated after a
+    # formula change.
     L.stamped_analysis('flops_analytic', {'config': {'d': d, 'heads': H, 'd_head': Dh, 'layers': L_layers, 'm': m, 'topk': k, 'window': w, 'm_hca': mph}, 'crossover_seq_len_csa_beats_dense': cross, 'rows': rows}, outdir=outdir, name='flops_analytic.json')
     L.atomic_write_csv(os.path.join(outdir, 'flops_analytic.csv'), None, rows)
     _flops_plot(rows, outdir)

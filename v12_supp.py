@@ -2010,11 +2010,10 @@ def run_finaltest(cfg=None, guard=None):
         for seed in pcfg['seeds']:
             _cell_status = _bylen_cell_status.get((v, int(seed)))
             if _cell_status == 'skipped_unhealthy_training':
-                # The one-shot access is not spent on weights whose own curve
-                # failed the health gate: the by-length cell was refused, so a
-                # probe measurement on the same weights would describe a
-                # checkpoint that is not part of the confirmatory panel.
-                print(f'[p5t] SKIP probe {v} s{seed}: its by-length cell was refused by the training-health gate — the probe budget is not spent on excluded weights')
+                # Weights whose own curve failed the health gate do not get a
+                # probe measurement: the by-length cell was refused, so the
+                # checkpoint is not part of the confirmatory panel.
+                print(f'[p5t] SKIP probe {v} s{seed}: its by-length cell was refused by the training-health gate — the weights are not part of the confirmatory panel')
                 continue
             V10.run_probe_cell(pcfg, v, seed, guard=guard, val_ids=test_ids, mech_summ=mech_summ)
     # 3) confirmation statistics (zero GPU, from disk)
@@ -2857,8 +2856,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         res['expected_sign'] = exp_sign
         if exp_sign in ('positive', 'negative') and math.isfinite(res.get('mean', float('nan'))):
             # A mean of exactly 0 has no direction: treat it as NOT matching
-            # the pre-registered sign (the old `(mean > 0) == (exp == 'positive')`
-            # encoding made mean==0 spuriously satisfy expected_sign='negative').
+            # any pre-registered sign.
             if res['mean'] == 0.0:
                 res['direction_ok'] = False
                 res['direction_note'] = 'mean delta is exactly zero — no observed direction, cannot match any pre-registered sign'
@@ -2972,7 +2970,7 @@ def v12_analysis(out='analysis_v12/stats.json'):
     if os.path.exists(os.path.join(TEST_OUTDIR, 'bylen.json')):
         st['finaltest'] = finaltest_stats()
         # this file's LAST writer is v12_analysis: re-stamp so the trace names
-        # the code that produced the final content, not the earlier v10 pass
+        # the code that produced the final content
         st = L.stamped_analysis('v12_analysis', st, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     return st
 
