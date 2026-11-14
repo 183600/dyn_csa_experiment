@@ -352,8 +352,8 @@ def merge_long_aggregate(adir, snapshot_agg):
         fm = _seed_map(fentry, tag=str(key))
         _overlap = set(sm) & set(fm)
         n_old_all = len(sm)
-        # The fresh run supplies every seed it re-measured (old seeds are
-        # replaced); the old snapshot contributes only seeds it alone measured.
+        # The fresh run supplies every seed it re-measured (prior seeds are
+        # replaced); the prior snapshot contributes only seeds it alone measured.
         n_fresh = len(fm)
         sm.update(fm)
         if not sm:
@@ -371,7 +371,7 @@ def merge_long_aggregate(adir, snapshot_agg):
         if n_fresh:
             _fresh_covers = n_old_all == 0 or len(_overlap) == n_old_all
             # The pooled totals describe the snapshot's seed set.  When the
-            # fresh aggregate re-measured every old seed, its pooled values
+            # fresh aggregate re-measured every prior seed, its pooled values
             # already cover the union and must replace the stale snapshot
             # fields; otherwise the union has no exact per-seed NLL denominator
             # and claiming a token-pooled PPL would be false.  Reports prefer
@@ -417,7 +417,7 @@ def merge_long_aggregate(adir, snapshot_agg):
                     # mean; the per-seed PPL fields above remain exact.
                     continue
                 elif _vo_ok and (n_old_all + n_fresh) > 0:
-                    # Disjoint seed sets: the old mean covers exactly the old
+                    # Disjoint seed sets: the prior mean covers exactly the prior
                     # seeds, so weighting by the two set sizes is the union.
                     w_old = n_old_all / (n_old_all + n_fresh)
                     sentry[_f] = _vo * w_old + _vn * (1.0 - w_old)

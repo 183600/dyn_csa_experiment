@@ -590,9 +590,8 @@ def t_training_health_classifier():
 
 def t_training_health_noise_aware_threshold():
     # Four equally spaced eval points with realistic CE jitter: the tail slope
-    # is +3.2e-5, five times the fixed 1e-5 tolerance, yet it is entirely
-    # within the slope's own noise (2*SE ~ 3.4e-5).  The adaptive threshold
-    # must call it healthy.
+    # exceeds the fixed tolerance but lies within the slope's own sampling
+    # noise.  The adaptive threshold must call it healthy.
     hist = [{'step': 0, 'train_ce': 5.0, 'val_ce': 4.00, 'val_ppl': 54.6},
             {'step': 250, 'train_ce': 4.5, 'val_ce': 4.02, 'val_ppl': 55.7},
             {'step': 500, 'train_ce': 4.0, 'val_ce': 4.01, 'val_ppl': 55.1},
@@ -813,8 +812,8 @@ def t_signflip_saddlepoint_large_n():
         b = L.exact_signflip_p(d)
         assert a['method'].startswith('saddlepoint'), a
         assert a['p'] == b['p'], 'saddlepoint fallback must be deterministic'
-        # Fixed-seed Monte-Carlo reference (200k draws) — the saddlepoint tail
-        # must agree within tolerance for the larger shifts.
+        # Fixed-seed Monte-Carlo reference — the saddlepoint tail must agree
+        # within tolerance for the larger shifts.
         draws = 200000
         obs = abs(d.mean())
         signs = rng.choice([-1.0, 1.0], size=(draws, n))
@@ -1844,8 +1843,7 @@ def t_review5_power_enumeration():
     res_nd10 = V12._power_enumeration([1.0] * 10, None, 0.05, 4)
     assert res_nd10['power_holm_conservative']['q=0.95'] > 0.5, res_nd10
     # n=16 is the documented enumeration ceiling.  The null-tail lookup must
-    # be logarithmic; a linear scan is O(4**n) and hangs at the ceiling (seed
-    # panels are expected to grow).
+    # stay logarithmic as the seed panel grows.
     _res16 = V12._power_enumeration([1.0] * 16, 'positive', 0.05, 4)
     assert _res16['status'] == 'ok' and _res16['power_holm_conservative']['q=0.95'] > 0.0, _res16
     # direction-aware: the all-opposite pattern (0 same-sign) rejects the
@@ -5823,7 +5821,7 @@ def t_corpus_audit_overlap_metadata_exact():
     # The val row deliberately shares the train VOCABULARY (and the same
     # empirical distribution, in a non-contiguous order): this test exercises
     # the document-overlap metadata gate, and a shifted or disjoint vocabulary
-    # would (correctly) trip the now-reachable normalized-JS gate instead.
+    # would (correctly) trip the normalized-JS gate instead.
     tr = np.array([7, 9, 3, 5] * 10, dtype=np.int64)
     va = np.array([[5, 3, 9, 7]], dtype=np.int64)
     for bad in (0.9, True, -0.5):
@@ -5987,8 +5985,8 @@ def t_audit_length_exact_integer_fields():
 
 def t_error_analysis_cli_geometry():
     # Row/rank counts may be zero (no rows) but never negative; every sizing
-    # argument is positive.  A negative --max-rows previously sliced the panel
-    # from the end instead of refusing the request.
+    # argument is positive.  A negative --max-rows must refuse the request
+    # instead of slicing the panel from the end.
     import error_analysis as _EA
     for _bad in ('-1', '1.5', 'x', ''):
         try:
@@ -6892,7 +6890,7 @@ def t_v7_lenphase_merge_prior_by_len():
     assert 4096 in merged and merged[4096]['ppl'] == 4.0, merged
     assert 1024 in merged and merged[1024]['ppl'] == 5.0, merged
     assert all(not isinstance(k, str) for k in merged), merged
-    # A re-evaluated length replaces the old cell, never duplicates it.
+    # A re-evaluated length replaces the prior cell, never duplicates it.
     merged2 = V7._merge_prior_by_len({512: {'ppl': 1.0}},
                                      {512: {'ppl': 9.0}}, [512], label='x')
     assert merged2 == {512: {'ppl': 9.0}}, merged2
@@ -8950,7 +8948,7 @@ def t_v6_merge_refuses_cross_config_pooling():
         RG.merge_long_aggregate(td, snapshot)
         merged = json.load(open(agg_path, encoding='utf-8'))
         # re-measured under a different run_cfg: the snapshot seed 3 (99.0,
-        # old config) must NOT be pooled into the fresh entry
+        # prior config) must NOT be pooled into the fresh entry
         assert merged['hybrid_fixed']['seeds'] == [0, 1, 2], merged['hybrid_fixed']
         assert 99.0 not in merged['hybrid_fixed']['ppls'], merged['hybrid_fixed']
         # the fresh entry's own same-config dPPL fields survive untouched

@@ -33,7 +33,7 @@
                与 CPU 微型演示——不是实验，是测量代码自检）
   report       汇总运行本地可执行的全部审计，输出 audit_report.json
 
-运行纪律：`python audit_gates.py causality` 在 CPU 上几秒内完成；其余子命令
+运行纪律：`python audit_gates.py causality` 在 CPU 上运行；其余子命令
 读 `results_*/`（不存在时给出「不可本地核验」的明确说明而不是报错）。
 """
 import json
@@ -1336,7 +1336,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
 # ---------------------------------------------------------------------------
 
 def audit_causality():
-    """自回归正确性单元审计（纯 CPU、微型形状、几秒完成——不是实验）。
+    """自回归正确性单元审计（纯 CPU、微型形状——不是实验）。
 
     核验点（每项都是断言，失败即退出码非零）：
       a. 标签移位：eval PPL 的 cross_entropy 输入=ids[:, :-1] 目标=ids[:, 1:]
@@ -2238,11 +2238,11 @@ def train_flops_estimate(params, tokens, attn_overhead=0.35):
         with_attn = base * (1.0 + overhead)
     except OverflowError:
         with_attn = float('inf')
-    return {'flops_6nd': base, 'flops_with_attn_proxy': with_attn, 'attn_overhead_assumed': overhead, 'note': 'analytic PROXY, not a measurement; report alongside TimeGuard seconds'}
+    return {'flops_6nd': base, 'flops_with_attn_proxy': with_attn, 'attn_overhead_assumed': overhead, 'note': 'analytic PROXY, not a measurement; report alongside the TimeGuard accounting'}
 
 
 def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.json'), panels=(('results_lm_v10_scale_s', 'csa_fixed', 8000), ('results_lm_v10_scale_l8k', 'csa_fixed', 8000), ('results_lm_v10_scale_lflop', 'csa_fixed', None))):
-    """规模核算（零 GPU）：每面板 6ND 估算 + 已记账实测秒数。"""
+    """规模核算（零 GPU）：每面板 6ND 估算与记录对账。"""
     out = {'status': 'ok', 'panels': {}}
     for d, v, steps in panels:
         _sp = os.path.join(d, 'summary.json')
@@ -2441,7 +2441,7 @@ def measure_prefill_decode(model, ids, device, warmup=1, iters=3):
 
 
 def audit_efficiency_demo():
-    """CPU 微型自检：证明测量代码可运行（不是实验，秒级）。"""
+    """CPU 微型自检：证明测量代码可运行（不是实验）。"""
     try:
         import torch
         import numpy as np

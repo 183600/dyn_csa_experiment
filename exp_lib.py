@@ -9630,7 +9630,7 @@ def pair_reason(ra, rb):
             return f'different {_k} ({ra.get(_k)!r} vs {rb.get(_k)!r})'
     # Content identities: same run_cfg (steps / tokens / vocab / ...) does NOT
     # prove the same corpus or the same validation rows.  Scaling panels rebuild
-    # caches at larger token caps, so pairing a new run with an old one on a
+    # caches at larger token caps, so pairing a new run with an earlier one on a
     # different val slice would silently compare two different evaluation sets.
     # Both-present equality is required; a one-sided fingerprint is
     # unverifiable, exactly like the optimizer-descriptor gate above.
@@ -13286,7 +13286,7 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
       exclude every row's first token, i.e. they score exactly the positions
       a from-scratch LM is scored on.  Panel-vs-floor comparisons should use
       the matched scale (``methodology_audit`` does); the historical scale is
-      kept for continuity with previously recorded artifacts.
+      kept for continuity with existing artifacts.
     """
     ids = np.asarray(train_ids, dtype=np.int64).ravel()
     # The vocabulary is an exact positive count, not a boolean/fractional
@@ -15895,7 +15895,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 # The floor must be compared on the SAME denominator as the
                 # panel: the neural panel scores R x (L-1) positions, so use
                 # the matched-denominator floor (excludes row-first tokens)
-                # whenever the artifact provides it.  An old artifact without
+                # whenever the artifact provides it.  An earlier artifact without
                 # the field falls back to the historical scale, which is
                 # slightly INFLATED (row-first tokens have no context) — the
                 # fallback makes "beats the floor" easier, so it is labelled.
@@ -18875,7 +18875,7 @@ def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
         for t in range(max(1, int(ids.shape[1]) - n_dec), int(ids.shape[1]) + 1):
             # One untimed call per prefix LENGTH: the first forward at a new
             # shape can include one-time kernel selection / allocator growth,
-            # which would otherwise bias the timed p50/p95.  The sweep helper
+            # which would otherwise bias the timing measurement.  The sweep helper
             # warms every (batch, length) cell for the same reason.
             model(ids[:, :t])
             if device.type == 'cuda':
@@ -20783,7 +20783,7 @@ class TimeGuard:
                 st.update(raw)
                 # Every field below feeds the cap arithmetic.  A malformed
                 # value must fail closed: reading a string/NaN/bool as booked
-                # time would silently reset or inflate the remaining budget.
+                # time would silently corrupt the accounting.
                 _booked = st.get('booked_seconds', 0.0)
                 if (isinstance(_booked, (bool, np.bool_))
                         or not isinstance(_booked, numbers.Real)
@@ -22958,7 +22958,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         print('[cap] raise RUN_CAP and re-run to fill these cells in.')
     if stale_dropped:
         _still = [k for k in stale_dropped if k not in summary]
-        print(f'\n[resume] {len(stale_dropped)} cell(s) held a record from a DIFFERENT config and were re-run; {len(_still)} of them produced NO measurement this pass and are now ABSENT from {summary_path} (the stale record was removed rather than kept, so no number measured by older code can be reported under the current config):')
+        print(f'\n[resume] {len(stale_dropped)} cell(s) held a record from a DIFFERENT config and were re-run; {len(_still)} of them produced NO measurement this pass and are now ABSENT from {summary_path} (the stale record was removed rather than kept, so no number measured by earlier code can be reported under the current config):')
         for _k in _still:
             print(f'    {_k}')
         if len(_still) != len(stale_dropped):

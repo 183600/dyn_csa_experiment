@@ -2606,7 +2606,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
     return out
 
 def _merge_prior_by_len(prev_by_len, new_cells, need_lens, *, label=''):
-    """Merge previously evaluated length cells with a partial re-evaluation.
+    """Merge prior length cells with a partial re-evaluation.
 
     Only exact integer length keys survive.  A length that is being
     re-evaluated is replaced by the new measurement, and two spellings of one
