@@ -241,11 +241,9 @@ def _curve_slope_stats(points, key, k=4):
     """Least-squares slope + its standard error over the last k FINITE points.
 
     Returning the standard error is what makes the health thresholds
-    noise-aware: with four equally spaced eval points and CE noise of order
-    0.01-0.03, the slope's standard error is ~5e-5 per step, five times a
-    fixed ``slope_tol=1e-5``.  A fixed tolerance therefore lets the
-    *sign of the noise* decide ``healthy`` vs ``overfitting``.  Callers that
-    need a scale-free criterion compare the slope with a multiple of this SE.
+    noise-aware: evaluation noise can make a fixed ``slope_tol`` compare only
+    the sign of that noise.  Callers that need a scale-free criterion compare
+    the slope with a multiple of this SE.
     """
     pts = []
     for p in (points if points is not None else []):
@@ -7549,14 +7547,12 @@ class _DocDeduplicator:
 
     A document is a group: once seen (tokenizer fit, train or validation) any
     exact copy or a near copy within ``near_threshold`` SimHash bits is skipped
-    on every later split.  Measured sensitivity: a 1-word edit of a 12/30/60/
-    150-word document moves the SimHash by ~17/11/8/5 bits on average, so for
-    WikiText's short line-"documents" this layer is effectively an EXACT-copy
-    filter (only near-identical short lines or lightly edited LONG documents
-    fall inside the Hamming-3 net).  The load-bearing guarantees are exact
-    dedup + the official article-level split + the P5T 13-gram shingle
-    overlap gate; residual near-duplicate leakage is measured there, not
-    assumed away here.
+    on every later split.  For WikiText's short line-"documents" this layer is
+    effectively an EXACT-copy filter (only near-identical short lines or
+    lightly edited LONG documents fall inside the Hamming-3 net).  The
+    load-bearing guarantees are exact dedup + the official article-level split
+    + the P5T 13-gram shingle overlap gate; residual near-duplicate leakage
+    is measured there, not assumed away here.
     """
 
     def __init__(self, *, near_threshold=3, bands=4):
@@ -10003,13 +9999,9 @@ def _signflip_saddlepoint_p(values):
     and applying the Lugannani-Rice formula gives a much more accurate tail
     than a normal approximation while staying deterministic.
 
-    ACCURACY (measured against the exact meet-in-the-middle count at n=41-43):
-    the relative error of this approximation is at most ~2% for p in
-    [0.002, 0.04] (the practically relevant band around alpha=0.05 and the
-    Holm thresholds), ~0.2% near p~2e-5 and vanishing in the far tail; the
-    2/2^n floor clamp absorbs any downward bias.  Consumers that need a
-    certified-exact p (e.g. the frozen confirmation at n<=40) use the exact
-    branches; this approximation only serves n > 40 seed panels.
+    Consumers that need a certified-exact p (e.g. the frozen confirmation at
+    n<=40) use the exact branches; this approximation only serves n > 40 seed
+    panels, where the 2/2^n floor clamp absorbs any downward bias.
 
     Returns ``(p, method)``.  Zeros are removed because they multiply the
     number of sign assignments without changing the null distribution; the
@@ -10950,10 +10942,9 @@ def _gammaincc(a, x):
     if x == 0.0:
         return 1.0
     gln = math.lgamma(a)
-    # The series at x ~ a needs O(sqrt(a)) terms; a fixed 1000-iteration cap
-    # silently truncates for a >~ 2.5e4 (rel err 8e-6 at df=1e5 and growing),
-    # so the cap is adaptive (20*sqrt(a)+100, floor 1000 — unchanged for the
-    # small-a regime every current caller reaches).
+    # The series at x ~ a needs O(sqrt(a)) terms; a fixed iteration cap
+    # truncates for large a, so the cap is adaptive (20*sqrt(a)+100, floor
+    # 1000), while every current caller stays in the small-a regime.
     _cap = max(1000, int(20.0 * math.sqrt(a)) + 100)
     if x < a + 1.0:
         ap = float(a)
@@ -11145,10 +11136,10 @@ def chi2_sf(x, df):
     if x <= 0.0:
         return 1.0
     # The Wilson-Hilferty transformation is bulk-accurate only (|x-df|/df
-    # small); in the tail its relative error grows with df (measured 2.7% at
-    # x=1.05*df, df=1e6).  The exact branches above stay accurate to <1e-7
-    # up to df=1e8 with the adaptive iteration cap, so the approximation is
-    # reserved for df beyond that, and never materialises df as a float.
+    # small); in the tail its relative error grows with df.  The exact
+    # branches above remain usable up to df=1e8 with the adaptive iteration
+    # cap, so the approximation is reserved for df beyond that, and never
+    # materialises df as a float.
     if df == float('inf') or df > 1e8:
         try:
             _ratio = x / df
@@ -18372,9 +18363,8 @@ def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
         for t in range(max(1, int(ids.shape[1]) - n_dec), int(ids.shape[1]) + 1):
             # One untimed call per prefix LENGTH: the first forward at a new
             # shape can include one-time kernel selection / allocator growth,
-            # which would otherwise land in the timed p50/p95 as a bias (the
-            # sweep helper warms every (batch, length) cell for the same
-            # reason).
+            # which would otherwise bias the timed p50/p95.  The sweep helper
+            # warms every (batch, length) cell for the same reason.
             model(ids[:, :t])
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)

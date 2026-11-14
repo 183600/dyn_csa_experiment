@@ -1440,7 +1440,7 @@ def _scale_crossovers():
         _synth_seeds = sorted(s for s in common
                               if getattr(ha, 'per_seed_synth', {}).get(s) or getattr(hb, 'per_seed_synth', {}).get(s))
         if _synth_seeds:
-            # A reconstructed curve is a copy of an OLD aggregate, not an
+            # A reconstructed curve is a copy of a prior aggregate, not an
             # independent run.  It may be displayed as provenance, but it must
             # not enter a crossover position, a mean trajectory or a fit.
             print(f'[stats] {label}: seed(s) {_synth_seeds} carry a SYNTHESIZED reconstruction — excluded from every crossover statistic (not an independent run)')
@@ -1593,7 +1593,7 @@ def _equal_token_slices():
                         if getattr(ha, 'per_seed_synth', {}).get(s)
                         or getattr(hb, 'per_seed_synth', {}).get(s))
         if _synth:
-            # Reconstructed curves are copies of an old aggregate, not
+            # Reconstructed curves are copies of a prior aggregate, not
             # independent runs; they may not enter an endpoint, convergence
             # read or matched-token slice.
             print(f'[stats] {name}: seed(s) {_synth} carry a SYNTHESIZED reconstruction — excluded from the matched-token analysis')

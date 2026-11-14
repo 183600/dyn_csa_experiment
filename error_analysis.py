@@ -119,9 +119,8 @@ def _compare_reason(meta_a, meta_b, seq_len, max_seq_a=None, max_seq_b=None):
         return (f'requested seq_len={_sl} exceeds checkpoint B position-table '
                 f'capacity max_seq={_msb}')
     # A's capacity is checked symmetrically: B is run on A's validation
-    # batch, but A itself is also evaluated at seq_len, and an over-capacity
-    # table used to surface only as a cryptic embedding/position lookup error
-    # after most of the work was done.
+    # batch, but A itself is also evaluated at seq_len, so an over-capacity
+    # table must be refused before either model runs.
     _msa = max_seq_a if max_seq_a is not None else meta_a.get('train_len') or meta_a.get('max_seq')
     try:
         _msa = int(_msa) if _msa is not None else None

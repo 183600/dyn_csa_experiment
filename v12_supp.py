@@ -2566,7 +2566,7 @@ def _frozen_rule_confirms(holm_entry, comp, alpha, n_seeds_fallback=8):
     pair count reaches the declared min_seeds_for_confirmation floor.
     `coverage_ok` and the init-core digests are reported instrumentation,
     never decision inputs.  Both `finaltest_stats` and the report's legacy
-    fallback call this ONE implementation so they cannot drift apart again.
+    fallback call this ONE implementation so they cannot drift apart.
     """
     _ph = (holm_entry or {}).get('p_holm') if isinstance(holm_entry, dict) else None
     # A boolean is a flag, not a probability (float(False) == 0.0 would be the
