@@ -6274,11 +6274,10 @@ def _ids_fp(train_ids):
         if _arr.dtype == np.dtype(np.uint64) and _arr.size                 and int(_arr.max()) > np.iinfo(np.int64).max:
             _canon = np.dtype(np.uint64)
     _cs = 1 << 24
-    # Chunk by ELEMENTS, not by first-axis length: a wide 2-D cache (e.g.
-    # documents x sequence length) can have millions of elements per row, so
-    # slicing `_cs` rows would materialise the whole table in one block.
-    # Boundaries do not change the digest (the per-chunk bytes are concatenated
-    # in the same C-order row sequence).
+    # Chunk by ELEMENTS, not by first-axis length: `_cs` bounds the number of
+    # elements per chunk for any input rank.  Boundaries do not change the
+    # digest (the per-chunk bytes are concatenated in the same C-order row
+    # sequence).
     _cols = int(np.prod(_arr.shape[1:], dtype=np.int64)) if _arr.ndim > 1 else 1
     _rows_per_chunk = max(1, _cs // max(1, _cols))
     for _off in range(0, len(_arr), _rows_per_chunk):
@@ -21697,10 +21696,10 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     nll_mat = np.stack([a for a, _ in rows], axis=0)          # [S, R]
     ntok_mat = np.stack([b for _, b in rows], axis=0)         # [S, R]
     # A row with no scored tokens carries no measurement and must not enter
-    # the resampling population: keeping it would waste multinomial draws on
-    # a (0, 0) column and dilute the effective document count.  Same rule as
-    # _combined_seed_doc_ci / _nll_doc_ci; the eval rows are shared across
-    # seeds, so the union test is exact.
+    # the resampling population: a (0, 0) column would contribute no
+    # resampling mass and would dilute the effective document count.  Same
+    # rule as _combined_seed_doc_ci / _nll_doc_ci; the eval rows are shared
+    # across seeds, so the union test is exact.
     _pos = ntok_mat > 0
     if (_pos.any(axis=0) & (~_pos).any(axis=0)).any():
         # One seed scored a row that another seed reports zero tokens for:

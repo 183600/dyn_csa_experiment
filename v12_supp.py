@@ -3491,9 +3491,9 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
                       'amp_dtype': _tk.get('amp_dtype'),
                       'train_knobs': _tk, 'recipe': _recipe}
         # Parameter matching is part of the frozen comparison contract: the
-        # analysis refuses a pair whose totals differ by >1%, but discovering
-        # that only after P5T would waste the access.  Build the real shapes
-        # here (CPU) and check it up front.
+        # analysis refuses a pair whose totals differ by >1%, so build the
+        # real shapes here (CPU) and check it up front rather than only after
+        # the P5T access.
         try:
             _mr_for_shape = float(_expected_mr) if _expected_mr is not None else float(_actual_mr)
             _shape_model = L.SmallGPT(int(sig.get('v', 8192)), int(sig.get('d', 256)),

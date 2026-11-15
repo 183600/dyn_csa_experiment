@@ -11280,8 +11280,8 @@ def t_round21_temporal_values_and_exact_full_range():
                               n_blocks=len(_cnt))
     assert torch.equal(_a, _b), 'huge overlap must clamp to the exact same geometry'
 
-    # The fingerprint chunk boundary is an element budget, not a first-axis
-    # count: the same logical 2-D table must remain bit-identical.
+    # The fingerprint chunk boundary is an element count, not a first-axis
+    # row count: the same logical 2-D table must remain bit-identical.
     _wide = np.arange(2 * 5000, dtype=np.int32).reshape(2, 5000)
     assert L._ids_fp(_wide) == L._ids_fp(_wide.reshape(-1)), '2-D fingerprint changed'
 
