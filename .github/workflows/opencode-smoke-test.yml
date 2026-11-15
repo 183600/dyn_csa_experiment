@@ -1,0 +1,85 @@
+name: OpenCode Smoke Test
+
+# 目的：验证 GitHub Actions 环境里能否调用 opencode（OpenCode Zen 免费模型）。
+# 两条路径：
+#   1) marketplace action：dceoy/opencode-action（github.com/marketplace/actions/opencode-github-action）
+#   2) opencode CLI：npm i -g opencode-ai 后 `opencode run -m opencode/<free-model>`
+# 每条路径各自随机挑选一个免费模型（.github/scripts/pick_free_model.py）。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/opencode-smoke-test.yml'
+      - '.github/scripts/pick_free_model.py'
+
+permissions:
+  contents: read
+
+jobs:
+  action-test:
+    name: opencode via marketplace action
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Pick a random free model
+        id: pick
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          MODEL="$(python3 .github/scripts/pick_free_model.py)"
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "[smoke] 随机选择的免费模型: opencode/$MODEL"
+
+      - name: Run OpenCode (dceoy/opencode-action)
+        uses: dceoy/opencode-action@163f9a9cd3d3f497e2847635585419f951371d2f  # v0.8.1
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          model: opencode/${{ steps.pick.outputs.model }}
+          prompt: '请原样输出这几个字符: OPENCODE_OK 。不要修改任何文件，不要执行任何其他操作。'
+          use-github-token: true
+          timeout-minutes: 10
+
+  cli-test:
+    name: opencode via CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install opencode
+        run: npm i -g opencode-ai
+
+      - name: Run opencode CLI with a random free model
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          for attempt in 1 2 3; do
+            MODEL="$(python3 .github/scripts/pick_free_model.py)"
+            echo "[smoke][cli] attempt $attempt: 随机免费模型 opencode/$MODEL"
+            OUT="$(timeout -k 30 240 opencode run -m "opencode/$MODEL" '只输出这几个字符: OPENCODE_OK' < /dev/null 2>&1)" && RC=0 || RC=$?
+            printf '%s\n' "$OUT" | tail -15
+            if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'OPENCODE_OK'; then
+              echo "[smoke][cli] PASS: opencode/$MODEL 调用成功"
+              exit 0
+            fi
+            echo "[smoke][cli] attempt $attempt 失败 (rc=$RC)，换一个随机免费模型重试"
+          done
+          echo "[smoke][cli] FAIL: 3 次随机免费模型调用均失败"
+          exit 1
