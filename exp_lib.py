@@ -6509,9 +6509,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             _problems.append(
                 f"cache tokenizer fit max rows {meta.get('tokenizer_fit_max_rows')!r} "
                 'does not match the current protocol (50000); rebuild the corpus cache')
-        # The fit cap is a function of the CURRENT code constant and the
-        # requested budget; the cache tag pins the budget (cap{n_train_tokens})
-        # but NOT TOKENIZER_FIT_TOKENS, so a cache built under a different
+        # The fit cap is a function of the CURRENT code constant, but NOT
+        # TOKENIZER_FIT_TOKENS, so a cache built under a different
         # fit-token constant would otherwise be served as current protocol.
         # Fail closed into a rebuild instead.
         _hit_fit_cap = min(int(TOKENIZER_FIT_TOKENS), int(n_train_tokens))
@@ -6635,9 +6634,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     # Tokenizer fit is a frozen TRAIN prefix with an explicit token cap:
     # every document it sees is also inside the model's training region (for
     # caps below the global cap), never a validation/test row.  The fit cap is
-    # `min(TOKENIZER_FIT_TOKENS, n_train_tokens)`, i.e. it DEPENDS on the
-    # requested train-token budget: two caches built at different caps can
-    # carry different tokenizer fits.  The scale ladder pins one cap per cache
+    # `min(TOKENIZER_FIT_TOKENS, n_train_tokens)`.  The scale ladder pins one cap per cache
     # (the cache tag embeds the cap, and cross-cache pairing is refused
     # fail-closed), so arms inside one comparison always share one tokenizer —
     # but "one tokenizer version across all tiers" is a property of the plan's

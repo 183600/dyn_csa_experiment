@@ -10924,7 +10924,6 @@ def t_round18_fail_closed_edge_cases():
         out = A.audit_length(p)
         assert out['status'] == 'fail' and any('no by_len' in x for x in out['problems']), out
 
-    # A budget panel with params but no derivable token allocation fails.
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
             json.dump({'a::s0': {'variant': 'csa_fixed', 'params': 100}}, f)
