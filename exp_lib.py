@@ -6265,14 +6265,21 @@ def _ids_fp(train_ids):
             pass
     _h = hashlib.sha256()
     _arr = np.asarray(train_ids)
+    # A token-id array must be a genuine integer array: a boolean array is a
+    # flag vector, not token ids, and must fail closed instead of taking the
+    # raw-bytes path below (whose digest would diverge from the same tokens
+    # stored as integers).  Float content arrays are still hashed here because
+    # the audit layers use the digest to inspect NaN/Inf caches.
+    if _arr.dtype == bool:
+        raise TypeError(f'token id fingerprint: ids must be integers, got dtype {_arr.dtype}')
     _canon = None
     if np.issubdtype(_arr.dtype, np.integer):
         _canon = np.dtype(np.int64)
-        # uint64 is the only integer width that cannot be represented exactly
-        # in int64.  Keep it as uint64 only when a value actually needs that
-        # range; all ordinary token/doc ids stay on the signed canonical form.
-        if _arr.dtype == np.dtype(np.uint64) and _arr.size                 and int(_arr.max()) > np.iinfo(np.int64).max:
-            _canon = np.dtype(np.uint64)
+    # uint64 is the only integer width that cannot be represented exactly
+    # in int64.  Keep it as uint64 only when a value actually needs that
+    # range; all ordinary token/doc ids stay on the signed canonical form.
+    if _arr.dtype == np.dtype(np.uint64) and _arr.size                 and int(_arr.max()) > np.iinfo(np.int64).max:
+        _canon = np.dtype(np.uint64)
     _cs = 1 << 24
     # Chunk by ELEMENTS, not by first-axis length: `_cs` bounds the number of
     # elements per chunk for any input rank.  Boundaries do not change the
@@ -7625,12 +7632,18 @@ _FWEB_MEMO = {}
 _FWEB_MEMO_CAP = 2
 
 def _fineweb_disk_dtype(vocab):
-    if vocab <= 65536:
+    # A vocabulary size is an exact positive integer; bool flags or float
+    # spellings (8192.9) must not silently narrow the on-disk cache width or
+    # widen the accepted id space.
+    _v = _as_seed_int(vocab)
+    if _v is None or _v <= 0:
+        raise ValueError(f'vocab must be a positive integer, got {vocab!r}')
+    if _v <= 65536:
         return np.uint16
     # int32 holds ids 0..2**31-1, so vocab == 2**31 is still representable.
-    if vocab <= 2 ** 31:
+    if _v <= 2 ** 31:
         return np.int32
-    raise ValueError(f'vocab {vocab} exceeds the id range representable by the on-disk corpus cache')
+    raise ValueError(f'vocab {_v} exceeds the id range representable by the on-disk corpus cache')
 
 def _disk_ids_chunk(buf, disk_dt, vocab):
     # Range check must run on the pre-cast Python ints: once the array is
@@ -7669,20 +7682,21 @@ def _npy_serve_int32(path):
     src = np.asarray(mm)
     if not np.issubdtype(src.dtype, np.integer):
         raise TypeError(f'_npy_serve_int32: expected an integer token cache at {path}, got dtype {src.dtype}')
+    if src.size:
+        _mn, _mx = int(src.min()), int(src.max())
+        if _mn < 0 or _mx > 2 ** 31 - 1:
+            raise ValueError(f'_npy_serve_int32: token ids in {path} span [{_mn}, {_mx}], outside the int32 transport range')
     if src.dtype in (np.uint8, np.uint16, np.int32):
         return src
     # Wider integer cache: narrow to int32 only after proving every id fits.
     # A silent wrap (e.g. 2**32 + 5 -> 5) would pass the downstream
     # vocab-range check for small vocabularies and corrupt the corpus.
-    # Validate BEFORE the sidecar/fallback block: a validation ValueError
+    # The range check above runs before the narrow-dtype early return and
+    # before the sidecar/fallback block: a validation ValueError
     # (non-integer values, negative ids, out-of-int32 ids) must propagate.
     # Catching it there and falling through to an int32 cast would truncate a
     # float cache or wrap a large id, exactly the corruption this guard exists
     # to prevent.
-    if src.size:
-        _mn, _mx = int(src.min()), int(src.max())
-        if _mn < 0 or _mx > 2 ** 31 - 1:
-            raise ValueError(f'_npy_serve_int32: token ids in {path} span [{_mn}, {_mx}], outside the int32 transport range')
     # Serve an identity-bound int32 sidecar: the returned values are the same
     # exact integers and the fingerprint stays on the int32 canonical form.
     try:
@@ -9195,6 +9209,11 @@ def _cache_id_upper_bound(path):
 
 def _ids_narrow(train_ids):
     if train_ids.dtype in (np.uint8, np.uint16, np.int32):
+        # Narrow transports are returned as-is, but the token-id contract still
+        # holds: an int32 array can carry negative ids that must not be served
+        # as token ids (they would index the embedding table from the end).
+        if train_ids.size and int(train_ids.min()) < 0:
+            raise ValueError(f'_ids_narrow: token ids must be non-negative, got min {int(train_ids.min())}')
         return train_ids
     import weakref as _weakref
     _key = id(train_ids)
@@ -9231,7 +9250,7 @@ def _ids_narrow(train_ids):
             # this full scan happens at cache build time.
             _mn = int(train_ids.min()) if train_ids.size else 0
             _mx = int(train_ids.max()) if train_ids.size else -1
-            if -2 ** 31 <= _mn and _mx < 2 ** 31:
+            if _mn >= 0 and _mx < 2 ** 31:
                 _dir = os.path.dirname(os.path.abspath(_side)) or '.'
                 _fd, _tmp = tempfile.mkstemp(dir=_dir, prefix=os.path.basename(_side) + '.', suffix='.tmp')
                 os.close(_fd)
@@ -9259,7 +9278,7 @@ def _ids_narrow(train_ids):
             pass
     _mn = int(train_ids.min()) if train_ids.size else 0
     _mx = int(train_ids.max()) if train_ids.size else -1
-    if train_ids.size and -2 ** 31 <= _mn and _mx < 2 ** 31:
+    if train_ids.size and _mn >= 0 and _mx < 2 ** 31:
         _n = train_ids.astype(np.int32)
         _narrow_memo_put(_key, train_ids, _n)
         return _n

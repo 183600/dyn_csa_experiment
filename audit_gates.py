@@ -801,6 +801,11 @@ def _sidecar_fp(arr):
     import numpy as np
     h = hashlib.sha256()
     a = np.asarray(arr)
+    # Mirror exp_lib._ids_fp exactly: a boolean flag array is not token ids and
+    # fails closed here, while integer storage widths are hashed through one
+    # canonical int64 form so the digest stays byte-identical to exp_lib.
+    if a.dtype == bool:
+        raise TypeError(f'token id fingerprint: ids must be integers, got dtype {a.dtype}')
     _canon = None
     if np.issubdtype(a.dtype, np.integer):
         _canon = np.dtype(np.int64)
