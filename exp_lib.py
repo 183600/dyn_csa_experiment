@@ -21519,6 +21519,8 @@ _MLP_RATIO_MEMO = {}
 def variant_mlp_ratio(variant, vocab, *, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=None, ref_variant='csa_dynamic'):
     if matched is None:
         matched = PARAM_MATCHED
+    if isinstance(matched, bool):
+        matched = PARAM_MATCHED if matched else set()
     if variant not in matched:
         return 4.0
     # The ratio is a pure function of these arguments (the parameter count
