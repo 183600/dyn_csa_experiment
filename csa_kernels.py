@@ -259,6 +259,25 @@ class PoolGeometry:
         last_np = np.where(colmask, np.clip(ends_full - 1, 0, T - 1), T - 1)
         max_len = max(1, int(counts_np.max(initial=0)))
         if overlap is not None:
+            # Match the eager pooling entry points: an overlap is a
+            # non-negative exact integer, and any value >= T is the same
+            # "all tokens of the previous block" geometry.  Clamping here
+            # keeps the host int64 subtraction from overflowing on an
+            # oversized (but conceptually valid) request; a Boolean,
+            # temporal, complex or fractional value is not a token count.
+            import numbers
+            if (isinstance(overlap, (bool, np.bool_, np.datetime64,
+                                     np.timedelta64, complex, np.complexfloating))
+                    or not isinstance(overlap, numbers.Real)):
+                raise ValueError(
+                    f'PoolGeometry: overlap={overlap!r} must be a non-negative '
+                    'exact integer (or None)')
+            _of = float(overlap)
+            if not math.isfinite(_of) or _of != math.floor(_of) or _of < 0.0:
+                raise ValueError(
+                    f'PoolGeometry: overlap={overlap!r} must be a non-negative '
+                    'exact integer (or None)')
+            overlap = min(int(_of), int(T))
             end_prev_full = np.concatenate([np.full((R, 1), -1, dtype=np.int64), ends_full[:, :-1]], axis=1)
             starts_prev_full = np.concatenate([np.zeros((R, 1), dtype=np.int64), starts_full[:, :-1]], axis=1)
             ov_start_full = np.maximum(end_prev_full - int(overlap), starts_prev_full)

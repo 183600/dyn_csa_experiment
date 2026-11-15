@@ -8724,7 +8724,8 @@ def _content_fp_text(value):
     A boolean flag is not a fingerprint: the text 'True' is not a corpus or
     validation-slice identity.  Booleans (and empty values) are treated as
     absent so pairing fails closed."""
-    if value is None or isinstance(value, (bool, np.bool_)):
+    if (value is None or isinstance(value, (bool, np.bool_))
+            or _is_nonmeasurement_scalar(value)):
         return None
     if isinstance(value, (bytes, bytearray)):
         # A bytes fingerprint is the same identity as its text twin.  Empty
@@ -8755,9 +8756,10 @@ def assert_shared_validation_fp(records, *, context='comparison'):
                 _prov = r.get('provenance')
                 _data = _prov.get('data') if isinstance(_prov, dict) else None
                 _fp = _data.get('val_fp') if isinstance(_data, dict) else None
-            if isinstance(_fp, (bool, np.bool_)):
+            if (isinstance(_fp, (bool, np.bool_))
+                    or _is_nonmeasurement_scalar(_fp)):
                 raise ValueError(
-                    f'{context}: a record carries a boolean validation '
+                    f'{context}: a record carries a non-measurement validation '
                     f'fingerprint ({_fp!r}), which is not a corpus identity; '
                     'the comparison is unverifiable')
             _text = _content_fp_text(_fp)
@@ -9757,8 +9759,9 @@ def pair_reason(ra, rb):
         # two absent values and silently take the permissive absent-vs-absent
         # path — two records with garbage provenance would pair as if
         # controlled.  Refuse instead.
-        if isinstance(_ra, (bool, np.bool_)) or isinstance(_rb, (bool, np.bool_)):
-            return f'unverifiable {_k} (a boolean is not a corpus / evaluation-slice fingerprint)'
+        if (isinstance(_ra, (bool, np.bool_)) or _is_nonmeasurement_scalar(_ra)
+                or isinstance(_rb, (bool, np.bool_)) or _is_nonmeasurement_scalar(_rb)):
+            return f'unverifiable {_k} (a non-measurement value is not a corpus / evaluation-slice fingerprint)'
         _pa = _content_fp_text(_ra)
         _pb = _content_fp_text(_rb)
         if (_pa is None) != (_pb is None):
@@ -9772,8 +9775,9 @@ def pair_reason(ra, rb):
     # RNG-state equality is deliberately NOT required: architecture-induced
     # RNG consumption is part of the arm.
     _ra, _rb = ra.get('init_core_fp'), rb.get('init_core_fp')
-    if isinstance(_ra, (bool, np.bool_)) or isinstance(_rb, (bool, np.bool_)):
-        return 'unverifiable init_core_fp (a boolean is not a matched-initialization digest)'
+    if (isinstance(_ra, (bool, np.bool_)) or _is_nonmeasurement_scalar(_ra)
+            or isinstance(_rb, (bool, np.bool_)) or _is_nonmeasurement_scalar(_rb)):
+        return 'unverifiable init_core_fp (a non-measurement value is not a matched-initialization digest)'
     _ia = _content_fp_text(_ra)
     _ib = _content_fp_text(_rb)
     if (_ia is None) != (_ib is None):
@@ -10249,8 +10253,9 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             out['reasons'].append(f'Holm p {_ph!r} is not a probability in [0,1]')
         elif not (_ph < _alpha):
             out['reasons'].append(f'Holm p {_ph:.3g} is not < alpha={_alpha}')
-    if isinstance(mean, (bool, np.bool_)) or isinstance(std, (bool, np.bool_)):
-        out['reasons'].append('mean/std are boolean flags, not measurements')
+    if (isinstance(mean, (bool, np.bool_)) or _is_nonmeasurement_scalar(mean)
+            or isinstance(std, (bool, np.bool_)) or _is_nonmeasurement_scalar(std)):
+        out['reasons'].append('mean/std are boolean/temporal/complex values, not measurements')
     else:
         try:
             _mean_f = float(mean)
@@ -10275,8 +10280,11 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
         # or 4.9 into m=4, silently relaxing the correction instead of failing
         # closed on malformed input.
         _fs = None
-        if isinstance(family_size, (bool, np.bool_)):
-            out['reasons'].append(f'family_size {family_size!r} is a boolean flag, not a comparison count')
+        if (isinstance(family_size, (bool, np.bool_))
+                or _is_nonmeasurement_scalar(family_size)):
+            out['reasons'].append(
+                f'family_size {family_size!r} is a boolean/temporal/complex '
+                'value, not a comparison count')
         elif isinstance(family_size, numbers.Integral):
             _fs = int(family_size)
         elif isinstance(family_size, numbers.Real):
@@ -11739,7 +11747,8 @@ def paired_log_ratio(with_values, without_values, seeds=None):
     for s, a, b in zip(ss, wa, wb):
         # Boolean flags are not PPL measurements.  float(True) would become
         # PPL 1.0 and enter the log-ratio as a real observation.
-        if isinstance(a, (bool, np.bool_)) or isinstance(b, (bool, np.bool_)):
+        if (isinstance(a, (bool, np.bool_)) or _is_nonmeasurement_scalar(a)
+                or isinstance(b, (bool, np.bool_)) or _is_nonmeasurement_scalar(b)):
             dropped.append(s)
             continue
         try:
@@ -11823,9 +11832,9 @@ def _scale_points(points):
         # check but never pair in scaling_trend's by-seed map, silently
         # discarding the primary paired test.
         seeds_kept = [_seed_identity(x) for x in seeds_kept]
-        if isinstance(scale, (bool, np.bool_)):
-            raise ValueError('scale point %r: scale %r is a boolean flag, not a measurement'
-                             % (label, scale))
+        if isinstance(scale, (bool, np.bool_)) or _is_nonmeasurement_scalar(scale):
+            raise ValueError('scale point %r: scale %r is a boolean/temporal/complex '
+                             'value, not a measurement' % (label, scale))
         try:
             sc = float(scale)
         except (TypeError, ValueError, OverflowError):
@@ -12139,7 +12148,8 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
     for s, x, y in zip(ss, a, b):
         # Boolean flags are not scale effects; reject them before float()
         # turns them into 0/1 observations.
-        if isinstance(x, (bool, np.bool_)) or isinstance(y, (bool, np.bool_)):
+        if (isinstance(x, (bool, np.bool_)) or _is_nonmeasurement_scalar(x)
+                or isinstance(y, (bool, np.bool_)) or _is_nonmeasurement_scalar(y)):
             continue
         try:
             fx, fy = float(x), float(y)
@@ -12512,8 +12522,8 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         tiers = []
     _tol_raw = (policy.get('tokens_per_param_tolerance', 0.25)
                 if tolerance is None else tolerance)
-    if isinstance(_tol_raw, (bool, np.bool_)):
-        problems.append(f'tolerance={_tol_raw!r} is a boolean flag, not a fraction')
+    if isinstance(_tol_raw, (bool, np.bool_)) or _is_nonmeasurement_scalar(_tol_raw):
+        problems.append(f'tolerance={_tol_raw!r} is a boolean/temporal/complex value, not a fraction')
         tol = 0.0
     else:
         try:
@@ -12599,8 +12609,8 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             else:
                 # Canonicalise the fingerprint once, with the same rule the
                 # rest of the scale machinery uses.
-                if isinstance(_v, (bool, np.bool_)):
-                    problems.append(f'{name}: {_fpk}={_v!r} is a boolean, not a fingerprint')
+                if isinstance(_v, (bool, np.bool_)) or _is_nonmeasurement_scalar(_v):
+                    problems.append(f'{name}: {_fpk}={_v!r} is a boolean/temporal/complex value, not a fingerprint')
                     continue
                 if isinstance(_v, (str, bytes, bytearray)) and not _v:
                     # An empty marker is the explicit "not recorded" state.
@@ -12617,10 +12627,11 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             seq = _as_int(cfg['seq_len'], 'seq_len')
             declared_tokens = _as_int(cfg.get('n_train_tokens') or 0, 'n_train_tokens')
             _lr_raw = cfg.get('lr')
-            if isinstance(_lr_raw, (bool, np.bool_)):
-                # A boolean is a flag, not a learning rate: float(True)=1.0
-                # would silently become a plausible (and finite) LR.
-                raise ValueError(f'lr={_lr_raw!r} is a boolean, not a number')
+            if isinstance(_lr_raw, (bool, np.bool_)) or _is_nonmeasurement_scalar(_lr_raw):
+                # A boolean/temporal/complex value is not a learning rate:
+                # float(True)=1.0 would silently become a plausible (and
+                # finite) LR, and a duration would become its ns count.
+                raise ValueError(f'lr={_lr_raw!r} is a boolean/temporal/complex value, not a number')
             lr = float(_lr_raw)
             warmup = _as_int(cfg.get('warmup') or 0, 'warmup')
             seeds = [_as_int(s, 'seed') for s in (cfg.get('seeds') or [])]
@@ -12790,7 +12801,8 @@ def loglog_regression(points, *, alpha=0.05):
             x, y, label = p[0], p[1], i
         else:
             continue
-        if isinstance(x, (bool, np.bool_)) or isinstance(y, (bool, np.bool_)):
+        if (isinstance(x, (bool, np.bool_)) or _is_nonmeasurement_scalar(x)
+                or isinstance(y, (bool, np.bool_)) or _is_nonmeasurement_scalar(y)):
             continue
         try:
             fx, fy = float(x), float(y)
@@ -12895,7 +12907,7 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
     scale panels are observational, not randomized.
     """
     _min_points = _valid_min_n(min_points)
-    if isinstance(volume_tol, (bool, np.bool_)):
+    if isinstance(volume_tol, (bool, np.bool_)) or _is_nonmeasurement_scalar(volume_tol):
         _volume_tol = None
     else:
         try:
@@ -12905,7 +12917,7 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
         else:
             if not math.isfinite(_volume_tol) or _volume_tol < 0.0:
                 _volume_tol = None
-    if isinstance(d_spread_min, (bool, np.bool_)):
+    if isinstance(d_spread_min, (bool, np.bool_)) or _is_nonmeasurement_scalar(d_spread_min):
         _d_spread_min = None
     else:
         try:
@@ -12958,7 +12970,8 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
         # Booleans are flags, not measured widths/token counts.  float(True)
         # would otherwise become d=1 or a one-token training volume and enter
         # the fit as a real point.
-        if any(isinstance(_x, (bool, np.bool_)) for _x in (dur, tok, tr) if _x is not None):
+        if any(isinstance(_x, (bool, np.bool_)) or _is_nonmeasurement_scalar(_x)
+               for _x in (dur, tok, tr) if _x is not None):
             continue
         try:
             fd = float(dur)
@@ -13513,7 +13526,7 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     if _vocab is None or _vocab <= 0:
         raise ValueError(f'vocab_size must be a positive integer, got {vocab_size!r}')
     vocab_size = _vocab
-    if isinstance(alpha, (bool, np.bool_)):
+    if isinstance(alpha, (bool, np.bool_)) or _is_nonmeasurement_scalar(alpha):
         raise ValueError(f'alpha must be a finite positive number, got {alpha!r}')
     try:
         alpha = float(alpha)
@@ -13560,7 +13573,7 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
                 'n_tokens_matched': _m_n, 'nll_matched': _m_nll,
                 'ppl_matched_denominator': float(_safe_exp_ppl(_m_nll)) if math.isfinite(_m_nll) else float('nan')}
     _uni, uniq, ctx, pair_counts = counts
-    if isinstance(interpolation, (bool, np.bool_)):
+    if isinstance(interpolation, (bool, np.bool_)) or _is_nonmeasurement_scalar(interpolation):
         raise ValueError(f'interpolation must be a finite number in [0, 1], got {interpolation!r}')
     try:
         lam = float(interpolation)

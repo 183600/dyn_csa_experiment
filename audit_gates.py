@@ -904,7 +904,10 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
     # JS thresholds live on the ln2-NORMALIZED scale (js/ln2 in [0,1]), the
     # same scale the corpus hard gate uses.  A raw-nats threshold above ln(2)
     # can never fire; validate reachability instead of keeping a dead gate.
-    if isinstance(js_warn, (bool, np.bool_)) or isinstance(js_fail, (bool, np.bool_)):
+    if (isinstance(js_warn, (bool, np.bool_, np.datetime64, np.timedelta64,
+                             complex, np.complexfloating))
+            or isinstance(js_fail, (bool, np.bool_, np.datetime64, np.timedelta64,
+                                    complex, np.complexfloating))):
         raise ValueError('js_warn/js_fail must be numbers on the normalized JS scale')
     try:
         js_warn = float(js_warn)
@@ -2285,14 +2288,16 @@ def train_flops_estimate(params, tokens, attn_overhead=0.35):
 
     6·N·D 是前向+反向的常用近似；稀疏选择/池化/激活重算与长序列注意力
     不与参数量成比例，因此用一个**显式声明的**注意力项系数。"""
+    import numpy as np
     # Parameters and tokens are exact positive counts.
     n = _exact_int_scalar(params)
     d_tok = _exact_int_scalar(tokens)
     if n is None or n <= 0 or d_tok is None or d_tok <= 0:
         raise ValueError(f'train_flops_estimate: params/tokens must be positive integers (got {params!r}, {tokens!r})')
-    if (isinstance(attn_overhead, bool)
+    if (isinstance(attn_overhead, (bool, np.datetime64, np.timedelta64,
+                                   complex, np.complexfloating))
             or getattr(getattr(attn_overhead, 'dtype', None), 'kind', None) == 'b'):
-        raise ValueError(f'train_flops_estimate: attn_overhead={attn_overhead!r} is a boolean, not a coefficient')
+        raise ValueError(f'train_flops_estimate: attn_overhead={attn_overhead!r} is a boolean/temporal/complex value, not a coefficient')
     try:
         overhead = float(attn_overhead)
     except (TypeError, ValueError, OverflowError):
@@ -2569,10 +2574,11 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
     `pairs` may be a list of (arm_a, arm_b); by default every arm pair sharing
     a panel is reported (descriptive)."""
     import numpy as np
-    if isinstance(tolerance, (bool, np.bool_)):
+    if isinstance(tolerance, (bool, np.bool_, np.datetime64, np.timedelta64,
+                              complex, np.complexfloating)):
         return {'status': 'fail', 'panels': {}, 'claims_allowed': [], 'refused': [],
                 'tolerance': None,
-                'problems': [f'tolerance={tolerance!r} is a boolean flag, not a fraction'],
+                'problems': [f'tolerance={tolerance!r} is a boolean/temporal/complex value, not a fraction'],
                 'note': 'measured prefill only; no KV cache in this model; analytic FLOPs are never substituted for timing'}
     try:
         tolerance = float(tolerance)

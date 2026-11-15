@@ -125,8 +125,11 @@ def _compare_reason(meta_a, meta_b, seq_len, max_seq_a=None, max_seq_b=None):
             return f'architecture differs on {_k} ({_va!r} vs {_vb!r})'
     _mr_a = meta_a.get('mlp_ratio', 4.0)
     _mr_b = meta_b.get('mlp_ratio', 4.0)
-    if isinstance(_mr_a, (bool, np.bool_)) or isinstance(_mr_b, (bool, np.bool_)):
-        return 'mlp_ratio is a boolean flag in at least one checkpoint'
+    if (isinstance(_mr_a, (bool, np.bool_, np.datetime64, np.timedelta64,
+                           complex, np.complexfloating))
+            or isinstance(_mr_b, (bool, np.bool_, np.datetime64, np.timedelta64,
+                                  complex, np.complexfloating))):
+        return 'mlp_ratio is a boolean/temporal/complex value in at least one checkpoint'
     try:
         _mr_a = float(_mr_a)
         _mr_b = float(_mr_b)

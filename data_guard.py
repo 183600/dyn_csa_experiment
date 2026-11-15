@@ -195,7 +195,8 @@ def _unhashable_identity(value):
 def _check_fraction(name, value):
     # Booleans and temporal values are not fractions.  Same contract as
     # _check_count.
-    if isinstance(value, (bool, np.bool_, np.datetime64, np.timedelta64)):
+    if isinstance(value, (bool, np.bool_, np.datetime64, np.timedelta64,
+                          complex, np.complexfloating)):
         raise ValueError(f'{name} must be a number in [0, 1], got {value!r}')
     try:
         value = float(value)

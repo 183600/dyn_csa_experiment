@@ -11299,6 +11299,126 @@ def t_round21_temporal_values_and_exact_full_range():
         assert loaded == {'ppl': None, 'ok': 1.0, 'arr': [1.0, None]}, loaded
 
 
+def t_round22_nonmeasurement_scalars_in_measurement_paths():
+    # Temporal/complex scalar spellings are never PPL/effect/scale/tuning
+    # measurements.  Every shared contract must refuse them instead of
+    # discarding the imaginary part or interpreting a duration's ns count as
+    # an ordinary number.
+    import data_guard as DG
+    import error_analysis as EA
+    _td = np.timedelta64(1, 'D')
+    _tp = np.timedelta64(1, 'ns')
+    _z = np.complex128(1 + 0j)
+    _stats = {'n': 6, 'p_exact_signflip': 0.01, 'n_nonzero': 6,
+              'mean': 1.0, 'std': 0.1}
+    for _bad in (_td, _tp, _z, 1 + 0j):
+        _claim = L.reportable_claim(_stats, family_size=_bad)
+        assert _claim['allowed'] is False, (_bad, _claim)
+        assert any('family_size' in _r for _r in _claim['reasons']), (_bad, _claim)
+    for _bad in (_td, _tp, _z, 1 + 0j, np.datetime64('2020-01-01')):
+        _claim = L.reportable_claim(dict(_stats, mean=_bad))
+        assert _claim['allowed'] is False, (_bad, _claim)
+        _claim = L.reportable_claim(dict(_stats, std=_bad))
+        assert _claim['allowed'] is False, (_bad, _claim)
+
+    # Paired log ratios / interactions / scale points / log-log fits drop or
+    # refuse non-measurements; they must not become huge duration effects.
+    _r = L.paired_log_ratio([_td, 2.0, 3.0], [1.0, 1.0, 1.0])
+    assert _r['n'] == 2 and _r['n_dropped'] == 1, _r
+    assert L.paired_log_ratio([_z, 2.0], [1.0, 1.0])['n'] == 1
+    assert L.scale_interaction([_td, 0.1], [1.0, 0.2])['n'] == 1
+    assert L.loglog_regression([(_td, 1.0), (2, 4), (4, 16)])['n_points'] == 2
+    _pts = [{'label': 'A', 'scale': _td, 'effects': [1.0, 2.0], 'seeds': [0, 1]},
+            {'label': 'B', 'scale': 2.0, 'effects': [1.1, 2.1], 'seeds': [0, 1]}]
+    try:
+        L.meta_analyze_effects(_pts)
+        raise AssertionError('meta_analyze_effects accepted a temporal scale')
+    except ValueError:
+        pass
+    _cr = L.crossover_scaling_fit(
+        [{'label': 'a', 'd': _td, 'crossover_tokens': 1, 'train_tokens': 1}])
+    assert _cr['n_input'] == 0, _cr
+    assert L.crossover_scaling_fit(
+        [{'label': 'a', 'd': 32, 'crossover_tokens': 1, 'train_tokens': 1}],
+        volume_tol=_td)['status'] == 'invalid_options'
+    for _bad in (_td, _z):
+        for _kw in ({'alpha': _bad}, {'order': 2, 'interpolation': _bad}):
+            try:
+                L.ngram_lm_score([1, 2], np.array([[1, 2]]), 8, **_kw)
+                raise AssertionError(f'ngram_lm_score accepted {_kw!r}')
+            except ValueError:
+                pass
+
+    # The zero-GPU report/audit twins follow the same contract.
+    _v7r = V7.exact_sign_permutation([_td, 1.0, 2.0])
+    assert _v7r['n'] == 2 and _v7r['n_dropped'] == 1, _v7r
+    assert L._content_fp_text(_td) is None
+    assert BR._content_fp_text(_z) is None
+    try:
+        L.assert_shared_validation_fp([{'val_fp': _td}])
+        raise AssertionError('assert_shared_validation_fp accepted a temporal val_fp')
+    except ValueError:
+        pass
+    _fp_base = {'run_cfg': 'CFG', 'data_fp': 'x', 'val_fp': 'y',
+                'eval_fp': 'z', 'init_core_fp': 'i', 'steps': 1,
+                'tokens_seen': 1}
+    assert 'non-measurement' in L.pair_reason(dict(_fp_base, data_fp=_td), _fp_base)
+    assert 'non-measurement' in BR._pair_reason(dict(_fp_base, init_core_fp=_z), _fp_base)
+    for _bad in (_td, _z):
+        try:
+            BR.holm_adjust([('a', 0.01)], _bad)
+            raise AssertionError(f'build_report.holm_adjust accepted alpha={_bad!r}')
+        except ValueError:
+            pass
+        assert BR.holm_adjust([('a', _bad)], 0.05)['a'] == 1.0
+        try:
+            DG._check_fraction('f', _bad)
+            raise AssertionError(f'_check_fraction accepted {_bad!r}')
+        except ValueError:
+            pass
+    _base = {'vocab': 100, 'd': 8, 'n_layers': 1, 'n_heads': 1, 'd_head': 8,
+             'mlp_ratio': 4.0, 'cfg': ['c'], 'train_fp': 'T', 'eval_fp': 'E',
+             'code': 'K'}
+    for _bad in (_td, _z):
+        assert EA._compare_reason(dict(_base, mlp_ratio=_bad), _base, 8,
+                                  max_seq_a=16, max_seq_b=16) is not None
+        try:
+            A.audit_split_discipline(js_warn=_bad)
+            raise AssertionError(f'audit_split_discipline accepted js_warn={_bad!r}')
+        except ValueError:
+            pass
+        _eff = A.audit_efficiency_pairs(tolerance=_bad)
+        assert _eff['status'] == 'fail' and _eff['tolerance'] is None, _eff
+        assert BR._sig_gate(dict(_stats, p_holm=0.01), alpha=_bad) is False
+        try:
+            BR.global_multiplicity_adjust([('a', 0.01)], _bad)
+            raise AssertionError(f'global_multiplicity_adjust accepted alpha={_bad!r}')
+        except ValueError:
+            pass
+        try:
+            A.train_flops_estimate(10, 100, attn_overhead=_bad)
+            raise AssertionError(f'train_flops_estimate accepted attn_overhead={_bad!r}')
+        except ValueError:
+            pass
+        _lad = L.scale_ladder_audit(
+            [{'name': 'T', 'cfg': {'steps': 3, 'batch_size': 2, 'seq_len': 8,
+                                   'lr': 1e-3, 'warmup': 0, 'seeds': [0]}}],
+            tolerance=_bad)
+        assert _lad['status'] == 'fail' or any('tolerance' in p for p in _lad['problems']), _lad
+        # Kernel pool geometry shares the eager overlap contract: oversized
+        # requests clamp to "all previous tokens"; negative/fractional/flags
+        # are refused instead of silently changing the B-lane width.
+        import csa_kernels as CK
+        _g = CK.PoolGeometry([[2, 3]], 10 ** 30, 5, torch.device('cpu'), 3)
+        assert _g.overlap == 5 and _g.W_b == 2, (_g.overlap, _g.W_b)
+        for _bad_ov in (-1, 3.5, True, _td, _z):
+            try:
+                CK.PoolGeometry([[2, 3]], _bad_ov, 5, torch.device('cpu'), 3)
+                raise AssertionError(f'PoolGeometry accepted overlap={_bad_ov!r}')
+            except ValueError:
+                pass
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -11651,6 +11771,7 @@ def main():
     _check('N56 category order / one-sided clip / TimeGuard cap exactness', t_round20_category_order_and_cap_exactness)
     _check('N57 ngram count helper requires an exact vocabulary', t_round20b_ngram_count_helper_requires_exact_vocab)
     _check('N58 temporal scalars fail closed; exact full-range quantile; strict open-block JSON', t_round21_temporal_values_and_exact_full_range)
+    _check('N59 temporal/complex scalars refused in PPL/effect/report paths', t_round22_nonmeasurement_scalars_in_measurement_paths)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

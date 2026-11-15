@@ -251,8 +251,9 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
     # a value outside [0,1] would either silently corrupt nothing (negative)
     # or ask rng.choice for more positions than the far context holds (>1),
     # so validate before any mode-specific branch.
-    if isinstance(rho, (bool, np.bool_)):
-        raise ValueError(f'_corrupt_row: rho={rho!r} is a boolean flag, not a corruption fraction')
+    if isinstance(rho, (bool, np.bool_, np.datetime64, np.timedelta64,
+                        complex, np.complexfloating)):
+        raise ValueError(f'_corrupt_row: rho={rho!r} is a boolean/temporal/complex value, not a corruption fraction')
     try:
         _rho = float(rho)
     except (TypeError, ValueError, OverflowError):
@@ -634,8 +635,9 @@ def _probe_defs(cfg):
             raise ValueError(f'_probe_defs: rhos for mode {_mode!r} must be a list')
         _rhos_f = []
         for rho in _rhos:
-            if isinstance(rho, (bool, np.bool_)):
-                raise ValueError(f'_probe_defs: rho={rho!r} is a boolean, not a density')
+            if isinstance(rho, (bool, np.bool_, np.datetime64, np.timedelta64,
+                                complex, np.complexfloating)):
+                raise ValueError(f'_probe_defs: rho={rho!r} is a boolean/temporal/complex value, not a density')
             try:
                 _rf = float(rho)
             except (TypeError, ValueError, OverflowError):
@@ -689,8 +691,9 @@ def _niah_fingerprint(cfg, condition=None):
         # The distractor condition's corruption density is part of the
         # measurement; the clean condition does not read rho.
         _rho = _n.get('rho', 0.5)
-        if isinstance(_rho, (bool, np.bool_)):
-            raise ValueError('_niah_fingerprint: rho is a boolean, not a density')
+        if isinstance(_rho, (bool, np.bool_, np.datetime64, np.timedelta64,
+                             complex, np.complexfloating)):
+            raise ValueError('_niah_fingerprint: rho is a boolean/temporal/complex value, not a density')
         try:
             _rho = float(_rho)
         except (TypeError, ValueError, OverflowError):
@@ -736,8 +739,9 @@ def _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed, 
     if condition not in ('clean', 'distract'):
         raise ValueError(
             f"NIAH-natural: condition={condition!r} must be 'clean' or 'distract'")
-    if isinstance(rho, (bool, np.bool_)):
-        raise ValueError(f'NIAH-natural: rho={rho!r} is a boolean, not a density')
+    if isinstance(rho, (bool, np.bool_, np.datetime64, np.timedelta64,
+                        complex, np.complexfloating)):
+        raise ValueError(f'NIAH-natural: rho={rho!r} is a boolean/temporal/complex value, not a density')
     try:
         rho = float(rho)
     except (TypeError, ValueError, OverflowError):
@@ -1889,7 +1893,8 @@ def v10_analysis(out='analysis_v10/stats.json'):
             try:
                 ns = []
                 for x in ns_raw:
-                    if isinstance(x, (bool, np.bool_)):
+                    if isinstance(x, (bool, np.bool_, np.datetime64, np.timedelta64,
+                                      complex, np.complexfloating)):
                         return float('nan')
                     ns.append(float(x))
                 nt = []

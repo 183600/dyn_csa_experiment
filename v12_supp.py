@@ -475,8 +475,9 @@ def _load_manifest(path):
             if not isinstance(_pv, list) or not _pv:
                 raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.{_pk} must be a non-empty list ({_pv!r})')
             for _x in _pv:
-                if isinstance(_x, (bool, np.bool_)):
-                    raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.{_pk} contains a boolean ({_x!r})')
+                if isinstance(_x, (bool, np.bool_, np.datetime64, np.timedelta64,
+                                   complex, np.complexfloating)):
+                    raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.{_pk} contains a boolean/temporal/complex value ({_x!r})')
                 try:
                     _xf = float(_x)
                 except (TypeError, ValueError, OverflowError):
@@ -630,8 +631,9 @@ def _load_manifest(path):
             raise SystemExit(f'[v12] REFUSE: binding.training_recipe_signature must be an object of machine-checkable fields ({_bind.get("training_recipe_signature")!r})')
         if _sig is not None:
             for _sk, _sv in _sig.items():
-                if isinstance(_sv, (bool, np.bool_)):
-                    raise SystemExit(f'[v12] REFUSE: training_recipe_signature.{_sk}={_sv!r} is a boolean, not a numeric recipe knob')
+                if isinstance(_sv, (bool, np.bool_, np.datetime64, np.timedelta64,
+                                    complex, np.complexfloating)):
+                    raise SystemExit(f'[v12] REFUSE: training_recipe_signature.{_sk}={_sv!r} is a boolean/temporal/complex value, not a numeric recipe knob')
                 if isinstance(_sv, numbers.Real):
                     try:
                         _svf = float(_sv)
@@ -647,8 +649,9 @@ def _load_manifest(path):
                 if not isinstance(_asig, dict) or not _asig:
                     raise SystemExit(f'[v12] REFUSE: binding.per_arm_recipe_signature[{_arm!r}] must be a non-empty object')
                 for _sk, _sv in _asig.items():
-                    if isinstance(_sv, (bool, np.bool_)):
-                        raise SystemExit(f'[v12] REFUSE: per-arm signature {_arm!r}.{_sk}={_sv!r} is a boolean, not a numeric recipe knob')
+                    if isinstance(_sv, (bool, np.bool_, np.datetime64, np.timedelta64,
+                                        complex, np.complexfloating)):
+                        raise SystemExit(f'[v12] REFUSE: per-arm signature {_arm!r}.{_sk}={_sv!r} is a boolean/temporal/complex value, not a numeric recipe knob')
                     if isinstance(_sv, numbers.Real):
                         try:
                             _svf = float(_sv)
@@ -1612,9 +1615,11 @@ def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
                          'cannot be computed for a malformed plan')}
     mags = []
     for _x in deltas:
-        if isinstance(_x, (bool, np.bool_)) or not isinstance(_x, numbers.Real):
+        if (isinstance(_x, (bool, np.bool_, np.datetime64, np.timedelta64,
+                            complex, np.complexfloating))
+                or not isinstance(_x, numbers.Real)):
             return {'n': n, 'status': 'invalid_data',
-                    'note': 'paired delta(s) contain a non-numeric or boolean value'}
+                    'note': 'paired delta(s) contain a non-measurement value'}
         try:
             _f = float(_x)
         except (TypeError, ValueError, OverflowError):
@@ -1847,8 +1852,11 @@ def _power_artifact_problem(manifest, power):
         return (f"manifest sha256 {str(power.get('manifest'))[:12]}… does not match "
                 f"the frozen manifest {str(_sha)[:12]}… (stale artifact from another plan)")
     _raw_alpha, _raw_palpha = _stat.get('alpha', 0.05), power.get('alpha')
-    if isinstance(_raw_alpha, (bool, np.bool_)) or isinstance(_raw_palpha, (bool, np.bool_)):
-        return 'artifact alpha/m_comparisons is malformed (a boolean is not a level)'
+    if (isinstance(_raw_alpha, (bool, np.bool_, np.datetime64, np.timedelta64,
+                                complex, np.complexfloating))
+            or isinstance(_raw_palpha, (bool, np.bool_, np.datetime64, np.timedelta64,
+                                        complex, np.complexfloating))):
+        return 'artifact alpha/m_comparisons is malformed (a boolean/temporal/complex value is not a level)'
     try:
         _alpha = float(_raw_alpha)
         _m = len(manifest.get('primary_comparisons') or [])
@@ -2673,7 +2681,10 @@ def _frozen_rule_confirms(holm_entry, comp, alpha, n_seeds_fallback=8):
     _ph = (holm_entry or {}).get('p_holm') if isinstance(holm_entry, dict) else None
     # A boolean is a flag, not a probability (float(False) == 0.0 would be the
     # strongest possible p); alpha is likewise a real level, not a flag.
-    if isinstance(_ph, (bool, np.bool_)) or isinstance(alpha, (bool, np.bool_)):
+    if (isinstance(_ph, (bool, np.bool_, np.datetime64, np.timedelta64,
+                         complex, np.complexfloating))
+            or isinstance(alpha, (bool, np.bool_, np.datetime64, np.timedelta64,
+                                  complex, np.complexfloating))):
         return False
     try:
         _a = float(alpha)
@@ -2772,8 +2783,9 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         _check_or_write_freeze_lock(_lock_dir, manifest, unified_fp, stage='accessed',
                                     train_fp=(next(iter(_adm_train_fps)) if len(_adm_train_fps) == 1 else None))
     _alpha_raw = (manifest.get('statistics') or {}).get('alpha', 0.05)
-    if isinstance(_alpha_raw, (bool, np.bool_)):
-        raise SystemExit(f'[p5t stats] REFUSE: statistics.alpha={_alpha_raw!r} is a boolean, not a significance level')
+    if isinstance(_alpha_raw, (bool, np.bool_, np.datetime64, np.timedelta64,
+                               complex, np.complexfloating)):
+        raise SystemExit(f'[p5t stats] REFUSE: statistics.alpha={_alpha_raw!r} is a boolean/temporal/complex value, not a significance level')
     try:
         _alpha = float(_alpha_raw)
     except (TypeError, ValueError, OverflowError):
@@ -2991,7 +3003,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         # Booleans are flags, not probabilities.  float(False) == 0.0 would
         # become the strongest possible p and let a malformed comparison
         # shrink the family while appearing significant.
-        if isinstance(p, (bool, np.bool_)):
+        if isinstance(p, (bool, np.bool_, np.datetime64, np.timedelta64,
+                          complex, np.complexfloating)):
             p = float('nan')
         try:
             p = float(p)

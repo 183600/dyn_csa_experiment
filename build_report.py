@@ -634,7 +634,9 @@ def per_seed_records(outdir):
 def _content_fp_text(value):
     """Canonical non-empty content-identity string, or None (booleans are
     flags, not fingerprints).  Mirrors exp_lib._content_fp_text."""
-    if value is None or isinstance(value, (bool, np.bool_)):
+    if (value is None or isinstance(value, (bool, np.bool_, np.datetime64,
+                                            np.timedelta64, complex,
+                                            np.complexfloating))):
         return None
     if isinstance(value, (bytes, bytearray)):
         # Same identity contract as exp_lib._content_fp_text: decode a bytes
@@ -694,8 +696,11 @@ def _pair_reason(ra, rb):
         # A boolean is a flag, not a corpus / evaluation-slice identity, so
         # both-boolean must be refused instead of collapsing to the
         # absent-vs-absent permissive path.  Mirrors exp_lib.pair_reason.
-        if isinstance(_ra, (bool, np.bool_)) or isinstance(_rb, (bool, np.bool_)):
-            return f'unverifiable {_k} (a boolean is not a corpus / evaluation-slice fingerprint)'
+        if (isinstance(_ra, (bool, np.bool_, np.datetime64, np.timedelta64,
+                             complex, np.complexfloating))
+                or isinstance(_rb, (bool, np.bool_, np.datetime64, np.timedelta64,
+                                    complex, np.complexfloating))):
+            return f'unverifiable {_k} (a non-measurement value is not a corpus / evaluation-slice fingerprint)'
         _pa = _content_fp_text(_ra)
         _pb = _content_fp_text(_rb)
         if (_pa is None) != (_pb is None):
@@ -705,8 +710,11 @@ def _pair_reason(ra, rb):
     # Matched initialization: equal seeds/geometry do not prove the two arms
     # started from the same shared trunk.  Mirror exp_lib.pair_reason.
     _ra, _rb = ra.get('init_core_fp'), rb.get('init_core_fp')
-    if isinstance(_ra, (bool, np.bool_)) or isinstance(_rb, (bool, np.bool_)):
-        return 'unverifiable init_core_fp (a boolean is not a matched-initialization digest)'
+    if (isinstance(_ra, (bool, np.bool_, np.datetime64, np.timedelta64,
+                         complex, np.complexfloating))
+            or isinstance(_rb, (bool, np.bool_, np.datetime64, np.timedelta64,
+                                complex, np.complexfloating))):
+        return 'unverifiable init_core_fp (a non-measurement value is not a matched-initialization digest)'
     _ia = _content_fp_text(_ra)
     _ib = _content_fp_text(_rb)
     if (_ia is None) != (_ib is None):
@@ -1955,7 +1963,8 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):
         else:
             _note_comparison(label, st.get('p_exact_signflip'), family,
                              st.get('p_holm'), st.get('n'), st.get('mean'))
-    if isinstance(alpha, (bool, np.bool_)):
+    if isinstance(alpha, (bool, np.bool_, np.datetime64, np.timedelta64,
+                          complex, np.complexfloating)):
         return False
     try:
         alpha = float(alpha)
@@ -1968,9 +1977,12 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):
     p = st.get('p_exact_signflip')
     ph = st.get('p_holm')
     mean, std = st.get('mean'), st.get('std')
-    if any(isinstance(v, (bool, np.bool_)) for v in (n, p, ph, mean, std)):
+    if any(isinstance(v, (bool, np.bool_, np.datetime64, np.timedelta64,
+                          complex, np.complexfloating))
+           for v in (n, p, ph, mean, std)):
         # float(False) == 0.0 would otherwise turn a boolean flag into a
-        # significant p-value (or a zero seed count into a real measurement).
+        # significant p-value (or a zero seed count into a real measurement);
+        # temporal/complex spellings are not p-values or effect sizes either.
         return False
     _min_n = _int_or(min_n, None)
     if n is None or _min_n is None:
@@ -2025,7 +2037,8 @@ def global_multiplicity_adjust(named_pvals, alpha=0.05):
     Benjamini-Hochberg step-up q-values + Bonferroni over ALL displayed
     comparisons.  Invalid/missing p keeps a p=1 slot (fail-closed family size,
     same convention as holm_adjust).  Duplicate names are a hard error."""
-    if isinstance(alpha, bool):
+    if isinstance(alpha, (bool, np.bool_, np.datetime64, np.timedelta64,
+                          complex, np.complexfloating)):
         raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
     try:
         a = float(alpha)
@@ -2044,7 +2057,9 @@ def global_multiplicity_adjust(named_pvals, alpha=0.05):
         seen.add(name)
         p = item[1]
         valid = False
-        if p is not None and not isinstance(p, (bool, np.bool_)):
+        if p is not None and not isinstance(p, (bool, np.bool_,
+                                                np.datetime64, np.timedelta64,
+                                                complex, np.complexfloating)):
             try:
                 pf = float(p)
                 valid = math.isfinite(pf) and 0.0 <= pf <= 1.0
@@ -2144,7 +2159,8 @@ def holm_adjust(named_pvals, alpha=0.05):
     p-values keep a dummy p=1 slot so the family size is not silently shrunk."""
     # Same alpha contract as exp_lib.holm_adjust: a boolean/out-of-range level
     # would silently change every rejection decision.
-    if isinstance(alpha, (bool, np.bool_)):
+    if isinstance(alpha, (bool, np.bool_, np.datetime64, np.timedelta64,
+                          complex, np.complexfloating)):
         raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
     try:
         _a = float(alpha)
@@ -2160,9 +2176,12 @@ def holm_adjust(named_pvals, alpha=0.05):
         if name in _seen:
             raise ValueError(f'holm_adjust: duplicate comparison name {name!r}')
         _seen.add(name)
-        if isinstance(v, (bool, np.bool_)):
-            # A flag is not a probability: float(False) == 0.0 would make it
-            # the strongest possible p-value and shrink the family.
+        if isinstance(v, (bool, np.bool_, np.datetime64, np.timedelta64,
+                          complex, np.complexfloating)):
+            # A flag/temporal/complex value is not a probability: float(False)
+            # == 0.0 would make it the strongest possible p-value and shrink
+            # the family, while complex values silently discard the imaginary
+            # part.
             pv = float('nan')
         else:
             try:
@@ -2296,9 +2315,11 @@ def sec_stats():
         _pv = None
         if isinstance(v, dict) and 'omitted' not in v:
             _pv = v.get('p_exact_signflip') if v.get('p_exact_signflip') is not None else v.get('p')
-            if isinstance(_pv, (bool, np.bool_)):
+            if isinstance(_pv, (bool, np.bool_, np.datetime64, np.timedelta64,
+                                complex, np.complexfloating)):
                 # Booleans are flags; float(False)==0.0 would enter Holm as
-                # the strongest possible p while the display shows n/a.
+                # the strongest possible p while the display shows n/a;
+                # temporal/complex spellings are not probabilities either.
                 _pv = None
             else:
                 try:

@@ -1667,7 +1667,8 @@ def exact_sign_permutation(deltas):
     # contract as exp_lib.exact_signflip_p.
     _vals = []
     for _x in (deltas if deltas is not None else []):
-        if isinstance(_x, (bool, np.bool_)):
+        if isinstance(_x, (bool, np.bool_, np.datetime64, np.timedelta64,
+                           complex, np.complexfloating)):
             _vals.append(float('nan'))
             continue
         try:
