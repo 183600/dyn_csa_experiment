@@ -150,20 +150,16 @@ jobs:
       - name: Install opencode
         run: npm i -g opencode-ai
 
-      - name: Configure opencode (independent families - NVIDIA GLM 20% / DeepSeek 80%)
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      - name: Configure opencode (zen free models via OPENCODE_API_KEY)
         run: |
           mkdir -p ~/.config/opencode
-          # provider 配置模板由主循环的探测脚本按线上目录实时生成（独立双家族）：
-          #   opencode.deepseek.json      —— DeepSeek 官方 API（DeepSeek 家族首选）
-          #   opencode.nvidia.json        —— NVIDIA glm-5.3（NVIDIA 家族首选）
-          #   opencode.nvidia-flash.json  —— NVIDIA glm-5.3-flash（NVIDIA 家族内降级）
-          # opencode Zen 免费 deepseek / big-pickle（DeepSeek 家族内兜底）无需任何配置文件。
-          # 两大家族相互独立：失效只在家族内级联，绝不跨家族回退。
-          # harness 永远是 opencode：所有 provider 一律通过 `opencode run -m ...` 调用。
-          echo "[info] opencode 配置目录就绪；provider 模板将在主循环探测后生成"
+          # 主模型全面切换为 opencode Zen 免费模型（OPENCODE_API_KEY 认证，
+          # 无需任何自定义 provider 配置文件）；每个阶段随机挑选一个免费模型，
+          # 失败自动换下一个随机免费模型（.github/scripts/pick_free_model.py）。
+          # DeepSeek 官方 API 不再承担编码，只作为 push 前的把关人
+          # （.github/scripts/deepseek_gate.py 审查全部待推送 diff）。
+          # harness 永远是 opencode：一律通过 `opencode run -m opencode/<model>` 调用。
+          echo "[info] opencode 配置目录就绪；免费模型随机挑选 + DeepSeek 把关已就位"
 
       - name: Configure git
         run: |
@@ -173,8 +169,8 @@ jobs:
       - name: Run opencode for ~5 hours (5 phases per iteration)
         timeout-minutes: 300
         env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
         run: |
           set +e
           set -o pipefail
@@ -195,303 +191,25 @@ jobs:
           CLEAN_TIMEOUT=$((30*60))    # 30m
           APPLY_TIMEOUT=$((60*60))    # 1h（算力申请.md 检查）
 
-          # ================= provider 策略：独立双家族（失效只在家族内级联，不跨家族） =================
-          # NVIDIA 家族（20%）：glm-5.3 → glm-5.3-flash —— glm-5.3 探测不到或调用失败
-          #             自动降级 glm-5.3-flash（https://integrate.api.nvidia.com/v1）；
-          #             两者都不可用时保持本家族重试，绝不切换到 DeepSeek 家族。
-          # DeepSeek 家族（80%）：DeepSeek 官方 API（https://api.deepseek.com/v1，
-          #             模型默认 deepseek-chat，官方稳定别名，探测目录自动校准）
-          #             → opencode Zen 免费 deepseek（deepseek-v4.1-flash-free）
-          #             → big-pickle；全链不可用时保持本家族重试，绝不切换到 NVIDIA 家族。
-          # 家族由 run_phase 在每个阶段开始时掷骰确定（NVIDIA_PROB%），阶段内固定。
-          # harness 永远是 opencode：所有 provider 一律通过 `opencode run -m ...` 调用。
-          NVIDIA_PROB=20
-          FREE_MODEL="opencode/deepseek-v4.1-flash-free"
-          # DeepSeek 家族内兜底：官方与免费 deepseek 均不可用时，切换同为 Zen 网关
-          #           免费的 big-pickle（Big Pickle）。
-          PICKLE_MODEL="opencode/big-pickle"
-          DEEPSEEK_MODEL=""
-          NVIDIA_MODEL=""
-          NVIDIA_FLASH_MODEL=""
-          CURRENT_PROVIDER=""
-          PROVIDER_BROKEN=""
+          # ================= provider 策略：opencode Zen 免费模型随机轮换 =================
+          # 每个阶段开始时从线上目录随机挑选一个免费模型（type=chat + 工具调用 + 价格为 0；
+          # 目录不可用时回退 .github/scripts/pick_free_model.py 内置清单）。
+          # 单个模型调用失败/限流 → 标记本阶段失效，换下一个随机免费模型重试；
+          # 全部免费模型都失效 → 清空失效标记重新随机（相当于整轮重置）。
+          # DeepSeek 官方 API 不参与编码，只在 push 前把关（deepseek_gate）。
+          CURRENT_MODEL=""
+          BROKEN_MODELS=""
 
           mark_broken() {
-            case ",$PROVIDER_BROKEN," in *",$1,"*) ;; *) PROVIDER_BROKEN="$PROVIDER_BROKEN${PROVIDER_BROKEN:+,}$1" ;; esac
-          }
-          is_broken() {
-            case ",$PROVIDER_BROKEN," in *",$1,"*) return 0 ;; *) return 1 ;; esac
+            case ",$BROKEN_MODELS," in *",$1,"*) ;; *) BROKEN_MODELS="$BROKEN_MODELS${BROKEN_MODELS:+,}$1" ;; esac
           }
 
-          # ---------- DeepSeek 官方 API 探测（健康检查 + 模型解析 + 生成配置模板） ----------
-          cat > /tmp/probe_deepseek.py <<'PYEOF'
-          import json, os, sys, urllib.request
-
-          def emit(status, model=''):
-              print((status + ' ' + model).strip())
-              sys.exit(0)
-
-          key = os.environ.get('DEEPSEEK_API_KEY', '').strip()
-          if not key:
-              emit('DOWN')
-          try:
-              req = urllib.request.Request(
-                  'https://api.deepseek.com/models',
-                  headers={'Authorization': 'Bearer ' + key})
-              with urllib.request.urlopen(req, timeout=20) as r:
-                  d = json.load(r)
-          except Exception:
-              emit('DOWN')
-
-          ids = [m.get('id', '') for m in (d.get('data') or []) if m.get('id')]
-          mid = 'deepseek-chat'
-          if 'deepseek-chat' in ids:
-              mid = 'deepseek-chat'
-          elif [i for i in ids if 'deepseek-chat' in i]:
-              mid = [i for i in ids if 'deepseek-chat' in i][0]
-          elif [i for i in ids if 'chat' in i]:
-              mid = [i for i in ids if 'chat' in i][0]
-          elif ids:
-              mid = ids[0]
-
-          cfg = {
-              '$schema': 'https://opencode.ai/config.json',
-              'provider': {
-                  'deepseek': {
-                      'npm': '@ai-sdk/openai-compatible',
-                      'name': 'DeepSeek',
-                      'options': {
-                          'baseURL': 'https://api.deepseek.com/v1',
-                          'apiKey': '{env:DEEPSEEK_API_KEY}',
-                      },
-                      'models': {mid: {'name': mid}},
-                  }
-              },
-              'model': 'deepseek/' + mid,
-          }
-          try:
-              os.makedirs(os.path.expanduser('~/.config/opencode'), exist_ok=True)
-              with open(os.path.expanduser('~/.config/opencode/opencode.deepseek.json'), 'w') as f:
-                  json.dump(cfg, f, indent=2, ensure_ascii=False)
-          except Exception:
-              pass
-          emit('OK', mid)
-          PYEOF
-
-          probe_deepseek() {
-            local out st mid
-            out="$(python3 /tmp/probe_deepseek.py 2>/dev/null)" || out="DOWN"
-            st="${out%% *}"; mid="${out#* }"
-            if [ "$st" = "OK" ] && [ "$mid" != "$out" ] && [ -n "$mid" ]; then
-              DEEPSEEK_MODEL="$mid"; return 0
-            fi
-            DEEPSEEK_MODEL=""; return 1
+          # ---------- 随机免费模型挑选（线上目录实时过滤 + 内置清单兜底） ----------
+          pick_random_free_model() {
+            python3 .github/scripts/pick_free_model.py "$BROKEN_MODELS"
           }
 
-          # ---------- NVIDIA GLM 探测（NVIDIA 家族内两级：glm-5.3 → glm-5.3-flash） ----------
-          # 用法: probe_nvidia.py <primary|flash> —— primary 探测 glm-5.3（非 flash 版，
-          # 目录中不存在时输出 NOMODEL，由调用方在 NVIDIA 家族内降级 flash）；
-          # flash 探测 glm-5.3-flash。探测成功分别把 provider 配置写入
-          # opencode.nvidia.json / opencode.nvidia-flash.json。
-          cat > /tmp/probe_nvidia.py <<'PYEOF'
-          import json, os, sys, urllib.request
-
-          def emit(status, model=''):
-              print((status + ' ' + model).strip())
-              sys.exit(0)
-
-          def norm(s):
-              return s.lower().replace('.', '-').replace('_', '-')
-
-          mode = sys.argv[1] if len(sys.argv) > 1 else 'primary'
-
-          key = os.environ.get('NVIDIA_API_KEY', '').strip()
-          if not key:
-              emit('DOWN')
-          try:
-              req = urllib.request.Request(
-                  'https://integrate.api.nvidia.com/v1/models',
-                  headers={'Authorization': 'Bearer ' + key})
-              with urllib.request.urlopen(req, timeout=20) as r:
-                  d = json.load(r)
-          except Exception:
-              emit('DOWN')
-
-          ids = [m.get('id', '') for m in (d.get('data') or []) if m.get('id')]
-
-          def pick(cands, target):
-              if not cands:
-                  return ''
-              def keyf(x):
-                  return (0 if norm(x.rsplit('/', 1)[-1]) == target else 1, len(x))
-              return sorted(cands, key=keyf)[0]
-
-          if mode == 'flash':
-              mid = pick([i for i in ids if 'glm-5-3' in norm(i) and 'flash' in norm(i)], 'glm-5-3-flash')
-          else:
-              mid = pick([i for i in ids if 'glm-5-3' in norm(i) and 'flash' not in norm(i)], 'glm-5-3')
-          if not mid:
-              emit('NOMODEL')
-
-          cfg = {}
-          base = sys.argv[2] if len(sys.argv) > 2 else ''
-          if base and os.path.exists(base):
-              try:
-                  with open(base) as f:
-                      cfg = json.load(f)
-              except Exception:
-                  cfg = {}
-          cfg['$schema'] = 'https://opencode.ai/config.json'
-          cfg.setdefault('provider', {})
-          cfg['provider']['nvidia'] = {
-              'npm': '@ai-sdk/openai-compatible',
-              'name': 'NVIDIA',
-              'options': {
-                  'baseURL': 'https://integrate.api.nvidia.com/v1',
-                  'apiKey': '{env:NVIDIA_API_KEY}',
-              },
-              'models': {mid: {'name': mid}},
-          }
-          cfg['model'] = 'nvidia/' + mid
-          cfg_path = os.path.expanduser(
-              '~/.config/opencode/opencode.nvidia-flash.json' if mode == 'flash'
-              else '~/.config/opencode/opencode.nvidia.json')
-          try:
-              os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
-              with open(cfg_path, 'w') as f:
-                  json.dump(cfg, f, indent=2, ensure_ascii=False)
-          except Exception:
-              pass
-          emit('OK', mid)
-          PYEOF
-
-          probe_nvidia() {
-            # $1: primary|flash —— 分别探测 glm-5.3 / glm-5.3-flash
-            local out st mid
-            out="$(python3 /tmp/probe_nvidia.py "$1" 2>/dev/null)" || out="DOWN"
-            st="${out%% *}"; mid="${out#* }"
-            if [ "$st" = "OK" ] && [ "$mid" != "$out" ] && [ -n "$mid" ]; then
-              if [ "$1" = "flash" ]; then NVIDIA_FLASH_MODEL="$mid"; else NVIDIA_MODEL="$mid"; fi
-              return 0
-            fi
-            if [ "$1" = "flash" ]; then NVIDIA_FLASH_MODEL=""; else NVIDIA_MODEL=""; fi
-            return 1
-          }
-
-          # ---------- 切换 provider（每次调用都重写配置，防 agent 篡改） ----------
-          switch_provider() {
-            case "$1" in
-              pickle)
-                rm -f "$HOME/.config/opencode/opencode.json" \
-                      "$HOME/.config/opencode/opencode.jsonc" \
-                      "$HOME/.config/opencode/config.json" 2>/dev/null
-                CURRENT_PROVIDER="pickle"
-                ;;
-              deepseek)
-                cp -f "$HOME/.config/opencode/opencode.deepseek.json" \
-                      "$HOME/.config/opencode/opencode.json" 2>/dev/null || true
-                CURRENT_PROVIDER="deepseek"
-                ;;
-              nvidia)
-                cp -f "$HOME/.config/opencode/opencode.nvidia.json" \
-                      "$HOME/.config/opencode/opencode.json" 2>/dev/null || true
-                CURRENT_PROVIDER="nvidia"
-                ;;
-              nvidia_flash)
-                cp -f "$HOME/.config/opencode/opencode.nvidia-flash.json" \
-                      "$HOME/.config/opencode/opencode.json" 2>/dev/null || true
-                CURRENT_PROVIDER="nvidia_flash"
-                ;;
-              free)
-                rm -f "$HOME/.config/opencode/opencode.json" \
-                      "$HOME/.config/opencode/opencode.jsonc" \
-                      "$HOME/.config/opencode/config.json" 2>/dev/null
-                CURRENT_PROVIDER="free"
-                ;;
-            esac
-            FAIL_COUNT=0
-            RATE_COUNT=0
-          }
-
-          # ---------- provider 家族化选择（独立级联，不跨家族） ----------
-          # NVIDIA 家族：glm-5.3 → glm-5.3-flash；DeepSeek 家族：官方 → 免费 deepseek → big-pickle。
-          # 任一家族全链失效时只重置本家族重试，绝不回退到另一个家族。
-          pick_provider() {
-            local fam="${1:-deepseek}" round
-            for round in 1 2; do
-              if [ "$fam" = "nvidia" ]; then
-                if ! is_broken nvidia && probe_nvidia primary; then
-                  switch_provider nvidia
-                  echo "[info] NVIDIA 家族：使用 glm-5.3（$NVIDIA_MODEL）"
-                  return 0
-                fi
-                if ! is_broken nvidia_flash && probe_nvidia flash; then
-                  switch_provider nvidia_flash
-                  echo "[info] NVIDIA 家族：glm-5.3 不可用，降级 glm-5.3-flash（$NVIDIA_FLASH_MODEL）"
-                  return 0
-                fi
-              else
-                if ! is_broken deepseek && probe_deepseek; then
-                  switch_provider deepseek
-                  echo "[info] DeepSeek 家族：使用 DeepSeek 官方 API（$DEEPSEEK_MODEL）"
-                  return 0
-                fi
-                if ! is_broken free; then
-                  switch_provider free
-                  echo "[info] DeepSeek 家族：官方端点不可用，改用 opencode 免费 deepseek（$FREE_MODEL）"
-                  return 0
-                fi
-                if ! is_broken pickle; then
-                  switch_provider pickle
-                  echo "[info] DeepSeek 家族：免费 deepseek 不可用，改用 big-pickle（$PICKLE_MODEL）"
-                  return 0
-                fi
-              fi
-              # 本家族成员全部失效：清空失效标记后再探一轮（第二轮仍失败则返回失败）
-              [ "$round" -eq 1 ] && PROVIDER_BROKEN=""
-            done
-            if [ "$fam" = "nvidia" ]; then
-              echo "[warn] NVIDIA 家族（glm-5.3 / glm-5.3-flash）均不可用——独立策略不切换 DeepSeek 家族，稍后重试"
-            else
-              echo "[warn] DeepSeek 家族（官方 / 免费 deepseek / big-pickle）均不可用——独立策略不切换 NVIDIA 家族，稍后重试"
-            fi
-            return 1
-          }
-
-          # ---------- 思考强度（仅免费 deepseek 兜底路径）：max > high > 不设置 ----------
-          # DeepSeek 官方与 NVIDIA 家族（glm-5.3 / glm-5.3-flash）走 openai-compatible 端点，不设置思考强度。
-          # 免费兜底先从 opencode 模型目录（models.dev）解析其支持的
-          # reasoning effort 档位：有 max 选 max，没有 max 选 high，否则不设置。
-          # 检测失败时兜底 max（无效 variant 会被 opencode 静默忽略）。
-          opencode models opencode --refresh >/dev/null 2>&1 || true
-          cat > /tmp/detect_variant.py <<'PYEOF'
-          import json, os, sys
-          try:
-              p = os.path.expanduser('~/.cache/opencode/models.json')
-              with open(p) as f:
-                  d = json.load(f)
-              m = d.get('opencode', {}).get('models', {}).get('deepseek-v4.1-flash-free')
-              if m is None:
-                  print('UNKNOWN')
-                  sys.exit()
-              values = []
-              for o in (m.get('reasoning_options') or []):
-                  values.extend(o.get('values') or [])
-              for cand in ('max', 'high'):
-                  if cand in values:
-                      print(cand)
-                      sys.exit()
-              print('NONE')
-          except Exception:
-              print('UNKNOWN')
-          PYEOF
-          VRESULT=$(python3 /tmp/detect_variant.py 2>/dev/null)
-          case "$VRESULT" in
-            max|high) VARIANT="$VRESULT" ;;
-            NONE)     VARIANT="" ;;
-            *)        VARIANT="max" ;;
-          esac
-          echo "[info] 独立双家族：NVIDIA(glm-5.3→glm-5.3-flash)=${NVIDIA_PROB}% | DeepSeek(官方→免费→big-pickle)=$((100-NVIDIA_PROB))% | 免费路径思考强度=${VARIANT:-<不设置>} (detect=$VRESULT)"
+          echo "[info] provider 策略：opencode Zen 免费模型随机轮换（每阶段随机挑选，失败自动换模型）；DeepSeek 官方 API 仅作 push 前把关"
 
           i=0
           FAIL_COUNT=0
@@ -557,6 +275,29 @@ jobs:
             return 0
           }
 
+          # ---------- DeepSeek 把关：push 前审查全部待推送改动 ----------
+          # APPROVE → 照常提交推送；REJECT → 回滚本轮改动不推送；
+          # UNAVAILABLE → 改动保留在工作区，跳过本次推送，下一轮重试。
+          run_deepseek_gate() {
+            if git diff --cached --quiet 2>/dev/null; then
+              echo "APPROVE"
+              return 0
+            fi
+            python3 .github/scripts/deepseek_gate.py "$1" 2>/dev/null || echo "UNAVAILABLE"
+          }
+
+          deepseek_gate() {
+            local v=""
+            for ga in 1 2 3; do
+              v="$(run_deepseek_gate "$1")"
+              case "$v" in
+                APPROVE|REJECT:*) echo "$v"; return 0 ;;
+              esac
+              [ "$ga" -lt 3 ] && { echo "[gate] DeepSeek 把关暂不可用 (attempt $ga)，20s 后重试"; sleep 20; }
+            done
+            echo "$v"
+          }
+
           commit_and_push() {
             # ⭐ 保护循环自身：回滚 AI 对 .github 的改动，防止 workflow 被改坏导致循环中断
             git checkout HEAD -- .github 2>/dev/null || true
@@ -567,6 +308,29 @@ jobs:
             rm -f docs/compute_plan.md
             rm -f .opencode_issues.md
             git add -A || true
+
+            # ⭐ DeepSeek 把关：必须审查通过才允许 push
+            local VERDICT
+            VERDICT="$(deepseek_gate "$1")"
+            case "$VERDICT" in
+              APPROVE)
+                echo "[gate] DeepSeek 把关通过 ($1)"
+                ;;
+              REJECT:*)
+                echo "[gate] DeepSeek 拦截本次改动 ($1)，原因: ${VERDICT#REJECT:} —— 已回滚，不推送"
+                git reset --hard HEAD >/dev/null 2>&1 || true
+                git clean -fdq >/dev/null 2>&1 || true
+                ensure_readme
+                ensure_docs
+                return 1
+                ;;
+              *)
+                echo "[gate] DeepSeek 把关不可用 ($1)，跳过本次推送；改动保留在工作区，下一轮重试"
+                git reset >/dev/null 2>&1 || true
+                return 1
+                ;;
+            esac
+
             git commit -m "auto: iteration $1$(model_tag)" || true
             git pull --rebase origin "$BRANCH" || git rebase --abort || true
             git push origin "HEAD:${BRANCH}" || echo "[warn] push $1 failed"
@@ -584,10 +348,25 @@ jobs:
             rm -f .opencode_issues.md
             git add -A || true
             if ! git diff --cached --quiet; then
-              git commit -m "auto: partial work saved on shutdown$(model_tag)" || true
-              git pull --rebase origin "$BRANCH" || git rebase --abort || true
-              git push origin "HEAD:${BRANCH}" || true
-              echo "[trap] partial work committed & pushed"
+              # ⭐ DeepSeek 把关同样适用于 shutdown 收尾提交（单次尝试，快速退出）
+              local VERDICT
+              VERDICT="$(run_deepseek_gate "shutdown partial work")"
+              case "$VERDICT" in
+                APPROVE)
+                  git commit -m "auto: partial work saved on shutdown$(model_tag)" || true
+                  git pull --rebase origin "$BRANCH" || git rebase --abort || true
+                  git push origin "HEAD:${BRANCH}" || true
+                  echo "[trap] partial work committed & pushed (DeepSeek 把关通过)"
+                  ;;
+                REJECT:*)
+                  echo "[trap] DeepSeek 拦截 shutdown 改动: ${VERDICT#REJECT:} —— 回滚，不推送"
+                  git reset --hard HEAD >/dev/null 2>&1 || true
+                  git clean -fdq >/dev/null 2>&1 || true
+                  ;;
+                *)
+                  echo "[trap] DeepSeek 把关不可用，shutdown 改动不推送（把关优先）"
+                  ;;
+              esac
             else
               echo "[trap] nothing to commit"
             fi
@@ -595,7 +374,7 @@ jobs:
           }
           trap on_shutdown TERM INT
 
-          # ---------- 单阶段执行（每阶段掷骰定家族，家族内独立级联，反复重试） ----------
+          # ---------- 单阶段执行（每阶段随机免费模型，失败自动换模型重试） ----------
           # 参数: phase_name  prompt  timeout_seconds
           # 返回: 0 成功 / 124|137|143 超时被杀（预算耗尽，改动照常提交）/ 1 时间用尽
           run_phase() {
@@ -603,10 +382,7 @@ jobs:
             local attempt=0
             FAIL_COUNT=0
             RATE_COUNT=0
-            PROVIDER_BROKEN=""
-            # 家族掷骰（每阶段一次，阶段内固定）：NVIDIA 家族与 DeepSeek 家族相互独立
-            local fam_roll=$((RANDOM % 100)) PHASE_FAMILY
-            if [ "$fam_roll" -lt "$NVIDIA_PROB" ]; then PHASE_FAMILY="nvidia"; else PHASE_FAMILY="deepseek"; fi
+            BROKEN_MODELS=""
 
             while :; do
               attempt=$((attempt+1))
@@ -623,52 +399,22 @@ jobs:
                 return 1
               fi
 
-              if ! pick_provider "$PHASE_FAMILY"; then
-                echo "[warn] phase=$phase 家族=$PHASE_FAMILY 本轮全部不可用，180s 后重试 (attempt=$attempt)"
-                sleep 180
+              # 随机挑选一个免费模型；全部被排除则清空失效标记重新随机
+              CURRENT_MODEL="$(pick_random_free_model)" || {
+                echo "[warn] phase=$phase 免费模型全部失效，重置失效标记，120s 后重新随机 (attempt=$attempt)"
+                BROKEN_MODELS=""
+                sleep 120
                 continue
-              fi
-              local MODEL_DESC="$FREE_MODEL"
-              case "$CURRENT_PROVIDER" in
-                deepseek)     MODEL_DESC="deepseek/$DEEPSEEK_MODEL" ;;
-                nvidia)       MODEL_DESC="nvidia/$NVIDIA_MODEL" ;;
-                nvidia_flash) MODEL_DESC="nvidia/$NVIDIA_FLASH_MODEL" ;;
-                pickle)       MODEL_DESC="$PICKLE_MODEL" ;;
-              esac
-              echo "=========== iter #$i | phase=$phase | attempt=$attempt | provider=$CURRENT_PROVIDER | model=$MODEL_DESC ==========="
+              }
+              local MODEL_DESC="opencode/$CURRENT_MODEL"
+              echo "=========== iter #$i | phase=$phase | attempt=$attempt | model=$MODEL_DESC (免费随机) ==========="
 
               # 防止 agent 写入的 opencode 配置干扰后续调用：
-              # deepseek/nvidia/nvidia_flash 路径恢复探测生成的模板，free 路径确保无自定义配置
-              # （switch_provider 已处理 ~/.config/opencode/，这里只清仓库内残留）
+              # zen 免费模型走内置 opencode provider，确保仓库内无自定义配置残留
               rm -f ./opencode.json ./opencode.jsonc ./.opencode.json 2>/dev/null
 
-              case "$CURRENT_PROVIDER" in
-                deepseek)
-                  record_model "deepseek/$DEEPSEEK_MODEL"
-                  timeout --kill-after=180 "$budget" opencode run -m "deepseek/$DEEPSEEK_MODEL" "$prompt" 2>&1 | tee "$OUT"
-                  ;;
-                nvidia)
-                  record_model "nvidia/$NVIDIA_MODEL"
-                  timeout --kill-after=180 "$budget" opencode run -m "nvidia/$NVIDIA_MODEL" "$prompt" 2>&1 | tee "$OUT"
-                  ;;
-                nvidia_flash)
-                  record_model "nvidia/$NVIDIA_FLASH_MODEL"
-                  timeout --kill-after=180 "$budget" opencode run -m "nvidia/$NVIDIA_FLASH_MODEL" "$prompt" 2>&1 | tee "$OUT"
-                  ;;
-                pickle)
-                  # big-pickle 无 reasoning effort 档位，不传 --variant
-                  record_model "$PICKLE_MODEL"
-                  timeout --kill-after=180 "$budget" opencode run -m "$PICKLE_MODEL" "$prompt" 2>&1 | tee "$OUT"
-                  ;;
-                free)
-                  record_model "$FREE_MODEL"
-                  if [ -n "$VARIANT" ]; then
-                    timeout --kill-after=180 "$budget" opencode run -m "$FREE_MODEL" --variant "$VARIANT" "$prompt" 2>&1 | tee "$OUT"
-                  else
-                    timeout --kill-after=180 "$budget" opencode run -m "$FREE_MODEL" "$prompt" 2>&1 | tee "$OUT"
-                  fi
-                  ;;
-              esac
+              record_model "$MODEL_DESC"
+              timeout --kill-after=180 "$budget" opencode run -m "$MODEL_DESC" "$prompt" < /dev/null 2>&1 | tee "$OUT"
               local EC=$?
 
               # 成功
@@ -682,20 +428,20 @@ jobs:
                 return $EC
               fi
 
-              # 429 限流 / 免费额度限制：标记当前 provider 本阶段失效，家族内降级重试
+              # 429 限流 / 免费额度限制：标记当前模型本阶段失效，换下一个随机免费模型
               if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429|FreeTierError|free tier"; then
                 RATE_COUNT=$((RATE_COUNT+1))
-                mark_broken "$CURRENT_PROVIDER"
-                echo "[warn] phase=$phase 命中限流/额度限制 (provider=$CURRENT_PROVIDER, 连续: $RATE_COUNT)，180s 后换 provider 重试 (attempt=$attempt)"
+                mark_broken "$CURRENT_MODEL"
+                echo "[warn] phase=$phase 命中限流/额度限制 (model=$CURRENT_MODEL, 连续: $RATE_COUNT)，180s 后换随机免费模型重试 (attempt=$attempt)"
                 sleep 180
                 continue
               fi
 
-              # 其它非零退出：标记当前 provider 本阶段失效，换边重试，
+              # 其它非零退出：标记当前模型本阶段失效，换下一个随机免费模型重试，
               # 直到阶段预算或全局时间用尽
               RATE_COUNT=0
-              mark_broken "$CURRENT_PROVIDER"
-              echo "[warn] phase=$phase provider=$CURRENT_PROVIDER 调用失败 (exit=$EC)，60s 后换 provider 重试 (attempt=$attempt)"
+              mark_broken "$CURRENT_MODEL"
+              echo "[warn] phase=$phase model=$CURRENT_MODEL 调用失败 (exit=$EC)，60s 后换随机免费模型重试 (attempt=$attempt)"
               sleep 60
             done
 
@@ -865,6 +611,8 @@ jobs:
 
       - name: Final commit and push
         if: always()
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           set +e
           # ⭐ 保护循环自身：回滚 AI 对 .github 的改动，防止 workflow 被改坏导致循环中断
@@ -899,6 +647,34 @@ jobs:
           # compute_plan.md 已废弃删除：任何阶段重新生成的副本都不入库
           rm -f docs/compute_plan.md
           git add -A
+
+          # ⭐ DeepSeek 把关：收尾提交同样必须审查通过才推送
+          gate_once() {
+            if git diff --cached --quiet 2>/dev/null; then echo "APPROVE"; return 0; fi
+            python3 .github/scripts/deepseek_gate.py "final cleanup" 2>/dev/null || echo "UNAVAILABLE"
+          }
+          FVERDICT=""
+          for ga in 1 2 3; do
+            FVERDICT="$(gate_once)"
+            case "$FVERDICT" in APPROVE|REJECT:*) break ;; esac
+            [ "$ga" -lt 3 ] && { echo "[gate] DeepSeek 把关暂不可用 (attempt $ga)，20s 后重试"; sleep 20; }
+          done
+          case "$FVERDICT" in
+            APPROVE)
+              ;;
+            REJECT:*)
+              echo "[gate] DeepSeek 拦截收尾改动: ${FVERDICT#REJECT:} —— 回滚，不推送"
+              git reset --hard HEAD >/dev/null 2>&1 || true
+              git clean -fdq >/dev/null 2>&1 || true
+              exit 0
+              ;;
+            *)
+              echo "[gate] DeepSeek 把关不可用，收尾改动不推送（把关优先）"
+              git reset >/dev/null 2>&1 || true
+              exit 0
+              ;;
+          esac
+
           LAST_MODEL="$(head -c 120 /tmp/last_model_used.txt 2>/dev/null || true)"
           git commit -m "auto: end of 5h run, cleanup${LAST_MODEL:+ [model: $LAST_MODEL]}" || echo "nothing to commit"
           BRANCH="${GITHUB_REF_NAME:-main}"
