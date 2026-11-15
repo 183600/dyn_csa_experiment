@@ -839,8 +839,10 @@ statement / mechanism / `predicted_sign` / `primary_metric` / falsifier；
   attention 的 straight-through 代理，不是 top-k 身份。因此默认臂应描述为
   「余弦阈值 + 由压缩率正则训练的标量偏移」。
 - 新增 opt-in `csa_dynamic_task`：切分决策按 gate 概率采样，训练损失加入
-  score-function 项 `-(CE - baseline) * logπ / n_decisions`。这才是「任务
-  损失可训练边界」的臂；它已加入 `ABL_VARIANTS` / `ABLATION_DESIGN`。
+  score-function 项 `+(CE - baseline) * logπ / n_decisions`（CE 是被最小化的
+  成本：advantage 为正时该项的梯度下降会**降低**该切分模式的采样概率；
+  写成 `-adv` 会强化坏切分）。这才是「任务损失可训练边界」的臂；它已加入
+  `ABL_VARIANTS` / `ABLATION_DESIGN`。
 - `csa_dyn_nocomp` 把 `comp_lambda_mult` 置零，同时冻结了 `delta_logit`
   的唯一梯度来源；它是「损失项移除」臂，不是「仅关正则、其余完全不变」
   的臂，报告必须这样写。

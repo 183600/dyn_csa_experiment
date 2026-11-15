@@ -19572,9 +19572,14 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                     # step.
                     _ce_item = float(ce.detach().item())
                     _comp_item = float(_comp.detach().item()) if _comp is not None else 0.0
+                    # Cost REINFORCE: `_adv` is a cost advantage (CE above an
+                    # EMA baseline = this cut pattern is WORSE). Descent on
+                    # `+adv * logp` therefore DECREASES the probability of
+                    # above-baseline-cost patterns; the previous `-adv` sign
+                    # reinforced bad cuts (gradient ascent on expected CE).
                     _adv = _ce_item - float(_ce_baseline)
                     _bdec = max(int(getattr(_inner_model, 'boundary_decisions', 0) or 0), 1)
-                    _pg = -_adv * _blp / _bdec
+                    _pg = _adv * _blp / _bdec
                     _pg_item = float(_pg.detach().item())
                     loss = ce + comp_lambda * _inner_model.comp_reg + BOUNDARY_PG_COEF * _pg
                     _ce_baseline = 0.99 * float(_ce_baseline) + 0.01 * _ce_item
@@ -19596,20 +19601,25 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             if _dist and _world > 1:
                 # Every rank must take the same branch: skipping backward on
                 # one rank while another enters DDP's gradient collective
-                # stalls the job.
+                # stalls the job. The branch below therefore tests the
+                # REDUCED `_step_ok` (all ranks' losses finite), not the
+                # local value alone.
                 _ok_t = torch.tensor([1 if math.isfinite(_loss_item) else 0], dtype=torch.int32, device=device)
                 torch.distributed.all_reduce(_ok_t, op=torch.distributed.ReduceOp.MIN)
                 _step_ok = bool(int(_ok_t.item()))
-            if not math.isfinite(_loss_item):
-                _step_ok = False
-                _skipped_steps += 1
-                _nonfinite_loss_steps += 1
-                if _first_bad_step is None:
-                    _first_bad_step = step + 1
-                _nan_events.append({'step': step + 1, 'kind': 'loss', 'loss': _loss_item,
-                                    'ce': _ce_item, 'comp_reg': _comp_item,
-                                    'boundary_pg': _pg_item, 'lr': base})
-                print(f'  [nan] non-finite loss at step {step + 1} (ce={_ce_item}, comp={_comp_item}, pg={_pg_item}); skipping the optimizer update')
+            if not _step_ok:
+                if not math.isfinite(_loss_item):
+                    _skipped_steps += 1
+                    _nonfinite_loss_steps += 1
+                    if _first_bad_step is None:
+                        _first_bad_step = step + 1
+                    _nan_events.append({'step': step + 1, 'kind': 'loss', 'loss': _loss_item,
+                                        'ce': _ce_item, 'comp_reg': _comp_item,
+                                        'boundary_pg': _pg_item, 'lr': base})
+                    print(f'  [nan] non-finite loss at step {step + 1} (ce={_ce_item}, comp={_comp_item}, pg={_pg_item}); skipping the optimizer update')
+                # This rank's loss was finite but another rank's was not:
+                # skip in lockstep so no rank enters DDP's backward
+                # collective while a peer is stalled on the skip path.
                 opt.zero_grad(set_to_none=True)
             elif _scaler is not None:
                 _scale_before = float(_scaler.get_scale())

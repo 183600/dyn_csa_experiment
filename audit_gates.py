@@ -155,6 +155,14 @@ def _load(path):
         return None
 
 
+def _repo_path(p):
+    # Anchor repo-relative names (defaults and `_iter_result_dirs()` names)
+    # at the repo root, NOT the CWD — otherwise a run from another directory
+    # audits whatever happens to sit in the CWD (or reports the repo's own
+    # panels as absent). Absolute paths pass through unchanged.
+    return p if os.path.isabs(p) else os.path.join(REPO, p)
+
+
 def _iter_result_dirs():
     for name in sorted(os.listdir(REPO)):
         if name.startswith('results_') and os.path.isdir(os.path.join(REPO, name)):
@@ -1492,7 +1500,7 @@ def audit_attribution(outdirs=None):
     _missing_panels = []
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
-        _sp = os.path.join(d, 'summary.json')
+        _sp = os.path.join(_repo_path(d), 'summary.json')
         summ = _load(_sp)
         if summ is None:
             if os.path.exists(_sp):
@@ -1614,7 +1622,7 @@ def audit_boundary(outdirs=None):
     import numpy as np
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
-        _sp = os.path.join(d, 'summary.json')
+        _sp = os.path.join(_repo_path(d), 'summary.json')
         summ = _load(_sp)
         if summ is None:
             if os.path.exists(_sp):
@@ -1701,7 +1709,7 @@ def audit_boundary(outdirs=None):
 # 5) length：长度外推评分口径一致性
 # ---------------------------------------------------------------------------
 
-def audit_length(bylen_path='results_lm_test/bylen.json'):
+def audit_length(bylen_path=os.path.join(REPO, 'results_lm_test/bylen.json')):
     """长度外推一致性（零 GPU）：同长度跨臂评分同一组目标 token。
 
     核验点：同一 L 下全部记录的 n_tok 与 eval_span 必须一致（n_tok =
@@ -1916,7 +1924,7 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
 # 6) fairness：冻结臂的基线公平审计
 # ---------------------------------------------------------------------------
 
-def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
+def audit_fairness(summary_path=os.path.join(REPO, 'results_v10_mech/summary.json'), arms=None):
     """基线公平（零 GPU）：优化器/调度/训练量跨臂一致 + 调参机会审计。
 
     核验点：冻结四臂的 run_cfg（lr/wd/steps/token/warmup/形状）逐字段一致
@@ -2073,7 +2081,7 @@ def audit_failures(outdirs=None):
     out = {'status': 'ok', 'panels': {}}
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
-        _sp = os.path.join(d, 'summary.json')
+        _sp = os.path.join(_repo_path(d), 'summary.json')
         summ = _load(_sp)
         if summ is None:
             if os.path.exists(_sp):
@@ -2124,7 +2132,7 @@ def audit_metrics(outdirs=None):
     out = {'status': 'ok', 'policy': L.metric_policy_audit(), 'panels': {}}
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
-        sp = os.path.join(d, 'summary.json')
+        sp = os.path.join(_repo_path(d), 'summary.json')
         summ = _load(sp)
         if summ is None:
             if os.path.exists(sp):
@@ -2327,7 +2335,7 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
     """规模核算（零 GPU）：每面板 6ND 估算与记录对账。"""
     out = {'status': 'ok', 'panels': {}}
     for d, v, steps in panels:
-        _sp = os.path.join(d, 'summary.json')
+        _sp = os.path.join(_repo_path(d), 'summary.json')
         summ = _load(_sp)
         if summ is None:
             if os.path.exists(_sp):
@@ -2458,8 +2466,9 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
         est = train_flops_estimate(p0, tok) if tok else None
         out['panels'][d] = {'params': p0, 'steps': _steps, 'tokens': tok, 'estimate': est}
     for sf in state_files:
-        st = _load(sf)
-        if st is None and os.path.exists(sf):
+        _sf_path = _repo_path(sf)
+        st = _load(_sf_path)
+        if st is None and os.path.exists(_sf_path):
             out['status'] = 'fail'
             out.setdefault('problems', []).append(
                 f'{sf}: TimeGuard state exists but cannot be parsed — the run ledger cannot be reconciled')
@@ -2603,7 +2612,7 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
            'tolerance': tolerance,
            'note': 'measured prefill only; no KV cache in this model; analytic FLOPs are never substituted for timing'}
     for d in dirs:
-        _sp = os.path.join(d, 'summary.json')
+        _sp = os.path.join(_repo_path(d), 'summary.json')
         summ = _load(_sp)
         if summ is None:
             if os.path.exists(_sp):

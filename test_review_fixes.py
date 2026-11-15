@@ -3058,7 +3058,10 @@ def t_review3_boundary_arm_and_objective():
     y = torch.randint(0, 64, (1, 16), generator=torch.Generator().manual_seed(1))
     ce = m.ce_loss(x, y, 64)
     assert m.boundary_logp is not None and m.boundary_decisions > 0, 'boundary policy must emit log-probabilities'
-    loss = ce + 0.05 * m.comp_reg - float(ce.detach()) * m.boundary_logp / max(m.boundary_decisions, 1)
+    # Mirrors the training loop's cost-REINFORCE term: descent on
+    # `+adv_cost * logp` decreases the probability of above-baseline-cost
+    # cuts (baseline 0 here, matching the loop's first-step EMA).
+    loss = ce + 0.05 * m.comp_reg + float(ce.detach()) * m.boundary_logp / max(m.boundary_decisions, 1)
     loss.backward()
     grads = [p.grad.abs().sum().item() for n, p in m.named_parameters() if 'delta_logit' in n and p.grad is not None]
     assert grads and all(g > 0 for g in grads), f'delta_logit received no task-loss gradient: {grads}'
