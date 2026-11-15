@@ -276,7 +276,8 @@ def run_smoke():
     _got = {}
     if os.path.exists(_sp):
         try:
-            _got = json.load(open(_sp, encoding='utf-8'))
+            with open(_sp, encoding='utf-8') as _jf:
+                _got = json.load(_jf)
         except Exception:
             _got = {}
         if not isinstance(_got, dict):
@@ -686,7 +687,8 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
             path = os.path.join(cfg['outdir'], 'summary.json')
             if os.path.exists(path):
                 try:
-                    summaries[label] = json.load(open(path, encoding='utf-8'))
+                    with open(path, encoding='utf-8') as _jf:
+                        summaries[label] = json.load(_jf)
                 except Exception as e:
                     print(f'[m0-analysis] WARNING: {path} unreadable ({type(e).__name__}: {e}); panel skipped')
     summaries = {k: v for k, v in (summaries or {}).items() if isinstance(v, dict) and v}

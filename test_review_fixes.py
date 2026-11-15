@@ -3130,7 +3130,8 @@ def t_seed_axis_normalization():
                    n_layers=2, n_heads=4, d_head=16, dataset='unit', seeds=[0, 0],
                    variants=['full'])
         L.run(cfg, label='dedupe-unit')
-        m = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))
+        with open(os.path.join(d, 'run_manifest.json'), encoding='utf-8') as _jf:
+            m = json.load(_jf)
         entry = next(iter(m['panels'].values()))
         assert entry['n_planned'] == 1 and entry['n_completed'] == 1, entry
         assert entry['tracking_integrity']['seeds_unique'] is True, entry['tracking_integrity']
@@ -3339,7 +3340,8 @@ def t_panel_blocks_on_loader_contract_failure():
             assert 'batch iterator contract check FAILED' in str(e), e
         else:
             raise AssertionError('run() must hard-stop when the real loader contract fails')
-        dc = json.load(open(os.path.join(d, 'data_contract.json'), encoding='utf-8'))
+        with open(os.path.join(d, 'data_contract.json'), encoding='utf-8') as _jf:
+            dc = json.load(_jf)
         assert dc['passed'] is False and dc['checks']['labels_are_next_token_shift'] is False, dc
         assert not os.path.exists(os.path.join(d, 'summary.json')), 'no training cell may start after a failed loader contract'
     finally:
@@ -3420,7 +3422,8 @@ def t_panel_tracking_events():
         assert st['n_cells_planned'] == 2 and st['n_cells_to_run'] == 2 and st['n_cells_resumed'] == 0, st
         fin = next(x for x in lines if x.get('kind') == 'panel_finish')
         assert fin['n_cells_planned'] == 2 and fin['n_cells_measured'] == 2 and fin['n_cells_missing'] == 0, fin
-        m = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))
+        with open(os.path.join(d, 'run_manifest.json'), encoding='utf-8') as _jf:
+            m = json.load(_jf)
         entry = m['panels'][L._run_fp(cfg, 64, 2, 4, 16, 997, ids, val)]
         assert entry.get('tracking_schema') == 2 and 'reproducibility' in entry
         assert entry['data_contract']['passed'] is True, entry.get('data_contract')
@@ -3459,7 +3462,8 @@ def t_provenance_and_manifest():
         summary = {'full::seed0': {'ppl': 10.0, 'steps': 10, 'tokens_seen': 320, 'params': 100, 'train_time_s': 1.0, 'final_loss_smoothed': 2.3, 'rng_fp': 'abc', '_code': L.code_stamp(), 'losses': [3.0, 2.3], 'ppl_history': [[10, 10.0]]}}
         cfg = {'seeds': [0], 'variants': ['full'], 'outdir': d, 'n_train_tokens': 512, 'seq_len': 32}
         path = L.write_run_manifest(d, cfg, 'FP', prov, summary)
-        m = json.load(open(path, encoding='utf-8'))
+        with open(path, encoding='utf-8') as _jf:
+            m = json.load(_jf)
         assert m['manifest_version'] == 1 and 'FP' in m['panels'], m
         assert m['panels']['FP']['cells']['full::seed0']['ppl'] == 10.0
         assert m['panels']['FP']['provenance']['data']['train_fp'] == prov['data']['train_fp']
@@ -3481,7 +3485,8 @@ def t_manifest_seed_integrity_is_exact():
         rec = {'variant': 'full', 'seed': 0.9, 'ppl': 10.0, 'hyperparams': hp}
         path = L.write_run_manifest(d, cfg, 'FP', prov, {},
                                     cell_records={'full::seed0': rec})
-        integ = json.load(open(path, encoding='utf-8'))['panels']['FP']['tracking_integrity']
+        with open(path, encoding='utf-8') as _jf:
+            integ = json.load(_jf)['panels']['FP']['tracking_integrity']
         assert integ['with_seed_metadata'] == 0, integ
         assert integ['seed_metadata_mismatch'] == ['full::seed0'], integ
     finally:
@@ -3559,10 +3564,12 @@ def t_experiment_ledger():
         fp = L._run_fp(cfg, 64, 2, 4, 16, 997, ids, val)
         out = L._run_cell(cfg, 'full', 0, fp=fp, train_ids=ids, val_batch=val, vocab=997, prov=prov)
         assert out['status'] == 'ok' and out.get('run_id')
-        summary = json.load(open(os.path.join(d, 'summary.json'), encoding='utf-8'))
+        with open(os.path.join(d, 'summary.json'), encoding='utf-8') as _jf:
+            summary = json.load(_jf)
         rec = summary['full::seed0']
         assert rec.get('run_id') == out['run_id'] and rec.get('hyperparams') and rec.get('provenance')
-        lines = open(os.path.join(d, 'experiments.jsonl'), encoding='utf-8').read().strip().splitlines()
+        with open(os.path.join(d, 'experiments.jsonl'), encoding='utf-8') as _ef:
+            lines = _ef.read().strip().splitlines()
         assert len(lines) == 1, f'one completed cell must append exactly one ledger line (got {len(lines)})'
         ev = json.loads(lines[0])
         for k in ('run_id', 'run_cfg', 'seed', 'provenance', 'hyperparams', 'data_fp', 'metrics', 'losses', 'ppl_history'):
@@ -3572,7 +3579,8 @@ def t_experiment_ledger():
         dc = L.batch_contract_check(ids, cfg['seq_len'], cfg['batch_size'], torch.device('cpu'), seed=0, vocab=997)
         dc.update({'run_cfg': fp})
         L.write_run_manifest(d, cfg, fp, prov, summary, sanity=san, data_contract=dc)
-        m = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))
+        with open(os.path.join(d, 'run_manifest.json'), encoding='utf-8') as _jf:
+            m = json.load(_jf)
         entry = m['panels'][fp]
         cell = entry['cells']['full::seed0']
         assert entry['sanity'] == san and entry['experiment_log'] == 'experiments.jsonl'
@@ -3726,12 +3734,14 @@ def t_manifest_running_then_complete():
         prov = L.experiment_provenance(cfg, train_ids=tr, val_batch=va, vocab=97)
         planned = ['full::seed0', 'full::seed1']
         L.write_run_manifest(d, cfg, 'FP', prov, {}, status='running', planned_cells=planned, started_at='T0')
-        e = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))['panels']['FP']
+        with open(os.path.join(d, 'run_manifest.json'), encoding='utf-8') as _jf:
+            e = json.load(_jf)['panels']['FP']
         assert e['status'] == 'running' and e['n_planned'] == 2 and e['n_completed'] == 0
         assert e['missing_cells'] == planned and e['created_at'] == 'T0'
         summary = {'full::seed0': {'ppl': 10.0, 'steps': 3, 'tokens_seen': 192, 'params': 100, 'train_time_s': 1.0, 'final_loss_smoothed': 2.3, 'rng_fp': 'abc', '_code': L.code_stamp(), 'losses': [3.0, 2.3], 'ppl_history': []}}
         L.write_run_manifest(d, cfg, 'FP', prov, summary, status='complete', planned_cells=planned, started_at='T0')
-        e = json.load(open(os.path.join(d, 'run_manifest.json'), encoding='utf-8'))['panels']['FP']
+        with open(os.path.join(d, 'run_manifest.json'), encoding='utf-8') as _jf:
+            e = json.load(_jf)['panels']['FP']
         assert e['status'] == 'complete' and e['n_completed'] == 1 and e['missing_cells'] == ['full::seed1']
         assert e['created_at'] == 'T0', 'a final update must not reset the panel start time'
         assert e['data_version'] == prov['data']['data_version']
@@ -8976,7 +8986,8 @@ def t_v6_merge_refuses_cross_config_pooling():
                              'n_seeds': 2, 'ppl_mean': 31.0, 'ppl_std': 1.0},
         }
         RG.merge_long_aggregate(td, snapshot)
-        merged = json.load(open(agg_path, encoding='utf-8'))
+        with open(agg_path, encoding='utf-8') as _jf:
+            merged = json.load(_jf)
         # re-measured under a different run_cfg: the snapshot seed 3 (99.0,
         # prior config) must NOT be pooled into the fresh entry
         assert merged['hybrid_fixed']['seeds'] == [0, 1, 2], merged['hybrid_fixed']
@@ -9003,7 +9014,8 @@ def t_v6_merge_refuses_cross_config_pooling():
                      'ppl_mean': 21.0, 'ppl_std': 1.0},
         }
         RG.merge_long_aggregate(td, snapshot2)
-        merged2 = json.load(open(agg_path, encoding='utf-8'))
+        with open(agg_path, encoding='utf-8') as _jf:
+            merged2 = json.load(_jf)
         assert merged2['h2']['seeds'] == [0, 1], merged2['h2']
         assert merged2['h2']['dPPL_vs_full_mean'] == -10.0, merged2['h2']
         assert merged2['h2']['n_paired'] == 2, merged2['h2']
@@ -9018,7 +9030,8 @@ def t_v6_merge_refuses_cross_config_pooling():
                      'n_seeds': 3, 'ppl_mean': 27.0, 'ppl_std': 1.0}}
         L.atomic_write_json(os.path.join(td, 'aggregate.json.v6bak'), bak, indent=2)
         RG._fold_backup_into_aggregate(td)
-        m3 = json.load(open(agg_path, encoding='utf-8'))
+        with open(agg_path, encoding='utf-8') as _jf:
+            m3 = json.load(_jf)
         assert m3['a']['seeds'] == [0, 1], m3['a']
         assert 70.0 not in m3['a']['ppls'], m3['a']
 
@@ -9487,7 +9500,8 @@ def t_review9_freeze_mirror_missing_local_is_not_a_reset():
             V12._check_or_write_freeze_lock(canon, man, 'FP1', stage='accessed',
                                             train_fp='TR1')
             lp = V12._freeze_lock_path(canon)
-            lock = json.load(open(lp, encoding='utf-8'))
+            with open(lp, encoding='utf-8') as _jf:
+                lock = json.load(_jf)
             lock['test_ids_fp'] = None
             lock['train_fp'] = None
             with open(lp, 'w', encoding='utf-8') as f:
@@ -10741,7 +10755,8 @@ def t_round16_seed_recovery_keeps_seed_averaged_fields_consistent():
         L.atomic_write_json(agg_path, live, indent=2)
         L.atomic_write_json(agg_path + '.v6bak', bak, indent=2)
         RG._fold_backup_into_aggregate(td)
-        m = json.load(open(agg_path, encoding='utf-8'))['a']
+        with open(agg_path, encoding='utf-8') as _jf:
+            m = json.load(_jf)['a']
         assert m['seeds'] == [0, 1] and m['ppl_mean'] == 6.0, m
         assert m['ppl_curve'] == [[10, 6.0]] and m['avg_dyn_block_len'] == 2.0, m
         assert m['seed_averaged_fields'] == 'snapshot_union', m
@@ -10753,7 +10768,8 @@ def t_round16_seed_recovery_keeps_seed_averaged_fields_consistent():
         L.atomic_write_json(agg_path, live2, indent=2)
         L.atomic_write_json(agg_path + '.v6bak', bak, indent=2)
         RG._fold_backup_into_aggregate(td)
-        m2 = json.load(open(agg_path, encoding='utf-8'))['a']
+        with open(agg_path, encoding='utf-8') as _jf:
+            m2 = json.load(_jf)['a']
         assert m2['seeds'] == [0, 1, 2], m2
         assert 'ppl_curve' not in m2 and 'avg_dyn_block_len' not in m2, m2
         # Fresh-covers-union merges must not retain snapshot-only curve/secondary
@@ -10767,7 +10783,8 @@ def t_round16_seed_recovery_keeps_seed_averaged_fields_consistent():
                       'ppl_curve': [[10, 99.0]], 'avg_dyn_block_len': 9.0}}
         L.atomic_write_json(agg_path, fresh, indent=2)
         RG.merge_long_aggregate(td, snap)
-        mh = json.load(open(agg_path, encoding='utf-8'))['h']
+        with open(agg_path, encoding='utf-8') as _jf:
+            mh = json.load(_jf)['h']
         assert 'ppl_curve' not in mh and 'avg_dyn_block_len' not in mh, mh
 
 
@@ -10889,7 +10906,8 @@ def t_round18_fail_closed_edge_cases():
         path = L.write_run_manifest(
             d, cfg, 'FP', prov,
             {'full::seed0': {'ppl': 10.0, 'losses': [3.0, 2.3]}})
-        integ = json.load(open(path, encoding='utf-8'))['panels']['FP']['tracking_integrity']
+        with open(path, encoding='utf-8') as _jf:
+            integ = json.load(_jf)['panels']['FP']['tracking_integrity']
         assert integ['with_seed_metadata'] == 0, integ
         assert integ['seed_metadata_mismatch'] == ['full::seed0'], integ
 
@@ -10954,7 +10972,8 @@ def t_round18_fail_closed_edge_cases():
                       'ppl_primary': 110.0, 'ppl_pooled': 110.0}}
         L.atomic_write_json(ap, fresh, indent=2)
         RG.merge_long_aggregate(td, snap)
-        m = json.load(open(ap, encoding='utf-8'))['h']
+        with open(ap, encoding='utf-8') as _jf:
+            m = json.load(_jf)['h']
         assert m['ppl_mean'] == 11.0 and 'ppl_primary' not in m and 'ppl_pooled' not in m, m
 
     # The torch reference attention sanitises non-finite softmax weights just

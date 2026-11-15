@@ -60,7 +60,8 @@ def make_guard():
         for src in ('run_time_state_v8.json', 'run_time_state_v7.json'):
             if os.path.exists(src):
                 try:
-                    st = json.load(open(src, encoding='utf-8'))
+                    with open(src, encoding='utf-8') as _jf:
+                        st = json.load(_jf)
                     sbc = st.get('sps_by_class') or {}
                     norm = st.get('norm_sps')
                     if not sbc and norm is None:
@@ -371,7 +372,8 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
 
     def _n_seeds_of(_outdir):
         try:
-            _s = json.load(open(os.path.join(REPO, _outdir, 'summary.json'), encoding='utf-8'))
+            with open(os.path.join(REPO, _outdir, 'summary.json'), encoding='utf-8') as _jf:
+                _s = json.load(_jf)
         except Exception:
             return None
         if not isinstance(_s, dict):

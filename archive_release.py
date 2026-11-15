@@ -371,7 +371,8 @@ def cmd_verify(tar_path):
               'anchored to any independently published digest')
         return 1
     try:
-        _parts = open(side, encoding='utf-8').read().split()
+        with open(side, encoding='utf-8') as _sf:
+            _parts = _sf.read().split()
     except OSError as _e:
         print(f'[archive] REFUSE: cannot read {side} ({type(_e).__name__}: {_e})')
         return 1

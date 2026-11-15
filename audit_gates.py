@@ -148,7 +148,8 @@ def _load(path):
     if not os.path.exists(path):
         return None
     try:
-        return json.load(open(path, encoding='utf-8'))
+        with open(path, encoding='utf-8') as _jf:
+            return json.load(_jf)
     except Exception as e:
         print(f'[audit] WARNING: {path} exists but cannot be parsed ({type(e).__name__}: {e})')
         return None

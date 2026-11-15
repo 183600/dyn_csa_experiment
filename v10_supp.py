@@ -33,7 +33,8 @@ def make_guard():
         for src in ('run_time_state_v9.json', 'run_time_state_v8.json', 'run_time_state_v7.json'):
             if os.path.exists(src):
                 try:
-                    st = json.load(open(src, encoding='utf-8'))
+                    with open(src, encoding='utf-8') as _jf:
+                        st = json.load(_jf)
                     sbc = st.get('sps_by_class') or {}
                     norm = st.get('norm_sps')
                     if not sbc and norm is None:
@@ -910,7 +911,8 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
         _msp = os.path.join(cfg.get('outdir') or P3MT_PAYLOAD['outdir'], 'summary.json')
         if os.path.exists(_msp):
             try:
-                mech_summ = json.load(open(_msp, encoding='utf-8'))
+                with open(_msp, encoding='utf-8') as _jf:
+                    mech_summ = json.load(_jf)
             except Exception as _e:
                 print(f'[p3mp] FATAL: {_msp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — without it no checkpoint can be attributed to a training recipe, so the probe would score unknown weights.  Move it aside to re-train.')
                 raise
@@ -1140,7 +1142,8 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP', par=None):
     _msp = os.path.join(_trdir, 'summary.json')
     if os.path.exists(_msp):
         try:
-            mech_summ = json.load(open(_msp, encoding='utf-8'))
+            with open(_msp, encoding='utf-8') as _jf:
+                mech_summ = json.load(_jf)
         except Exception as _e:
             print(f'[p3mp] FATAL: {_msp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — without it no checkpoint can be attributed to a training recipe, so the probe would score unknown weights.  Move it aside to re-train.')
             raise
@@ -1277,7 +1280,8 @@ def _hist_by_seed(outdir, variant, raw=None):
         if not os.path.exists(sp):
             return out
         try:
-            raw = json.load(open(sp, encoding='utf-8'))
+            with open(sp, encoding='utf-8') as _jf:
+                raw = json.load(_jf)
         except Exception as e:
             print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — no curve for {variant}')
             return out
@@ -1424,7 +1428,8 @@ def _tokens_per_step(outdir, fallback=None, raw=None):
         if not os.path.exists(sp):
             return None
         try:
-            raw = json.load(open(sp, encoding='utf-8'))
+            with open(sp, encoding='utf-8') as _jf:
+                raw = json.load(_jf)
         except Exception as e:
             print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — no tokens/step for this panel')
             return None
@@ -1724,7 +1729,8 @@ def v10_analysis(out='analysis_v10/stats.json'):
     sp = PROBE['summary']
     if os.path.exists(sp):
         try:
-            raw = json.load(open(sp, encoding='utf-8'))
+            with open(sp, encoding='utf-8') as _jf:
+                raw = json.load(_jf)
         except Exception as _e:
             print(f'[stats] FATAL: {sp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — refusing to compute probe statistics from a truncated file; move it aside to re-probe.')
             raise
@@ -2010,7 +2016,8 @@ def v10_analysis(out='analysis_v10/stats.json'):
         _nsp = (PROBE.get('niah') or {}).get('summary')
         if _nsp and os.path.exists(_nsp):
             try:
-                nraw = json.load(open(_nsp, encoding='utf-8'))
+                with open(_nsp, encoding='utf-8') as _jf:
+                    nraw = json.load(_jf)
             except Exception as _e:
                 print(f'[stats] WARNING: {_nsp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — the NIAH-natural panel is skipped')
                 nraw = {}
@@ -2225,7 +2232,8 @@ def _fmt_pm(cell, std=None):
 
 def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     v10_analysis(out=stats_p)
-    st = json.load(open(stats_p, encoding='utf-8'))
+    with open(stats_p, encoding='utf-8') as _jf:
+        st = json.load(_jf)
     if not isinstance(st, dict):
         raise RuntimeError(f'{stats_p} is valid JSON but not an object ({type(st).__name__}); refusing to build a report over it')
     probe = st['probe']
@@ -2236,7 +2244,8 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     mech_sum = {}
     mp = os.path.join(P3MT_PAYLOAD['outdir'], 'summary.json')
     if os.path.exists(mp):
-        mech_sum = json.load(open(mp, encoding='utf-8'))
+        with open(mp, encoding='utf-8') as _jf:
+            mech_sum = json.load(_jf)
         if not isinstance(mech_sum, dict):
             print(f'[report] WARNING: {mp} is valid JSON but not an object ({type(mech_sum).__name__}) — the mechanism records are omitted')
             mech_sum = {}
@@ -2716,7 +2725,8 @@ def run_smoke():
     niah_sum = {}
     _nsp = 'results_smoke_v10/niah_natural.json'
     if os.path.exists(_nsp):
-        niah_sum = json.load(open(_nsp, encoding='utf-8'))
+        with open(_nsp, encoding='utf-8') as _jf:
+            niah_sum = json.load(_jf)
     _niah_got = {(r.get('arm'), r.get('condition')) for r in niah_sum.values() if isinstance(r, dict)}
     _niah_want = {('learned', 'clean'), ('learned', 'distract'), ('randidx', 'clean'), ('randidx', 'distract'), ('allblocks', 'clean'), ('allblocks', 'distract')}
     assert _niah_want <= _niah_got, f'NIAH cells missing: {_niah_want - _niah_got} (got {sorted(_niah_got)})'

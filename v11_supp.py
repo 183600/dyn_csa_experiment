@@ -31,7 +31,8 @@ def make_guard():
         for src in ('run_time_state_v10.json', 'run_time_state_v9.json', 'run_time_state_v8.json', 'run_time_state_v7.json'):
             if os.path.exists(src):
                 try:
-                    st = json.load(open(src, encoding='utf-8'))
+                    with open(src, encoding='utf-8') as _jf:
+                        st = json.load(_jf)
                     sbc = st.get('sps_by_class') or {}
                     norm = st.get('norm_sps')
                     if not sbc and norm is None:
@@ -88,7 +89,8 @@ def v11_analysis(out='analysis_v11/stats.json'):
     sp = V10.PROBE['summary']
     if os.path.exists(sp):
         try:
-            raw = json.load(open(sp, encoding='utf-8'))
+            with open(sp, encoding='utf-8') as _jf:
+                raw = json.load(_jf)
         except Exception as _e:
             print(f'[stats] FATAL: {sp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — refusing to compute probe statistics from a truncated file; move it aside to re-probe.')
             raise
@@ -301,7 +303,8 @@ def _one_record_per_seed(rows, label=''):
 
 def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     v11_analysis(out=stats_p)
-    st = json.load(open(stats_p, encoding='utf-8'))
+    with open(stats_p, encoding='utf-8') as _jf:
+        st = json.load(_jf)
     if not isinstance(st, dict):
         raise RuntimeError(f'{stats_p} is valid JSON but not an object ({type(st).__name__}); refusing to build a report over it')
     probe = st['probe']
@@ -312,7 +315,8 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     mech_sum = {}
     mp = os.path.join(V10.P3MT_PAYLOAD['outdir'], 'summary.json')
     if os.path.exists(mp):
-        mech_sum = json.load(open(mp, encoding='utf-8'))
+        with open(mp, encoding='utf-8') as _jf:
+            mech_sum = json.load(_jf)
         if not isinstance(mech_sum, dict):
             print(f'[report] WARNING: {mp} is valid JSON but not an object ({type(mech_sum).__name__}) — the mechanism records are omitted')
             mech_sum = {}
@@ -351,7 +355,8 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     _prov_unreadable = []
     for _p in sorted(glob.glob('results_*/summary.json')):
         try:
-            _d = json.load(open(_p, encoding='utf-8'))
+            with open(_p, encoding='utf-8') as _jf:
+                _d = json.load(_jf)
         except Exception as _pe:
             _prov_unreadable.append((_p.split('/')[0], f'{type(_pe).__name__}: {_pe}'))
             print(f'[provenance] WARNING: {_p} cannot be parsed ({type(_pe).__name__}: {_pe}) — reported as unreadable, NOT silently omitted')
@@ -689,7 +694,8 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
 
     def _n_seeds_of(_outdir, _variants=None):
         try:
-            _s = json.load(open(os.path.join(REPO, _outdir, 'summary.json'), encoding='utf-8'))
+            with open(os.path.join(REPO, _outdir, 'summary.json'), encoding='utf-8') as _jf:
+                _s = json.load(_jf)
         except Exception:
             return None
         if not isinstance(_s, dict):

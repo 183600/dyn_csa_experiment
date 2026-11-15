@@ -6490,7 +6490,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         # Serve the train ids as a read-only mapping so every process (and the
         # parallel workers' corpus cache) shares the OS page cache.
         train_ids = np.load(tr_path, mmap_mode='r')
-        meta = json.load(open(me_path, encoding='utf-8'))
+        with open(me_path, encoding='utf-8') as _jf:
+            meta = json.load(_jf)
         val_batch = np.load(va_path)
         val_bnd = np.load(vp_path)
         _sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path})
@@ -6964,7 +6965,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             return _hit
         print('[data] loading cached TEST token ids ...')
         test_ids = np.load(te_path)
-        meta = json.load(open(me_path, encoding='utf-8'))
+        with open(me_path, encoding='utf-8') as _jf:
+            meta = json.load(_jf)
         test_bnd = np.load(tb_path)
         test_doc_ids = None
         if os.path.exists(td_path):
@@ -7080,7 +7082,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         _train_fit_fps = set()
         for _mp in _glob2.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
             try:
-                _mt = json.load(open(_mp, encoding='utf-8'))
+                with open(_mp, encoding='utf-8') as _jf:
+                    _mt = json.load(_jf)
             except Exception as _me:
                 raise RuntimeError(
                     f'load_wikitest: {_mp} cannot be parsed '
@@ -7210,7 +7213,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     _train_meta_paths = []
     for _mp in _glob.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
         try:
-            _mobj = json.load(open(_mp, encoding='utf-8'))
+            with open(_mp, encoding='utf-8') as _jf:
+                _mobj = json.load(_jf)
         except Exception as _me:
             raise RuntimeError(
                 f'load_wikitest: {_mp} cannot be parsed '
@@ -7306,7 +7310,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             raise RuntimeError(f'load_wikitest: the freshly fitted test tokenizer is not identical to the cached train tokenizer ({_tp}) — same-size vocabularies can still use different merges, so the splits cannot be paired; delete wt103_cache/ and rebuild both')
     for _mp in _glob.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
         try:
-            _mt = json.load(open(_mp, encoding='utf-8'))
+            with open(_mp, encoding='utf-8') as _jf:
+                _mt = json.load(_jf)
         except Exception as _me:
             raise RuntimeError(
                 f'load_wikitest: {_mp} cannot be parsed '
@@ -7384,7 +7389,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     for _mpath in _train_meta_paths:
         try:
             _mtag = os.path.basename(_mpath)[len('meta_'):-len('.json')]
-            _mobj = json.load(open(_mpath, encoding='utf-8'))
+            with open(_mpath, encoding='utf-8') as _jf:
+                _mobj = json.load(_jf)
         except Exception:
             continue
         if _mobj.get('fit_fp') and _mobj['fit_fp'] != _fit_fp_build:
@@ -8106,7 +8112,8 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             print('[data] serving fineweb token ids from the in-process memo (same cache files, already verified) ...')
             return _hit
         print('[data] loading cached fineweb token ids ...')
-        meta = json.load(open(me_path, encoding='utf-8'))
+        with open(me_path, encoding='utf-8') as _jf:
+            meta = json.load(_jf)
         train_ids = _npy_serve_int32(tr_path)
         _sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path,
                                   'train_doc_ids': trd_path, 'val_doc_ids': vad_path})
@@ -8448,8 +8455,10 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             },
         }, indent=0)
         print('[data] cached fineweb token ids to disk (resume-safe)')
+        with open(me_path, encoding='utf-8') as _jf:
+            _meta = json.load(_jf)
         audit_corpus_split(train_ids, val_batch, vocab, dataset='fineweb',
-                           meta=json.load(open(me_path, encoding='utf-8')))
+                           meta=_meta)
         _out = (train_ids, val_batch, vocab, tok, val_bnd)
         _memo_put(_FWEB_MEMO, (os.path.abspath(cache_dir), tag, _memo_file_sig({'train': tr_path, 'val': va_path, 'bnd': vp_path, 'meta': me_path, 'train_doc_ids': trd_path, 'val_doc_ids': vad_path}), _local_sig), _out, _FWEB_MEMO_CAP)
         return _out
@@ -13084,7 +13093,8 @@ def variant_presence(outdir):
     if not os.path.exists(sp):
         return out
     try:
-        raw = json.load(open(sp, encoding='utf-8'))
+        with open(sp, encoding='utf-8') as _jf:
+            raw = json.load(_jf)
     except Exception as e:
         print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — variant presence cannot be established')
         return out
@@ -13223,7 +13233,8 @@ def read_panel(outdir):
     if not os.path.exists(sp):
         return {}
     try:
-        raw = json.load(open(sp, encoding='utf-8'))
+        with open(sp, encoding='utf-8') as _jf:
+            raw = json.load(_jf)
     except Exception as e:
         print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — this panel is EXCLUDED')
         return {}
@@ -13714,7 +13725,8 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
     if artifact is None and path:
         if os.path.exists(path):
             try:
-                artifact = json.load(open(path, encoding='utf-8'))
+                with open(path, encoding='utf-8') as _jf:
+                    artifact = json.load(_jf)
             except Exception as e:
                 return {'status': 'fail', 'baseline_verified': False,
                         'problems': [f'cannot parse {path}: {type(e).__name__}: {e}']}
@@ -14468,7 +14480,8 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     if selected is None and path:
         if os.path.exists(path):
             try:
-                selected = json.load(open(path, encoding='utf-8'))
+                with open(path, encoding='utf-8') as _jf:
+                    selected = json.load(_jf)
             except Exception as e:
                 return {'status': 'fail', 'tuning_verified': False, 'problems': [f'cannot parse {path}: {type(e).__name__}: {e}']}
         else:

@@ -76,7 +76,8 @@ def _fold_backup_into_aggregate(adir):
     if not os.path.exists(bak_path):
         return
     try:
-        bak = json.load(open(bak_path, encoding='utf-8'))
+        with open(bak_path, encoding='utf-8') as _jf:
+            bak = json.load(_jf)
     except Exception as _e:
         print(f'[synth] NOTE: the pre-retrain snapshot {bak_path} cannot be parsed ({type(_e).__name__}: {_e}) — ignoring it')
         return
@@ -87,7 +88,8 @@ def _fold_backup_into_aggregate(adir):
         live = {}
     else:
         try:
-            live = json.load(open(agg_path, encoding='utf-8'))
+            with open(agg_path, encoding='utf-8') as _jf:
+                live = json.load(_jf)
         except Exception as _e:
             print(f'[synth] WARNING: the live {agg_path} cannot be parsed ({type(_e).__name__}: {_e}) — refusing to overwrite corrupt evidence from the backup; move it aside to rebuild explicitly')
             return
@@ -178,7 +180,8 @@ def synthesize_long_summary():
         print(f'[synth] SKIP: {agg_path} is absent — the panel is a LOCAL experiment artifact and is not tracked in the repository, so there is nothing to synthesize from.  Run the v3 panel (or restore the artifact) if you need this reconstruction.')
         return ({'skipped_missing_aggregate': agg_path}, None)
     try:
-        agg = json.load(open(agg_path, encoding='utf-8'))
+        with open(agg_path, encoding='utf-8') as _jf:
+            agg = json.load(_jf)
     except Exception as _e:
         print(f'[synth] SKIP: {agg_path} exists but cannot be parsed ({type(_e).__name__}: {_e}) — refusing to rebuild summary.json from a corrupt aggregate; re-derive the aggregate first.')
         return ({'skipped_unreadable_aggregate': agg_path}, None)
@@ -189,7 +192,8 @@ def synthesize_long_summary():
     summary = {}
     if os.path.exists(spath):
         try:
-            summary = json.load(open(spath, encoding='utf-8'))
+            with open(spath, encoding='utf-8') as _jf:
+                summary = json.load(_jf)
         except Exception as _e:
             print(f'[synth] FATAL: {spath} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
             raise
@@ -324,7 +328,8 @@ def merge_long_aggregate(adir, snapshot_agg):
         return
     agg_path = os.path.join(adir, 'aggregate.json')
     try:
-        fresh = json.load(open(agg_path, encoding='utf-8'))
+        with open(agg_path, encoding='utf-8') as _jf:
+            fresh = json.load(_jf)
     except Exception as _e:
         print(f'[v6-merge] WARNING: cannot read the freshly written {agg_path} ({type(_e).__name__}: {_e}) — the snapshot is left unmerged; re-run `_finish_panel` on the panel to rebuild it')
         return
@@ -721,7 +726,8 @@ def run_smoke():
     _got = {}
     if os.path.exists(_sp):
         try:
-            _got = json.load(open(_sp, encoding='utf-8'))
+            with open(_sp, encoding='utf-8') as _jf:
+                _got = json.load(_jf)
         except Exception:
             _got = {}
         if not isinstance(_got, dict):

@@ -82,7 +82,8 @@ def make_guard():
         for src in ('run_time_state_v11.json', 'run_time_state_v10.json', 'run_time_state_v9.json', 'run_time_state_v8.json', 'run_time_state_v7.json'):
             if os.path.exists(src):
                 try:
-                    st = json.load(open(src, encoding='utf-8'))
+                    with open(src, encoding='utf-8') as _jf:
+                        st = json.load(_jf)
                     sbc = st.get('sps_by_class') or {}
                     norm = st.get('norm_sps')
                     if not sbc and norm is None:
@@ -240,7 +241,8 @@ def _lock_proves_test_access(path):
     if not os.path.exists(path):
         return False
     try:
-        lock = json.load(open(path, encoding='utf-8'))
+        with open(path, encoding='utf-8') as _jf:
+            lock = json.load(_jf)
     except Exception:
         return True
     if not isinstance(lock, dict):
@@ -334,7 +336,8 @@ def _load_manifest(path):
     if not os.path.exists(path):
         raise SystemExit(f'[v12] REFUSE: freeze manifest {path} does not exist — a confirmation run requires a PRE-REGISTERED plan (arms, seeds, endpoints, statistics); write the manifest first, then run P5T')
     try:
-        m = json.load(open(path, encoding='utf-8'))
+        with open(path, encoding='utf-8') as _jf:
+            m = json.load(_jf)
     except Exception as e:
         raise SystemExit(f'[v12] REFUSE: freeze manifest {path} cannot be parsed ({type(e).__name__}: {e})')
     if not isinstance(m, dict):
@@ -1093,7 +1096,8 @@ def _verify_lock_mirror(outdir, lock=None):
     if not os.path.exists(mp):
         return None
     try:
-        mirror = json.load(open(mp, encoding='utf-8'))
+        with open(mp, encoding='utf-8') as _jf:
+            mirror = json.load(_jf)
     except Exception as e:
         raise SystemExit(f'[v12] REFUSE: freeze-lock mirror {mp} exists but cannot be parsed ({type(e).__name__}: {e}) — the mirror is part of the one-shot-access evidence; restore it from git history or re-freeze consciously')
     if not isinstance(mirror, dict):
@@ -1122,7 +1126,8 @@ def _verify_lock_mirror(outdir, lock=None):
         return mirror
     if lock is None:
         try:
-            lock = json.load(open(lp, encoding='utf-8'))
+            with open(lp, encoding='utf-8') as _jf:
+                lock = json.load(_jf)
         except Exception:
             return mirror
     for _k in ('manifest_sha256', 'test_ids_fp', 'train_fp'):
@@ -1166,7 +1171,8 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
     _mirror_prev = _verify_lock_mirror(outdir)
     if os.path.exists(lp):
         try:
-            lock = json.load(open(lp, encoding='utf-8'))
+            with open(lp, encoding='utf-8') as _jf:
+                lock = json.load(_jf)
         except Exception as e:
             raise SystemExit(f'[v12] REFUSE: freeze lock {lp} exists but cannot be parsed ({type(e).__name__}: {e}) — delete it only if you can prove no test-split record was ever written under it')
         if not isinstance(lock, dict):
@@ -1323,7 +1329,8 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         return out
     mech_summ = {}
     if os.path.exists(cfg['mech_summary']):
-        mech_summ = json.load(open(cfg['mech_summary'], encoding='utf-8'))
+        with open(cfg['mech_summary'], encoding='utf-8') as _jf:
+            mech_summ = json.load(_jf)
         if not isinstance(mech_summ, dict):
             raise RuntimeError(
                 f'[p5t] REFUSE {v} s{seed}: {cfg["mech_summary"]} is valid JSON '
@@ -1747,7 +1754,8 @@ def run_power_check(cfg=None):
     summary = {}
     if os.path.exists(summary_path):
         try:
-            summary = json.load(open(summary_path, encoding='utf-8'))
+            with open(summary_path, encoding='utf-8') as _jf:
+                summary = json.load(_jf)
         except Exception as _e:
             raise SystemExit(f'[v12 power] REFUSE: {summary_path} exists but cannot be parsed ({type(_e).__name__}: {_e})')
     else:
@@ -1956,7 +1964,8 @@ def run_finaltest(cfg=None, guard=None):
     _cand_train_fps = set()
     if os.path.exists(cfg.get('mech_summary') or ''):
         try:
-            _ms = json.load(open(cfg['mech_summary'], encoding='utf-8'))
+            with open(cfg['mech_summary'], encoding='utf-8') as _jf:
+                _ms = json.load(_jf)
         except Exception:
             _ms = {}
         for _v in manifest['arms']:
@@ -2017,7 +2026,8 @@ def run_finaltest(cfg=None, guard=None):
                     'V12_SKIP_POWER=1 is the explicit override (recorded in the artifact).')
         else:
             try:
-                _pow = json.load(open(_power_path, encoding='utf-8'))
+                with open(_power_path, encoding='utf-8') as _jf:
+                    _pow = json.load(_jf)
             except Exception as _pe:
                 raise SystemExit(
                     f'[v12] REFUSE: the pre-access power artifact {_power_path} exists but '
@@ -2112,7 +2122,8 @@ def run_finaltest(cfg=None, guard=None):
     pcfg = dict(V10.PROBE, outdir=outdir, ckpt_dir=cfg['ckpt_dir'], summary=cfg['probe_summary'], variants=list(manifest['arms']), seeds=[int(s) for s in manifest['seeds']], eval_lens=[int(x) for x in (_probe_eval.get('eval_lens') or [2048, 4096])], rhos=_probe_rhos, modes={_probe_mode: _probe_rhos}, niah=None, arm_overrides={v: ['learned'] for v in V10.SCRATCH_CONTROLS}, target=int(_probe_eval.get('target', cfg.get('target', 512))), n_seq=int(_probe_eval.get('n_seq', _nseq_clean)), chunk=int(cfg.get('chunk', 4)), manifest_sha256=manifest.get('manifest_sha256'))
     mech_summ = {}
     if os.path.exists(cfg['mech_summary']):
-        mech_summ = json.load(open(cfg['mech_summary'], encoding='utf-8'))
+        with open(cfg['mech_summary'], encoding='utf-8') as _jf:
+            mech_summ = json.load(_jf)
     for v in pcfg['variants']:
         for seed in pcfg['seeds']:
             _cell_status = _bylen_cell_status.get((v, int(seed)))
@@ -2511,7 +2522,8 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
     slice_fp = _slice_text
     out['slice_fp'] = _slice_text
     try:
-        raw = json.load(open(probe_path, encoding='utf-8'))
+        with open(probe_path, encoding='utf-8') as _jf:
+            raw = json.load(_jf)
     except Exception as e:
         out['error'] = f'{type(e).__name__}: {e}'
         return out
@@ -2766,7 +2778,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     probe_path = probe_path or os.path.join(TEST_OUTDIR, 'distractor.json')
     raw = {}
     if os.path.exists(bylen_path):
-        raw = json.load(open(bylen_path, encoding='utf-8'))
+        with open(bylen_path, encoding='utf-8') as _jf:
+            raw = json.load(_jf)
         if not isinstance(raw, dict):
             raise SystemExit(f'[v12] REFUSE: {bylen_path} is valid JSON but not an object ({type(raw).__name__}) — the confirmation records cannot be admitted')
     admitted, unified_fp = _admit_confirmation_records(raw, manifest)
@@ -3093,7 +3106,8 @@ def v12_analysis(out='analysis_v12/stats.json'):
     """Zero-GPU aggregate: the shared v10 analysis over the extended probe +
     the frozen final-test statistics (when they exist on disk)."""
     V10.v10_analysis(out=out)
-    st = json.load(open(out, encoding='utf-8'))
+    with open(out, encoding='utf-8') as _jf:
+        st = json.load(_jf)
     if os.path.exists(os.path.join(TEST_OUTDIR, 'bylen.json')):
         st['finaltest'] = finaltest_stats()
         # this file's LAST writer is v12_analysis: re-stamp so the trace names
@@ -3110,7 +3124,8 @@ def _fmt_pm(cell):
 
 def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     v12_analysis(out=stats_p)
-    st = json.load(open(stats_p, encoding='utf-8'))
+    with open(stats_p, encoding='utf-8') as _jf:
+        st = json.load(_jf)
     if not isinstance(st, dict):
         raise RuntimeError(
             f'{stats_p} is valid JSON but not an object ({type(st).__name__}); '
@@ -3133,7 +3148,8 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     m = ft.get('manifest') or {}
     if not m and os.path.exists(FREEZE_MANIFEST):
         try:
-            _mc = json.load(open(FREEZE_MANIFEST, encoding='utf-8'))
+            with open(FREEZE_MANIFEST, encoding='utf-8') as _jf:
+                _mc = json.load(_jf)
             m = {'frozen_at': _mc.get('frozen_at'), 'manifest_sha256': None, 'arms': _mc.get('arms'), 'seeds': _mc.get('seeds'), 'code_semantics_expected': _mc.get('code_semantics_expected'), 'statistics': _mc.get('statistics'), 'scope': _mc.get('scope'), 'revision': _mc.get('revision')}
         except Exception:
             pass
@@ -3157,7 +3173,8 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         A('| 冻结的主比较 |')
         A('|---|')
         try:
-            _mc = json.load(open(FREEZE_MANIFEST, encoding='utf-8'))
+            with open(FREEZE_MANIFEST, encoding='utf-8') as _jf:
+                _mc = json.load(_jf)
             for c in _mc.get('primary_comparisons', []):
                 A(f"| {c.get('name', '?')} — {c.get('a')} vs {c.get('b')} @ {c.get('endpoint', '?')} |")
         except Exception:
@@ -3604,7 +3621,8 @@ def run_smoke():
     _, val_ids, _, _, _ = L.load_wikitext(1024, 4000000)
     cfg = dict(FINALTEST_CFG, manifest=_mpath, outdir='results_smoke_v12', ckpt_dir='results_smoke_v12/ckpt', mech_summary='results_smoke_v12/summary.json', bylen_summary='results_smoke_v12/bylen.json', probe_summary='results_smoke_v12/distractor.json', n_seq=4, chunk=2, stats_out='results_smoke_v12/test_stats.json', test_ids=np.asarray(val_ids[:4, :1025], dtype=np.int64), smoke=True)
     stats = run_finaltest(cfg)
-    _bylen = json.load(open('results_smoke_v12/bylen.json', encoding='utf-8'))
+    with open('results_smoke_v12/bylen.json', encoding='utf-8') as _jf:
+        _bylen = json.load(_jf)
     if not isinstance(_bylen, dict):
         raise SystemExit(
             f'[smoke] FAILED: results_smoke_v12/bylen.json is valid JSON but '
@@ -3613,7 +3631,8 @@ def run_smoke():
     assert {'csa_fixed_rope', 'csa_fixed_rope_allblocks'} <= got, f'finaltest bylen cells missing: {got}'
     _probe = {}
     if os.path.exists('results_smoke_v12/distractor.json'):
-        _probe = json.load(open('results_smoke_v12/distractor.json', encoding='utf-8'))
+        with open('results_smoke_v12/distractor.json', encoding='utf-8') as _jf:
+            _probe = json.load(_jf)
         if not isinstance(_probe, dict):
             raise SystemExit(
                 f'[smoke] FAILED: results_smoke_v12/distractor.json is valid JSON '

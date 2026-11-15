@@ -1830,7 +1830,8 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
         if not os.path.exists(sp):
             continue
         try:
-            s = json.load(open(sp, encoding='utf-8'))
+            with open(sp, encoding='utf-8') as _jf:
+                s = json.load(_jf)
         except Exception as e:
             print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — its panel is EXCLUDED from these statistics')
             continue
@@ -2085,7 +2086,8 @@ def run_niah_phase(payload, guard=None, label=''):
     summary = {}
     if os.path.exists(spath):
         try:
-            summary = json.load(open(spath, encoding='utf-8'))
+            with open(spath, encoding='utf-8') as _jf:
+                summary = json.load(_jf)
         except Exception as _e:
             print(f'[resume] FATAL: {spath} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
             raise
