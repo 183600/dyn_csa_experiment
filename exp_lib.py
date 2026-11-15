@@ -6327,7 +6327,7 @@ def _validate_token_ids(ids, vocab, label='token ids'):
         raise ValueError(f'{label}: vocab must be a positive integer, got {vocab!r}')
     if arr.size == 0:
         return arr
-    if not np.issubdtype(arr.dtype, np.integer):
+    if arr.dtype == bool or not np.issubdtype(arr.dtype, np.integer):
         raise TypeError(f'{label}: expected integer token ids, got dtype {arr.dtype}')
     mn, mx = int(arr.min()), int(arr.max())
     if mn < 0 or mx >= _v:
@@ -13458,9 +13458,10 @@ SIMPLE_BASELINE_POLICY = {
 def _ngram_train_counts(train_ids, vocab_size):
     """Return (unigram counts, bigram key counts, bigram context counts)."""
     _raw = np.asarray(train_ids)
-    if _raw.size and not np.issubdtype(_raw.dtype, np.integer):
-        # A float id (1.9) would truncate to a DIFFERENT token id; malformed
-        # ids must be rejected, not silently remapped.
+    if _raw.size and (_raw.dtype == bool or not np.issubdtype(_raw.dtype, np.integer)):
+        # A float id (1.9) would truncate to a DIFFERENT token id; a boolean
+        # array is a flag, not a token id, and must not be silently remapped
+        # to 0/1.  Malformed ids must be rejected, not silently remapped.
         raise TypeError(f'ngram baseline: train ids must be integers, got dtype {_raw.dtype}')
     ids = _raw.astype(np.int64, copy=False).ravel()
     # The vocabulary is an exact positive count, not a bool/fractional
@@ -13485,7 +13486,7 @@ def _ngram_train_counts(train_ids, vocab_size):
 
 def _ngram_eval_parts(eval_ids):
     _raw = np.asarray(eval_ids)
-    if _raw.size and not np.issubdtype(_raw.dtype, np.integer):
+    if _raw.size and (_raw.dtype == bool or not np.issubdtype(_raw.dtype, np.integer)):
         raise TypeError(f'ngram baseline: eval ids must be integers, got dtype {_raw.dtype}')
     arr = _raw.astype(np.int64, copy=False)
     if arr.ndim == 1:
@@ -13519,7 +13520,7 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
       kept for continuity with existing artifacts.
     """
     _raw_train = np.asarray(train_ids)
-    if _raw_train.size and not np.issubdtype(_raw_train.dtype, np.integer):
+    if _raw_train.size and (_raw_train.dtype == bool or not np.issubdtype(_raw_train.dtype, np.integer)):
         # Validate BEFORE the int64 cast: casting a float id (1.9) first
         # would silently remap it to a different valid token id, so the
         # count-table guard would never see the malformed input.
@@ -13683,7 +13684,7 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
     # `_ids_fp` hashes the canonical chunked form of any integer width and
     # accepts the training stream (possibly a memmap) directly.
     train_arr = np.asarray(train_ids)
-    if not np.issubdtype(train_arr.dtype, np.integer):
+    if train_arr.dtype == bool or not np.issubdtype(train_arr.dtype, np.integer):
         raise TypeError(f'ngram baseline: train ids must be integers, got dtype {train_arr.dtype}')
     train_arr = train_arr.reshape(-1)
     eval_arr = np.asarray(eval_ids, dtype=np.int64)
@@ -19982,7 +19983,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     freq = None
     if train_ids is not None:
         _raw_train = np.asarray(train_ids)
-        if _raw_train.size and not np.issubdtype(_raw_train.dtype, np.integer):
+        if _raw_train.size and (_raw_train.dtype == bool or not np.issubdtype(_raw_train.dtype, np.integer)):
             # Casting a float id first (1.9 -> 1) would compute the rare-token
             # flags from a different corpus; the diagnostic must not invent
             # frequencies from malformed ids.
@@ -20293,7 +20294,7 @@ def _batch_arrays(batch, vocab=None):
         raise ValueError(f'overfit batch row mismatch: inputs {x.shape[0]} vs targets {y.shape[0]}')
     if x.shape[1] < y.shape[1]:
         raise ValueError(f'overfit batch targets are longer than inputs ({y.shape[1]} > {x.shape[1]})')
-    if not np.issubdtype(x.dtype, np.integer) or not np.issubdtype(y.dtype, np.integer):
+    if x.dtype == bool or y.dtype == bool or not np.issubdtype(x.dtype, np.integer) or not np.issubdtype(y.dtype, np.integer):
         raise TypeError('overfit batch inputs/targets must be integer token ids')
     x = np.ascontiguousarray(x, dtype=np.int64)
     y = np.ascontiguousarray(y, dtype=np.int64)
