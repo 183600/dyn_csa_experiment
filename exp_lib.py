@@ -1362,6 +1362,8 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
     # performs no H2D).  Every value reaching the device — the integer block
     # ids (with the `_pool_cpu` tag re-attached to each device row) and the
     # 0.0/1.0 honoured mask — is identical to the per-row form.
+    if len(gate_lists) == 0:
+        return []
     bids_cpu = []
     nblks = []
     hons = []
