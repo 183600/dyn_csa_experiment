@@ -439,13 +439,34 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     }
 
 
+def _is_temporal_scalar(v):
+    """True for NumPy datetime/timedelta scalars (not measurements)."""
+    return isinstance(v, (np.datetime64, np.timedelta64))
+
+
+def _is_complex_scalar(v):
+    """True for complex scalars (not counts, seeds or real measurements)."""
+    return isinstance(v, (complex, np.complexfloating))
+
+
+def _is_nonmeasurement_scalar(v):
+    """True for temporal/complex values that numeric contracts must refuse.
+
+    NumPy registers ``timedelta64`` as a real/integral scalar and accepts
+    ``int()``/``float()`` on many complex scalars by discarding the imaginary
+    part; neither is a count/seed/statistic.  Boolean flags are handled by the
+    callers' existing checks.
+    """
+    return _is_temporal_scalar(v) or _is_complex_scalar(v)
+
+
 def _safe_exp_ppl(x):
     """``exp`` for a PPL accumulator without raising on divergent CE.
 
     ``math.exp`` raises once the exponent exceeds ~709.  A training run that
     has diverged but still produced finite CE must be recorded as ``inf`` and
     diagnosed.  The clamp keeps the CI bounds consistent."""
-    if isinstance(x, (bool, np.bool_)):
+    if isinstance(x, (bool, np.bool_)) or _is_nonmeasurement_scalar(x):
         return None
     try:
         x = float(x)
@@ -476,7 +497,8 @@ def _finite_scalar(v):
     those and turn a valid panel into "no data".  Booleans and
     complex/non-numeric objects are not measurements.
     """
-    if isinstance(v, (bool, np.bool_)) or not isinstance(v, numbers.Real):
+    if (isinstance(v, (bool, np.bool_)) or _is_nonmeasurement_scalar(v)
+            or not isinstance(v, numbers.Real)):
         return None
     try:
         f = float(v)
@@ -509,7 +531,7 @@ def _exact_count_float(v):
 
 def _valid_alpha01(alpha):
     """Significance level in (0,1), or None for a malformed/boolean value."""
-    if isinstance(alpha, (bool, np.bool_)):
+    if isinstance(alpha, (bool, np.bool_)) or _is_nonmeasurement_scalar(alpha):
         return None
     try:
         a = float(alpha)
@@ -1618,9 +1640,13 @@ def _causal_quantile_exact(x, cols, target_block_tokens, _full_range=False):
     first_row = cols == 0
     nc = max(1, int(cols.numel()))
     if (_full_range and n > 0 and cols.numel() == n
+            and bool(torch.equal(cols, idx))
             and bool(torch.isfinite(x).all())):
         # `lo`/`lo + 1` never exceed `n - 1` on the full range (q <= 1), so
-        # the clamped gathers reduce to the plain rank targets.
+        # the clamped gathers reduce to the plain rank targets.  The helper
+        # writes columns by their position in the full table, so the
+        # shortcut is valid only for the ACTUAL arange(n), not any n-entry
+        # column list (e.g. a permuted subset of the same length).
         return _causal_quantile_rank(x, lo, frac, use_hi, first_row, q, n)
     _pair_bytes = 16
     _budget = 128 << 20
@@ -2332,6 +2358,12 @@ def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n
         # Empty sequence: no blocks to pool.  Keep the same return contract as
         # the non-empty path.
         return (Xa[:0], torch.empty(0, dtype=torch.long, device=dev), 0)
+    if overlap is not None and overlap > n:
+        # The overlap is "the last N tokens of the previous block".  Any
+        # N >= n already covers every token of every block, so clamping is
+        # value-identical and keeps the host int32 geometry arithmetic inside
+        # its transport range at large requested overlaps.
+        overlap = int(n)
     if n_blocks is None:
         B = _n_blocks_cached(block_ids)
     else:
@@ -2526,7 +2558,7 @@ def _pool_parts_flat(counts_l, B, ov, n, pad_to=1):
         if pad:
             flat[total:] = 0
         return _pool_geom_content_put(_ck, (flat, total))
-    except (RuntimeError, TypeError, ValueError, AttributeError):
+    except (RuntimeError, TypeError, ValueError, AttributeError, OverflowError):
         return None
 
 def _pool_parts_host(block_ids, B, ov, n, counts_l):
@@ -2548,7 +2580,7 @@ def _pool_parts_host(block_ids, B, ov, n, counts_l):
         # the bucket pad is sliced off first; the unbound segment views are
         # read-only views into buf.
         return buf[:total].view(8 if ov is not None else 4, int(B)).unbind(0)
-    except (RuntimeError, TypeError, ValueError, AttributeError):
+    except (RuntimeError, TypeError, ValueError, AttributeError, OverflowError):
         return None
 
 def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pad_to=1):
@@ -2616,7 +2648,7 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
         else:
             np.minimum(pos, pa_rows - 1, out=pos_a)
         return _pool_geom_content_put(_ck, (flat_i, flat_b, n_a, n_b, W_b, max_len))
-    except (RuntimeError, TypeError, ValueError, AttributeError):
+    except (RuntimeError, TypeError, ValueError, AttributeError, OverflowError):
         return None
 
 def _pool_geom_host_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, dev):
@@ -2635,7 +2667,7 @@ def _pool_geom_host_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, de
         mbuf = _h2d_async(flat_b, torch.bool, dev)
         # the bucket pad tail is never read: every view has an explicit end.
         return (g_a, mbuf[0:n_a].view(B, max_len), g_b, mbuf[n_a:n_a + n_b].view(B, W_b), b_off, pos_a)
-    except (RuntimeError, TypeError, ValueError, AttributeError):
+    except (RuntimeError, TypeError, ValueError, AttributeError, OverflowError):
         return None
 
 def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows, pad_to=1):
@@ -2674,7 +2706,7 @@ def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows, pad_to=1):
         else:
             np.minimum(pos, p_rows - 1, out=pos_a)
         return _pool_geom_content_put(_ck, (flat_i, mask_np, n_g, max_len))
-    except (RuntimeError, TypeError, ValueError, AttributeError):
+    except (RuntimeError, TypeError, ValueError, AttributeError, OverflowError):
         return None
 
 def _pool_geom_host_single(counts_l, B, n, max_len, p_rows, dev):
@@ -2692,7 +2724,7 @@ def _pool_geom_host_single(counts_l, B, n, max_len, p_rows, dev):
         buf = _h2d_async(flat_i, torch.int32, dev)
         mask = _h2d_async(mask_np, torch.bool, dev)[:n_g].view(B, max_len)
         return (buf[0:n_g].view(B, max_len), mask, buf[n_g:n_g + max_len])
-    except (RuntimeError, TypeError, ValueError, AttributeError):
+    except (RuntimeError, TypeError, ValueError, AttributeError, OverflowError):
         return None
 
 def _pool_parts(block_ids, B, ov, n):
@@ -3386,6 +3418,8 @@ def causal_prefix_pool(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
     Fd = int(Xa.shape[1])
     if T == 0:
         return Xa[:0]
+    if overlap is not None and overlap > T:
+        overlap = T
     pg = _open_prefix_geometry(bid, n_blocks=int(geo['n_blocks']), scope=scope,
                                window=window, window_start=window_start,
                                candidate_table=False)
@@ -3495,6 +3529,8 @@ def causal_prefix_pool_reference(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
     out = Xa.new_zeros((T, Fd))
     if T == 0:
         return out
+    if overlap is not None and overlap > T:
+        overlap = T
     pg = _open_prefix_geometry(bid, n_blocks=int(geo['n_blocks']), scope=scope,
                                window=window, window_start=window_start,
                                candidate_table=False)
@@ -4696,7 +4732,7 @@ class AttnCfg:
         def _cfg_int(label, value, minimum):
             # Structural counts are exact integers: booleans and fractional
             # values must not be silently truncated into a different config.
-            if isinstance(value, (bool, np.bool_)):
+            if isinstance(value, (bool, np.bool_)) or _is_nonmeasurement_scalar(value):
                 raise ValueError(f'{label} must be an integer, got {value!r}')
             if isinstance(value, numbers.Integral):
                 out = int(value)
@@ -6238,8 +6274,15 @@ def _ids_fp(train_ids):
         if _arr.dtype == np.dtype(np.uint64) and _arr.size                 and int(_arr.max()) > np.iinfo(np.int64).max:
             _canon = np.dtype(np.uint64)
     _cs = 1 << 24
-    for _off in range(0, len(_arr), _cs):
-        _part = _arr[_off:_off + _cs]
+    # Chunk by ELEMENTS, not by first-axis length: a wide 2-D cache (e.g.
+    # documents x sequence length) can have millions of elements per row, so
+    # slicing `_cs` rows would materialise the whole table in one block.
+    # Boundaries do not change the digest (the per-chunk bytes are concatenated
+    # in the same C-order row sequence).
+    _cols = int(np.prod(_arr.shape[1:], dtype=np.int64)) if _arr.ndim > 1 else 1
+    _rows_per_chunk = max(1, _cs // max(1, _cols))
+    for _off in range(0, len(_arr), _rows_per_chunk):
+        _part = _arr[_off:_off + _rows_per_chunk]
         if _canon is not None and _part.dtype != _canon:
             _part = _part.astype(_canon, copy=False)
         # astype(copy=False) preserves a Fortran layout, and memoryview.cast
@@ -7797,12 +7840,14 @@ class _DocDeduplicator:
     """
 
     def __init__(self, *, near_threshold=3, bands=4):
-        if isinstance(bands, (bool, np.bool_)) or not isinstance(bands, numbers.Integral):
+        if (isinstance(bands, (bool, np.bool_)) or _is_nonmeasurement_scalar(bands)
+                or not isinstance(bands, numbers.Integral)):
             raise ValueError(f'bands must be an integer in [1, 8], got {bands!r}')
         bands = int(bands)
         if bands < 1 or bands > 8:
             raise ValueError('bands must be in [1, 8]')
         if (isinstance(near_threshold, (bool, np.bool_))
+                or _is_nonmeasurement_scalar(near_threshold)
                 or not isinstance(near_threshold, numbers.Integral)):
             raise ValueError(f'near_threshold must be a non-negative integer, got {near_threshold!r}')
         near_threshold = int(near_threshold)
@@ -9111,7 +9156,7 @@ def _cache_id_upper_bound(path):
         return None
     for key in ('max_id', 'max_token_id', 'token_max'):
         raw = meta.get(key)
-        if isinstance(raw, (bool, np.bool_)):
+        if isinstance(raw, (bool, np.bool_)) or _is_nonmeasurement_scalar(raw):
             continue
         if isinstance(raw, numbers.Integral):
             v = int(raw)
@@ -9125,7 +9170,7 @@ def _cache_id_upper_bound(path):
         if 0 <= v < 2 ** 31:
             return v
     raw_vocab = meta.get('vocab')
-    if isinstance(raw_vocab, (bool, np.bool_)):
+    if isinstance(raw_vocab, (bool, np.bool_)) or _is_nonmeasurement_scalar(raw_vocab):
         return None
     if isinstance(raw_vocab, numbers.Integral):
         vocab = int(raw_vocab)
@@ -9869,7 +9914,7 @@ def holm_adjust(named_pvals, alpha=0.05):
     counted in ``m`` as ``p=1`` (its own ``p_holm`` stays None).  Dropping it
     from ``m`` would shrink the correction family and make the remaining
     comparisons look more significant than the caller's stated family allows."""
-    if isinstance(alpha, (bool, np.bool_)):
+    if isinstance(alpha, (bool, np.bool_)) or _is_nonmeasurement_scalar(alpha):
         raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
     try:
         a = float(alpha)
@@ -9888,10 +9933,11 @@ def holm_adjust(named_pvals, alpha=0.05):
             # corrupt the correction family.
             raise ValueError(f'holm_adjust: duplicate comparison name {sname!r}')
         _seen_names.add(sname)
-        if isinstance(p, (bool, np.bool_)):
-            # A boolean is a flag, not a probability.  float(False) == 0.0
-            # would otherwise become the strongest possible p-value and
-            # shrink the correction family to a bogus "certain" result.
+        if isinstance(p, (bool, np.bool_)) or _is_nonmeasurement_scalar(p):
+            # A boolean/flag or temporal/complex value is not a probability.
+            # float(False) == 0.0 would otherwise become the strongest
+            # possible p-value and shrink the correction family to a bogus
+            # "certain" result.
             pv = float('nan')
         else:
             try:
@@ -9953,9 +9999,10 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         p = v.get('p_exact_signflip')
         if p is None:
             p = v.get('p')
-        if isinstance(p, (bool, np.bool_)):
-            # Boolean flags are not p-values; treat them as invalid so the
-            # declared family keeps a p=1 slot instead of a fake p=0.
+        if isinstance(p, (bool, np.bool_)) or _is_nonmeasurement_scalar(p):
+            # Boolean/temporal/complex values are not p-values; treat them as
+            # invalid so the declared family keeps a p=1 slot instead of a
+            # fake p=0.
             p = float('nan')
         else:
             try:
@@ -10060,9 +10107,9 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     into a prohibition on *reporting* the number -- it only forbids the words
     "significant"/"confirmed" and records exactly why.
     """
-    if isinstance(alpha, (bool, np.bool_)):
+    if isinstance(alpha, (bool, np.bool_)) or _is_nonmeasurement_scalar(alpha):
         _alpha = float('nan')
-        _alpha_bad = f'alpha {alpha!r} is a boolean flag, not a significance level'
+        _alpha_bad = f'alpha {alpha!r} is a boolean/temporal/complex value, not a significance level'
     else:
         try:
             _alpha = float(alpha)
@@ -10071,7 +10118,7 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
         _alpha_bad = (None if (math.isfinite(_alpha) and 0.0 < _alpha < 1.0)
                       else f'alpha {alpha!r} is not in (0,1)')
     _min_n = None
-    if isinstance(min_n, (bool, np.bool_)):
+    if isinstance(min_n, (bool, np.bool_)) or _is_nonmeasurement_scalar(min_n):
         pass
     elif isinstance(min_n, numbers.Integral):
         _min_n = int(min_n)
@@ -10100,9 +10147,9 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
         out['reasons'].append('not a statistics dict')
         return out
     _n_raw = stats.get('n')
-    if isinstance(_n_raw, (bool, np.bool_)):
+    if isinstance(_n_raw, (bool, np.bool_)) or _is_nonmeasurement_scalar(_n_raw):
         n = 0
-        out['reasons'].append('n is a boolean flag, not a seed count')
+        out['reasons'].append('n is a boolean/temporal/complex value, not a seed count')
     elif isinstance(_n_raw, numbers.Integral):
         n = int(_n_raw)
     elif isinstance(_n_raw, numbers.Real):
@@ -10124,7 +10171,7 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     ph = stats.get('p_holm')
     mean, std = stats.get('mean'), stats.get('std')
     out['n'] = n
-    if isinstance(p, (bool, np.bool_)):
+    if isinstance(p, (bool, np.bool_)) or _is_nonmeasurement_scalar(p):
         # float(False) == 0.0 must never be read as a significant p-value.
         out['p_raw'] = None
     else:
@@ -10132,7 +10179,7 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             out['p_raw'] = float(p) if p is not None else None
         except (TypeError, ValueError, OverflowError):
             out['p_raw'] = None
-    if isinstance(ph, (bool, np.bool_)):
+    if isinstance(ph, (bool, np.bool_)) or _is_nonmeasurement_scalar(ph):
         out['p_holm'] = None
     else:
         try:
@@ -10534,7 +10581,8 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
         return None
     nb = _valid_bootstrap_count(n_boot, minimum=20)
     sd = _rng_seed_int(seed)
-    if nb is None or sd is None or isinstance(conf, (bool, np.bool_)):
+    if (nb is None or sd is None or isinstance(conf, (bool, np.bool_))
+            or _is_nonmeasurement_scalar(conf)):
         return None
     if not (0.0 < c < 1.0):
         return None
@@ -10863,7 +10911,7 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     it as a null result."""
     m = _as_seed_int(m_comparisons)
     n_max = _as_seed_int(n_max)
-    if isinstance(alpha, (bool, np.bool_)):
+    if isinstance(alpha, (bool, np.bool_)) or _is_nonmeasurement_scalar(alpha):
         return None
     try:
         a = float(alpha)
@@ -10924,7 +10972,7 @@ def global_multiplicity_audit(named_pvals, *, alpha=0.05,
 
     The audit never forbids REPORTING a number; it only separates the wordings
     a cross-panel quote is allowed to use, exactly like `reportable_claim`."""
-    if isinstance(alpha, (bool, np.bool_)):
+    if isinstance(alpha, (bool, np.bool_)) or _is_nonmeasurement_scalar(alpha):
         raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
     try:
         a = float(alpha)
@@ -10973,7 +11021,8 @@ def global_multiplicity_audit(named_pvals, *, alpha=0.05,
     for e in entries:
         p = e['p']
         valid = False
-        if p is not None and not isinstance(p, (bool, np.bool_)):
+        if (p is not None and not isinstance(p, (bool, np.bool_))
+                and not _is_nonmeasurement_scalar(p)):
             try:
                 pf = float(p)
                 valid = math.isfinite(pf) and 0.0 <= pf <= 1.0
@@ -11175,7 +11224,7 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
         return None
     # Planning fails closed on a malformed significance level (e.g. a JSON
     # string).
-    if isinstance(alpha, (bool, np.bool_)):
+    if isinstance(alpha, (bool, np.bool_)) or _is_nonmeasurement_scalar(alpha):
         return None
     try:
         a = float(alpha)
@@ -11223,7 +11272,7 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
     kmin = signflip_min_consistency(n_seeds, m_comparisons, alpha)
     if kmin is None or kmin <= 0:
         return 0.0 if kmin is None else 1.0
-    if isinstance(q, (bool, np.bool_)):
+    if isinstance(q, (bool, np.bool_)) or _is_nonmeasurement_scalar(q):
         return 0.0
     try:
         n = int(n_seeds)
@@ -11266,8 +11315,8 @@ def tost_paired(deltas, margin, conf=0.90):
     d = np.asarray([f for f in (_finite_scalar(x) for x in (deltas if deltas is not None else []))
                     if f is not None], dtype=float)
     n = int(d.size)
-    _bad_option = (isinstance(margin, (bool, np.bool_))
-                   or isinstance(conf, (bool, np.bool_)))
+    _bad_option = (isinstance(margin, (bool, np.bool_)) or _is_nonmeasurement_scalar(margin)
+                   or isinstance(conf, (bool, np.bool_)) or _is_nonmeasurement_scalar(conf))
     try:
         margin = float(margin)
         conf = float(conf)
@@ -11461,9 +11510,9 @@ def _f_sf(f, df1, df2):
     P(F >= f) = I_x(df2/2, df1/2)，x = df2 / (df2 + df1*f)（标准恒等式，
     由 CDF 的 I_{df1 f/(df1 f + df2)}(df1/2, df2/2) 与 I_x(a,b) 的补关系
     得到）。用于 scaling_trend 的失拟（lack-of-fit）检验。"""
-    if (isinstance(f, (bool, np.bool_))
-            or isinstance(df1, (bool, np.bool_))
-            or isinstance(df2, (bool, np.bool_))):
+    if (isinstance(f, (bool, np.bool_)) or _is_nonmeasurement_scalar(f)
+            or isinstance(df1, (bool, np.bool_)) or _is_nonmeasurement_scalar(df1)
+            or isinstance(df2, (bool, np.bool_)) or _is_nonmeasurement_scalar(df2)):
         return None
     if not (df1 > 0.0 and df2 > 0.0):
         return None
@@ -11511,7 +11560,8 @@ def _f_sf(f, df1, df2):
 
 def _student_t_sf(t, df):
     """Student t 的上尾概率 P(T >= t)。"""
-    if isinstance(t, (bool, np.bool_)) or isinstance(df, (bool, np.bool_)):
+    if (isinstance(t, (bool, np.bool_)) or _is_nonmeasurement_scalar(t)
+            or isinstance(df, (bool, np.bool_)) or _is_nonmeasurement_scalar(df)):
         return float('nan')
     if not (df > 0.0):
         return float('nan')
@@ -11562,9 +11612,9 @@ def _student_t_sf(t, df):
 
 def student_t_two_sided_p(t, df):
     """双侧 Student t 检验 p 值（小样本斜率/交互推断用）。"""
-    if isinstance(t, (bool, np.bool_)):
-        # A flag is not a t statistic; float(True)==1.0 would report the p of
-        # a test the caller never specified.
+    if isinstance(t, (bool, np.bool_)) or _is_nonmeasurement_scalar(t):
+        # A flag/duration is not a t statistic; float(True)==1.0 would report
+        # the p of a test the caller never specified.
         return float('nan')
     try:
         _t = abs(float(t))
@@ -11586,7 +11636,8 @@ def student_t_two_sided_p(t, df):
 
 def _t_critical(conf, df):
     """双侧置信区间的 t 临界值；用二分求解，避免依赖 scipy。"""
-    if isinstance(conf, (bool, np.bool_)) or isinstance(df, (bool, np.bool_)):
+    if (isinstance(conf, (bool, np.bool_)) or _is_nonmeasurement_scalar(conf)
+            or isinstance(df, (bool, np.bool_)) or _is_nonmeasurement_scalar(df)):
         return float('nan')
     if not (0.0 < conf < 1.0) or not (df > 0.0):
         return float('nan')
@@ -11612,7 +11663,8 @@ def _t_critical(conf, df):
 
 def chi2_sf(x, df):
     """卡方分布上尾概率 P(chi2_df >= x)（Cochran Q 用）。"""
-    if isinstance(x, (bool, np.bool_)) or isinstance(df, (bool, np.bool_)):
+    if (isinstance(x, (bool, np.bool_)) or _is_nonmeasurement_scalar(x)
+            or isinstance(df, (bool, np.bool_)) or _is_nonmeasurement_scalar(df)):
         return float('nan')
     if not (df > 0.0):
         return float('nan')
@@ -12486,7 +12538,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
     def _as_int(value, label, *, allow_none=False):
         if value is None and allow_none:
             return None
-        if isinstance(value, (bool, np.bool_)):
+        if isinstance(value, (bool, np.bool_)) or _is_nonmeasurement_scalar(value):
             raise ValueError(f'{label} must be an integer, got {value!r}')
         if isinstance(value, numbers.Integral):
             return int(value)
@@ -13102,7 +13154,7 @@ def _record_identity(rec, key, legacy_ok):
     return (var, record_tag(rec, key, legacy_ok), seed)
 
 def _as_seed_int(v):
-    if v is None or isinstance(v, (bool, np.bool_)):
+    if v is None or isinstance(v, (bool, np.bool_)) or _is_nonmeasurement_scalar(v):
         return None
     if isinstance(v, numbers.Integral):
         return int(v)
@@ -14648,6 +14700,9 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             return []
         if isinstance(_raw, (bool, np.bool_)):
             problems.append(f'{_label} contains a boolean flag ({_raw!r})')
+            return []
+        if _is_nonmeasurement_scalar(_raw):
+            problems.append(f'{_label} is a temporal value, not a seed list ({_raw!r})')
             return []
         if isinstance(_raw, numbers.Integral):
             return [int(_raw)]
@@ -19086,11 +19141,8 @@ def _save_analysis_checkpoint(path, model, meta):
 def _percentile(vals, q):
     xs = []
     for v in vals:
-        try:
-            fv = float(v)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if math.isfinite(fv):
+        fv = _finite_scalar(v)
+        if fv is not None:
             xs.append(fv)
     xs.sort()
     if not xs:
@@ -22900,6 +22952,8 @@ def _as_bool_flag(value):
     values fall back to the geometry default."""
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
+    if _is_nonmeasurement_scalar(value):
+        return None
     if isinstance(value, numbers.Integral):
         _iv = int(value)
         return bool(_iv) if _iv in (0, 1) else None

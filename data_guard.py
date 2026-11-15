@@ -1104,7 +1104,7 @@ class LeakageSafePreprocessor:
                  clip_quantiles=(0.001, 0.999), clip_z=None, eps=_EPS):
         if scale not in ('standard', 'robust', 'minmax', 'none'):
             raise ValueError(f'unknown scale={scale!r}')
-        if isinstance(missing, (bool, np.bool_)):
+        if isinstance(missing, (bool, np.bool_, np.datetime64, np.timedelta64, complex, np.complexfloating)):
             raise ValueError(
                 f'missing must be a finite constant or one of '
                 f"'median'/'mean'/'zero', got {missing!r}")
@@ -1119,20 +1119,21 @@ class LeakageSafePreprocessor:
             raise ValueError(f'unknown missing={missing!r}')
         if clip_quantiles is not None:
             lo, hi = clip_quantiles
-            if any(isinstance(v, (bool, np.bool_)) for v in (lo, hi)):
-                raise ValueError('clip_quantiles must be numeric, not booleans')
+            if any(isinstance(v, (bool, np.bool_, np.datetime64, np.timedelta64, complex, np.complexfloating))
+                   for v in (lo, hi)):
+                raise ValueError('clip_quantiles must be numeric, not booleans/temporal/complex values')
             lo, hi = float(lo), float(hi)
             if not (0.0 <= lo < hi <= 1.0):
                 raise ValueError('clip_quantiles must satisfy 0 <= lo < hi <= 1')
             clip_quantiles = (lo, hi)
-        if isinstance(clip_z, (bool, np.bool_)):
-            raise ValueError('clip_z must be positive or None, not a boolean')
+        if isinstance(clip_z, (bool, np.bool_, np.datetime64, np.timedelta64, complex, np.complexfloating)):
+            raise ValueError('clip_z must be positive or None, not a boolean/temporal/complex value')
         if clip_z is not None:
             clip_z = float(clip_z)
             if not (math.isfinite(clip_z) and clip_z > 0.0):
                 raise ValueError('clip_z must be a finite positive number or None')
-        if isinstance(eps, (bool, np.bool_)):
-            raise ValueError('eps must be a finite non-negative number, not a boolean')
+        if isinstance(eps, (bool, np.bool_, np.datetime64, np.timedelta64, complex, np.complexfloating)):
+            raise ValueError('eps must be a finite non-negative number, not a boolean/temporal/complex value')
         eps = float(eps)
         if not (math.isfinite(eps) and eps >= 0.0):
             raise ValueError(f'eps must be a finite non-negative number, got {eps!r}')
@@ -2366,7 +2367,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
     """
     # A NaN/negative threshold silently disables the corresponding gate
     # (NaN compares False against everything), which is worse than an error.
-    if isinstance(clip_z, (bool, np.bool_)):
+    if isinstance(clip_z, (bool, np.bool_, np.datetime64, np.timedelta64, complex, np.complexfloating)):
         raise ValueError(f'clip_z must be a positive finite number, got {clip_z!r}')
     try:
         clip_z = float(clip_z)
@@ -2374,7 +2375,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         raise ValueError(f'clip_z must be a positive finite number, got {clip_z!r}') from None
     if not math.isfinite(clip_z) or clip_z <= 0.0:
         raise ValueError(f'clip_z must be a positive finite number, got {clip_z!r}')
-    if isinstance(shift_threshold, (bool, np.bool_)):
+    if isinstance(shift_threshold, (bool, np.bool_, np.datetime64, np.timedelta64, complex, np.complexfloating)):
         raise ValueError(
             f'shift_threshold must be a finite non-negative number, got '
             f'{shift_threshold!r}')

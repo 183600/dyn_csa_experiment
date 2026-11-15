@@ -11172,6 +11172,133 @@ def t_round20b_ngram_count_helper_requires_exact_vocab():
     assert len(uniq) == len(counts) == 2, (uniq, counts)
 
 
+def t_round21_temporal_values_and_exact_full_range():
+    # NumPy duration scalars register as numbers.Integral/Real, but they are
+    # temporal values, not counts/measurements.  Every shared scalar contract
+    # must fail closed (return None / raise ValueError) instead of calling
+    # int()/float() on them (which either raises an unrelated TypeError or
+    # silently treats 1 ns as the number 1e-9).
+    import data_guard as DG
+    import open_block_supp as OB
+    for _bad in (np.timedelta64(1, 'D'), np.timedelta64(1, 'ns'),
+                 np.datetime64('2020-01-01')):
+        assert L._as_seed_int(_bad) is None, _bad
+        assert L._finite_scalar(_bad) is None, _bad
+        assert L._safe_exp_ppl(_bad) is None, _bad
+        assert L._valid_alpha01(_bad) is None, _bad
+        assert L._as_bool_flag(_bad) is None, _bad
+        for _kw in ({'missing': _bad}, {'clip_z': _bad}, {'eps': _bad},
+                    {'clip_quantiles': (_bad, 0.9)}):
+            try:
+                DG.LeakageSafePreprocessor(**_kw)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'preprocessor accepted temporal option {_kw!r}')
+    for _kw in ({'clip_z': np.timedelta64(1, 'ns')},
+                {'shift_threshold': np.timedelta64(1, 'ns')}):
+        try:
+            DG.data_quality_report([[1.0], [2.0]], **_kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'data_quality_report accepted temporal option {_kw!r}')
+    # Complex scalars are not count/seed/real-measurement values either: NumPy
+    # happily casts a zero-imaginary complex to int/float while Python's
+    # complex does not, so both spellings must be refused consistently.
+    for _bad in (np.complex64(3 + 0j), np.complex128(1 + 0j), 1 + 0j):
+        assert L._as_seed_int(_bad) is None, _bad
+        assert L._finite_scalar(_bad) is None, _bad
+        assert L._safe_exp_ppl(_bad) is None, _bad
+        assert L._valid_alpha01(_bad) is None, _bad
+        assert L._as_bool_flag(_bad) is None, _bad
+
+    # The report/audit twins use the same scalar contracts, so a duration
+    # cannot be quoted as a PPL/length identity there either.
+    assert BR._as_finite(np.timedelta64(1, 'ns')) is None
+    assert BR._int_or(np.timedelta64(1, 'ns'), 7) == 7
+    assert A._exact_int_scalar(np.timedelta64(1, 'ns')) is None
+    assert A._exact_int_scalar(np.complex64(3 + 0j)) is None
+
+    # Statistical helpers must treat a duration like a boolean flag (not a
+    # number): reject it instead of evaluating a test at 1 ns == 1e-9.
+    _td = np.timedelta64(1, 'ns')
+    assert L._f_sf(_td, 3.0, 7.0) is None
+    assert math.isnan(L._student_t_sf(_td, 5))
+    assert math.isnan(L.student_t_two_sided_p(_td, 5))
+    assert math.isnan(L._t_critical(0.95, _td))
+    assert math.isnan(L.chi2_sf(_td, 3))
+    assert L.signflip_min_consistency(6, 3, alpha=_td) is None
+    assert L.signflip_min_n_for_holm(3, alpha=_td) is None
+    assert L.signflip_power(6, 3, _td) == 0.0
+    try:
+        L.global_multiplicity_audit([('a', 0.01)], alpha=_td)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('global_multiplicity_audit accepted a temporal alpha')
+    assert L.bootstrap_mean_ci([1.0, 2.0, 3.0], conf=_td) is None
+    assert L.tost_paired([0.1, 0.2, 0.3], _td)['equivalent'] is None
+    assert L.holm_adjust([('a', _td)], 0.05)['a']['p_holm'] is None
+    try:
+        L.holm_adjust([('a', 0.01)], _td)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('holm_adjust accepted a temporal alpha')
+    _claim = L.reportable_claim({'n': _td, 'p_exact_signflip': _td,
+                                 'p_holm': _td, 'mean': 1.0, 'std': 0.1,
+                                 'n_nonzero': 6})
+    assert _claim['allowed'] is False and _claim['p_raw'] is None, _claim
+
+    # The closed-form causal quantile's full-table shortcut writes by column
+    # POSITION, so it is valid only when the requested columns are the actual
+    # arange(n).  A same-length permuted column list must take the general
+    # gather path and produce the same values as the non-shortcut call.
+    torch.manual_seed(0)
+    x = torch.randn(2, 6)
+    full = torch.arange(6, dtype=torch.long)
+    perm = torch.tensor([3, 0, 5, 1, 4, 2], dtype=torch.long)
+    a = L._causal_quantile_exact(x, perm, 4, _full_range=True)
+    b = L._causal_quantile_exact(x, perm, 4, _full_range=False)
+    assert torch.allclose(a, b), (a, b)
+    c = L._causal_quantile_exact(x, full, 4, _full_range=True)
+    d = L._causal_quantile_exact(x, full, 4, _full_range=False)
+    assert torch.equal(c, d), (c, d)
+
+    # An overlap larger than the whole sequence is exactly "all previous
+    # tokens"; clamping it must not overflow the host int32 geometry path.
+    _bid, _hon, _cnt = L._segment(12, [False] * 11, 2, 4)
+    _bid = torch.tensor(_bid)
+    _F = 3
+    _Xa = torch.randn(12, _F); _Za = torch.randn(12, _F)
+    _Xb = torch.randn(12, _F); _Zb = torch.randn(12, _F)
+    _Bp = torch.randn(max(4, 12), _F)
+    _a = L.causal_prefix_pool(_Xa, _Xb, _Za, _Zb, _bid, _Bp, _Bp, 12,
+                              n_blocks=len(_cnt))
+    _b = L.causal_prefix_pool(_Xa, _Xb, _Za, _Zb, _bid, _Bp, _Bp, 10 ** 30,
+                              n_blocks=len(_cnt))
+    assert torch.equal(_a, _b), 'huge overlap must clamp to the exact same geometry'
+
+    # The fingerprint chunk boundary is an element budget, not a first-axis
+    # count: the same logical 2-D table must remain bit-identical.
+    _wide = np.arange(2 * 5000, dtype=np.int32).reshape(2, 5000)
+    assert L._ids_fp(_wide) == L._ids_fp(_wide.reshape(-1)), '2-D fingerprint changed'
+
+    # open-block summaries use the same strict JSON contract as exp_lib:
+    # non-finite diagnostics become null instead of an invalid NaN token.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'summary.json')
+        OB._atomic_json(path, {'ppl': float('nan'), 'ok': 1.0,
+                               'arr': np.array([1.0, float('inf')])})
+        with open(path, encoding='utf-8') as f:
+            text = f.read()
+        assert 'NaN' not in text and 'Infinity' not in text, text
+        loaded = json.loads(text)
+        assert loaded == {'ppl': None, 'ok': 1.0, 'arr': [1.0, None]}, loaded
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -11523,6 +11650,7 @@ def main():
     _check('N55 categorical fingerprint follows encoder identity', t_round19c_categorical_fingerprint_uses_encoder_identity)
     _check('N56 category order / one-sided clip / TimeGuard cap exactness', t_round20_category_order_and_cap_exactness)
     _check('N57 ngram count helper requires an exact vocabulary', t_round20b_ngram_count_helper_requires_exact_vocab)
+    _check('N58 temporal scalars fail closed; exact full-range quantile; strict open-block JSON', t_round21_temporal_values_and_exact_full_range)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

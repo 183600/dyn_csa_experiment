@@ -79,8 +79,12 @@ def _exact_int_scalar(value):
     # np.bool_ is neither numbers.Integral nor numbers.Real on NumPy 2, so it
     # would otherwise fall through float(np.True_) == 1.0 and be accepted.
     # Its dtype kind is the stable spelling across NumPy versions.
-    if (value is None or isinstance(value, bool)
-            or getattr(getattr(value, 'dtype', None), 'kind', None) == 'b'):
+    _kind = getattr(getattr(value, 'dtype', None), 'kind', None)
+    if (value is None or isinstance(value, (bool, complex))
+            or _kind in ('b', 'M', 'm', 'c')):
+        # Boolean flags, datetimes/timedeltas and complex values are not
+        # exact integer identities (np.timedelta64 even registers as an
+        # Integral and int() on a unit-bearing value raises).
         return None
     if isinstance(value, numbers.Integral):
         return int(value)

@@ -30,7 +30,9 @@ def _as_finite(v):
     ``np.int64``/``np.float32`` values, which could turn a non-empty panel into
     "no data" or make the local exact test disagree with ``exp_lib``.
     """
-    if isinstance(v, bool) or not isinstance(v, numbers.Real):
+    if (isinstance(v, (bool, np.bool_))
+            or isinstance(v, (np.datetime64, np.timedelta64))
+            or not isinstance(v, numbers.Real)):
         return None
     try:
         f = float(v)
@@ -372,7 +374,8 @@ def _finite_or_none(v):
     return _as_finite(v)
 
 def _int_or(v, default):
-    if v is None or isinstance(v, (bool, np.bool_)):
+    if (v is None or isinstance(v, (bool, np.bool_))
+            or isinstance(v, (np.datetime64, np.timedelta64, complex, np.complexfloating))):
         return default
     if isinstance(v, numbers.Integral):
         return int(v)
@@ -1532,6 +1535,8 @@ def sec_p1l():
         # Integers/strings are parsed without a float round-trip so an id above
         # 2**53 cannot silently map to a neighbouring length.
         if isinstance(Ln, (bool, np.bool_)):
+            return None
+        if isinstance(Ln, (np.datetime64, np.timedelta64, complex, np.complexfloating)):
             return None
         if isinstance(Ln, numbers.Integral):
             v = int(Ln)
