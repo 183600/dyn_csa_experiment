@@ -100,7 +100,9 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           set -e
-          git fetch origin main 2>/dev/null || true
+          # 基准：检出自带的 origin/main（== 本次 run 的 head commit）。
+          # 不要 fetch 最新 main——否则冒烟测试的“待推送改动”会混入
+          # 检出点与最新 main 之间的无关差异（时差假象）。
           # ---- 场景 1：无害小改动 → 期望 APPROVE ----
           echo "# gate smoke test marker" >> error_analysis.py
           git add -A
