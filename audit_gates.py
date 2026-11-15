@@ -2760,7 +2760,9 @@ def audit_release_readiness(path='RELEASES.md'):
         out['problems'].append(f'{path} is missing')
         return out
     rows = []
-    for line in open(p, encoding='utf-8'):
+    with open(p, encoding='utf-8') as _fh:
+        _lines = _fh.readlines()
+    for line in _lines:
         line = line.strip()
         if not line.startswith('|'):
             continue

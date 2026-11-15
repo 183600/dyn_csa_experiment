@@ -106,6 +106,7 @@ def kernel_stamp():
 
 
 _ENV_CACHE = {}
+_ENV_CACHE_MISSING = object()
 
 
 def _env_cached(name):
@@ -113,8 +114,8 @@ def _env_cached(name):
     CSA_KERNEL_{POOL,IDX,ATTN} / CSA_KERNEL_IDX_CHUNK）在仓库内从不被
     运行期改写（只有 CSA_KERNEL 本身按设计每次 forward 重读，不走这里），
     与 _TRITON_STATE 同为 cache-once 模式。"""
-    v = _ENV_CACHE.get(name, None)
-    if v is None:
+    v = _ENV_CACHE.get(name, _ENV_CACHE_MISSING)
+    if v is _ENV_CACHE_MISSING:
         v = os.environ.get(name)
         _ENV_CACHE[name] = v
     return v
