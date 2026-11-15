@@ -14656,7 +14656,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         selection_stabilities[arm] = _stab
         if _stab.get('status') == 'ok':
             _recorded = entry.get('selection_stability')
-            if isinstance(_recorded, dict) and isinstance(_recorded.get('stable'), bool):
+            if isinstance(_recorded, dict) and isinstance(_recorded.get('stable'), (bool, np.bool_)):
                 if bool(_recorded['stable']) != bool(_stab.get('stable')):
                     problems.append(f'{arm}: recorded selection_stability={_recorded.get("stable")} '
                                     f'but leave-one-seed-out re-selection gives {_stab.get("stable")}')
@@ -21519,8 +21519,8 @@ _MLP_RATIO_MEMO = {}
 def variant_mlp_ratio(variant, vocab, *, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=None, ref_variant='csa_dynamic'):
     if matched is None:
         matched = PARAM_MATCHED
-    if isinstance(matched, bool):
-        matched = PARAM_MATCHED if matched else set()
+    if isinstance(matched, (bool, np.bool_)):
+        matched = PARAM_MATCHED if bool(matched) else set()
     if variant not in matched:
         return 4.0
     # The ratio is a pure function of these arguments (the parameter count

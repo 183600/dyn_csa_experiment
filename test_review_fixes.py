@@ -11437,6 +11437,34 @@ def t_round22_nonmeasurement_scalars_in_measurement_paths():
                 pass
 
 
+def t_variant_mlp_ratio_bool_flag():
+    # `matched` is a boolean flag ("use the parameter-matched arm").  Both the
+    # Python bool and its NumPy spelling must select the same branch; the NumPy
+    # spelling used to fall through to the set-membership test and raise.
+    assert L.variant_mlp_ratio('full_matched', 8192, matched=True) > 4.0
+    assert L.variant_mlp_ratio('full_matched', 8192, matched=False) == 4.0
+    assert L.variant_mlp_ratio('full_matched', 8192, matched=np.bool_(True)) > 4.0
+    assert L.variant_mlp_ratio('full_matched', 8192, matched=np.bool_(False)) == 4.0
+    assert L.variant_mlp_ratio('csa_dynamic', 8192, matched=True) == 4.0
+    assert L.variant_mlp_ratio('csa_dynamic', 8192, matched=np.bool_(True)) == 4.0
+
+
+def t_baseline_tuning_audit_np_bool_stability():
+    # A recorded selection-stability flag may legitimately round-trip through
+    # NumPy (np.bool_); the audit must compare it instead of silently skipping.
+    _trial = {'config': {'lr': 0.001}, 'ppl': 1.0,
+              'seed_ppls': {'0': 1.0, '1': 1.0, '2': 1.0}}
+    _art = {'selection_metric': 'ppl', 'selection_split': 'validation',
+            'direction': 'lower_is_better',
+            'arms': {'full_matched': {'trials': [_trial],
+                                     'selected': {'lr': 0.001},
+                                     'selected_metric_value': 1.0,
+                                     'selection_stability': {'stable': np.bool_(False)}}}}
+    _r = L.baseline_tuning_audit(_art, protocol=L.BASELINE_TUNING_PROTOCOL)
+    _problems = list(_r.get('problems') or [])
+    assert any('recorded selection_stability=False' in p for p in _problems), _problems
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -11790,6 +11818,8 @@ def main():
     _check('N57 ngram count helper requires an exact vocabulary', t_round20b_ngram_count_helper_requires_exact_vocab)
     _check('N58 temporal scalars fail closed; exact full-range quantile; strict open-block JSON', t_round21_temporal_values_and_exact_full_range)
     _check('N59 temporal/complex scalars refused in PPL/effect/report paths', t_round22_nonmeasurement_scalars_in_measurement_paths)
+    _check('N60 variant_mlp_ratio bool-flag handling incl. NumPy bools', t_variant_mlp_ratio_bool_flag)
+    _check('N61 baseline_tuning_audit compares a NumPy boolean stability flag', t_baseline_tuning_audit_np_bool_stability)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
