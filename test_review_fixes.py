@@ -11439,8 +11439,7 @@ def t_round22_nonmeasurement_scalars_in_measurement_paths():
 
 def t_variant_mlp_ratio_bool_flag():
     # `matched` is a boolean flag ("use the parameter-matched arm").  Both the
-    # Python bool and its NumPy spelling must select the same branch; the NumPy
-    # spelling used to fall through to the set-membership test and raise.
+    # Python bool and its NumPy spelling must select the same branch.
     assert L.variant_mlp_ratio('full_matched', 8192, matched=True) > 4.0
     assert L.variant_mlp_ratio('full_matched', 8192, matched=False) == 4.0
     assert L.variant_mlp_ratio('full_matched', 8192, matched=np.bool_(True)) > 4.0
