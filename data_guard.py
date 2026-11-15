@@ -1890,6 +1890,7 @@ def _matrix_fingerprint(X):
     # corpus fingerprint, so those integral tables are hashed as exact
     # uint64 instead.  In-range tables keep the same fingerprint.
     _integral = (arr.dtype != object
+                 and arr.dtype.kind not in ('M', 'm')
                  and (np.issubdtype(arr.dtype, np.integer)
                       or np.issubdtype(arr.dtype, np.bool_)))
     _obj_int = False
@@ -2181,6 +2182,7 @@ def _row_keys(X):
     # leakage).  uint64 keeps every integer value exact, including negatives
     # via two's complement.
     _integral = (src.dtype != object
+                 and src.dtype.kind not in ('M', 'm')
                  and (np.issubdtype(src.dtype, np.integer)
                       or np.issubdtype(src.dtype, np.bool_)))
     if _integral and src.size:

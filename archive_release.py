@@ -452,7 +452,8 @@ def cmd_verify(tar_path):
             print(f'[archive] REFUSE: expected exactly one {man_name!r} inside the archive, found {len(_hits)}')
             return 1
         try:
-            man = json.load(tf.extractfile(man_name))
+            with tf.extractfile(man_name) as _man_f:
+                man = json.load(_man_f)
         except Exception as _e:
             print(f'[archive] REFUSE: the archive manifest is not valid JSON ({type(_e).__name__}: {_e})')
             return 1
@@ -475,11 +476,12 @@ def cmd_verify(tar_path):
                 bad.append(f'{member.name}: in tar but its content cannot be read')
                 continue
             h = hashlib.sha256()
-            while True:
-                b = f.read(1 << 20)
-                if not b:
-                    break
-                h.update(b)
+            with f:
+                while True:
+                    b = f.read(1 << 20)
+                    if not b:
+                        break
+                    h.update(b)
             got = h.hexdigest()
             _entry = man['files'].get(member.name)
             if _entry is None:

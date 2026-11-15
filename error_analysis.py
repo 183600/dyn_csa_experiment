@@ -45,7 +45,7 @@ def _nonnegative_int(text):
     """argparse type for row/rank counts: a negative value is not a subset."""
     if not isinstance(text, str):
         text = str(text)
-    if re.fullmatch(r'-?(?:0|[1-9][0-9]*)', text) is None:
+    if re.fullmatch(r'(?:0|[1-9][0-9]*)', text) is None:
         raise argparse.ArgumentTypeError(
             f'expected a non-negative integer, got {text!r}') from None
     try:
