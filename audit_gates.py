@@ -3005,8 +3005,37 @@ def _aggregate_audit_status(results):
     return 'ok'
 
 
+def _run_audit(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except ModuleNotFoundError as e:
+        name = getattr(fn, '__name__', 'audit')
+        return {'status': 'not_verifiable_locally',
+                'note': f'missing optional dependency {e.name!r} required by {name} — {e}'}
+    except ImportError as e:
+        name = getattr(fn, '__name__', 'audit')
+        return {'status': 'not_verifiable_locally',
+                'note': f'cannot import dependency required by {name} — {type(e).__name__}: {e}'}
+
+
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'failures': audit_failures(), 'budget': audit_budget(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+           'leakage': _run_audit(audit_leakage),
+           'split_discipline': _run_audit(audit_split_discipline),
+           'attribution': _run_audit(audit_attribution),
+           'boundary': _run_audit(audit_boundary),
+           'length': _run_audit(audit_length),
+           'fairness': _run_audit(audit_fairness),
+           'metrics': _run_audit(audit_metrics),
+           'tuning': _run_audit(audit_tuning),
+           'simple_baseline': _run_audit(audit_simple_baseline),
+           'hypotheses': _run_audit(audit_hypotheses),
+           'methodology': _run_audit(audit_methodology),
+           'failures': _run_audit(audit_failures),
+           'budget': _run_audit(audit_budget),
+           'efficiency_pairs': _run_audit(audit_efficiency_pairs),
+           'release': _run_audit(audit_release_readiness),
+           'selection': _run_audit(audit_selection)}
     # The CLI exit code follows the aggregate status, not only the top-level
     # record's own status.
     res['status'] = _aggregate_audit_status(res)
@@ -3037,6 +3066,6 @@ if __name__ == '__main__':
     if _arg not in _cmds:
         print(f'[audit] unknown subcommand {_arg!r}; expected one of {sorted(_cmds)}')
         raise SystemExit(2)
-    _r = _cmds[_arg]()
+    _r = _run_audit(_cmds[_arg])
     if isinstance(_r, dict) and _r.get('status') == 'fail':
         raise SystemExit(1)
