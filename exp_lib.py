@@ -4386,6 +4386,12 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # logits + cat），供调用方在跳过（无梯度下已死的）soft 尾部后保持
         # 硬分支逐位一致；它不改变任何取值，只固定走哪套既有分解。
         if soft is None and not soft_form:
+            if k_all.shape[0] == 0 or (_rows.dim() > 1 and _rows.shape[1] == 0):
+                # Width-0 soft prior or empty block table: no K lanes to project
+                # onto.  Skip the einsum and return zero attention directly,
+                # avoiding the dimension mismatch that occurs when k_all has 0 rows.
+                out[s:e] = qseg.new_zeros_like(qseg)
+                continue
             Kset = _tk2(k_all, _rows)
             logits = _einsum('qhd,qmhd->qhm', qseg, Kset)
             del Kset
