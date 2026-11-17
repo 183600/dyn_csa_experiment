@@ -3058,8 +3058,8 @@ def t_review3_boundary_arm_and_objective():
     y = torch.randint(0, 64, (1, 16), generator=torch.Generator().manual_seed(1))
     ce = m.ce_loss(x, y, 64)
     assert m.boundary_logp is not None and m.boundary_decisions > 0, 'boundary policy must emit log-probabilities'
-    # Mirrors the training loop's cost-REINFORCE term: descent on
-    # `+adv_cost * logp` decreases the probability of above-baseline-cost
+    # Mirrors the training loop's reinforce term: descent on
+    # `+adv * logp` decreases the probability of above-baseline
     # cuts (baseline 0 here, matching the loop's first-step EMA).
     loss = ce + 0.05 * m.comp_reg + float(ce.detach()) * m.boundary_logp / max(m.boundary_decisions, 1)
     loss.backward()
@@ -9933,7 +9933,7 @@ def t_round10_pool_without_b_lane():
 
 
 def t_round10_prefix_reference_honours_use_overlap():
-    # The oracle and the optimized implementation must agree on the
+    # The oracle and the reference implementation must agree on the
     # no-overlap configuration as well as the overlap one.
     n, Fd = 12, 3
     g = torch.Generator().manual_seed(17)

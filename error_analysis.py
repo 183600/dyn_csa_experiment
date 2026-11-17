@@ -60,7 +60,7 @@ def _nonnegative_int(text):
 
 
 def _positive_int(text):
-    """argparse type for geometry/budget sizes: zero would size no tensor."""
+    """argparse type for geometry sizes: zero would size no tensor."""
     value = _nonnegative_int(text)
     if value < 1:
         raise argparse.ArgumentTypeError(

@@ -19572,11 +19572,10 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                     # step.
                     _ce_item = float(ce.detach().item())
                     _comp_item = float(_comp.detach().item()) if _comp is not None else 0.0
-                    # Cost REINFORCE: `_adv` is a cost advantage (CE above an
-                    # EMA baseline = this cut pattern is WORSE). Descent on
-                    # `+adv * logp` therefore DECREASES the probability of
-                    # above-baseline-cost patterns; the opposite sign would be
-                    # gradient ascent on expected CE.
+                    # Reinforce term: `_adv` is an advantage (CE above an
+                    # EMA baseline). Descent on `+adv * logp` decreases the
+                    # probability of above-baseline patterns; the opposite
+                    # sign would be gradient ascent on expected CE.
                     _adv = _ce_item - float(_ce_baseline)
                     _bdec = max(int(getattr(_inner_model, 'boundary_decisions', 0) or 0), 1)
                     _pg = _adv * _blp / _bdec
