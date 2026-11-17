@@ -3433,9 +3433,9 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
         errs.append(f'eval.distractor_probe.mode={_probe_mode!r} is all-or-nothing and only admits rho=1.0 (got {_probe_rhos})')
     _probe_lens = [int(x) for x in (_probe_plan.get('eval_lens') or [2048, 4096])]
     _probe_target = int(_probe_plan.get('target', FINALTEST_CFG.get('target', 512)))
-    # run_finaltest now defaults an omitted probe n_seq to the FROZEN row
-    # count (the probe must score the same rows as the primary panel); the
-    # pre-flight must validate that same effective value.
+    # An omitted probe n_seq defaults to the FROZEN row count (the probe must
+    # score the same rows as the primary panel); the pre-flight must validate
+    # that same effective value.
     _probe_nseq = int(_probe_plan.get(
         'n_seq', _nseq if _nseq > 0 else FINALTEST_CFG.get('n_seq', 16)))
     if _probe_nseq <= 0:
