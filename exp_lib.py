@@ -7688,7 +7688,7 @@ def _i32_sidecar_path(path):
 def _npy_serve_int32(path):
     mm = np.load(path, mmap_mode='r')
     src = np.asarray(mm)
-    if not np.issubdtype(src.dtype, np.integer):
+    if src.dtype == bool or not np.issubdtype(src.dtype, np.integer):
         raise TypeError(f'_npy_serve_int32: expected an integer token cache at {path}, got dtype {src.dtype}')
     if src.size:
         _mn, _mx = int(src.min()), int(src.max())
@@ -13684,7 +13684,7 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
                 if _shared_counts is None:
                     _raw_train = np.asarray(train_ids)
                     if (_raw_train.size
-                            and not np.issubdtype(_raw_train.dtype, np.integer)):
+                            and (_raw_train.dtype == bool or not np.issubdtype(_raw_train.dtype, np.integer))):
                         raise TypeError(
                             'ngram baseline: train ids must be integers, got '
                             f'dtype {_raw_train.dtype}')
