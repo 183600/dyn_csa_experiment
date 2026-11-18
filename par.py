@@ -618,11 +618,16 @@ def run_jobs(jobs, ctx, phase_label="phase"):
                         # them — booking again would double-count the cell
                         # against the run-time cap).
                         _prior = _read_result(entry["result_path"])
+                        _prior_status = (
+                            _prior.get("status")
+                            if isinstance(_prior, dict) else None
+                        )
                         _prior_ok = (
-                            isinstance(_prior, dict)
-                            and isinstance(_prior.get("status"), str)
-                            and bool(_prior.get("status").strip())
-                            and _prior.get("status") != "unreadable_result"
+                            isinstance(_prior_status, str)
+                            and bool(_prior_status.strip())
+                            and _prior_status not in (
+                                "unreadable_result", "fatal", "empty_exit"
+                            )
                         )
                         _terminate_entries([entry])
                         entry["log_f"].close()

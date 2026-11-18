@@ -147,7 +147,17 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None):
         _cfg_groups.setdefault((V8._cfg_key(panel[a][_s].get('run_cfg')),
                                 V8._cfg_key(panel[b][_s].get('run_cfg'))), []).append(_s)
     if len(_cfg_groups) > 1:
-        _ranked = sorted(_cfg_groups.items(), key=lambda kv: (not (isinstance(kv[0][0], str) and V.CKPT_CODE and kv[0][0].endswith(f'_cs{V.CKPT_CODE}')), -len(kv[1]), str(kv[0])))
+        _cur_sfx = f'_cs{V.CKPT_CODE}' if V.CKPT_CODE else None
+
+        def _cfg_rank(kv):
+            _ca, _cb = kv[0]
+            _pairable = (isinstance(_ca, str) and isinstance(_cb, str)
+                         and bool(_ca) and bool(_cb) and _ca == _cb)
+            _current = (_pairable and _cur_sfx is not None
+                        and _ca.endswith(_cur_sfx) and _cb.endswith(_cur_sfx))
+            return (not _pairable, not _current, -len(kv[1]), str(kv[0]))
+
+        _ranked = sorted(_cfg_groups.items(), key=_cfg_rank)
         common = _ranked[0][1]
         print(f'[stats] {who}{name}: paired seeds span {len(_cfg_groups)} run_cfg groups — keeping only the largest/current group ({len(common)} seed(s)) instead of pooling configurations')
     dl, skipped, unstamped, why = ([], [], 0, set())
@@ -319,7 +329,7 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     for k, v in comp.items():
         if k.startswith('seq2k'):
             if 'omitted' in v:
-                A(f'| {k} | 0 | —（{v['omitted']}） | — |')
+                A(f'| {k} | 0 | —（{v['omitted']}） | — | — |')
                 continue
             A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} | {_holm_txt(v)} |')
     A('')
@@ -343,15 +353,22 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
             continue
         v = comp[k]
         if 'omitted' in v:
-            A(f'| {k} | 0 | —（{v['omitted']}） | — |')
+            A(f'| {k} | 0 | —（{v['omitted']}） | — | — |')
             continue
         A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} | {_holm_txt(v)} |')
     A('')
     _r20 = comp.get('rope20k: csa_fixed_rope - full_rope') or {}
     if _r20 and 'omitted' not in _r20:
         c = _r20
-        _dir20 = '落后' if c['mean'] > 0 else '领先'
-        _tail20 = '——与 abs-PE 长跑的「渐近线反转」方向同向；但 n<6 时精确检验下限 >0.05，只能作方向性读数，不能写「复现」或「显著」。' if c['mean'] > 0 else '——方向与 abs-PE 长跑的「渐近线反转」**相反**，「同向复现」的读法在本轮产物上不成立，以该配对数字为准。'
+        if c['mean'] > 0:
+            _dir20 = '落后'
+            _tail20 = '——与 abs-PE 长跑的「渐近线反转」方向同向；但 n<6 时精确检验下限 >0.05，只能作方向性读数，不能写「复现」或「显著」。'
+        elif c['mean'] < 0:
+            _dir20 = '领先'
+            _tail20 = '——方向与 abs-PE 长跑的「渐近线反转」**相反**，「同向复现」的读法在本轮产物上不成立，以该配对数字为准。'
+        else:
+            _dir20 = '持平'
+            _tail20 = '——Δ 恰为 0，无方向可判定，不作「同向 / 相反」的读法。'
         A(f'**结论**：RoPE 面板上 `csa_fixed_rope` {_dir20} `full_rope` **{abs(c['mean']):.2f} PPL**（n={c['n']}，p={c['p_exact_signflip']:.3f}）' + _tail20)
     _a20 = comp.get('long20k(abs): csa_fixed - full') or {}
     if _a20 and 'omitted' in _a20:

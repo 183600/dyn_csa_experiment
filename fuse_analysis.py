@@ -333,7 +333,9 @@ def main(argv=None):
             if not _gate_ok:
                 lines.append(f'> 注：{len(SEEDS) - len(_ok_seeds)} 个 seed 未通过配置/训练量配对门禁（{_why}），已按本仓库惯例排除——Δ 与 p 值只在可配对的 {_ok_seeds} 上计算，跨配置的种子差不进入检验。')
             _d_f1m = d_f1.mean()
-            _n_same = int(((d_f1 != 0) & ((d_f1 > 0) == (_d_f1m > 0))).sum())
+            _d_f1_sign = 1 if _d_f1m > 0 else (-1 if _d_f1m < 0 else 0)
+            _n_same = (int(((d_f1 != 0) & (np.sign(d_f1) == _d_f1_sign)).sum())
+                       if _d_f1_sign else 0)
             lines.append(f'- 层均边界 F1：Δ = {_d_f1m:+.4f} ± {sample_std(d_f1):.4f}，{_n_same}/{_n_f1} 同向，p({_rf1["method"]}) = {p_f1:.3f}')
             _n_ppl = len(d_ppl)
             # Both the exact enumeration and the meet-in-the-middle branch

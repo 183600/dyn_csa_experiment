@@ -98,7 +98,17 @@ def _add_paired(comparisons, name, panel, a, b, who='', outdir=None):
         _cfg_groups.setdefault((_cfg_key(panel[a][_s].get('run_cfg')),
                                 _cfg_key(panel[b][_s].get('run_cfg'))), []).append(_s)
     if len(_cfg_groups) > 1:
-        _ranked = sorted(_cfg_groups.items(), key=lambda kv: (not (isinstance(kv[0][0], str) and V.CKPT_CODE and kv[0][0].endswith(f'_cs{V.CKPT_CODE}')), -len(kv[1]), str(kv[0])))
+        _cur_sfx = f'_cs{V.CKPT_CODE}' if V.CKPT_CODE else None
+
+        def _cfg_rank(kv):
+            _ca, _cb = kv[0]
+            _pairable = (isinstance(_ca, str) and isinstance(_cb, str)
+                         and bool(_ca) and bool(_cb) and _ca == _cb)
+            _current = (_pairable and _cur_sfx is not None
+                        and _ca.endswith(_cur_sfx) and _cb.endswith(_cur_sfx))
+            return (not _pairable, not _current, -len(kv[1]), str(kv[0]))
+
+        _ranked = sorted(_cfg_groups.items(), key=_cfg_rank)
         common = _ranked[0][1]
         print(f'[stats] {who}{name}: paired seeds span {len(_cfg_groups)} run_cfg groups — keeping only the largest/current group ({len(common)} seed(s)) instead of pooling configurations')
     dl, skipped, unstamped, why = ([], [], 0, set())

@@ -785,8 +785,17 @@ def paired_row(a_records, b_records):
                      _pair_condition_tail(a_records[_tk]),
                      _pair_condition_tail(b_records[_tk]))].append(_tk)
     if len(_cfg_groups) > 1:
-        _ranked = sorted(_cfg_groups.items(),
-                         key=lambda kv: (not (isinstance(kv[0][0], str) and _CUR_CS and kv[0][0].endswith(f'_cs{_CUR_CS}')), -len(kv[1]), str(kv[0])))
+        _cfg_cur_sfx = f'_cs{_CUR_CS}' if _CUR_CS else None
+
+        def _cfg_group_rank(kv):
+            _ca, _cb = kv[0][:2]
+            _pairable = (isinstance(_ca, str) and isinstance(_cb, str)
+                         and bool(_ca) and bool(_cb) and _ca == _cb)
+            _current = (_pairable and _cfg_cur_sfx is not None
+                        and _ca.endswith(_cfg_cur_sfx) and _cb.endswith(_cfg_cur_sfx))
+            return (not _pairable, not _current, -len(kv[1]), str(kv[0]))
+
+        _ranked = sorted(_cfg_groups.items(), key=_cfg_group_rank)
         _keep_cfg, _kept_keys = _ranked[0]
         print(f'[report] paired_row: the paired seeds span {len(_cfg_groups)} training-condition groups; pooling them would fabricate n, so only the largest/current group ({len(_kept_keys)} seed(s)) is tested and the rest are skipped')
         common = _kept_keys
@@ -863,11 +872,11 @@ def sec_p0r():
         # (`is_param_matched` returns None) keep the "params 未知" tag but do
         # not assert the structural-mismatch block.
         rope_is_defect = is_param_matched(_cf_r, _fu_r) is False
-        _w_abs = '领先' if g_abs < 0 else '落后'
-        _w_absm = '领先' if g_abs_m < 0 else '落后'
-        _w_rope = '领先' if g_rope < 0 else '落后'
-        _d_abs_t = ('改善' if d_abs > 0 else '变差') + f' **{abs(d_abs):.2f}**'
-        _d_sp_t = ('改善' if d_sp > 0 else '变差') + f' **{abs(d_sp):.2f}**'
+        _w_abs = ('未知' if not math.isfinite(g_abs) else '领先' if g_abs < 0 else '落后' if g_abs > 0 else '持平')
+        _w_absm = ('未知' if not math.isfinite(g_abs_m) else '领先' if g_abs_m < 0 else '落后' if g_abs_m > 0 else '持平')
+        _w_rope = ('未知' if not math.isfinite(g_rope) else '领先' if g_rope < 0 else '落后' if g_rope > 0 else '持平')
+        _d_abs_t = ('未知' if not math.isfinite(d_abs) else '改善' if d_abs > 0 else '变差' if d_abs < 0 else '不变') + f' **{abs(d_abs):.2f}**'
+        _d_sp_t = ('未知' if not math.isfinite(d_sp) else '改善' if d_sp > 0 else '变差' if d_sp < 0 else '不变') + f' **{abs(d_sp):.2f}**'
         _gain_conf = [f'dense 臂{unmatched_tag(_fu, _fu_r)}' for _ in [1] if unmatched_tag(_fu, _fu_r)] + [f'sparse 臂{unmatched_tag(_cf, _cf_r)}' for _ in [1] if unmatched_tag(_cf, _cf_r)]
         _gain_note = f'（注：{'；'.join(_gain_conf)}，对应对比同时含容量效应）' if _gain_conf else ''
         lines += [f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL（参数对齐 `full_matched` 时{_w_absm} **{abs(g_abs_m):.2f}**；两者相差 **{g_abs - g_abs_m:+.2f} PPL**，即容量差异贡献的部分）{unmatched_tag(_cf, _mt)}。' if _has_mt else f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL。⚠ **本面板没有参数对齐的 dense 臂**（`full_matched` 缺失），该差距因此**含未剥离的容量效应**，不能作为机制性结论的依据。', f'- RoPE 面板：`csa_fixed_rope` {_w_rope} `full_rope` **{abs(g_rope):.2f}** PPL{rope_unmatched}。', f'- RoPE 使 dense {_d_abs_t}、sparse {_d_sp_t}{_gain_note}。', '']

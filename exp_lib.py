@@ -10747,6 +10747,20 @@ def wilcoxon_signed_rank_p(deltas):
     return {'p': float(p), 'method': 'normal', 'n_nonzero': n, 'w_plus': w_plus, 'w_min': w,
             'note': f'normal approximation; exact DP is used for n<={_WILCOXON_EXACT_MAX_N}'}
 
+def _stable_mean_std(values, ddof=1):
+    a = np.asarray(values, dtype=float)
+    if a.size == 0:
+        return float('nan'), float('nan')
+    ref = float(a[0])
+    shifted = a - ref
+    smean = float(shifted.mean())
+    mean = ref + smean
+    if a.size <= ddof:
+        return mean, float('nan')
+    ss = float(((shifted - smean) ** 2).sum())
+    return mean, math.sqrt(ss / (a.size - ddof))
+
+
 def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_values=None):
     """Paired contrast summary with an explicit effect-vs-seed-noise verdict.
 
@@ -10808,8 +10822,9 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
         _, _exp = math.frexp(_amax)
         if _exp:
             d = np.ldexp(d, -_exp)
-    mean = float(d.mean())
-    std = float(d.std(ddof=1)) if n > 1 else 0.0
+    mean, std = _stable_mean_std(d, ddof=1)
+    if n == 1:
+        std = 0.0
     sem = float(std / math.sqrt(n)) if n > 1 else float('nan')
     p = exact_signflip_p(d)['p']
     # d_z is scale-free; an absolute 1e-12 cutoff turns a genuinely variable
@@ -10925,6 +10940,11 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
     # value (and underflows to 0 only when it truly is below float range).
     shift = max(0, m.bit_length() - 53)
     mant = m >> shift
+    if shift:
+        rem = m - (mant << shift)
+        half = 1 << (shift - 1)
+        if rem > half or (rem == half and (mant & 1)):
+            mant += 1
     exp = shift - e
     if exp > 1023:
         return 1.0
@@ -12086,8 +12106,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         if p.get('vocab') is not None:
             row['vocab'] = p['vocab']
         if n:
-            m = float(d.mean())
-            sd = float(d.std(ddof=1)) if n > 1 else float('nan')
+            m, sd = _stable_mean_std(d, ddof=1)
             se = float(sd / math.sqrt(n)) if (n > 1 and math.isfinite(sd)) else float('nan')
             row.update({'mean': m, 'std': sd, 'se': se, 'underpowered': n < int(min_seeds)})
             if n > 1:
@@ -12278,11 +12297,13 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
                     'note': out['corpus_binding']['refusal_reason']})
         return out
     x = np.asarray([math.log10(p['scale']) if log_scale else p['scale'] for p in pts], dtype=float)
-    y = np.asarray([float(np.mean(p['effects'])) for p in pts], dtype=float)
+    y = np.asarray([_stable_mean_std(p['effects'])[0] for p in pts], dtype=float)
     n = np.asarray([float(len(p['effects'])) for p in pts], dtype=float)
     sw = float(n.sum())
-    xbar = float((n * x).sum() / sw)
-    ybar = float((n * y).sum() / sw)
+    xref = float(x[0])
+    yref = float(y[0])
+    xbar = xref + float((n * (x - xref)).sum() / sw)
+    ybar = yref + float((n * (y - yref)).sum() / sw)
     sxx = float((n * (x - xbar) ** 2).sum())
     if sxx <= 0.0:
         out.update({'status': 'degenerate_scale_axis', 'verdict': 'degenerate_scale_axis'})
@@ -12290,14 +12311,14 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     slope = float((n * (x - xbar) * (y - ybar)).sum() / sxx)
     intercept = float(ybar - slope * xbar)
     k = len(pts)
-    resid = y - (slope * x + intercept)
+    resid = (y - ybar) - slope * (x - xbar)
     wls = {'slope': slope, 'intercept': intercept, 'x_transform': 'log10' if log_scale else 'linear',
            'weights': 'n_seeds per scale', 'r2': (1.0 - float((n * resid ** 2).sum() / (n * (y - ybar) ** 2).sum())) if float((n * (y - ybar) ** 2).sum()) > 0 else float('nan')}
     if k > 2:
         sigma2 = float((n * resid ** 2).sum() / (k - 2))
         se = float(math.sqrt(sigma2 / sxx))
         tc = _t_critical(1.0 - float(alpha), k - 2)
-        tstat = slope / se if se > 0 else float('inf')
+        tstat = slope / se if se > 0 else (0.0 if abs(slope) <= 1e-15 else float('inf'))
         wls.update({'se': se, 'ci': [slope - tc * se, slope + tc * se],
                     'p': student_t_two_sided_p(tstat, k - 2), 'df': k - 2})
     out['wls'] = wls
@@ -12320,14 +12341,17 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         slopes = []
         for s in complete:
             yy = np.asarray([by_seed[s][lb] for lb in labels], dtype=float)
-            yybar = float(yy.mean())
-            slopes.append(float(((x - xbar_s) * (yy - yybar)).sum() / sxx_s))
+            ref = float(yy[0])
+            shifted = yy - ref
+            yybar = float(shifted.mean())
+            slopes.append(float(((x - xbar_s) * (shifted - yybar)).sum() / sxx_s))
         slopes = np.asarray(slopes, dtype=float)
         st = paired_effect_stats(slopes, alpha=alpha, min_n=min_seeds)
         tc = _t_critical(1.0 - float(alpha), len(slopes) - 1)
-        se_s = float(slopes.std(ddof=1) / math.sqrt(len(slopes))) if len(slopes) > 1 else float('nan')
-        paired.update({'slope_mean': float(slopes.mean()), 'slope_std': float(slopes.std(ddof=1)) if len(slopes) > 1 else float('nan'),
-                       'se': se_s, 'ci': [float(slopes.mean()) - tc * se_s, float(slopes.mean()) + tc * se_s] if math.isfinite(se_s) else None,
+        _sm, _ss = _stable_mean_std(slopes, ddof=1)
+        se_s = float(_ss / math.sqrt(len(slopes))) if len(slopes) > 1 else float('nan')
+        paired.update({'slope_mean': _sm, 'slope_std': _ss if len(slopes) > 1 else float('nan'),
+                       'se': se_s, 'ci': [_sm - tc * se_s, _sm + tc * se_s] if math.isfinite(se_s) else None,
                        'p_exact_signflip': st['p_exact_signflip'], 'p_floor': st['p_floor'],
                        'resolution_limited': st['resolution_limited'], 'underpowered': st['underpowered'],
                        'within_seed_noise': st['within_seed_noise'], 'significant': st['significant'],
@@ -12368,7 +12392,9 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         _df_pe = 0
         for p in pts:
             _eff = np.asarray(p['effects'], dtype=float)
-            _ss_pe += float(((_eff - float(_eff.mean())) ** 2).sum())
+            if _eff.size:
+                _shift = _eff - float(_eff[0])
+                _ss_pe += float(((_shift - float(_shift.mean())) ** 2).sum())
             _df_pe += len(_eff) - 1
         _ss_lof = float((n * resid ** 2).sum())
         _c = float(n.sum() - (n ** 2).sum() / n.sum())
@@ -12420,10 +12446,12 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     # that when the paired slope is the primary inference.
     het_for_verdict = out.get('heterogeneity') or {}
     if paired_primary:
-        _yc = np.asarray([float(np.mean([by_seed[s][lb] for s in complete])) for lb in labels], dtype=float)
+        _yc = np.asarray([_stable_mean_std([by_seed[s][lb] for s in complete])[0] for lb in labels], dtype=float)
         _sp = float(paired['slope_mean'])
-        _ip = float(_yc.mean() - _sp * x.mean())
-        _rp = _yc - (_sp * x + _ip)
+        _yc_bar = _stable_mean_std(_yc)[0]
+        _x_bar_p = float(x.mean())
+        _ip = float(_yc_bar - _sp * _x_bar_p)
+        _rp = (_yc - _yc_bar) - _sp * (x - _x_bar_p)
         _cp = float(len(complete))
         _q_p = float((_cp * _rp ** 2).sum())
         _df_p = k - 2
@@ -12434,7 +12462,8 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         _ss_pe_p = 0.0
         for lb in labels:
             _ce = np.asarray([by_seed[s][lb] for s in complete], dtype=float)
-            _ss_pe_p += float(((_ce - float(_ce.mean())) ** 2).sum())
+            _shift = _ce - float(_ce[0])
+            _ss_pe_p += float(((_shift - float(_shift.mean())) ** 2).sum())
         _df_pe_p = k * (len(complete) - 1)
         _c_p = _cp * (k - 1)
         if _df_p > 0 and _df_pe_p > 0 and _ss_pe_p > 0.0:
@@ -15810,17 +15839,21 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     st['compute_control'] = _cc
                     st['compute_matched'] = _cc.get('compute_matched')
                     if _cc.get('compute_matched') is False and isinstance(st.get('mean'), (int, float)) and math.isfinite(float(st['mean'])):
-                        _better = a if float(st['mean']) < 0 else b
-                        _more = _cc.get('more_compute_arm')
-                        _bias = ('favors_claimed_winner' if _more == _better else 'conservative_against_claimed_winner')
-                        st['compute_confound_direction'] = _bias
-                        st['compute_ratio'] = max(_cc.get('time_ratio_a_over_b') or 1.0, 1.0 / (_cc.get('time_ratio_a_over_b') or 1.0)) if _cc.get('time_ratio_a_over_b') else max(_cc.get('proxy_ratio_a_over_b') or 1.0, 1.0 / (_cc.get('proxy_ratio_a_over_b') or 1.0))
-                        if _bias == 'favors_claimed_winner' and float(st['compute_ratio']) > 1.5:
-                            st['mechanism_claim_allowed'] = False
-                            report.setdefault('compute_confounded', []).append(
-                                '%s vs %s: the arm that wins by %.2f PPL also consumed about %.2fx the compute (%s); '
-                                'the measured difference is not separable from the compute difference'
-                                % (a, b, abs(float(st['mean'])), float(st['compute_ratio']), _cc.get('compute_matched_source')))
+                        _mean_sign = _sign_of(st['mean'])
+                        if _mean_sign == 0:
+                            st['compute_confound_direction'] = 'no_observed_winner'
+                        else:
+                            _better = a if _mean_sign < 0 else b
+                            _more = _cc.get('more_compute_arm')
+                            _bias = ('favors_claimed_winner' if _more == _better else 'conservative_against_claimed_winner')
+                            st['compute_confound_direction'] = _bias
+                            st['compute_ratio'] = max(_cc.get('time_ratio_a_over_b') or 1.0, 1.0 / (_cc.get('time_ratio_a_over_b') or 1.0)) if _cc.get('time_ratio_a_over_b') else max(_cc.get('proxy_ratio_a_over_b') or 1.0, 1.0 / (_cc.get('proxy_ratio_a_over_b') or 1.0))
+                            if _bias == 'favors_claimed_winner' and float(st['compute_ratio']) > 1.5:
+                                st['mechanism_claim_allowed'] = False
+                                report.setdefault('compute_confounded', []).append(
+                                    '%s vs %s: the arm that wins by %.2f PPL also consumed about %.2fx the compute (%s); '
+                                    'the measured difference is not separable from the compute difference'
+                                    % (a, b, abs(float(st['mean'])), float(st['compute_ratio']), _cc.get('compute_matched_source')))
                     if _a_vals and _b_vals:
                         _a_mean = float(np.mean(_a_vals))
                         _b_mean = float(np.mean(_b_vals))
