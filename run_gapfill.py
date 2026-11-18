@@ -630,10 +630,8 @@ def run_overfit(cfg=None, variants=None, steps=None):
             'provenance': _prov,
             'reports': _repro,
         })
-    # No reports (explicit CSA_SKIP_REPRO / all cached) means NO evidence, not
-    # a pass: all([]) is True, so recording `passed: True, n_reports: 0` would
-    # claim a same-seed check that never ran.  Match panel_start's contract and
-    # emit None instead.
+    # No reports (explicit CSA_SKIP_REPRO / all cached) is absence of evidence,
+    # not a pass, so emit None like panel_start does.
     _repro_doc = {'passed': _repro_passed, 'n_reports': len(_repro)} if _repro else None
     L.log_experiment_event(cfg['outdir'], {'kind': 'preflight', 'tracking_schema': 2, 'status': ('ok' if ok and _repro_passed else 'failed'), 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'run_cfg': _pfp, 'sanity': {'passed': ok, 'n_reports': len(reports)}, 'reproducibility': _repro_doc})
     if not ok:

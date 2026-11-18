@@ -251,8 +251,7 @@ def run_overfit_check(variants=None, steps=250, arch=None, seq_len=None, vocab=2
             'reports': _repro,
         })
     # Zero reports (explicit skip / all cached) is absence of evidence, not a
-    # pass: all([]) is True.  Emit None like panel_start does instead of
-    # recording `passed: True, n_reports: 0`.
+    # pass, so emit None like panel_start does.
     _repro_doc = {'passed': _repro_passed, 'n_reports': len(_repro)} if _repro else None
     L.log_experiment_event('results_overfit_sanity_m0', {'kind': 'preflight', 'tracking_schema': 2, 'status': ('ok' if ok and _repro_passed else 'failed'), 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'run_cfg': _pfp, 'sanity': {'passed': ok, 'n_reports': len(reports)}, 'reproducibility': _repro_doc})
     if not ok:

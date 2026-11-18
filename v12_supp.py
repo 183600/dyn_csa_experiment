@@ -3243,10 +3243,8 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             # NOT required — v3 explicitly removed the all-12-seeds veto —
             # and the init-core digests are instrumentation, not decision
             # inputs.
-            # Use the manifest's declared confirmation floor, not the helper's
-            # legacy default (8).  `finaltest_stats` passes len(manifest['seeds'])
-            # (12); without the same floor here the report can list a
-            # comparison as confirmed even though the stats artifact does not.
+            # Use the manifest's declared confirmation floor so the report and
+            # the stats artifact apply the same gate.
             _floor = None
             _stat_m = m.get('statistics') or {}
             if isinstance(_stat_m, dict) and _stat_m.get('min_seeds_for_confirmation') is not None:

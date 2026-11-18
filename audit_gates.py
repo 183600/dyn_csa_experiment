@@ -1681,10 +1681,9 @@ def audit_boundary(outdirs=None):
                 if not (0.0 <= p <= 1.0 and 0.0 <= rp <= 1.0):
                     bad.append(f'{key}: precision/random_precision outside [0,1] ({p!r}, {rp!r})')
                     continue
-                # Decide the tie FIRST.  Checking `p > rp` before the 1e-9
-                # tolerance made a precision a hair above the baseline (e.g.
-                # 5e-10) "exceed" and pass the gate, even though the code's own
-                # tolerance calls that a block-length artifact (a failed claim).
+                # The tie tolerance takes precedence over the comparison: a
+                # precision within 1e-9 of the random baseline is a
+                # block-length artifact, not an "exceeds" result.
                 if abs(p - rp) < 1e-9:
                     verdict = 'at baseline (block-length artifact)'
                 elif p > rp:
