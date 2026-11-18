@@ -228,18 +228,7 @@ python v10_supp.py analysis       # 零 GPU 统计 -> analysis_v10/
 python v10_supp.py report         # 从磁盘重建 REPORT_v10.md（零 GPU）
 ```
 
-阶段（均可续跑）：P3MT（重训两个 RoPE 臂，P1L 配方）、P3MTC（**同预算
-从头训练的选择器对照**：`csa_fixed_rope_randidx` / `csa_fixed_rope_allblocks`，
-后者同时充当逐项对齐的 dense 孪生臂）、P3MP（仅评估的远距离干扰注入：
-成对污染上下文、干净的 512-token 目标，对比 learned-selection / dense /
-random-indexer / see-everything 各臂，**uniform / realistic-token（natural）/
-mask / delete + 评审二轮新增 span / doc / topical 腐坏模式** + NIAH-natural
-远端必要信息任务）、P3T（topk 扫描 seeds 2/3 → n=4）、P3SS/P3SL（
-d=128/4L 8000 步与 d=512/10L 4000 步交叉面板）、P3SL2/P3SL3（**等 token
-与 6ND 参数量代理预算的大模型臂**——规模混杂修复，代理 ≠ 实测等
-FLOPs，见 `docs/design_notes.md` §16）。成对污染协议、预注册交叉判据、
-腐坏模式/ΔNLL 口径（§15）与「测试时干预 vs 从头训练对照」的区别
-（§18）见 `docs/design_notes.md`。
+阶段（均可续跑）：P3MT、P3MTC、P3MP、P3T、P3SS/P3SL、P3SL2/P3SL3。详见驱动脚本与 `docs/design_notes.md`。
 
 ### v12 确认套件（探索 / 确认分离）
 
@@ -265,11 +254,9 @@ V12_REFREEZE=1 显式改冻结并把前轮降级为探索性）。test split
 phase 只读 train/valid。首次 test split 评估之后禁止追加冻结比较或种子
 （构造性选择偏差，见 `DECISION_LOG.md`）。
 
-**范围声明（评审二轮·意见四）**：本确认只覆盖**固定分块 CSA 机制**的主张；
-动态分块优于固定分块、动态边界的语义价值、HCA 的优劣与动态分块的规模
-规律**不在本确认内**，需要各自的预注册冻结。
+**范围声明**：本确认只覆盖**固定分块 CSA 机制**的主张；动态分块优于固定分块、动态边界的语义价值、HCA 的优劣与动态分块的规模规律**不在本确认内**，需要各自的预注册冻结。
 
-**可执行审计入口（评审二轮·意见十一，零实验）**：
+**可执行审计入口（零实验）**：
 
 ```bash
 python audit_gates.py causality   # 纯 CPU 单元审计：前缀不变性 / 标签移位 / 解码一致性
