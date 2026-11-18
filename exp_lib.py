@@ -22173,6 +22173,19 @@ def aggregate(summary, *, outdir=None):
     def _agg_key(v, tag, fp_idx=None):
         key = v if not tag else f'{v}#{tag}'
         return key if fp_idx is None else f'{key}@cfg{fp_idx}'
+
+    def _group_params(_recs):
+        # One exact parameter count shared by the whole group — or None when
+        # any record omits/carries a malformed or different count.
+        _vals = {_as_seed_int(r.get('params')) for r in (_recs or ())}
+        _vals = {v for v in _vals if v is not None and v > 0}
+        return next(iter(_vals)) if len(_vals) == 1 else None
+
+    def _rel_param_diff(_a, _b):
+        if _a is None or _b is None:
+            return None
+        return abs(_a - _b) / float(max(_a, _b))
+
     for (v, tag), recs in per_variant.items():
         if _steps_ok(recs):
             _split_groups.append(((v, tag, None), recs))
@@ -22426,18 +22439,6 @@ def aggregate(summary, *, outdir=None):
         # and those counts use the same exact-integer normalisation.
         return json.dumps([rec.get('run_cfg'), [_count_id(rec, k) for k in PAIR_STEP_KEYS]], sort_keys=True, default=str)
 
-    def _group_params(_recs):
-        # One exact parameter count shared by the whole group — or None when
-        # any record omits/carries a malformed or different count.
-        _vals = {_as_seed_int(r.get('params')) for r in (_recs or ())}
-        _vals = {v for v in _vals if v is not None and v > 0}
-        return next(iter(_vals)) if len(_vals) == 1 else None
-
-    def _rel_param_diff(_a, _b):
-        if _a is None or _b is None:
-            return None
-        return abs(_a - _b) / float(max(_a, _b))
-
     def _baseline_for(tag, fp_idx, base_groups, recs):
         _want = _cfg_fp_noparam(recs[0]) if recs else None
         if _want is not None:
@@ -22453,8 +22454,8 @@ def aggregate(summary, *, outdir=None):
                     _matches.sort(key=lambda item: (_rel_param_diff(_arm_p, _group_params(item[1]))
                                                     if _rel_param_diff(_arm_p, _group_params(item[1])) is not None
                                                     else 2.0))
-                _g, _t = _matches[0]
-                return (_g, _t[0])
+                _k, _recs = _matches[0]
+                return (_recs, _k[0])
         for _cand in ((tag, fp_idx), (tag, None), ('', None)):
             if _cand in base_groups:
                 return (base_groups[_cand], _cand[0])
