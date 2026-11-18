@@ -1394,13 +1394,23 @@ def run_warmup_cell_job(job):
     cfg = dict(job['cfg'])
     guard = L.TimeGuard(job['guard_cap']) if job.get('guard_cap') else None
     L.set_seed(int(job['seed']))
-    train_ids, val_batch, vocab, _, val_bnd = L.load_wikitext(cfg['seq_len'], cfg['n_train_tokens'])
+    train_ids, val_batch, vocab, _, val_bnd = L.load_run_corpus(cfg)
     # pin determinism BEFORE the fingerprint (run_warmup does the same in the
     # parent; `_warm_fp` embeds `determinism_label()`)
     if torch.cuda.is_available():
         L._pin_cuda_determinism()
+    d = cfg.get('d', 256)
+    n_layers = cfg.get('n_layers', 6)
+    n_heads = cfg.get('n_heads', 8)
+    d_head = cfg.get('d_head', 32)
+    matched = set(PARAM_MATCHED_V7) | {'full_matched', 'full_sw128_matched'}
+    v = job['v']
+    ratios = {v: L.variant_mlp_ratio(
+        v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head,
+        seq_len=cfg['seq_len'], matched=matched,
+        ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'))}
     fp = _warm_fp(cfg, vocab, train_ids, val_batch)
-    return run_warmup_cell(cfg, job['v'], job['extra']['warm'], job['seed'], guard=guard, ratios={}, fp=fp, train_ids=train_ids, val_batch=val_batch, vocab=vocab, val_bnd=val_bnd, prebook=True)
+    return run_warmup_cell(cfg, v, job['extra']['warm'], job['seed'], guard=guard, ratios=ratios, fp=fp, train_ids=train_ids, val_batch=val_batch, vocab=vocab, val_bnd=val_bnd, prebook=True)
 
 
 def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), variants=('csa_fixed',), par=None):

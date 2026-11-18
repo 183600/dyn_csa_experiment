@@ -146,29 +146,13 @@ def _atomic_json(path, obj):
 
 def _load_summary(outdir):
     p = os.path.join(outdir, 'summary.json')
-    if os.path.exists(p):
-        try:
-            with open(p, encoding='utf-8') as f:
-                d = json.load(f)
-        except Exception as e:
-            # An existing-but-unreadable summary is corrupt evidence, not an
-            # empty panel: silently returning {} would let the next save
-            # overwrite it (and make the lost cells look like they never ran).
-            raise ValueError(
-                f'open-block summary {p} exists but cannot be parsed '
-                f'({type(e).__name__}: {e}); move it aside to start fresh') from e
-        if not isinstance(d, dict):
-            # Valid JSON but the wrong shape is corrupt evidence, not an empty
-            # panel: silently returning {} would let the next save overwrite
-            # whatever records the file still holds.
-            raise ValueError(f'open-block summary {p} is valid JSON but not an object '
-                             f'({type(d).__name__}); refusing to overwrite it')
-        return d
-    return {}
+    if not os.path.exists(p):
+        return {}
+    return L.locked_json_read(p)
 
 
 def _save_summary(outdir, summary):
-    _atomic_json(os.path.join(outdir, 'summary.json'), summary)
+    L.locked_json_update(os.path.join(outdir, 'summary.json'), lambda _obj: summary)
 
 
 def _finite_float(value):
@@ -224,7 +208,8 @@ def _wikitext_data(cfg):
 def _run_one(cfg, *, variant, seed, train_ids, val_batch, vocab, val_bnd,
              outdir, fp, device, max_hours=None):
     key = f'{variant}::seed{int(seed)}'
-    summary = _load_summary(outdir)
+    spath = os.path.join(outdir, 'summary.json')
+    summary = L.locked_json_read(spath) if os.path.exists(spath) else {}
     _stored = summary.get(key)
     if (_is_current(_stored, fp)
             and isinstance(_stored, dict)
@@ -267,9 +252,16 @@ def _run_one(cfg, *, variant, seed, train_ids, val_batch, vocab, val_bnd,
         amp_dtype=rec.get('amp_dtype', 'auto'),
         eager_batch=rec.get('eager_batch', False))
     rec['hyperparams']['open_block_config'] = rec.get('open_block_config')
-    summary[key] = rec
-    _save_summary(outdir, summary)
-    print(f'[open-block] {key}: NLL/token={float(rec["nll_sum"]) / max(int(rec["n_tokens"]), 1):.6f} PPL={rec["ppl"]:.4f}')
+
+    def _apply(summary):
+        summary[key] = rec
+        return summary
+    L.locked_json_update(spath, _apply)
+    _nll_sum = _finite_float(rec.get('nll_sum'))
+    _n_tok = L._as_seed_int(rec.get('n_tokens'))
+    _ppl = _finite_float(rec.get('ppl'))
+    _nll_tok = (_nll_sum / max(int(_n_tok), 1)) if (_nll_sum is not None and _n_tok) else None
+    print(f'[open-block] {key}: NLL/token={_nll_tok if _nll_tok is not None else "n/a"} PPL={_ppl if _ppl is not None else rec.get("ppl")}')
     return rec
 
 

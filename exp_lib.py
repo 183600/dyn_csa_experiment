@@ -1025,7 +1025,8 @@ def _segment(n, want_cut_list, min_block, max_block):
         hit = _SEGMENT_CACHE.get(key)
         if hit is not None:
             _SEGMENT_CACHE.move_to_end(key)
-            return hit
+            bids_h, hon_h, counts_h = hit
+            return (bids_h.copy(), dict(hon_h), counts_h.copy() if hasattr(counts_h, 'copy') else list(counts_h))
     # `want_cut_list` arrives as a python list (per-row `.tolist()`) or as a
     # numpy bool row (the batched `_hoist_blocks_from_cuts` path); normalising
     # through np.asarray is a no-op for the latter.  Same booleans either way.
@@ -1077,7 +1078,7 @@ def _segment(n, want_cut_list, min_block, max_block):
         if cacheable:
             while len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
                 _SEGMENT_CACHE.popitem(last=False)
-            _SEGMENT_CACHE[key] = (bids, honoured, counts)
+            _SEGMENT_CACHE[key] = (bids.copy(), dict(honoured), counts.copy() if hasattr(counts, 'copy') else list(counts))
         return (bids, honoured, counts)
     # Successor-table form of the original greedy scan: with p the start of
     # the current block, the next block start is f(p) = min(p + max_block,
@@ -1127,7 +1128,7 @@ def _segment(n, want_cut_list, min_block, max_block):
     if cacheable:
         while len(_SEGMENT_CACHE) >= _SEGMENT_CACHE_CAP:
             _SEGMENT_CACHE.popitem(last=False)
-        _SEGMENT_CACHE[key] = (bids, honoured, counts)
+        _SEGMENT_CACHE[key] = (bids.copy(), dict(honoured), counts.copy() if hasattr(counts, 'copy') else list(counts))
     return (bids, honoured, counts)
 
 _H2D_POOL = {}
@@ -1209,8 +1210,8 @@ def _h2d_stage(shape, dtype, device):
                             ev2 = torch.cuda.Event()
                             ev2.record()
                     except BaseException:
-                        # Keep the conservative reservation: an enqueue may
-                        # already have succeeded before the failure.
+                        with _H2D_POOL_LOCK:
+                            _slot[1] = None
                         raise
                     with _H2D_POOL_LOCK:
                         _slot[1] = ev2
@@ -1314,10 +1315,15 @@ def _d2h_stage(shape, dtype, device):
                 slots[i][1] = _D2H_BUSY
 
                 def sync(_buf=buf, _slot=slots[i], _device=device):
-                    with torch.inference_mode(False), torch.cuda.device(_device):
-                        ev2 = torch.cuda.Event()
-                        ev2.record()
-                        ev2.synchronize()
+                    try:
+                        with torch.inference_mode(False), torch.cuda.device(_device):
+                            ev2 = torch.cuda.Event()
+                            ev2.record()
+                            ev2.synchronize()
+                    except BaseException:
+                        with _D2H_POOL_LOCK:
+                            _slot[1] = None
+                        raise
                     with _D2H_POOL_LOCK:
                         _slot[1] = ev2
                     return _buf

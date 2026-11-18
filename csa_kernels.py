@@ -763,13 +763,17 @@ class FusedPool(torch.autograd.Function):
             comp = _pool_fwd_triton(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b)
         else:
             comp = _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b)
-        ctx.save_for_backward(Xa, Xb, Za, Zb, B_pos_a, B_pos_b, bid)
+        # Xb/Zb may be None (single-stream/HCA pool); save_for_backward rejects None.
+        ctx.save_for_backward(Xa, Za, B_pos_a, B_pos_b, bid)
+        ctx.Xb = Xb
+        ctx.Zb = Zb
         ctx.geom = geom
         return comp
 
     @staticmethod
     def backward(ctx, dcomp):
-        Xa, Xb, Za, Zb, B_pos_a, B_pos_b, bid = ctx.saved_tensors
+        Xa, Za, B_pos_a, B_pos_b, bid = ctx.saved_tensors
+        Xb, Zb = ctx.Xb, ctx.Zb
         geom = ctx.geom
         if dcomp is None:
             return (None,) * 9
@@ -1121,13 +1125,16 @@ class FusedIndexer(torch.autograd.Function):
             idx, valid, soft = _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=need_soft)
         else:
             idx, valid, soft = _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk, need_soft=need_soft)
-        ctx.save_for_backward(qI, kI, w_idx, last_tok, idx, valid, soft)
+        # soft may be None when the prior is not requested/needed.
+        ctx.save_for_backward(qI, kI, w_idx, last_tok, idx, valid)
+        ctx.soft = soft
         ctx.topk = int(topk)
         return idx, valid, soft
 
     @staticmethod
     def backward(ctx, gidx, gvalid, gs):
-        qI, kI, w_idx, last_tok, idx, valid, soft = ctx.saved_tensors
+        qI, kI, w_idx, last_tok, idx, valid = ctx.saved_tensors
+        soft = ctx.soft
         if gs is None:
             return (None,) * 7
         ng = ctx.needs_input_grad
@@ -1155,7 +1162,11 @@ def lightning_indexer_kernel(qI, kI, w_idx, last_tok, topk, impl=None, need_soft
     路径。    qI [R,T,nIH,hd]、kI [R,Bm,nIH,hd]、w_idx [R,T,nIH]、
     last_tok [R,Bm]。返回 (idx, valid, soft)。"""
     impl = impl or _op_impl('IDX')
-    return FusedIndexer.apply(impl, qI, kI, w_idx, last_tok, int(topk), bool(need_soft))
+    # grad is only needed when some differentiable input actually requires it.
+    need_soft = bool(need_soft) or any(
+        isinstance(t, torch.Tensor) and t.requires_grad
+        for t in (qI, kI, w_idx))
+    return FusedIndexer.apply(impl, qI, kI, w_idx, last_tok, int(topk), need_soft)
 
 
 # ============================================================================
@@ -1521,7 +1532,11 @@ class FusedSparseAttention(torch.autograd.Function):
             out = _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale, idx_arange)
         else:
             out = _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale)
-        ctx.save_for_backward(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink)
+        # valid/soft/sink may be None (HCA, no prior, no sink).
+        ctx.save_for_backward(q, k_blk, v_blk, k_sw, v_sw, topk_idx, last_tok)
+        ctx.valid = valid
+        ctx.soft = soft
+        ctx.sink = sink
         # 反向必须跑与前向同一个后端：前向拿到的是调用方解析好的 impl
         # （gathered_attention_kernel 经 _op_impl('ATTN')）。
         ctx.impl = impl
@@ -1532,7 +1547,8 @@ class FusedSparseAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO):
-        q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink = ctx.saved_tensors
+        q, k_blk, v_blk, k_sw, v_sw, topk_idx, last_tok = ctx.saved_tensors
+        valid, soft, sink = ctx.valid, ctx.soft, ctx.sink
         if dO is None:
             return (None,) * 13
         dO = dO.contiguous()
@@ -2457,6 +2473,8 @@ def _pool_fwd_triton(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
     triton = K.triton
     R, T, C = Xa.shape
     Bm = geom.Bm
+    if T == 0:
+        return torch.zeros((R, Bm, C), device=Xa.device, dtype=Xa.dtype)
     L, W = geom.max_len, geom.W_b
     has_b = Xb is not None and W > 0
     Xa = Xa.contiguous()
