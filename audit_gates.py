@@ -1681,7 +1681,17 @@ def audit_boundary(outdirs=None):
                 if not (0.0 <= p <= 1.0 and 0.0 <= rp <= 1.0):
                     bad.append(f'{key}: precision/random_precision outside [0,1] ({p!r}, {rp!r})')
                     continue
-                agg.append({'key': key, 'precision': p, 'random_baseline': rp, 'excess': p - rp, 'ratio': (p / rp) if rp else None, 'verdict': 'exceeds random baseline' if p > rp else ('at baseline (block-length artifact)' if abs(p - rp) < 1e-9 else 'below baseline')})
+                # Decide the tie FIRST.  Checking `p > rp` before the 1e-9
+                # tolerance made a precision a hair above the baseline (e.g.
+                # 5e-10) "exceed" and pass the gate, even though the code's own
+                # tolerance calls that a block-length artifact (a failed claim).
+                if abs(p - rp) < 1e-9:
+                    verdict = 'at baseline (block-length artifact)'
+                elif p > rp:
+                    verdict = 'exceeds random baseline'
+                else:
+                    verdict = 'below baseline'
+                agg.append({'key': key, 'precision': p, 'random_baseline': rp, 'excess': p - rp, 'ratio': (p / rp) if rp else None, 'verdict': verdict})
             out['panels'][d] = agg
             out.setdefault('cells_audited', {})[d] = len(agg)
             if bad:
@@ -2518,7 +2528,15 @@ def measure_prefill_decode(model, ids, device, warmup=1, iters=3):
         print(f'[audit] NOTE: exp_lib.measure_efficiency unavailable ({type(_e).__name__}: {_e}); using the local fallback')
     import torch
     import time as _t
-    res = {'n_tokens': int(ids.shape[1])}
+    n_tokens = int(ids.shape[1])
+    iters = max(1, int(iters))  # same floor as exp_lib.measure_efficiency
+    res = {'n_tokens': n_tokens}
+    if n_tokens < 1:
+        # An empty sequence has no prefill to time; without this guard the
+        # prefix sweep below would divide by n_dec == 0.
+        res.update({'status': 'refused_empty_sequence',
+                    'error': 'empty token sequence: prefill/decode timing is undefined'})
+        return res
     model.eval()
     with torch.inference_mode():
         for _ in range(warmup):
@@ -2533,7 +2551,7 @@ def measure_prefill_decode(model, ids, device, warmup=1, iters=3):
             torch.cuda.synchronize()
         res['prefill_ms_per_iter'] = (_t.perf_counter() - t0) * 1000.0 / iters
         t0 = _t.perf_counter()
-        n_dec = min(32, int(ids.shape[1]))
+        n_dec = min(32, n_tokens)
         for t in range(1, n_dec + 1):
             model(ids[:, :t])
         _per_tok = (_t.perf_counter() - t0) * 1000.0 / n_dec

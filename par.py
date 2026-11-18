@@ -35,6 +35,16 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(REPO, "par_jobs")
 _OFF = ("", "0", "no", "off", "false", "none", "serial")
 
+# A result file carrying one of these statuses is NOT a completed measurement:
+# the child crashed (fatal), exited before producing a result (empty_exit), its
+# JSON could not be read (unreadable_result), or the dispatcher killed it
+# (watchdog_timeout).  Both the watchdog-adoption path and the normal
+# completion path must reject the same set, otherwise a lost cell is silently
+# recorded as done and disappears from the panel summary.
+_INVALID_RESULT_STATUSES = frozenset(
+    ("unreadable_result", "fatal", "empty_exit", "watchdog_timeout")
+)
+
 
 def _torch():
     try:
@@ -625,9 +635,7 @@ def run_jobs(jobs, ctx, phase_label="phase"):
                         _prior_ok = (
                             isinstance(_prior_status, str)
                             and bool(_prior_status.strip())
-                            and _prior_status not in (
-                                "unreadable_result", "fatal", "empty_exit"
-                            )
+                            and _prior_status not in _INVALID_RESULT_STATUSES
                         )
                         _terminate_entries([entry])
                         entry["log_f"].close()
@@ -682,7 +690,7 @@ def run_jobs(jobs, ctx, phase_label="phase"):
                     isinstance(result, dict)
                     and isinstance(status, str)
                     and bool(status.strip())
-                    and status != "unreadable_result"
+                    and status not in _INVALID_RESULT_STATUSES
                 )
                 if rc != 0 or not valid_result:
                     _dump_log_tail(entry)

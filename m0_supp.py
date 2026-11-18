@@ -240,16 +240,21 @@ def run_overfit_check(variants=None, steps=250, arch=None, seq_len=None, vocab=2
         })
         L.log_experiment_event('results_overfit_sanity_m0', {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'm0_repro', 'run_cfg': _pfp, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'error': f'{_fe}', 'reproducibility': {'passed': False, 'n_reports': len(_reports)}})
         raise
+    _repro_passed = all(bool(r.get('passed')) for r in _repro)
     if _repro:
         L.atomic_write_json('results_overfit_sanity_m0/reproducibility.json', {
             'kind': 'duplicate_run_reproducibility_panel',
             'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
             'run_cfg': _pfp,
-            'passed': all(bool(r.get('passed')) for r in _repro),
+            'passed': _repro_passed,
             'provenance': _prov,
             'reports': _repro,
         })
-    L.log_experiment_event('results_overfit_sanity_m0', {'kind': 'preflight', 'tracking_schema': 2, 'status': ('ok' if ok and all(bool(r.get('passed')) for r in _repro) else 'failed'), 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'run_cfg': _pfp, 'sanity': {'passed': ok, 'n_reports': len(reports)}, 'reproducibility': {'passed': all(bool(r.get('passed')) for r in _repro), 'n_reports': len(_repro)}})
+    # Zero reports (explicit skip / all cached) is absence of evidence, not a
+    # pass: all([]) is True.  Emit None like panel_start does instead of
+    # recording `passed: True, n_reports: 0`.
+    _repro_doc = {'passed': _repro_passed, 'n_reports': len(_repro)} if _repro else None
+    L.log_experiment_event('results_overfit_sanity_m0', {'kind': 'preflight', 'tracking_schema': 2, 'status': ('ok' if ok and _repro_passed else 'failed'), 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'run_cfg': _pfp, 'sanity': {'passed': ok, 'n_reports': len(reports)}, 'reproducibility': _repro_doc})
     if not ok:
         _bad = [r['variant'] for r in reports if not r['passed']]
         raise RuntimeError(f'small-batch overfit sanity check FAILED for {_bad} — do NOT start training; inspect results_overfit_sanity_m0/overfit_sanity.json')

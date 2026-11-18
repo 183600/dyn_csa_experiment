@@ -620,16 +620,22 @@ def run_overfit(cfg=None, variants=None, steps=None):
         })
         L.log_experiment_event(cfg['outdir'], {'kind': 'preflight', 'tracking_schema': 2, 'status': 'failed', 'stage': 'gapfill_repro', 'run_cfg': _pfp, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'error': f'{_fe}', 'reproducibility': {'passed': False, 'n_reports': len(_reports)}})
         raise
+    _repro_passed = all(bool(r.get('passed')) for r in _repro)
     if _repro:
         L.atomic_write_json(os.path.join(cfg['outdir'], 'reproducibility.json'), {
             'kind': 'duplicate_run_reproducibility_panel',
             'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
             'run_cfg': _pfp,
-            'passed': all(bool(r.get('passed')) for r in _repro),
+            'passed': _repro_passed,
             'provenance': _prov,
             'reports': _repro,
         })
-    L.log_experiment_event(cfg['outdir'], {'kind': 'preflight', 'tracking_schema': 2, 'status': ('ok' if ok and all(bool(r.get('passed')) for r in _repro) else 'failed'), 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'run_cfg': _pfp, 'sanity': {'passed': ok, 'n_reports': len(reports)}, 'reproducibility': {'passed': all(bool(r.get('passed')) for r in _repro), 'n_reports': len(_repro)}})
+    # No reports (explicit CSA_SKIP_REPRO / all cached) means NO evidence, not
+    # a pass: all([]) is True, so recording `passed: True, n_reports: 0` would
+    # claim a same-seed check that never ran.  Match panel_start's contract and
+    # emit None instead.
+    _repro_doc = {'passed': _repro_passed, 'n_reports': len(_repro)} if _repro else None
+    L.log_experiment_event(cfg['outdir'], {'kind': 'preflight', 'tracking_schema': 2, 'status': ('ok' if ok and _repro_passed else 'failed'), 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'run_cfg': _pfp, 'sanity': {'passed': ok, 'n_reports': len(reports)}, 'reproducibility': _repro_doc})
     if not ok:
         _bad = [r['variant'] for r in reports if not r['passed']]
         raise RuntimeError(f'small-batch overfit sanity check FAILED for {_bad} — do NOT start the full run; this points at a gradient/loss/label plumbing problem (see {cfg["outdir"]}/overfit_sanity.json)')

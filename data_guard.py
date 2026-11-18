@@ -193,10 +193,14 @@ def _unhashable_identity(value):
 # ---------------------------------------------------------------------------
 
 def _check_fraction(name, value):
-    # Booleans and temporal values are not fractions.  Same contract as
-    # _check_count.
-    if isinstance(value, (bool, np.bool_, np.datetime64, np.timedelta64,
-                          complex, np.complexfloating)):
+    # Same structural contract as _check_count: a real scalar only.  Without
+    # the isinstance guard, float() silently coerces a 0-d bool array
+    # (np.array(True) -> 1.0) or a numeric string ("0.5" -> 0.5) into a split
+    # ratio, which the sibling count/geometry validators all refuse.
+    if (isinstance(value, (bool, np.bool_, np.ndarray, str,
+                           np.datetime64, np.timedelta64,
+                           complex, np.complexfloating))
+            or not isinstance(value, numbers.Real)):
         raise ValueError(f'{name} must be a number in [0, 1], got {value!r}')
     try:
         value = float(value)

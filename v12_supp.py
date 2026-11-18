@@ -3243,8 +3243,19 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             # NOT required — v3 explicitly removed the all-12-seeds veto —
             # and the init-core digests are instrumentation, not decision
             # inputs.
+            # Use the manifest's declared confirmation floor, not the helper's
+            # legacy default (8).  `finaltest_stats` passes len(manifest['seeds'])
+            # (12); without the same floor here the report can list a
+            # comparison as confirmed even though the stats artifact does not.
+            _floor = None
+            _stat_m = m.get('statistics') or {}
+            if isinstance(_stat_m, dict) and _stat_m.get('min_seeds_for_confirmation') is not None:
+                _floor = L._as_seed_int(_stat_m['min_seeds_for_confirmation'])
+            if _floor is None and isinstance(m.get('seeds'), (list, tuple)) and m['seeds']:
+                _floor = len(m['seeds'])
+            _floor_args = () if _floor is None else (_floor,)
             _conf = [k for k, v in holm.items()
-                     if _frozen_rule_confirms(v, comps.get(k, {}), _alpha)]
+                     if _frozen_rule_confirms(v, comps.get(k, {}), _alpha, *_floor_args)]
         if _conf:
             A(f'**确认结果**：{len(_conf)}/{len(comps)} 个冻结主比较在 Holm 校正后成立**且方向符合预注册**（{sorted(_conf)}）——这是预注册规则下的确认性证据。')
         else:

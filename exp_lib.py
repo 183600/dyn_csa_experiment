@@ -9969,18 +9969,12 @@ def holm_adjust(named_pvals, alpha=0.05):
             # corrupt the correction family.
             raise ValueError(f'holm_adjust: duplicate comparison name {sname!r}')
         _seen_names.add(sname)
-        if isinstance(p, (bool, np.bool_)) or _is_nonmeasurement_scalar(p):
-            # A boolean/flag or temporal/complex value is not a probability.
-            # float(False) == 0.0 would otherwise become the strongest
-            # possible p-value and shrink the correction family to a bogus
-            # "certain" result.
-            pv = float('nan')
-        else:
-            try:
-                pv = float(p)
-            except (TypeError, ValueError, OverflowError):
-                pv = float('nan')
-        if (not math.isfinite(pv)) or pv < 0.0 or pv > 1.0:
+        # _finite_scalar is the single numeric-measurement contract: it
+        # refuses booleans, temporal/complex scalars AND numeric strings such
+        # as "0.01".  float("0.01") would otherwise manufacture a significant
+        # p-value from a stringified JSON artifact and shrink the Holm family.
+        pv = _finite_scalar(p)
+        if pv is None or pv < 0.0 or pv > 1.0:
             invalid[sname] = {'p_raw': p, 'p_holm': None, 'rank': None, 'reject': False, 'reason': 'p not in [0,1] or not finite'}
             continue
         fam.append((sname, pv))
@@ -10035,17 +10029,10 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         p = v.get('p_exact_signflip')
         if p is None:
             p = v.get('p')
-        if isinstance(p, (bool, np.bool_)) or _is_nonmeasurement_scalar(p):
-            # Boolean/temporal/complex values are not p-values; treat them as
-            # invalid so the declared family keeps a p=1 slot instead of a
-            # fake p=0.
-            p = float('nan')
-        else:
-            try:
-                p = float(p)
-            except (TypeError, ValueError, OverflowError):
-                p = float('nan')
-        if math.isfinite(p) and 0.0 <= p <= 1.0:
+        # A p-value must be a real numeric measurement, not a string that
+        # float() happens to parse.  Invalid rows keep a p=1 family slot.
+        p = _finite_scalar(p)
+        if p is not None and 0.0 <= p <= 1.0:
             pairs.append((str(k), p))
             tested += 1
             _tested_vals.append(v)
@@ -10207,21 +10194,11 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     ph = stats.get('p_holm')
     mean, std = stats.get('mean'), stats.get('std')
     out['n'] = n
-    if isinstance(p, (bool, np.bool_)) or _is_nonmeasurement_scalar(p):
-        # float(False) == 0.0 must never be read as a significant p-value.
-        out['p_raw'] = None
-    else:
-        try:
-            out['p_raw'] = float(p) if p is not None else None
-        except (TypeError, ValueError, OverflowError):
-            out['p_raw'] = None
-    if isinstance(ph, (bool, np.bool_)) or _is_nonmeasurement_scalar(ph):
-        out['p_holm'] = None
-    else:
-        try:
-            out['p_holm'] = float(ph) if ph is not None else None
-        except (TypeError, ValueError, OverflowError):
-            out['p_holm'] = None
+    # _finite_scalar rejects bools, temporal/complex values AND numeric
+    # strings; float("0.01") must not become a significant p-value from a
+    # stringified JSON artifact.
+    out['p_raw'] = _finite_scalar(p) if p is not None else None
+    out['p_holm'] = _finite_scalar(ph) if ph is not None else None
     # The exact test drops zero deltas, so the resolution floor is controlled
     # by the number of NONZERO pairs.  Fall back to n when the stats dict
     # lacks that field.
@@ -11080,15 +11057,10 @@ def global_multiplicity_audit(named_pvals, *, alpha=0.05,
     pvals = []
     for e in entries:
         p = e['p']
-        valid = False
-        if (p is not None and not isinstance(p, (bool, np.bool_))
-                and not _is_nonmeasurement_scalar(p)):
-            try:
-                pf = float(p)
-                valid = math.isfinite(pf) and 0.0 <= pf <= 1.0
-            except (TypeError, ValueError, OverflowError):
-                valid = False
-        if valid:
+        # Numeric strings must not be coerced into significant p-values here
+        # either — the other statistic gates use the same measurement contract.
+        pf = _finite_scalar(p)
+        if pf is not None and 0.0 <= pf <= 1.0:
             e['p_raw'] = pf
         else:
             e['p_raw'] = None
@@ -21345,7 +21317,16 @@ class TimeGuard:
                 if seconds > 0:
                     bookings[str(token)] = {'seconds': float(seconds), 'pid': int(os.getpid()), 'ts': time.time()}
                 else:
-                    bookings.pop(str(token), None)
+                    # A negative value is a refund MAGNITUDE, not "erase this
+                    # token": subtract it from the outstanding booking.  A full
+                    # refund (-booked, what every in-repo caller uses) still
+                    # removes the token exactly as before.
+                    _tok = str(token)
+                    _b = bookings.get(_tok)
+                    if _b is not None:
+                        _b['seconds'] = float(_b.get('seconds', 0.0)) + float(seconds)
+                        if _b['seconds'] <= 0.0:
+                            bookings.pop(_tok, None)
                 legacy = float(self.state['booked_untracked'])
                 self.state['booked_seconds'] = legacy + sum(float(b.get('seconds', 0.0)) for b in bookings.values())
             self._save()

@@ -985,7 +985,12 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
                 if _ce_baseline is None:
                     _ce_baseline = _ce_d.new_zeros(())
                 _bdec = max(int(getattr(model, 'boundary_decisions', 0) or 0), 1)
-                loss = ce + comp_lambda * model.comp_reg + L.BOUNDARY_PG_COEF * (-(_ce_d - _ce_baseline) * _blp / _bdec)
+                # Match exp_lib.train_variant's score-function term: descent
+                # on `+adv * logp` (adv = CE above EMA baseline) REDUCES the
+                # probability of above-baseline, high-loss cuts.  The previous
+                # leading minus was gradient ascent on expected CE and
+                # reinforced bad boundaries.
+                loss = ce + comp_lambda * model.comp_reg + L.BOUNDARY_PG_COEF * ((_ce_d - _ce_baseline) * _blp / _bdec)
             else:
                 loss = ce + comp_lambda * model.comp_reg
             _loss_item = float(loss.detach().item())

@@ -133,7 +133,9 @@ def _ppl_value(entry):
     for k in ('ppl_primary', 'ppl_pooled', 'ppl_mean'):
         v = entry.get(k)
         _f = _as_finite(v)
-        if _f is not None:
+        # A PPL is a positive perplexity; zero/negative values are corrupt
+        # aggregates, not numbers to quote in a table or fold into a delta.
+        if _f is not None and _f > 0.0:
             return _f
     return None
 

@@ -159,7 +159,12 @@ def _panel_block(panel):
                 by_cfg.setdefault(_gk, {})[s] = r
                 raw_cfg[_gk] = r.get('run_cfg')
             _cur_sfx = f'_cs{L.code_stamp()}'
-            _ranked = sorted(by_cfg.items(), key=lambda kv: (not (isinstance(raw_cfg.get(kv[0]), str) and raw_cfg[kv[0]].endswith(_cur_sfx)), -len(kv[1])))
+            # Final `str(kv[0])` key matches _add_paired / bootstrap_report:
+            # two current-stamped groups with equal seed counts must not be
+            # ordered by insertion (JSON key) order, otherwise the table's
+            # seed group can differ from the paired-delta group purely because
+            # of how the summary file happened to be serialized.
+            _ranked = sorted(by_cfg.items(), key=lambda kv: (not (isinstance(raw_cfg.get(kv[0]), str) and raw_cfg[kv[0]].endswith(_cur_sfx)), -len(kv[1]), str(kv[0])))
             _kept_cfg = raw_cfg.get(_ranked[0][0])
             if len(by_cfg) > 1:
                 keep = _ranked[0][1]
