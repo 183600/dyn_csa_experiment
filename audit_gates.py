@@ -3070,6 +3070,37 @@ def _run_audit(fn, *args, **kwargs):
                 'note': f'cannot import dependency required by {name} — {type(e).__name__}: {e}'}
 
 
+def _json_fallback_clean(obj):
+    """Strict-JSON-safe fallback sanitizer for audit reports.
+
+    Mirrors the repo's JSON contract enough for the fallback path: non-finite
+    floats become null and NumPy scalars/arrays become plain Python values, so
+    a partial/fallback audit report is still parseable when exp_lib's strict
+    writer is unavailable.
+    """
+    if isinstance(obj, dict):
+        return {str(k): _json_fallback_clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_fallback_clean(v) for v in obj]
+    try:
+        import numpy as _np
+        if isinstance(obj, _np.ndarray):
+            return _json_fallback_clean(obj.tolist())
+        if isinstance(obj, _np.generic):
+            return _json_fallback_clean(obj.item())
+    except Exception:
+        pass
+    if isinstance(obj, bool) or obj is None:
+        return obj
+    if isinstance(obj, int):
+        return obj
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, str):
+        return obj
+    return str(obj)
+
+
 def run_report(out='audit_report.json'):
     res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
            'leakage': _run_audit(audit_leakage),
@@ -3091,7 +3122,6 @@ def run_report(out='audit_report.json'):
     # The CLI exit code follows the aggregate status, not only the top-level
     # record's own status.
     res['status'] = _aggregate_audit_status(res)
-    L_atomic = None
     try:
         L = _import_exp_lib()
         # The audit verdicts are quotable claims: stamp code/git provenance and
@@ -3104,7 +3134,7 @@ def run_report(out='audit_report.json'):
         print(f'[audit] wrote {out}')
     except Exception as e:
         with open(os.path.join(REPO, out), 'w', encoding='utf-8') as f:
-            json.dump(res, f, ensure_ascii=False, indent=2)
+            json.dump(_json_fallback_clean(res), f, ensure_ascii=False, indent=2, allow_nan=False)
         print(f'[audit] wrote {out} (fallback writer: {type(e).__name__})')
     return res
 

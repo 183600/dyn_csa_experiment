@@ -203,20 +203,23 @@ def _seg_structure(keys, n_rows):
 
 
 def _seg_apply(seg, values, out_flat):
-    """按共享段结构把一个头的值表归约进逐头 fp32 扁平行：值经同一排列
-    gather 后 cumsum，段和写入 seg_id 行（调用方保证 out_flat 已清零；
-    未被任何键覆盖的行保持零，与「零初始化全头缓冲后按 seg_id·nh+h
-    写入、末尾一次 cast」逐头 cast 的参考形式逐位一致）。"""
+    """按共享段结构把一个头的值表归约进逐头扁平行：值经同一排列 gather 后
+    cumsum，段和写入 seg_id 行（调用方保证 out_flat 已清零；未被任何键覆盖
+    的行保持零，与「零初始化全头缓冲后按 seg_id·nh+h 写入、末尾一次 cast」
+    逐头 cast 的参考形式逐位一致）。段内累加顺序与线程数无关。"""
     order, seg_end, seg_id_k, keep = seg
-    # Accumulate in the caller's output precision so index_copy_ dtypes match.
-    val_s = values.index_select(0, order).to(out_flat.dtype)
-    csum = val_s.cumsum_(dim=0)
+    # Accumulate in promoted precision (>=fp32 for fp16/bf16 inputs), matching
+    # _det_scatter_add_multi's fixed-order reduction, then cast on write so
+    # index_copy_ dtypes match out_flat.
+    val_s = values.index_select(0, order)
+    _wdt = torch.promote_types(val_s.dtype, torch.float32)
+    csum = val_s.to(_wdt).cumsum_(dim=0)
     hi = csum.index_select(0, seg_end)
     lo = torch.zeros_like(hi)
     if seg_end.numel() > 1:
         lo[1:] = csum.index_select(0, seg_end[:-1])
     seg_sum = hi - lo
-    out_flat.index_copy_(0, seg_id_k, seg_sum[keep])
+    out_flat.index_copy_(0, seg_id_k, seg_sum[keep].to(out_flat.dtype))
 
 
 class PoolGeometry:
