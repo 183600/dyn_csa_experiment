@@ -995,6 +995,22 @@ def _segment(n, want_cut_list, min_block, max_block):
             f'_segment: max_block={max_block!r} must be an exact integer >= '
             f'min_block={min_block!r} (or None)')
     max_block = _xb
+    _wl = np.asarray(want_cut_list)
+    if _wl.ndim != 1:
+        raise ValueError(
+            f'_segment: want_cut_list must be a 1-D cut row, got ndim={_wl.ndim}')
+    # The cut row carries one slot per consecutive token pair.  Slot indices
+    # 0..n-2 force block boundaries; a slot at index n-1 (cut after the final
+    # token) is a legal no-op, so the row may have length n-1 or n.  Any other
+    # length means a malformed table: too-short silently drops boundaries, a
+    # too-long one silently ignores its tail.  Refuse instead of segmenting
+    # against a wrong geometry.
+    _exp = max(int(n) - 1, 0)
+    _ok_len = (int(_wl.shape[0]) in (_exp, _exp + 1)) if n >= 1 else (int(_wl.shape[0]) == 0)
+    if not _ok_len:
+        raise ValueError(
+            f'_segment: want_cut_list length {int(_wl.shape[0])} not in ({_exp}, {_exp + 1}) '
+            f'for n={int(n)} — pass one cut slot per token boundary (an optional final no-op slot)')
     if n <= 0:
         # No tokens -> no blocks.  Returning the empty triple here (instead of
         # indexing ends[-1] on an empty array) keeps the public entry points
@@ -2389,6 +2405,10 @@ def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n
                 'be None (the previous-block overlap lane needs both)')
         return pool_blocks_single(Xa, Za, B_pos_a, block_ids,
                                   n_blocks=B, monotonic=monotonic)
+    if monotonic and block_ids.numel() > 1 and not bool((block_ids[1:] >= block_ids[:-1]).all()):
+        # Caller-guaranteed monotonicity is violated — fall back to the
+        # sorting path instead of silently pooling the wrong rows.
+        monotonic = False
     order, _ident = ((_arange_cache(block_ids.numel(), block_ids.device), True) if monotonic else _block_order(block_ids, n))
     if _ident:
         Xas, Xbs, Zas, Zbs = (Xa, Xb, Za, Zb)
@@ -3046,6 +3066,10 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
             raise ValueError(
                 f'pool_blocks_single: n_blocks={n_blocks!r} is smaller than '
                 f'the largest block id {int(block_ids.max().item())} + 1')
+    if monotonic and block_ids.numel() > 1 and not bool((block_ids[1:] >= block_ids[:-1]).all()):
+        # Caller-guaranteed monotonicity is violated — fall back to the
+        # sorting path instead of silently pooling the wrong rows.
+        monotonic = False
     order, _ident = ((_arange_cache(block_ids.numel(), block_ids.device), True) if monotonic else _block_order(block_ids, n))
     if _ident:
         Xs, Zs = (X, Z)
@@ -3537,7 +3561,7 @@ def causal_prefix_pool_reference(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
                                window=window, window_start=window_start,
                                candidate_table=False)
     cap_a = int(B_pos_a.shape[0])
-    cap_b = int(B_pos_b.shape[0])
+    cap_b = int(B_pos_b.shape[0]) if B_pos_b is not None else 0
     starts = geo['starts'].tolist()
     counts = geo['counts'].tolist()
     for tt in range(T):
@@ -3550,7 +3574,7 @@ def causal_prefix_pool_reference(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
         b = int(geo['block_of_token'][tt].item())
         if (use_overlap and str(scope) == 'full_prefix' and overlap is not None
                 and int(overlap) > 0 and b > 0
-                and Xb is not None and Zb is not None):
+                and Xb is not None and Zb is not None and B_pos_b is not None):
             ps, pend = int(starts[b - 1]), int(starts[b - 1]) + int(counts[b - 1])
             ovs = max(ps, pend - int(overlap))
             for u in range(ovs, pend):
@@ -5218,6 +5242,7 @@ class HybridAttention(nn.Module):
         gate_mean = None
         _seg_cuts = None
         if cfg.chunking == 'cosine_learnable':
+            _logits = None
             if gate_sig is not None:
                 gate, gate_list = gate_sig[0], gate_sig[1]
                 if len(gate_sig) > 2:
@@ -5235,7 +5260,15 @@ class HybridAttention(nn.Module):
                     prefix_mean.add_(self.delta_logit)
                     prefix_mean.sub_(sim)
                     prefix_mean.div_(max(cfg.temperature, 0.001))
-                    gate = torch.sigmoid_(prefix_mean)
+                    if getattr(cfg, 'boundary_policy', 'threshold') == 'reinforce' and torch.is_grad_enabled():
+                        # keep the pre-sigmoid affine scores for the
+                        # score-function path — clamping through logit()
+                        # would zero the policy gradient once the gate saturates
+                        _logits = prefix_mean
+                        gate = torch.sigmoid(_logits)
+                    else:
+                        _logits = None
+                        gate = torch.sigmoid_(prefix_mean)
                 gate_bool = None
                 gate_list = None
                 if gate.numel():
@@ -5243,7 +5276,8 @@ class HybridAttention(nn.Module):
                         # score-function path: the hard cuts are sampled, and
                         # the log-probability is returned so the LM loss can
                         # train the boundary policy (not just comp_reg).
-                        _logits = torch.logit(gate.clamp(1e-7, 1 - 1e-7))
+                        if _logits is None:
+                            _logits = torch.logit(gate.clamp(1e-7, 1 - 1e-7))
                         gate_bool = torch.bernoulli(gate).bool()
                         self.last_boundary_logp = -F.binary_cross_entropy_with_logits(
                             _logits, gate_bool.to(gate.dtype), reduction='sum')
@@ -16815,7 +16849,10 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
                     changed[k] = None
                     continue
                 changed[k] = bool(a[k] != c[k])
-            checks['different_seed_changes_streams'] = bool(all(v is not False for v in changed.values()) and changed)
+            # Only a stream that provably changed counts as passing.  A
+            # probed-but-unverifiable stream (e.g. a tensorflow draw that
+            # errored) must not wave the contract through.
+            checks['different_seed_changes_streams'] = bool(changed) and all(v is True for v in changed.values())
         except Exception as e:
             errors['rng_draws'] = f'{type(e).__name__}: {e}'
             a = b = c = {}
@@ -16863,6 +16900,7 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
         'streams': keys,
         'checks': checks,
         'different_seed_changed': changed,
+        'different_seed_unverifiable': [k for k, v in changed.items() if v is None],
         'draws_same_seed': a,
         'draws_other_seed': c,
         'worker_draws_a': w1,
@@ -22316,14 +22354,25 @@ def aggregate(summary, *, outdir=None):
                 print(f'[aggregate] {key}: seed(s) {_off_grid} of {len(hists)} evaluate at a DIFFERENT step grid than seed 0 — the seed-averaged curve is taken over the steps they SHARE (aligned on the step VALUE, not on list position), so a differently-sampled seed contributes only to the common steps.')
             steps_h = sorted(per_step)
             cols = {s: i for i, s in enumerate(steps_h)}
+            per_seed_steps = []
+            n_nonfinite = 0
             mat = np.full((len(hists), len(steps_h)), float('nan'))
             for _i, _h in enumerate(hists):
                 _own = {}
                 for _pt in _h:
                     _p = _point(_pt)
                     if _p is None:
+                        try:
+                            _sv = _finite_scalar(_pt[1])
+                            _st = _as_seed_int(_pt[0])
+                        except (TypeError, ValueError, IndexError):
+                            n_nonfinite += 1
+                            continue
+                        if _st is not None and _st >= 0 and _sv is None:
+                            n_nonfinite += 1
                         continue
                     _own[_p[0]] = _p[1]
+                per_seed_steps.append(set(_own))
                 for _s, _v in _own.items():
                     if _s in cols:
                         mat[_i, cols[_s]] = _v
@@ -22335,9 +22384,16 @@ def aggregate(summary, *, outdir=None):
             n_good = good.sum(axis=0)
             sums = np.where(good, mat, 0.0).sum(axis=0)
             mean_ppl = np.where(n_good > 0, sums / np.maximum(n_good, 1), np.nan)
-            n_dropped = int((~good).sum())
-            if n_dropped:
-                print(f'[aggregate] {key}: {n_dropped} non-finite PPL curve point(s) across {len(hists)} seed(s) excluded from the seed-averaged curve ({int((n_good == 0).sum())} step(s) had no usable seed and are omitted)')
+            # A structurally-absent grid cell (this seed never evaluated at
+            # that step) is not a corrupt measurement: count the two
+            # separately so the diagnostic does not overstate corruption.
+            _seed_steps = per_seed_steps
+            n_missing = int(sum(1 for _i in range(len(hists)) for _s in steps_h
+                                if _s not in _seed_steps[_i]))
+            n_bad_meas = int(sum(1 for _i in range(len(hists)) for _s, _c in cols.items()
+                                 if _s in _seed_steps[_i] and not good[_i, _c]))
+            if n_missing or n_bad_meas or n_nonfinite:
+                print(f'[aggregate] {key}: {n_missing} missing grid cell(s) (seed never evaluated there), {n_bad_meas} unusable recorded PPL point(s) and {n_nonfinite} non-finite recorded point(s) across {len(hists)} seed(s); recorded-but-unusable points are excluded from the seed-averaged curve ({int((n_good == 0).sum())} step(s) had no usable seed and are omitted)')
             _keep = n_good > 0
             entry['ppl_curve'] = [[int(s), float(m)] for s, m, k in zip(steps_h, mean_ppl, _keep) if k]
         agg[key] = entry
@@ -22370,13 +22426,35 @@ def aggregate(summary, *, outdir=None):
         # and those counts use the same exact-integer normalisation.
         return json.dumps([rec.get('run_cfg'), [_count_id(rec, k) for k in PAIR_STEP_KEYS]], sort_keys=True, default=str)
 
+    def _group_params(_recs):
+        # One exact parameter count shared by the whole group — or None when
+        # any record omits/carries a malformed or different count.
+        _vals = {_as_seed_int(r.get('params')) for r in (_recs or ())}
+        _vals = {v for v in _vals if v is not None and v > 0}
+        return next(iter(_vals)) if len(_vals) == 1 else None
+
+    def _rel_param_diff(_a, _b):
+        if _a is None or _b is None:
+            return None
+        return abs(_a - _b) / float(max(_a, _b))
+
     def _baseline_for(tag, fp_idx, base_groups, recs):
         _want = _cfg_fp_noparam(recs[0]) if recs else None
         if _want is not None:
             _cands = sorted(base_groups.items(), key=lambda kv: (kv[0][0] != tag, kv[0][1] is None))
-            for (_t_c, _i_c), _grp in _cands:
-                if any((_cfg_fp_noparam(_r) == _want for _r in _grp)):
-                    return (_grp, _t_c)
+            _matches = [(k, v) for k, v in _cands
+                        if any((_cfg_fp_noparam(_r) == _want for _r in v))]
+            if _matches:
+                _arm_p = _group_params(recs)
+                if _arm_p is not None and len(_matches) > 1:
+                    # Several `full` groups share the no-param fingerprint
+                    # (e.g. they were split by params upstream): pair against
+                    # the capacity-closest one instead of an arbitrary first.
+                    _matches.sort(key=lambda item: (_rel_param_diff(_arm_p, _group_params(item[1]))
+                                                    if _rel_param_diff(_arm_p, _group_params(item[1])) is not None
+                                                    else 2.0))
+                _g, _t = _matches[0]
+                return (_g, _t[0])
         for _cand in ((tag, fp_idx), (tag, None), ('', None)):
             if _cand in base_groups:
                 return (base_groups[_cand], _cand[0])
@@ -22400,6 +22478,18 @@ def aggregate(summary, *, outdir=None):
         elif tag and any((_t == '' for _t, _i in _full_groups)):
             _base_amb.append(f'{key}: `full#{tag}` and `full` both present')
             continue
+        # Parameter-control disclosure: a dPPL_vs_full pairing across a
+        # capacity boundary is not a controlled comparison.  The pair choice
+        # above prefers the capacity-closest matching baseline; whatever got
+        # paired, disclose the relative gap instead of leaving it implicit.
+        _arm_p = _group_params(recs)
+        _base_p = _group_params(base_recs)
+        _rel = _rel_param_diff(_arm_p, _base_p)
+        if _rel is not None:
+            agg[key]['dPPL_vs_full_param_rel_diff'] = float(_rel)
+            agg[key]['dPPL_vs_full_param_controlled'] = bool(_rel <= 0.01)
+            if _rel > 0.01:
+                print(f'[aggregate] {key}: WARNING: `full` baseline differs by {100.0 * _rel:.1f}% in parameter count (>1%) — this dPPL_vs_full contrast is capacity-confounded, not parameter-controlled')
         ds, skipped = _paired(recs, base_recs)
         if skipped:
             _why = sorted({reason for _s, reason in skipped})
@@ -22424,6 +22514,14 @@ def aggregate(summary, *, outdir=None):
         elif tag and any((_t == '' for _t, _i in _sw_groups)):
             _base_amb.append(f'{key}: `full_sw128_matched#{tag}` and the untagged one both present')
             continue
+        _arm_p = _group_params(recs)
+        _base_p = _group_params(base_recs)
+        _rel = _rel_param_diff(_arm_p, _base_p)
+        if _rel is not None:
+            agg[key]['dPPL_vs_sw128m_param_rel_diff'] = float(_rel)
+            agg[key]['dPPL_vs_sw128m_param_controlled'] = bool(_rel <= 0.01)
+            if _rel > 0.01:
+                print(f'[aggregate] {key}: WARNING: `full_sw128_matched` baseline differs by {100.0 * _rel:.1f}% in parameter count (>1%) — this dPPL_vs_sw128m contrast is capacity-confounded, not parameter-controlled')
         ds, skipped = _paired(recs, base_recs)
         if skipped:
             _why = sorted({reason for _s, reason in skipped})

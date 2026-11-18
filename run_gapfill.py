@@ -20,11 +20,27 @@ def _num_or_none(v):
     # NumPy floats, and lossy floats at/above 2**53 instead of truncating them.
     return L._as_seed_int(v)
 
+_SHUTDOWN_SCHEDULED = False
+
+def _shutdown_once(seconds):
+    global _SHUTDOWN_SCHEDULED
+    if _SHUTDOWN_SCHEDULED:
+        return
+    _SHUTDOWN_SCHEDULED = True
+    schedule_shutdown(seconds)
+
 def git_push(msg):
     if os.environ.get('V6_NO_PUSH'):
         print(f'[git] push skipped (V6_NO_PUSH): {msg}')
         return True
-    run = lambda *a: subprocess.run(a, cwd=REPO, capture_output=True, text=True, encoding='utf-8', errors='replace')
+
+    def run(*a):
+        try:
+            return subprocess.run(a, cwd=REPO, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=600)
+        except subprocess.TimeoutExpired:
+            # A network stall must not hang the driver forever with nothing
+            # pushed and no shutdown scheduled.
+            return subprocess.CompletedProcess(a, -9, '', 'git command timed out after 600s')
     ra = run('git', 'add', '-A')
     if ra.returncode != 0:
         print(f'[git] add FAILED: {(ra.stdout + ra.stderr)[-300:]} — NOT pushing (a commit could miss unstaged work); leaving the tree for inspection')
@@ -36,7 +52,11 @@ def git_push(msg):
         if run('git', 'status', '--porcelain').stdout.strip():
             print('[git] the commit failed while changes are still uncommitted — NOT pushing (a push would publish stale history and report success); leaving the tree for inspection')
             return False
-    _branch = run('git', 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
+    _branch_cp = run('git', 'rev-parse', '--abbrev-ref', 'HEAD')
+    if _branch_cp.returncode != 0:
+        print(f'[git] could not resolve the current branch: {(_branch_cp.stdout + _branch_cp.stderr)[-300:]} — NOT pushing (refusing to guess where this belongs); the work is committed locally only')
+        return False
+    _branch = _branch_cp.stdout.strip()
     if _branch != 'HEAD':
         rb = run('git', 'pull', '--rebase', '--autostash', 'origin', _branch)
         if rb.returncode != 0:
@@ -56,6 +76,46 @@ def git_push(msg):
     if not ok and committed:
         print('[git] WARNING: the commit is only on this instance — the work is NOT on the remote.  Re-push before shutting down.')
     return ok
+
+def _panel_missing(outdir, variants, seeds):
+    """Planned cells with no usable, non-synthesized record in the panel's
+    summary.json.  Returns (missing_keys, why); why is None on success.  A
+    missing/unreadable summary returns (None, reason) — treat that as
+    not-complete, not as complete."""
+    path = os.path.join(REPO, outdir, 'summary.json')
+    try:
+        with open(path, encoding='utf-8') as _jf:
+            summary = json.load(_jf)
+    except FileNotFoundError:
+        return None, 'summary.json is missing'
+    except Exception as _e:
+        return None, f'summary.json unreadable ({type(_e).__name__}: {_e})'
+    if not isinstance(summary, dict):
+        return None, f'summary.json is {type(summary).__name__}, not an object'
+    _missing = []
+    for seed in seeds:
+        for v in variants:
+            key = f'{v}::seed{int(seed)}'
+            rec = summary.get(key)
+            if not isinstance(rec, dict) or not L.ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
+                _missing.append(key)
+    return _missing, None
+
+
+def _push_phase(msg_complete, outdir, variants, seeds):
+    """Completeness-check a finished phase, then push.  Returns (attested,
+    pushed): attested=True means every planned cell holds a usable,
+    non-synthesized record, regardless of whether the git push then succeeds."""
+    _missing, _why = _panel_missing(outdir, variants, seeds)
+    if _missing:
+        print(f'[v6] WARNING: {outdir}: {len(_missing)} planned cell(s) missing/unusable after this phase — the phase is NOT complete:')
+        for _k in _missing:
+            print(f'    {_k}')
+        return False, git_push(f'{msg_complete} — INCOMPLETE ({len(_missing)} cell(s) missing, see run log)')
+    if _why:
+        print(f'[v6] WARNING: could not verify completeness of {outdir}: {_why} — the phase is NOT attested complete')
+        return False, git_push(f'{msg_complete} — UNATTESTED (completeness could not be verified)')
+    return True, git_push(msg_complete)
 
 def _agg_seed_map(entry, tag=''):
     out = {}
@@ -661,17 +721,29 @@ def run_full():
     # runs; on a box that already holds the panels every phase just resumes
     # and the order adds nothing.
     L.run(L.RUN, seeds=[0, 1, 2], guard=guard, label='P-CORE core table (results_lm_v3_1500)')
-    push_ok &= git_push('v6: results_lm_v3_1500 — 9-variant core table')
+    _a, _p = _push_phase('v6: results_lm_v3_1500 — 9-variant core table', 'results_lm_v3_1500', L.RUN['variants'], [0, 1, 2])
+    push_ok &= _p
+    panels_ok = _a
     L.run(L.RUN_ABL, seeds=[0, 1, 2], guard=guard, label='P-ABL leave-one-out ablation table (results_lm_v4_abl)')
-    push_ok &= git_push('v6: results_lm_v4_abl — leave-one-out ablation table (in-panel references + abl arms)')
+    _a, _p = _push_phase('v6: results_lm_v4_abl — leave-one-out ablation table (in-panel references + abl arms)', 'results_lm_v4_abl', L.RUN_ABL['variants'], [0, 1, 2])
+    push_ok &= _p
+    panels_ok &= _a
     L.run(L.RUN_SCALE, seeds=[0, 1, 2], guard=guard, label='P-SCALE d=384/8L/seq1024 probe (results_lm_v5_scale)')
-    push_ok &= git_push('v6: results_lm_v5_scale — model-scale probe (d=384, 8L, seq1024, 5 variants x 3 seeds)')
+    _a, _p = _push_phase('v6: results_lm_v5_scale — model-scale probe (d=384, 8L, seq1024, 5 variants x 3 seeds)', 'results_lm_v5_scale', L.RUN_SCALE['variants'], [0, 1, 2])
+    push_ok &= _p
+    panels_ok &= _a
     L.run({**L.RUN_LONG, 'variants': LONG_GAP_VARIANTS}, seeds=[0, 1, 2], guard=guard, label='P-LONG hybrid 3-seed long-run table (results_lm_v3_long)')
     merge_long_aggregate(os.path.join(REPO, 'results_lm_v3_long'), _long_snapshot)
-    push_ok &= git_push('v6: results_lm_v3_long hybrid variants at seeds 0-2 — 3-seed long-run table complete')
+    _a, _p = _push_phase('v6: results_lm_v3_long hybrid variants at seeds 0-2 — 3-seed long-run table complete', 'results_lm_v3_long', LONG_GAP_VARIANTS, [0, 1, 2])
+    push_ok &= _p
+    panels_ok &= _a
     guard.report()
+    if not panels_ok:
+        print('\n[v6] INCOMPLETE — one or more phases have missing/unusable cells or an unverified panel (see warnings above). NOT reporting success.')
+        _shutdown_once(2400)
+        sys.exit(1)
     print('\n[v6] ALL PHASES DONE.')
-    schedule_shutdown(90 if push_ok else 2400)
+    _shutdown_once(90 if push_ok else 2400)
     if not push_ok:
         print('[v6] WARNING: final push failed — instance stays up 40 min for a retry, then shuts down. Results are safe on the data disk either way.')
 
@@ -694,13 +766,11 @@ def run_topup():
         raise SystemExit(f"ABL_SEED_TARGET must be an integer, got {os.environ.get('ABL_SEED_TARGET')!r}")
     if target < 1:
         raise SystemExit('ABL_SEED_TARGET must be >= 1')
-    print(f'[topup] P-ABL seed target n={target} (declared contrasts={plan["declared_contrasts"]}, '
-          f'family-corrected minimum={plan["min_seeds_for_family_significance"]}); existing seeds are resumed, only missing cells run.')
-    guard = L.TimeGuard(L.RUN_CAP)
-    guard.report()
-    L.run(L.RUN_ABL, seeds=list(range(target)), guard=guard,
-          label=f'P-ABL seed top-up to n={target} (results_lm_v4_abl)')
+    # Validate ALL environment overrides before any GPU work starts: a
+    # malformed CORE_SEED_TARGET must fail before the hours-long P-ABL phase,
+    # not after it.
     _core_raw = os.environ.get('CORE_SEED_TARGET')
+    _core_target = None
     if _core_raw:
         try:
             _core_target = int(_core_raw)
@@ -708,13 +778,41 @@ def run_topup():
             raise SystemExit(f'CORE_SEED_TARGET must be an integer, got {_core_raw!r}')
         if _core_target < 1:
             raise SystemExit('CORE_SEED_TARGET must be >= 1')
+    print(f'[topup] P-ABL seed target n={target} (declared contrasts={plan["declared_contrasts"]}, '
+          f'family-corrected minimum={plan["min_seeds_for_family_significance"]}); existing seeds are resumed, only missing cells run.')
+    if _core_target is not None:
         print(f'[topup] P-CORE seed target n={_core_target} (baseline claims live in this panel; resume-safe)')
+    guard = L.TimeGuard(L.RUN_CAP)
+    guard.report()
+    L.run(L.RUN_ABL, seeds=list(range(target)), guard=guard,
+          label=f'P-ABL seed top-up to n={target} (results_lm_v4_abl)')
+    if _core_target is not None:
         L.run(L.RUN, seeds=list(range(_core_target)), guard=guard,
               label=f'P-CORE seed top-up to n={_core_target} (results_lm_v3_1500)')
-    ok = git_push(f'v6: P-ABL/P-CORE seed top-up (P-ABL n={target}' + (f", P-CORE n={_core_target}" if _core_raw else '') + '; resume-safe)')
+    _problems = []
+    for _label, _outdir, _variants, _seeds in (
+            ('P-ABL', 'results_lm_v4_abl', L.RUN_ABL['variants'], list(range(target))),
+    ) + ((('P-CORE', 'results_lm_v3_1500', L.RUN['variants'], list(range(_core_target))),) if _core_target is not None else ()):
+        _m, _w = _panel_missing(_outdir, _variants, _seeds)
+        if _m:
+            print(f'[topup] WARNING: {_label}: {len(_m)} planned cell(s) missing/unusable after the top-up — the panel is NOT complete:')
+            for _k in _m:
+                print(f'    {_k}')
+            _problems.append(f'{_label}: {len(_m)} cell(s) missing')
+        elif _w:
+            print(f'[topup] WARNING: {_label}: completeness could not be verified ({_w})')
+            _problems.append(f'{_label}: completeness UNVERIFIED ({_w})')
+    _msg = f'v6: P-ABL/P-CORE seed top-up (P-ABL n={target}' + (f", P-CORE n={_core_target}" if _core_target is not None else '') + '; resume-safe)'
+    if _problems:
+        ok = git_push(f'{_msg} — INCOMPLETE ({"; ".join(_problems)})')
+        guard.report()
+        print('\n[v6] TOP-UP INCOMPLETE — NOT reporting success.')
+        _shutdown_once(2400)
+        sys.exit(1)
+    ok = git_push(_msg)
     guard.report()
     print(f'\n[v6] TOP-UP DONE (target n={target}).')
-    schedule_shutdown(90 if ok else 2400)
+    _shutdown_once(90 if ok else 2400)
 
 def run_smoke():
     # The smoke must exercise every forward path the `full` phases schedule:
@@ -745,9 +843,12 @@ def run_smoke():
     shutil.rmtree('results_smoke', ignore_errors=True)
     print('\n[smoke] PASSED — the full pipeline works end to end; smoke outputs were deleted and no experiment directory was touched.')
 if __name__ == '__main__':
+    if len(sys.argv) > 2:
+        print(f"[v6] unexpected arguments {sys.argv[2:]!r}; expected at most one mode argument ('smoke', 'overfit', 'topup' or 'full' — no argument means 'full'). Nothing was started.")
+        raise SystemExit(2)
     mode = sys.argv[1] if len(sys.argv) > 1 else 'full'
     if mode in ('-h', '--help'):
-        print(__doc__ or '')
+        print('Usage: python run_gapfill.py [smoke|overfit|topup|full]\n  (no argument means full; RUN_CAP bounds the GPU time)')
         raise SystemExit(0)
     if mode not in ('smoke', 'overfit', 'topup', 'full'):
         print(f"[v6] unknown mode {mode!r}; expected 'smoke', 'overfit', 'topup' or 'full' (no argument means 'full').  Nothing was started.")
@@ -768,6 +869,15 @@ if __name__ == '__main__':
             run_full()
         else:
             raise SystemExit(f'unknown mode: {mode}')
+    except SystemExit:
+        if mode in ('full', 'topup') and not _SHUTDOWN_SCHEDULED:
+            print('\n[v6] STOPPED early (SystemExit) — no shutdown was scheduled; scheduling one and pushing a PARTIAL marker.')
+            try:
+                git_push('v6: PARTIAL — run_gapfill stopped early (SystemExit), see run_v6.log')
+            except Exception:
+                traceback.print_exc()
+            _shutdown_once(2400)
+        raise
     except Exception:
         traceback.print_exc()
         if mode in ('full', 'topup'):
@@ -776,7 +886,7 @@ if __name__ == '__main__':
                 git_push('v6: PARTIAL — run_gapfill interrupted, see run_v6.log (resume by re-running: completed runs are skipped)')
             except Exception:
                 traceback.print_exc()
-            schedule_shutdown(2400)
+            _shutdown_once(2400)
         else:
             print(f'\n[v6] INTERRUPTED in `{mode}` mode — the tree can hold half-written throwaway output, so NOTHING was committed or pushed and no shutdown was scheduled.  Resolve the failure and re-run; `smoke` exists to catch exactly this.')
         sys.exit(1)

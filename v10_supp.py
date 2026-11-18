@@ -974,9 +974,16 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             return False
         return (_rec.get('variant') == v and L._as_seed_int(_rec.get('seed')) == int(seed))
 
+    _msha_probe = cfg.get('manifest_sha256')
+
     def _cell_stale(_key, _fp_x, _summary=None, _mode='uniform'):
-        _rec = (_summary if _summary is not None else L.locked_json_read(spath)).get(_key)
+        _sum = (_summary if _summary is not None else L.locked_json_read(spath)) or {}
+        _rec = _sum.get(_key)
         if not _cell_identity_matches(_key, _rec):
+            return True
+        # Records from a different freeze revision must not be resume-skipped
+        # (nor recorded under a plan they were not measured against).
+        if _msha_probe is not None and (_rec or {}).get('manifest_sha256') != _msha_probe:
             return True
         return not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp_x, _mode) and (_rec or {}).get('recipe') == _ck_recipe and ((_rec or {}).get('val_fp') is None or (_rec or {}).get('val_fp') == _val_fp))
     _vocab_ck = int(d.get('vocab', 8192))
@@ -994,6 +1001,8 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     def _niah_stale(_key, _summary_n, _fp_n=None):
         _rec = (_summary_n or {}).get(_key)
         if not _cell_identity_matches(_key, _rec):
+            return True
+        if _msha_probe is not None and (not isinstance(_rec, dict) or _rec.get('manifest_sha256') != _msha_probe):
             return True
         _acc = L._finite_scalar(_rec.get('acc')) if isinstance(_rec, dict) else None
         _nll = L._finite_scalar(_rec.get('nll')) if isinstance(_rec, dict) else None

@@ -80,8 +80,13 @@ def _git_state():
     head = _run('rev-parse', 'HEAD')
     if head is None:
         return {'git': 'not a git repo / git unavailable'}
-    dirty = _run('status', '--porcelain') or ''
-    return {'git_head': head, 'git_branch': _run('rev-parse', '--abbrev-ref', 'HEAD'), 'dirty_files': dirty.splitlines()}
+    _branch = _run('rev-parse', '--abbrev-ref', 'HEAD')
+    dirty = _run('status', '--porcelain')
+    if dirty is None:
+        # A failed probe must not be recorded as a clean tree — an empty
+        # dirty_files list means "verified clean"; record None instead.
+        return {'git_head': head, 'git_branch': _branch, 'dirty_files': None, 'dirty_check': 'failed'}
+    return {'git_head': head, 'git_branch': _branch, 'dirty_files': dirty.splitlines()}
 
 
 def _env_snapshot():
@@ -210,6 +215,7 @@ def _ckpt_hash_table(dirs):
                 if n.endswith(_CKPT_EXTS):
                     p = os.path.join(root, n)
                     if os.path.islink(p) or not os.path.isfile(p):
+                        print(f'[archive] WARNING: skipping non-regular checkpoint file {os.path.relpath(p, REPO)} — the release manifest will NOT hash-attest it')
                         continue
                     rows[os.path.relpath(p, REPO)] = _sha256(p)
     return rows
@@ -328,7 +334,25 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
               'evidence archive is immutable; choose a new tag or move the old '
               'release aside explicitly')
         return 1
-    man = {'release': base_name, 'tag': tag, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'created_by': 'archive_release.py', 'git': _git_state(), 'environment': _env_snapshot(), 'dirs': list(dirs), 'include_ckpt_bodies': bool(include_ckpt), 'files': {}, 'checkpoint_hashes': _ckpt_hash_table(dirs)}
+    # Per-dir contribution accounting: a requested directory that was missing
+    # or resolved outside the repo contributes nothing, and the manifest must
+    # not read as if it had been attested.
+    _dirs_detail = {}
+    for d in dirs:
+        if not _dir_inside_repo(d):
+            _dirs_detail[d] = {'status': 'skipped', 'reason': 'missing_or_outside_repo', 'files': 0}
+            continue
+        _n = 0
+        for _root_w, _w_dirs, _names in os.walk(os.path.join(REPO, d)):
+            for _n_name in _names:
+                _p = os.path.join(_root_w, _n_name)
+                if os.path.isfile(_p) and not os.path.islink(_p) and (include_ckpt or not _n_name.endswith(_CKPT_EXTS)):
+                    _n += 1
+        _dirs_detail[d] = {'status': 'included', 'files': _n}
+    _skipped = {d: _info for d, _info in _dirs_detail.items() if _info['status'] == 'skipped'}
+    if _skipped:
+        print(f'[archive] WARNING: requested dir(s) skipped (missing or outside the repo): {sorted(_skipped)} — they are recorded in the manifest as skipped, with zero files')
+    man = {'release': base_name, 'tag': tag, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'created_by': 'archive_release.py', 'git': _git_state(), 'environment': _env_snapshot(), 'dirs': list(dirs), 'dirs_detail': _dirs_detail, 'include_ckpt_bodies': bool(include_ckpt), 'files': {}, 'checkpoint_hashes': _ckpt_hash_table(dirs)}
     man_ext = os.path.join(_outdir_abs, man_path_rel)
     sha_path = os.path.join(_outdir_abs, f'{base_name}.tar.gz.sha256')
     rec_path = os.path.join(_outdir_abs, f'{base_name}.release_record.json')
@@ -356,7 +380,7 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
         with open(tmp_sha, 'w', encoding='utf-8') as f:
             f.write(f'{tar_sha}  {os.path.basename(tar_path)}\n')
         with open(tmp_rec, 'w', encoding='utf-8') as f:
-            json.dump({'release': base_name, 'tag': tag, 'created_at': man['created_at'], 'tar_sha256': tar_sha, 'n_files': len(man['files']), 'n_ckpt_hashes': len(man['checkpoint_hashes']), 'git_head': (man['git'] or {}).get('git_head')}, f, ensure_ascii=False, indent=2)
+            json.dump({'release': base_name, 'tag': tag, 'created_at': man['created_at'], 'tar_sha256': tar_sha, 'n_files': len(man['files']), 'n_ckpt_hashes': len(man['checkpoint_hashes']), 'git_head': (man['git'].get('git_head') if isinstance(man.get('git'), dict) else None)}, f, ensure_ascii=False, indent=2)
         for _tmp, _final in ((tmp_tar, tar_path), (tmp_man, man_ext),
                              (tmp_sha, sha_path), (tmp_rec, rec_path)):
             os.replace(_tmp, _final)
@@ -454,6 +478,19 @@ def cmd_verify(tar_path):
                   'extraction would be ambiguous, so the content hashes '
                   'cannot identify one unique release tree')
             return 1
+        # Case-folded comparison: on case-insensitive filesystems
+        # (Windows/macOS defaults) member names differing only in case resolve
+        # to the same extraction path even though they differ byte-wise.
+        _case_map = {}
+        for _name in names:
+            _fold = posixpath.normpath(_name.replace('\\', '/'))
+            if _fold in ('.', ''):
+                _fold = ''
+            _case_map.setdefault(_fold.lower(), set()).add(_name)
+        _dup_case = [sorted(_raw) for _raw in _case_map.values() if len(_raw) > 1]
+        if _dup_case:
+            print(f'[archive] REFUSE: archive contains member paths that differ only in letter case {_dup_case[:5]} — on case-insensitive filesystems extraction would overwrite one with the other')
+            return 1
         # The manifest written by `make` is named after the archive itself.
         # Picking the first `*.MANIFEST.sha256` member would let an ordinary
         # collected file (e.g. a stray results_*/aaa.MANIFEST.sha256) hijack
@@ -522,7 +559,8 @@ def cmd_verify(tar_path):
         if bad:
             print('[archive] FAIL:\n  - ' + '\n  - '.join(bad[:20]))
             return 1
-        print('[archive] VERIFY OK — release ' + str(man.get('tag')) + ' created ' + str(man.get('created_at')) + ' @ git ' + str((man.get('git') or {}).get('git_head')))
+        _git_ok = man.get('git') if isinstance(man.get('git'), dict) else {}
+        print('[archive] VERIFY OK — release ' + str(man.get('tag')) + ' created ' + str(man.get('created_at')) + ' @ git ' + str(_git_ok.get('git_head')))
         return 0
 
 

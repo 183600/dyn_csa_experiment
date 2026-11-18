@@ -164,9 +164,21 @@ def _repo_path(p):
 
 
 def _iter_result_dirs():
+    root = os.path.realpath(REPO)
     for name in sorted(os.listdir(REPO)):
-        if name.startswith('results_') and os.path.isdir(os.path.join(REPO, name)):
-            yield name
+        if not name.startswith('results_'):
+            continue
+        _real = os.path.realpath(os.path.join(REPO, name))
+        try:
+            _inside = os.path.commonpath([root, _real]) == root
+        except ValueError:
+            _inside = False
+        if not (os.path.isdir(_real) and _inside):
+            # A symlinked results_* resolving outside the repo must not be
+            # enumerated — audits write into these directories.
+            print(f'[audit] WARNING: skipping {name}: resolves outside the repository — not audited')
+            continue
+        yield name
 
 
 def _import_exp_lib():
@@ -698,9 +710,15 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                         'is unavailable; use a shingle length no longer than the '
                         'shortest row and rebuild/audit the cache')
                 else:
+                    _fired = []
+                    if test_overlap > _max_shingle_ov:
+                        _fired.append(f'test-shingle overlap {test_overlap:.4f} > {_max_shingle_ov}')
+                    if max_row_overlap is not None and max_row_overlap > _max_row_ov:
+                        _fired.append(f'max row overlap {max_row_overlap} > {_max_row_ov}')
+                    if not _fired:  # defensive: a fired _viol must have a cause
+                        _fired.append('policy predicate fired (cause undetermined)')
                     out['note'] = (f'train/test document overlap exceeds the frozen policy '
-                                   f'(test-shingle overlap {test_overlap:.4f} > {_max_shingle_ov}, '
-                                   f'max row overlap {max_row_overlap} > {_max_row_ov}) — '
+                                   f'({"; ".join(_fired)}) — '
                                    'confirmation claims are UNAVAILABLE until the '
                                    'near-duplicate evaluation documents are excluded '
                                    '(or an explicit overlap-excluded sensitivity '

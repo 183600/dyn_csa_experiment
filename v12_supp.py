@@ -1092,6 +1092,8 @@ def _verify_lock_mirror(outdir, lock=None):
     gone (renamed/deleted results directory) — unless V12_REFREEZE=1."""
     if not _mirror_active(outdir):
         return None
+    if lock is not None and not isinstance(lock, dict):
+        raise SystemExit(f'[v12] REFUSE: freeze lock passed to the mirror check is not an object ({type(lock).__name__})')
     mp = _freeze_lock_mirror_path()
     if not os.path.exists(mp):
         return None
@@ -1130,6 +1132,8 @@ def _verify_lock_mirror(outdir, lock=None):
                 lock = json.load(_jf)
         except Exception:
             return mirror
+        if not isinstance(lock, dict):
+            raise SystemExit(f'[v12] REFUSE: freeze lock {lp} is valid JSON but not an object ({type(lock).__name__}) — refusing to interpret it')
     for _k in ('manifest_sha256', 'test_ids_fp', 'train_fp'):
         _mv = mirror.get(_k)
         _lv = lock.get(_k)
@@ -1439,7 +1443,14 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         # by_len_cells() only checks that a usable ppl exists; it does not
         # reject a truncated/partial cell.  Use the same full-shape predicate
         # as admission.
-        if (not all((L.by_len_cells([rec], Ln) for Ln in eval_lens))
+        # A by_len dict with ambiguous length spellings makes by_len_cells
+        # raise — treat the cell as stale (re-measure) rather than crash the
+        # resume.
+        try:
+            _cells_ok = all((L.by_len_cells([rec], Ln) for Ln in eval_lens))
+        except (ValueError, TypeError):
+            _cells_ok = False
+        if (not _cells_ok
                 or _by_len_shape_reason(rec, test_ids.shape[0]) is not None):
             return True
         # The record must belong to the SAME weights now on disk.  A metadata
@@ -2309,6 +2320,7 @@ def _admit_confirmation_records(raw, manifest):
     _require_train_fp = _train_fp_required(manifest) or bool(want_train_fp) or _any_train_fp
     for key, r in (raw or {}).items():
         if not isinstance(r, dict):
+            excluded.append(f'{key}: not a dict ({type(r).__name__})')
             continue
         why = None
         s_i = None
@@ -2612,7 +2624,12 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
         if _tfp_text is not None:
             _probe_train_fps.add(_tfp_text)
     for _ident in _ambiguous_idents:
-        groups.pop(_ident, None)
+        _popped = groups.pop(_ident, {})
+        for _sd in sorted(_popped):
+            excluded.append(
+                f'probe cell (variant={_ident[0]!r}, arm={_ident[1]!r}, eval_len={_ident[2]!r}, '
+                f'rho={_ident[3]!r}, mode={_ident[4]!r}) seed {_sd}: '
+                'dropped with the ambiguous cell — the pooled mean would be ambiguous')
     if len(_probe_train_fps) > 1:
         # The probe is descriptive, but pooling/contrasting records trained on
         # different corpora would still misattribute the effect to this slice.

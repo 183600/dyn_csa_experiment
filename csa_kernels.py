@@ -715,9 +715,11 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
             # 前向把 pos_a 钳到 B_pos_a 末行（见上方 clamp）：超程泳道的
             # 梯度必须按同一钳位语义累加进末行，而不是按形状截断或报错。
             _rows = min(int(gsum.shape[0]), int(gBpa.shape[0]))
-            gBpa[:_rows] += gsum[:_rows].to(B_pos_a.dtype)
-            if _rows < int(gsum.shape[0]):
-                gBpa[_rows - 1] += gsum[_rows:].sum(dim=0).to(B_pos_a.dtype)
+            if _rows > 0:
+                gBpa[:_rows] += gsum[:_rows].to(B_pos_a.dtype)
+                if _rows < int(gsum.shape[0]):
+                    gBpa[_rows - 1] += gsum[_rows:].sum(dim=0).to(B_pos_a.dtype)
+            # _rows == 0: B_pos_a 无行——无任何钳位目标，梯度为全零（不得索引空表）。
         if need_bpb and has_b:
             _k = b_off[:, b0:b1].reshape(-1)
             _v = glogit_b.reshape(-1, c)
@@ -752,9 +754,11 @@ class FusedPool(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, impl, Xa, Xb, Za, Zb, bid, geom, B_pos_a, B_pos_b):
-        if impl == 'triton' and not _triton_dtype_ok(Xa.dtype):
-            _warn_shape_fallback('pool', f'dtype={Xa.dtype} is not supported by the Triton kernel')
-            impl = 'ref'
+        if impl == 'triton':
+            ok, detail = _triton_float_dtypes_ok(Xa, Xb, Za, Zb, B_pos_a, B_pos_b)
+            if not ok:
+                _warn_shape_fallback('pool', detail)
+                impl = 'ref'
         if impl == 'triton':
             comp = _pool_fwd_triton(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b)
         else:
@@ -1076,12 +1080,27 @@ def _triton_dtype_ok(dtype):
     return dtype in (torch.float16, torch.bfloat16, torch.float32)
 
 
-def _indexer_impl_for_shape(impl, kI):
+def _triton_float_dtypes_ok(*tensors):
+    """All non-None floating tensors entering a Triton kernel must (a) each be
+    fp16/bf16/fp32 and (b) share a single dtype (tl.dot operands must match).
+    Returns (ok, detail)."""
+    dts = {t.dtype for t in tensors if t is not None and t.is_floating_point()}
+    bad = sorted({str(d) for d in dts if not _triton_dtype_ok(d)})
+    if bad:
+        return False, f'dtype={bad[0]} is not supported by the Triton kernel'
+    if len(dts) > 1:
+        return False, f'mixed floating dtypes {sorted(str(d) for d in dts)} are not supported by the Triton kernel'
+    return True, ''
+
+
+def _indexer_impl_for_shape(impl, qI, kI, w_idx):
     # The scoring kernel and the runner-up path both run on the Triton scorer.
     # Dtypes the kernels do not implement (fp64) use the reference backend.
-    if impl == 'triton' and not _triton_dtype_ok(kI.dtype):
-        _warn_shape_fallback('indexer', f'dtype={kI.dtype} is not supported by the Triton scorer')
-        return 'ref'
+    if impl == 'triton':
+        ok, detail = _triton_float_dtypes_ok(qI, kI, w_idx)
+        if not ok:
+            _warn_shape_fallback('indexer', detail)
+            return 'ref'
     return impl
 
 
@@ -1097,7 +1116,7 @@ class FusedIndexer(torch.autograd.Function):
         # is False inside a custom autograd Function's forward, so it cannot
         # detect that a backward will be built.
         need_soft = bool(need_soft) or any(ctx.needs_input_grad[1:4])
-        impl = _indexer_impl_for_shape(impl, kI)
+        impl = _indexer_impl_for_shape(impl, qI, kI, w_idx)
         if impl == 'triton':
             idx, valid, soft = _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=need_soft)
         else:
@@ -1472,11 +1491,12 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
 # 算子 3 的可微封装 + 公共入口
 # ============================================================================
 
-def _attn_impl_for_shape(impl, q, w):
+def _attn_impl_for_shape(impl, q, w, k_blk=None, v_blk=None, k_sw=None, v_sw=None, soft=None, sink=None):
     if impl != 'triton':
         return impl
-    if not _triton_dtype_ok(q.dtype):
-        _warn_shape_fallback('attention', f'dtype={q.dtype} is not supported by the Triton kernels')
+    ok, detail = _triton_float_dtypes_ok(q, k_blk, v_blk, k_sw, v_sw, soft, sink)
+    if not ok:
+        _warn_shape_fallback('attention', detail)
         return 'ref'
     hd = int(q.shape[-1])
     if int(w) < 1 or hd < 16 or (hd & (hd - 1)) != 0:
@@ -1492,7 +1512,7 @@ class FusedSparseAttention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, impl, q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale):
-        impl = _attn_impl_for_shape(impl, q, w)
+        impl = _attn_impl_for_shape(impl, q, w, k_blk, v_blk, k_sw, v_sw, soft, sink)
         # HCA's read-everything arm passes the cached stride-0 arange table:
         # every row is exactly arange(nb), so the triton kernels derive the
         # block id from the lane index.
@@ -1568,6 +1588,10 @@ def _op_impl(op):
     forced = (_env_cached(f'CSA_KERNEL_{op}') or '').strip().lower()
     if forced in ('triton', 'ref'):
         return forced
+    if forced:
+        raise ValueError(
+            f"unknown CSA_KERNEL_{op} value {os.environ.get(f'CSA_KERNEL_{op}')!r} "
+            "(expected unset/'' (follow CSA_KERNEL), 'triton', or 'ref')")
     return kernel_backend() or 'ref'
 
 
@@ -1780,11 +1804,15 @@ _MINL32 = -3.402823466e38
 
 
 def _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale, idx_arange=False):
+    R, T, nh, hd = q.shape
+    if R == 0 or T == 0:
+        # Nothing to attend: the correct output is empty; a zero-sized grid
+        # launch is invalid, and no triton import is needed.
+        return torch.empty((R, T, nh, hd), device=q.device, dtype=q.dtype)
     K = _kernels()
     if getattr(K, 'attn_fwd', None) is None:
         _attach_attn_kernels(K)
     triton = K.triton
-    R, T, nh, hd = q.shape
     nb = topk_idx.shape[-1]
     Bm = k_blk.shape[1]
     assert int(w) >= 1 and hd >= 16 and hd & (hd - 1) == 0, 'triton attention 前向要求 w >= 1 且 hd 为 2 的幂且 >= 16（其余形状走 ref 后端）'
@@ -1811,15 +1839,34 @@ def _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
 
 
 def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale, dO, needs, idx_arange=False):
-    K = _kernels()
-    if getattr(K, 'attn_fwd', None) is None:
-        _attach_attn_kernels(K)
-    triton = K.triton
     R, T, nh, hd = q.shape
     nb = topk_idx.shape[-1]
     Bm = k_blk.shape[1]
     dev = q.device
     dtype = q.dtype
+    need_dq = bool(needs[1])
+    need_dkb = bool(needs[2])
+    need_dvb = bool(needs[3])
+    need_dksw = bool(needs[4])
+    need_dvsw = bool(needs[5])
+    need_dsoft = bool(needs[9]) and soft is not None
+    need_dsink = bool(needs[10]) and sink is not None
+    if R == 0 or T == 0:
+        # No tokens: every gradient is the zero tensor autograd would
+        # produce; zero-sized grid launches are invalid (and no triton
+        # import is needed here).
+        dq = torch.zeros_like(q) if need_dq else None
+        dk_blk = torch.zeros((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else None
+        dv_blk = torch.zeros((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else None
+        dk_sw = torch.zeros((R, T, nh, hd), device=dev, dtype=dtype) if need_dksw else None
+        dv_sw = torch.zeros((R, T, nh, hd), device=dev, dtype=dtype) if need_dvsw else None
+        dsoft = torch.zeros((R, T, nb), device=dev, dtype=dtype) if need_dsoft else None
+        dsink = torch.zeros_like(sink) if need_dsink else None
+        return (dq, dk_blk, dv_blk, dk_sw, dv_sw, dsoft, dsink)
+    K = _kernels()
+    if getattr(K, 'attn_fwd', None) is None:
+        _attach_attn_kernels(K)
+    triton = K.triton
     assert int(w) >= 1 and hd >= 16 and hd & (hd - 1) == 0
     q = q.contiguous()
     k_blk, v_blk = k_blk.contiguous(), v_blk.contiguous()
@@ -1831,13 +1878,6 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
     soft_c = soft.contiguous() if soft is not None else topk_idx
     sink_c = torch.nan_to_num(sink).contiguous() if sink is not None else None
     sink_arg = sink_c if sink_c is not None else q
-    need_dq = bool(needs[1])
-    need_dkb = bool(needs[2])
-    need_dvb = bool(needs[3])
-    need_dksw = bool(needs[4])
-    need_dvsw = bool(needs[5])
-    need_dsoft = bool(needs[9]) and soft is not None
-    need_dsink = bool(needs[10]) and sink is not None
     BT, BW = 64, 64
     # soft 统计量（mS/ZS/GS）只在 HAS_SOFT 下被 attn_bwd_stats 写、被
     # attn_bwd_dq / dkdv 内核读；soft=None（HCA 臂）时给 1 元素占位缓冲。
@@ -1871,34 +1911,38 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
     if need_dkb or need_dvb:
         # attn_bwd_dkdv_blocks 对网格内每个 (r,b,h) 无条件 store（NEED_DK/
         # NEED_DV 与这里的分配条件一致）。
-        dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else q
-        dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else q
-        if idx_arange:
-            # Every row is arange(nb): the stable block-major order is
-            # implicit (lane = t*nb + b).  The kernel derives the segment
-            # bounds from b and T directly.
-            order = offs = q
-        else:
-            flat = topk_idx.reshape(R, T * nb)
+        dk_blk = torch.zeros((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else q
+        dv_blk = torch.zeros((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else q
+        if (R * Bm * nh) > 0:
+            # attn_bwd_dkdv_blocks 对网格内每个 (r,b,h) 无条件 store（NEED_DK/
+            # NEED_DV 与这里的分配条件一致）——空块表（Bm=0）无任何 (r,b,h)
+            # 可写，grid=0 的启动非法，跳过并保留零张量。
+            if idx_arange:
+                # Every row is arange(nb): the stable block-major order is
+                # implicit (lane = t*nb + b).  The kernel derives the segment
+                # bounds from b and T directly.
+                order = offs = q
+            else:
+                flat = topk_idx.reshape(R, T * nb)
             # 各行互相独立，稳定序逐位不变；order 保留 int64：lane 值域是
             # [0, T·nb)，T·nb ≥ 2³¹ 的超大配置下窄化到 int32 会翻负、内核
             # 再按 lane//NB 寻址即越界。
-            order = torch.argsort(flat, dim=1, stable=True)
-            # 计数是整数（块 id 非负且 < Bm），scatter_add_ 与逐行 bincount
-            # 给出同一组精确整数。lane 值域 [0, T·NB) 只在确实越过 int32
-            # 时才用 int64；常规规模下 order/计数/偏移表全部用 int32。
-            _narrow = int(T) * int(nb) < (1 << 31)
-            _idt = torch.int32 if _narrow else torch.int64
-            if _narrow:
-                order = order.to(torch.int32)
-            flat_l = flat.to(_idt)
-            cnt = torch.zeros((R, Bm), device=dev, dtype=_idt)
-            cnt.scatter_add_(1, flat_l, torch.ones_like(flat_l))
-            del flat_l
-            offs = torch.zeros((R, Bm + 1), device=dev, dtype=_idt)
-            offs[:, 1:] = cnt.cumsum(dim=1)
-            del flat, cnt
-        K.attn_bwd_dkdv_blocks[(R * Bm * nh,)](
+                order = torch.argsort(flat, dim=1, stable=True)
+                # 计数是整数（块 id 非负且 < Bm），scatter_add_ 与逐行 bincount
+                # 给出同一组精确整数。lane 值域 [0, T·NB) 只在确实越过 int32
+                # 时才用 int64；常规规模下 order/计数/偏移表全部用 int32。
+                _narrow = int(T) * int(nb) < (1 << 31)
+                _idt = torch.int32 if _narrow else torch.int64
+                if _narrow:
+                    order = order.to(torch.int32)
+                flat_l = flat.to(_idt)
+                cnt = torch.zeros((R, Bm), device=dev, dtype=_idt)
+                cnt.scatter_add_(1, flat_l, torch.ones_like(flat_l))
+                del flat_l
+                offs = torch.zeros((R, Bm + 1), device=dev, dtype=_idt)
+                offs[:, 1:] = cnt.cumsum(dim=1)
+                del flat, cnt
+            K.attn_bwd_dkdv_blocks[(R * Bm * nh,)](
             q, k_blk, v_blk, topk_idx, valid_c, last_tok, soft_c, sink_arg, dO,
             mA, ZA, mS, ZS, GA, GS,
             dk_blk, dv_blk, order, offs, T, Bm, nb, float(scale),
