@@ -605,9 +605,10 @@ def main(argv=None):
         if v is None or not np.isfinite(v):
             return '未测量'
         return f'{('-' if v < 0 else '')}{abs(float(v)):.4f}'
-    if _blk:
-        _blk_txt = '、'.join((f'{_n} {_blk[_n + '_fmt'].format(_blk[_n])}' for _n in ('len_mean', 'len_std', 'frac_at_min', 'blocks') if _n in _blk))
-        _blk_max = max((_blk[_n] for _n in ('len_mean', 'len_std', 'frac_at_min', 'blocks') if _n in _blk))
+    _blk_vals = [_blk[_n] for _n in ('len_mean', 'len_std', 'frac_at_min', 'blocks') if _n in _blk]
+    if _blk_vals:
+        _blk_txt = '、'.join((f'{_n} {_blk[_n + "_fmt"].format(_blk[_n])}' for _n in ('len_mean', 'len_std', 'frac_at_min', 'blocks') if _n in _blk))
+        _blk_max = max(_blk_vals)
         if _blk_max <= 0.01:
             _blk_line = f'2. **分块行为不变（已由产物核验）**：同面板两臂的最大单层单种子偏移为 **{_blk_txt}**（各统计量取逐层逐 seed 差的绝对值上界，越界阈值 0.01），全部落在小数点后 1~2 位内——恒等初始化的融合卷积只经 comp_reg 的弱梯度训练，在本轮训练量内基本没有离开恒等映射，既没有改变「在哪里切」，也没有改变「切多长」。\n'
         else:
@@ -636,7 +637,7 @@ def main(argv=None):
 
     _f1_sig = _fuse_gate('f1', _n_p, _n_p_eff, _f1_d, probe.get('sd_f1'), _f1_p)
     _ppl_sig = _fuse_gate('ppl', _n_pp, _n_pp_eff, _ppl_d, probe.get('sd_ppl'), _ppl_p)
-    _blk_stable = bool(_blk) and _blk_max <= 0.01
+    _blk_stable = bool(_blk_vals) and _blk_max <= 0.01
     if _f1_d is None:
         _c1 = f'1. **边界 F1 的同面板配对差未测量**（n={_n_p or 0} 的可用配对不足），本节不对 F1 方向作断言。\n'
     elif _f1_sig:

@@ -1101,6 +1101,8 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         losses.extend(torch.stack(_lbuf).tolist())
         _lbuf.clear()
     losses = [float(v) for v in losses]
+    _tail_vals = [v for v in (float(t) for t in _tail) if L._is_finite_number(v)]
+    _final_loss_smoothed = (sum(_tail_vals) / len(_tail_vals)) if _tail_vals else None
     if _health_history:
         _health = L.classify_training_health(_health_history)
     else:
@@ -1156,7 +1158,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         except Exception as _ee:
             print(f'[efficiency] WARNING: measurement failed ({type(_ee).__name__}: {_ee})')
             _efficiency = {'status': 'error', 'error': f'{type(_ee).__name__}: {_ee}'}
-    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}, 'train_knobs': _v7_knobs(device, batch_size), 'rng_fp': _rng_fp, 'data_fp': L._ids_fp(train_ids),
+    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': _final_loss_smoothed, 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}, 'train_knobs': _v7_knobs(device, batch_size), 'rng_fp': _rng_fp, 'data_fp': L._ids_fp(train_ids),
            'nll_sum': _eval_stats.get('nll_sum'), 'n_tokens': _eval_stats.get('n_tokens'),
            'nll_per_row': _eval_stats.get('nll_per_row'), 'n_tokens_per_row': _eval_stats.get('n_tokens_per_row'),
            'eval_rows': _eval_stats.get('eval_rows'), 'eval_seed': _eval_stats.get('eval_seed'),
@@ -1196,7 +1198,9 @@ def _warm_fp(cfg, vocab, train_ids, val_batch):
 def _phase_cell_record(v, seed, rec, *, run_cfg, metric='ppl', key=None):
     """Normalised manifest cell for a custom phase (warmup/NIAH/lenphase)."""
     _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
-    _loss_nums = [float(x) for x in _losses if isinstance(x, (int, float)) and not isinstance(x, bool)]
+    _loss_nums = [float(x) for x in _losses
+                  if isinstance(x, (int, float)) and not isinstance(x, bool)
+                  and math.isfinite(float(x))]
     _curve = {
         'n_points': len(_loss_nums),
         'first': _loss_nums[0] if _loss_nums else rec.get('curve_first'),
