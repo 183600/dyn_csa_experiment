@@ -918,6 +918,38 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
         purge=purge)
 
 
+def _contains_missing_marker(value):
+    """True if a composite group id embeds a NaN/NaT that breaks identity.
+
+    A hashable tuple/frozenset holding ``float('nan')`` is itself hashable, but
+    distinct NaN objects compare unequal, so two rows of the *same* missing
+    group get different group keys and a split can leak without being caught.
+    Plain composites are left untouched by ``_group_key``; only those carrying
+    a missing marker need the recursive canonicalisation.
+    """
+    if isinstance(value, (float, np.floating)):
+        try:
+            return math.isnan(float(value))
+        except (TypeError, ValueError, OverflowError):
+            return False
+    if isinstance(value, (complex, np.complexfloating)):
+        try:
+            return math.isnan(float(value.real)) or math.isnan(float(value.imag))
+        except (TypeError, ValueError, OverflowError):
+            return False
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        try:
+            return bool(np.isnat(value))
+        except TypeError:
+            return False
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return any(_contains_missing_marker(x) for x in value)
+    if isinstance(value, dict):
+        return any(_contains_missing_marker(k) or _contains_missing_marker(v)
+                   for k, v in value.items())
+    return False
+
+
 def _group_key(value):
     """Hashable group identity; NaN/NaT rows collapse into one missing group.
 
@@ -940,6 +972,11 @@ def _group_key(value):
     except TypeError:
         # Group ids are normally hashable scalars, but an object column of
         # lists/arrays is grouped by a stable identity.
+        return _UnhashableKey(value)
+    if isinstance(value, (tuple, frozenset)) and _contains_missing_marker(value):
+        # Hashable composites can embed NaN/NaT, whose distinct objects compare
+        # unequal. Canonicalise them with the same recursive identity used for
+        # unhashables so the same missing group cannot straddle two splits.
         return _UnhashableKey(value)
     return value
 

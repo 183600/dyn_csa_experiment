@@ -160,7 +160,9 @@ def _hist_points(r):
 def sample_std(vals):
     n = len(vals)
     if n < 2:
-        return 0.0
+        # Sample variance is undefined with fewer than two observations; 0.0
+        # would falsely assert perfect precision in the "mean ± std" tables.
+        return float('nan')
     mu = sum(vals) / n
     return (sum(((v - mu) ** 2 for v in vals)) / (n - 1)) ** 0.5
 
@@ -997,7 +999,7 @@ def sec_p0w():
         std = sample_std(ppls)
         sws = [s for _p, s, _sd in vals if _ppl_ok(s)]
         sw_s = f'{sum(sws) / len(sws):.2f}' if sws else '—'
-        lines.append(f'| `{v}` | {w} | {mean:.2f} ± {std:.2f} | {len(ppls)} | {sw_s} |')
+        lines.append(f'| `{v}` | {w} | {mean:.2f} ± {fm(std)} | {len(ppls)} | {sw_s} |')
     base = grp.get(('csa_fixed', 0))
     if base and len(base) >= 1:
         b = sum((p for p, _s, _sd in base)) / len(base)
@@ -1109,24 +1111,30 @@ def sec_p0e():
                 and _r['tokens_seen'] > 0):
             _tok_hdr = f'~{_r['tokens_seen'] / 1e6:.0f}M tokens'
             break
-    lines = [f'## P0-2 「渐近线更差」是否成立？（延长训练 / {_tok_hdr}）', '', '**待检验论断**：早期窗口两臂都未平台化、差距在收窄。要么延长，要么改述为「等训练量下收敛更慢」。', '', '**做法**：`csa_fixed` + `full`（seed 数见下表），同 LONG 配置延长训练（seq 512、bs 12、同一训练池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。', '', '| variant | PPL@终点 (pooled/mean; ±seed sd) | n | params |', '|---|---|---|---|']
+    _raw_items = [_kv for _kv in s.items()
+                  if isinstance(_kv[1], dict) and _measurable(_kv[1])
+                  and _record_variant(_kv[1], _kv[0]) is not None]
+    _stale_panel = False
+    if _CUR_CS:
+        _cur_items = [_kv for _kv in _raw_items if _kv[1].get('_code') == _CUR_CS]
+        if _raw_items and not _cur_items:
+            print(f'[report] sec_p0e: NONE of the {len(_raw_items)} measurable trajectory record(s) carries the current code-semantics stamp {_CUR_CS!r} — stale panel excluded')
+            _stale_panel = True
+        if len(_cur_items) < len(_raw_items) and not _stale_panel:
+            print(f'[report] sec_p0e: {len(_raw_items) - len(_cur_items)} measurable trajectory record(s) predate the current code semantics — excluded from the trajectory and conclusions')
+        _raw_items = _cur_items
+    lines = [f'## P0-2 「渐近线更差」是否成立？（延长训练 / {_tok_hdr}）', '', '**待检验论断**：早期窗口两臂都未平台化、差距在收窄。要么延长，要么改述为「等训练量下收敛更慢」。', '', '**做法**：`csa_fixed` + `full`（seed 数见下表），同 LONG 配置延长训练（seq 512、bs 12、同一训练池、同一 cosine LR 全长度；eval_every=2000 记录全程轨迹）。']
+    if _stale_panel:
+        # The aggregate endpoint table would publish numbers from the very
+        # panel just declared untrustworthy; drop it along with the trajectory.
+        lines += ['', f'> **⚠ 陈旧记录已排除**：全部可测量轨迹记录都早于当前代码语义戳 `{_CUR_CS}`，未进入轨迹表、尾段斜率或任何结论；重跑长跑面板后再纳入。', '']
+        return '\n'.join(lines) + '\n'
+    lines += ['', '| variant | PPL@终点 (pooled/mean; ±seed sd) | n | params |', '|---|---|---|---|']
     for v in sorted(d):
         r = _agg_entry(d, v)
         if r is None:
             continue
         lines.append(f'| `{v}` | {fm(_ppl_value(r))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
-    _raw_items = [_kv for _kv in s.items()
-                  if isinstance(_kv[1], dict) and _measurable(_kv[1])
-                  and _record_variant(_kv[1], _kv[0]) is not None]
-    if _CUR_CS:
-        _cur_items = [_kv for _kv in _raw_items if _kv[1].get('_code') == _CUR_CS]
-        if _raw_items and not _cur_items:
-            print(f'[report] sec_p0e: NONE of the {len(_raw_items)} measurable trajectory record(s) carries the current code-semantics stamp {_CUR_CS!r} — stale panel excluded')
-            lines += ['', f'> **⚠ 陈旧记录已排除**：全部可测量轨迹记录都早于当前代码语义戳 `{_CUR_CS}`，未进入轨迹表、尾段斜率或任何结论；重跑长跑面板后再纳入。', '']
-            return '\n'.join(lines) + '\n'
-        if len(_cur_items) < len(_raw_items):
-            print(f'[report] sec_p0e: {len(_raw_items) - len(_cur_items)} measurable trajectory record(s) predate the current code semantics — excluded from the trajectory and conclusions')
-        _raw_items = _cur_items
     _s_items = _prefer_one_cfg(
         _raw_items,
         lambda kv: (_record_variant(kv[1], kv[0]), kv[1].get('run_cfg')),
@@ -2001,14 +2009,14 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):
     try:
         if n < _min_n:
             return False
-        pf, phf = (float(p) if p is not None else None), (float(ph) if ph is not None else None)
-        if pf is None or not (math.isfinite(pf) and 0.0 <= pf <= 1.0 and pf < alpha):
+        pf, phf = _as_finite(p), _as_finite(ph)
+        if pf is None or not (0.0 <= pf <= 1.0 and pf < alpha):
             return False
-        if phf is None or not (math.isfinite(phf) and 0.0 <= phf <= 1.0 and phf < alpha):
+        if phf is None or not (0.0 <= phf <= 1.0 and phf < alpha):
             return False
-        if mean is None or std is None:
+        mf, sf = _as_finite(mean), _as_finite(std)
+        if mf is None or sf is None:
             return False
-        mf, sf = float(mean), float(std)
         if not (math.isfinite(mf) and math.isfinite(sf) and sf >= 0.0):
             return False
         if abs(mf) <= sf:
@@ -2067,15 +2075,8 @@ def global_multiplicity_adjust(named_pvals, alpha=0.05):
             raise ValueError(f'global_multiplicity_adjust: duplicate comparison name {name!r}')
         seen.add(name)
         p = item[1]
-        valid = False
-        if p is not None and not isinstance(p, (bool, np.bool_,
-                                                np.datetime64, np.timedelta64,
-                                                complex, np.complexfloating)):
-            try:
-                pf = float(p)
-                valid = math.isfinite(pf) and 0.0 <= pf <= 1.0
-            except (TypeError, ValueError, OverflowError):
-                valid = False
+        pf = _as_finite(p)
+        valid = pf is not None and 0.0 <= pf <= 1.0
         fam = item[2] if len(item) == 3 else None
         rows.append({'name': name, 'p_raw': (pf if valid else None),
                      'p_slot': (pf if valid else 1.0),
@@ -2187,18 +2188,11 @@ def holm_adjust(named_pvals, alpha=0.05):
         if name in _seen:
             raise ValueError(f'holm_adjust: duplicate comparison name {name!r}')
         _seen.add(name)
-        if isinstance(v, (bool, np.bool_, np.datetime64, np.timedelta64,
-                          complex, np.complexfloating)):
-            # A flag/temporal/complex value is not a probability: float(False)
-            # == 0.0 would make it the strongest possible p-value and shrink
-            # the family, while complex values silently discard the imaginary
-            # part.
-            pv = float('nan')
-        else:
-            try:
-                pv = float(v)
-            except (TypeError, ValueError, OverflowError):
-                pv = float('nan')
+        # A flag/temporal/complex/numeric-string value is not a probability:
+        # float(False) == 0.0 or float("0.0001") == 1e-4 would manufacture a
+        # significant p-value from a non-measurement and shrink the family.
+        _pv = _as_finite(v)
+        pv = _pv if _pv is not None else float('nan')
         if (not math.isfinite(pv)) or pv < 0.0 or pv > 1.0:
             pv = 1.0
         items.append((name, pv))
@@ -2326,17 +2320,11 @@ def sec_stats():
         _pv = None
         if isinstance(v, dict) and 'omitted' not in v:
             _pv = v.get('p_exact_signflip') if v.get('p_exact_signflip') is not None else v.get('p')
-            if isinstance(_pv, (bool, np.bool_, np.datetime64, np.timedelta64,
-                                complex, np.complexfloating)):
-                # Booleans are flags; float(False)==0.0 would enter Holm as
-                # the strongest possible p while the display shows n/a;
-                # temporal/complex spellings are not probabilities either.
-                _pv = None
-            else:
-                try:
-                    _pv = float(_pv)
-                except (TypeError, ValueError, OverflowError):
-                    _pv = None
+            # Booleans are flags (float(False)==0.0 would enter Holm as the
+            # strongest possible p), and numeric strings are serialization
+            # artifacts that exp_lib's twin refuses as well: both are not
+            # measurements, so keep them as an invalid p=1 slot.
+            _pv = _as_finite(_pv)
         # Omitted/invalid comparisons keep a dummy p=1 slot so a report cannot
         # shrink its own correction family by dropping a failed comparison.
         _pairs.append((k, _pv if (_pv is not None and math.isfinite(_pv) and 0.0 <= _pv <= 1.0) else 1.0))

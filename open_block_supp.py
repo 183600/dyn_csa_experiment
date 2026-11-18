@@ -759,6 +759,7 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
         'primary_family': prim_names,
         'primary_family_size': len(prim_names),
         'primary_holm_floor': _holm_floor,
+        'primary_holm_floor_n': _prim_n_max,
         'primary_holm_min_seeds': _holm_min_n,
         'comparisons': results,
         'diagnostics': diagnostics,
@@ -788,7 +789,7 @@ def _render_markdown(stats):
     lines = ['# Open-block panel: maximum block length × current-block reading', '']
     lines.append(f'Code: `{stats["code"]}`  |  cells: {len(stats["cells_available"])}  |  seeds: {stats["seeds_requested"]}')
     if stats.get('primary_holm_floor') is not None:
-        lines.append(f'Primary family Holm floor: `{_fmt(stats.get("primary_holm_floor"))}` at n={stats.get("seeds_requested")}; minimum seeds for a confirmatory claim: `{stats.get("primary_holm_min_seeds")}`.')
+        lines.append(f'Primary family Holm floor: `{_fmt(stats.get("primary_holm_floor"))}` at n={stats.get("primary_holm_floor_n") or stats.get("seeds_requested")}; minimum seeds for a confirmatory claim: `{stats.get("primary_holm_min_seeds")}`.')
     lines += ['', 'Delta convention: `a - b` on token NLL; negative means `a` is better.', '']
     lines.append('| comparison | family | n | mean ΔNLL | SD | dz | exact p | Holm p | p floor | CI95 | controlled |')
     lines.append('|---|---|---|---|---|---|---|---|---|---|---|')

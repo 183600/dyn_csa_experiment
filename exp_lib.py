@@ -9342,7 +9342,10 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
         # len == seq_len+1 still contains exactly one valid causal window
         # (start=0, targets up to len-1); only a shorter corpus is invalid.
         raise ValueError(f'batch_iter needs len(train_ids) >= seq_len+1 to sample a causal window, got len={len(train_ids)} seq_len={seq_len}. Increase n_train_tokens or reduce seq_len.')
-    train_ids = np.asarray(train_ids)
+    # Keep an ndarray/memmap's identity: np.asarray(memmap) returns a fresh
+    # view each call, so the identity-based pinned/GPU corpus cache below would
+    # never hit and a whole disk-backed corpus would be re-uploaded per call.
+    train_ids = train_ids if isinstance(train_ids, np.ndarray) else np.asarray(train_ids)
     _narrow = _ids_narrow(train_ids)
     _devkey = _dev_str(device)
     host = None
@@ -9468,6 +9471,8 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
         th.join(timeout=5.0)
 
 _WINDOW_SCAN_CHUNK = 1 << 20
+_WINDOW_CMP_BYTES = 1 << 22
+_BOOTSTRAP_MAX_ELEMS = 1 << 22
 
 
 def _window_follow_tokens(src, row, chunk=_WINDOW_SCAN_CHUNK):
@@ -9476,7 +9481,10 @@ def _window_follow_tokens(src, row, chunk=_WINDOW_SCAN_CHUNK):
     The returned set is exactly the set of ``src[p + len(row)]`` values over
     every valid start ``p``; a window with no following token
     (``p + len(row) == len(src)``) cannot be a training target and is not
-    returned.
+    returned.  The scan is vectorised over sliding windows so a frequent
+    first token cannot turn the preflight check into a per-occurrence Python
+    loop; the comparison buffer is capped at a few MB regardless of the
+    sequence length or window width.
     """
     src = np.asarray(src).reshape(-1)
     row = np.asarray(row).reshape(-1)
@@ -9485,15 +9493,17 @@ def _window_follow_tokens(src, row, chunk=_WINDOW_SCAN_CHUNK):
     out = set()
     if width <= 0 or n < width + 1:
         return out
-    first = row[0]
     last_start = n - width - 1
-    step = max(1, int(chunk))
+    # A sliding_window_view is a no-copy view; only the boolean comparison is
+    # materialised, and its size is capped by _WINDOW_CMP_BYTES.
+    windows = np.lib.stride_tricks.sliding_window_view(src, width)
+    step = max(1, min(int(chunk), _WINDOW_CMP_BYTES // max(1, width)))
     for start in range(0, last_start + 1, step):
         end = min(start + step, last_start + 1)
-        for offset in np.flatnonzero(src[start:end] == first):
-            pos = start + int(offset)
-            if np.array_equal(src[pos:pos + width], row):
-                out.add(int(src[pos + width]))
+        ok = np.all(windows[start:end] == row, axis=1)
+        if ok.any():
+            pos = start + np.flatnonzero(ok)
+            out.update(int(v) for v in src[pos + width])
     return out
 
 
@@ -10305,6 +10315,11 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     if (isinstance(mean, (bool, np.bool_)) or _is_nonmeasurement_scalar(mean)
             or isinstance(std, (bool, np.bool_)) or _is_nonmeasurement_scalar(std)):
         out['reasons'].append('mean/std are boolean/temporal/complex values, not measurements')
+    elif _finite_scalar(mean) is None or _finite_scalar(std) is None:
+        # float("1.0") would otherwise turn a stringified measurement into a
+        # passing effect-size gate, while p-values are already refused as
+        # strings by the _finite_scalar checks above.
+        out['reasons'].append('mean/std are not finite numeric measurements')
     else:
         try:
             _mean_f = float(mean)
@@ -10645,7 +10660,7 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
         return None
     rng = np.random.default_rng(sd)
     means = np.empty(nb, dtype=float)
-    _chunk = 256
+    _chunk = max(1, min(256, _BOOTSTRAP_MAX_ELEMS // max(1, n)))
     for _off in range(0, nb, _chunk):
         _nb = min(_chunk, nb - _off)
         _idx = rng.integers(0, n, size=(_nb, n))
@@ -10670,7 +10685,7 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
         return None
     rng = np.random.default_rng(sd)
     means = np.empty(nb, dtype=float)
-    chunk = 256
+    chunk = max(1, min(256, _BOOTSTRAP_MAX_ELEMS // max(1, d.size)))
     for off in range(0, nb, chunk):
         m = min(chunk, nb - off)
         idx = rng.integers(0, d.size, size=(m, d.size))
@@ -10690,7 +10705,7 @@ def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=2026
         return None
     rng = np.random.default_rng(sd)
     diff = np.empty(nb, dtype=float)
-    chunk = 256
+    chunk = max(1, min(256, _BOOTSTRAP_MAX_ELEMS // max(1, max(a.size, b.size))))
     for off in range(0, nb, chunk):
         m = min(chunk, nb - off)
         ai = rng.integers(0, a.size, size=(m, a.size))

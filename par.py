@@ -380,7 +380,11 @@ def _job_watchdog_seconds(job, ctx):
     """
     v = job.get("watchdog_seconds") or ctx.get("watchdog_seconds")
     if v:
-        return float(v)
+        try:
+            wd = float(v)
+        except (TypeError, ValueError, OverflowError):
+            return 12.0 * 3600.0
+        return wd if math.isfinite(wd) and wd > 0 else 12.0 * 3600.0
     try:
         import exp_lib as _L
         cap = job.get("guard_cap")
@@ -640,6 +644,17 @@ def run_jobs(jobs, ctx, phase_label="phase"):
                         _terminate_entries([entry])
                         entry["log_f"].close()
                         entry["done"] = True
+                        # Re-read after the child has been reaped: a child that
+                        # finished its finally-block result write in the narrow
+                        # window between the first read and termination must not
+                        # have that valid result clobbered by watchdog_timeout.
+                        _post = _read_result(entry["result_path"])
+                        _post_status = (_post.get("status")
+                                        if isinstance(_post, dict) else None)
+                        if (isinstance(_post_status, str)
+                                and bool(_post_status.strip())
+                                and _post_status not in _INVALID_RESULT_STATUSES):
+                            _prior, _prior_ok = _post, True
                         if _prior_ok:
                             print(
                                 f"[par] {entry['name']} had already written a "
@@ -677,15 +692,18 @@ def run_jobs(jobs, ctx, phase_label="phase"):
                 result = _read_result(entry["result_path"])
                 entry["result"] = result
                 results[entry["idx"]] = result
-                status = (result or {}).get("status", "missing_result")
+                status = (result or {}).get("status")
                 print(
                     f"[par] Done {entry['name']}: rc={rc}, "
-                    f"status={status}, "
+                    f"status={status if status is not None else 'missing_result'}, "
                     f"{(time.monotonic() - started) / 60:.1f} min "
                     "since dispatch.",
                     flush=True,
                 )
 
+                # A missing status must fail closed here exactly as it does on
+                # the watchdog-adoption path; the old fallback string made an
+                # empty {} result look like a successful cell.
                 valid_result = (
                     isinstance(result, dict)
                     and isinstance(status, str)
