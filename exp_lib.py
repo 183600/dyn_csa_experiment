@@ -10768,14 +10768,45 @@ def _stable_mean_std(values, ddof=1):
     a = np.asarray(values, dtype=float)
     if a.size == 0:
         return float('nan'), float('nan')
-    ref = float(a[0])
-    shifted = a - ref
-    smean = float(shifted.mean())
-    mean = ref + smean
+    if not np.all(np.isfinite(a)):
+        # Preserve the historical non-finite propagation: callers validate
+        # measurements before reaching here, and inf/nan has no finite
+        # rescaling that would make the summary meaningful.
+        ref = float(a[0])
+        shifted = a - ref
+        smean = float(shifted.mean())
+        mean = ref + smean
+        if a.size <= ddof:
+            return mean, float('nan')
+        ss = float(((shifted - smean) ** 2).sum())
+        return mean, math.sqrt(ss / (a.size - ddof))
+    # Center around zero by an exact power-of-two scale, not by a[0].  For
+    # opposite-sign values near the float limit `a - a[0]` overflows to inf
+    # (mean 0, std ~1.4e308 would be reported as -inf/nan); for tiny values
+    # the squared deviations underflow to 0 and the spread silently vanishes.
+    amax = float(np.max(np.abs(a)))
+    if amax == 0.0:
+        return 0.0, (0.0 if a.size > ddof else float('nan'))
+    _, exp = math.frexp(amax)
+
+    def _unscale(v):
+        if not exp:
+            return v
+        try:
+            return math.ldexp(v, exp)
+        except OverflowError:
+            # The spread can legitimately exceed the largest finite float
+            # (e.g. [max, -max]); report that limit instead of crashing.
+            return math.copysign(float('inf'), v)
+
+    scaled = np.ldexp(a, -exp) if exp else a
+    smean = float(scaled.mean())
+    mean = _unscale(smean)
     if a.size <= ddof:
         return mean, float('nan')
-    ss = float(((shifted - smean) ** 2).sum())
-    return mean, math.sqrt(ss / (a.size - ddof))
+    ss = float(((scaled - smean) ** 2).sum())
+    std = math.sqrt(ss / (a.size - ddof))
+    return mean, _unscale(std)
 
 
 def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_values=None):
