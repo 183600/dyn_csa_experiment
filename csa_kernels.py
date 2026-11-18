@@ -208,9 +208,8 @@ def _seg_apply(seg, values, out_flat):
     的行保持零，与「零初始化全头缓冲后按 seg_id·nh+h 写入、末尾一次 cast」
     逐头 cast 的参考形式逐位一致）。段内累加顺序与线程数无关。"""
     order, seg_end, seg_id_k, keep = seg
-    # Accumulate in promoted precision (>=fp32 for fp16/bf16 inputs), matching
-    # _det_scatter_add_multi's fixed-order reduction, then cast on write so
-    # index_copy_ dtypes match out_flat.
+    # Accumulate in promoted precision (>=fp32 for fp16/bf16 inputs), then
+    # cast on write so index_copy_ dtypes match out_flat.
     val_s = values.index_select(0, order)
     _wdt = torch.promote_types(val_s.dtype, torch.float32)
     csum = val_s.to(_wdt).cumsum_(dim=0)

@@ -644,10 +644,6 @@ def run_jobs(jobs, ctx, phase_label="phase"):
                         _terminate_entries([entry])
                         entry["log_f"].close()
                         entry["done"] = True
-                        # Re-read after the child has been reaped: a child that
-                        # finished its finally-block result write in the narrow
-                        # window between the first read and termination must not
-                        # have that valid result clobbered by watchdog_timeout.
                         _post = _read_result(entry["result_path"])
                         _post_status = (_post.get("status")
                                         if isinstance(_post, dict) else None)
@@ -701,9 +697,6 @@ def run_jobs(jobs, ctx, phase_label="phase"):
                     flush=True,
                 )
 
-                # A missing status must fail closed here exactly as it does on
-                # the watchdog-adoption path; the old fallback string made an
-                # empty {} result look like a successful cell.
                 valid_result = (
                     isinstance(result, dict)
                     and isinstance(status, str)

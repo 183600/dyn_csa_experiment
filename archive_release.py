@@ -401,9 +401,6 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
 
 def cmd_verify(tar_path):
     if not os.path.isfile(tar_path):
-        # A directory (or other non-regular path) passes os.path.exists but
-        # fails inside _sha256 with an uncaught IsADirectoryError; refuse with
-        # the same clean diagnostic used for every other malformed input.
         print(f'[archive] REFUSE: {tar_path} is not a regular archive file')
         return 1
     side = tar_path + '.sha256'

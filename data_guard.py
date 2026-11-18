@@ -919,14 +919,7 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
 
 
 def _contains_missing_marker(value):
-    """True if a composite group id embeds a NaN/NaT that breaks identity.
-
-    A hashable tuple/frozenset holding ``float('nan')`` is itself hashable, but
-    distinct NaN objects compare unequal, so two rows of the *same* missing
-    group get different group keys and a split can leak without being caught.
-    Plain composites are left untouched by ``_group_key``; only those carrying
-    a missing marker need the recursive canonicalisation.
-    """
+    """True if a composite group id embeds a NaN/NaT that breaks identity."""
     if isinstance(value, (float, np.floating)):
         try:
             return math.isnan(float(value))
@@ -974,9 +967,6 @@ def _group_key(value):
         # lists/arrays is grouped by a stable identity.
         return _UnhashableKey(value)
     if isinstance(value, (tuple, frozenset)) and _contains_missing_marker(value):
-        # Hashable composites can embed NaN/NaT, whose distinct objects compare
-        # unequal. Canonicalise them with the same recursive identity used for
-        # unhashables so the same missing group cannot straddle two splits.
         return _UnhashableKey(value)
     return value
 

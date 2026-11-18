@@ -9342,9 +9342,6 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
         # len == seq_len+1 still contains exactly one valid causal window
         # (start=0, targets up to len-1); only a shorter corpus is invalid.
         raise ValueError(f'batch_iter needs len(train_ids) >= seq_len+1 to sample a causal window, got len={len(train_ids)} seq_len={seq_len}. Increase n_train_tokens or reduce seq_len.')
-    # Keep an ndarray/memmap's identity: np.asarray(memmap) returns a fresh
-    # view each call, so the identity-based pinned/GPU corpus cache below would
-    # never hit and a whole disk-backed corpus would be re-uploaded per call.
     train_ids = train_ids if isinstance(train_ids, np.ndarray) else np.asarray(train_ids)
     _narrow = _ids_narrow(train_ids)
     _devkey = _dev_str(device)
@@ -9481,10 +9478,7 @@ def _window_follow_tokens(src, row, chunk=_WINDOW_SCAN_CHUNK):
     The returned set is exactly the set of ``src[p + len(row)]`` values over
     every valid start ``p``; a window with no following token
     (``p + len(row) == len(src)``) cannot be a training target and is not
-    returned.  The scan is vectorised over sliding windows so a frequent
-    first token cannot turn the preflight check into a per-occurrence Python
-    loop; the comparison buffer is capped at a few MB regardless of the
-    sequence length or window width.
+    returned.
     """
     src = np.asarray(src).reshape(-1)
     row = np.asarray(row).reshape(-1)
@@ -9494,8 +9488,6 @@ def _window_follow_tokens(src, row, chunk=_WINDOW_SCAN_CHUNK):
     if width <= 0 or n < width + 1:
         return out
     last_start = n - width - 1
-    # A sliding_window_view is a no-copy view; only the boolean comparison is
-    # materialised, and its size is capped by _WINDOW_CMP_BYTES.
     windows = np.lib.stride_tricks.sliding_window_view(src, width)
     step = max(1, min(int(chunk), _WINDOW_CMP_BYTES // max(1, width)))
     for start in range(0, last_start + 1, step):
@@ -10316,9 +10308,6 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             or isinstance(std, (bool, np.bool_)) or _is_nonmeasurement_scalar(std)):
         out['reasons'].append('mean/std are boolean/temporal/complex values, not measurements')
     elif _finite_scalar(mean) is None or _finite_scalar(std) is None:
-        # float("1.0") would otherwise turn a stringified measurement into a
-        # passing effect-size gate, while p-values are already refused as
-        # strings by the _finite_scalar checks above.
         out['reasons'].append('mean/std are not finite numeric measurements')
     else:
         try:

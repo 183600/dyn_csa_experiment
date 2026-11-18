@@ -160,8 +160,6 @@ def _hist_points(r):
 def sample_std(vals):
     n = len(vals)
     if n < 2:
-        # Sample variance is undefined with fewer than two observations; 0.0
-        # would falsely assert perfect precision in the "mean ± std" tables.
         return float('nan')
     mu = sum(vals) / n
     return (sum(((v - mu) ** 2 for v in vals)) / (n - 1)) ** 0.5

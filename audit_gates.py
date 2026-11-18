@@ -633,9 +633,6 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             row_overlaps = []
             if np.asarray(te).ndim == 2 and tr_s.size:
                 _tr_set = np.sort(tr_s)
-                # Honour the same max_rows_shingled cap _shingles used: scanning
-                # every test row here made the documented cap meaningless and
-                # dominated audit runtime on large caches.
                 for _i in _uniform_rows(int(np.asarray(te).shape[0]), int(max_rows_shingled))[0]:
                     _rh = _window_hashes(np.asarray(te)[int(_i)], shingle)
                     if _rh.size:
