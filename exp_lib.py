@@ -13384,6 +13384,27 @@ def _as_seed_int(v):
         return None
     return iv
 
+
+def _hash_seed_str(v):
+    """Fold a declared seed into the only range ``PYTHONHASHSEED`` accepts.
+
+    CPython parses ``PYTHONHASHSEED`` during config initialisation and aborts
+    the child interpreter with ``Fatal Python error: config_init_hash_seed``
+    unless the value is the literal ``random`` or a decimal integer in
+    ``[0, 2**32-1]``.  The panel deliberately preserves negative seed ids and
+    ids above ``2**32``, so writing a raw ``str(seed)`` into the environment
+    makes every spawned worker (par.py dispatch, the subprocess reproducibility
+    probe) die before running a single line of the job.  Fold exactly the way
+    ``set_seed`` folds the NumPy stream; an in-range seed is byte-identical to
+    the old spelling (``str(n) == str(n % 2**32)`` for ``0 <= n < 2**32``), so
+    recorded/repro hash seeds do not change for the normal panel.
+    """
+    n = _as_seed_int(v)
+    if n is None:
+        raise ValueError(f'PYTHONHASHSEED: seed must be an exact integer, got {v!r}')
+    return str(n if 0 <= n < 2 ** 32 else n % (2 ** 32))
+
+
 def _seed_identity(v):
     """Normalise a seed id for duplicate/pairing checks.
 
@@ -16689,7 +16710,9 @@ def set_seed(seed):
     if _seed is None:
         raise ValueError(f'set_seed: seed must be an exact integer, got {seed!r}')
     seed = _seed
-    os.environ['PYTHONHASHSEED'] = str(seed)
+    # Only [0, 2**32-1] (or `random`) is a startable PYTHONHASHSEED; a raw
+    # str(seed) here would make every later child process abort at startup.
+    os.environ['PYTHONHASHSEED'] = _hash_seed_str(seed)
     random.seed(seed)
     # NumPy's global RNG only accepts [0, 2**32-1], while the panel planner
     # deliberately preserves exact Python integers beyond that (and negative
@@ -17006,7 +17029,7 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
                 'print(json.dumps([random.random(),float(np.random.random()),float(torch.rand(1).item())]))' % seed
             )
             env = dict(os.environ)
-            env['PYTHONHASHSEED'] = str(seed)
+            env['PYTHONHASHSEED'] = _hash_seed_str(seed)
             try:
                 outs = [subprocess.check_output([sys.executable, '-c', code], cwd=os.path.dirname(os.path.abspath(__file__)), env=env, text=True, timeout=180).strip().splitlines()[-1] for _ in range(2)]
                 sub = {'same_seed_reproducible': bool(outs[0] == outs[1]), 'draws': outs}
@@ -19456,8 +19479,6 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
     prefill, and `decode_has_kv_cache=False` is recorded rather than pretending
     this is incremental decoding.
     """
-    was = model.training
-    model.eval()
     arr = torch.as_tensor(ids)
     if arr.ndim == 1:
         arr = arr[None, :]
@@ -19483,6 +19504,8 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
         out['tf32'] = bool(torch.backends.cuda.matmul.allow_tf32) if device.type == 'cuda' else None
     except Exception:
         pass
+    was = model.training
+    model.eval()
     try:
         _warmup = _as_seed_int(warmup)
         if _warmup is None or _warmup < 0:
@@ -20215,226 +20238,228 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     import heapq as _heapq
     was_training = model.training
     model.eval()
-    vb = np.asarray(val_batch)
-    if vb.ndim != 2 or vb.shape[1] < 2:
-        raise ValueError(f'analyze_errors needs a 2-D val_batch with >=2 tokens, got {vb.shape}')
-    n_rows, seq = int(vb.shape[0]), int(vb.shape[1])
-    span = seq - 1
-    V = int(vocab)
-    freq = None
-    if train_ids is not None:
-        _raw_train = np.asarray(train_ids)
-        if _raw_train.size and (_raw_train.dtype == bool or not np.issubdtype(_raw_train.dtype, np.integer)):
-            # Casting a float id first (1.9 -> 1) would compute the rare-token
-            # flags from a different corpus; the diagnostic must not invent
-            # frequencies from malformed ids.
-            print(f'[analyze_errors] WARNING: train_ids have dtype '
-                  f'{_raw_train.dtype}, not an integer token type — rare-token '
-                  'statistics are omitted instead of truncated')
-        else:
+    try:
+        vb = np.asarray(val_batch)
+        if vb.ndim != 2 or vb.shape[1] < 2:
+            raise ValueError(f'analyze_errors needs a 2-D val_batch with >=2 tokens, got {vb.shape}')
+        n_rows, seq = int(vb.shape[0]), int(vb.shape[1])
+        span = seq - 1
+        V = int(vocab)
+        freq = None
+        if train_ids is not None:
+            _raw_train = np.asarray(train_ids)
+            if _raw_train.size and (_raw_train.dtype == bool or not np.issubdtype(_raw_train.dtype, np.integer)):
+                # Casting a float id first (1.9 -> 1) would compute the rare-token
+                # flags from a different corpus; the diagnostic must not invent
+                # frequencies from malformed ids.
+                print(f'[analyze_errors] WARNING: train_ids have dtype '
+                      f'{_raw_train.dtype}, not an integer token type — rare-token '
+                      'statistics are omitted instead of truncated')
+            else:
+                try:
+                    freq = np.bincount(_raw_train.astype(np.int64, copy=False).reshape(-1),
+                                       minlength=V)[:V]
+                except Exception:
+                    freq = None
+        bnd_np = np.asarray(val_bnd) if val_bnd is not None else None
+        if bnd_np is not None and bnd_np.shape != vb.shape:
+            print(f'[analyze_errors] WARNING: boundary mask shape {bnd_np.shape} != val_batch shape {vb.shape} — boundary-token statistics are OMITTED rather than computed from a misaligned/truncated mask')
+            bnd_np = None
+        tok = tokenizer
+        tok_warned = False
+
+        def _decode(ids):
+            nonlocal tok_warned
+            if tok is None:
+                return None
             try:
-                freq = np.bincount(_raw_train.astype(np.int64, copy=False).reshape(-1),
-                                   minlength=V)[:V]
-            except Exception:
-                freq = None
-    bnd_np = np.asarray(val_bnd) if val_bnd is not None else None
-    if bnd_np is not None and bnd_np.shape != vb.shape:
-        print(f'[analyze_errors] WARNING: boundary mask shape {bnd_np.shape} != val_batch shape {vb.shape} — boundary-token statistics are OMITTED rather than computed from a misaligned/truncated mask')
-        bnd_np = None
-    tok = tokenizer
-    tok_warned = False
+                return tok.decode([int(x) for x in ids])
+            except Exception as e:
+                if not tok_warned:
+                    print(f'[errors] WARNING: tokenizer decode failed ({type(e).__name__}: {e}); ids will be reported without text')
+                    tok_warned = True
+                return None
 
-    def _decode(ids):
-        nonlocal tok_warned
-        if tok is None:
-            return None
-        try:
-            return tok.decode([int(x) for x in ids])
-        except Exception as e:
-            if not tok_warned:
-                print(f'[errors] WARNING: tokenizer decode failed ({type(e).__name__}: {e}); ids will be reported without text')
-                tok_warned = True
-            return None
+        seq_rows = []
+        tok_heap = []
+        buckets = collections.defaultdict(lambda: {'n': 0, 'ce_sum': 0.0})
+        n_targets = 0
+        n_nonfinite = 0
 
-    seq_rows = []
-    tok_heap = []
-    buckets = collections.defaultdict(lambda: {'n': 0, 'ce_sum': 0.0})
-    n_targets = 0
-    n_nonfinite = 0
-
-    def _bucket(pos, tgt):
-        frac = pos / max(1, span)
-        if frac < 0.1:
-            b = 'position:first10%'
-        elif frac < 0.5:
-            b = 'position:10-50%'
-        elif frac < 0.9:
-            b = 'position:50-90%'
-        else:
-            b = 'position:last10%'
-        return b
-
-    # Vectorised bucket accumulation.
-    _bucket_names = ['position:first10%', 'position:10-50%', 'position:50-90%',
-                     'position:last10%', 'target:rare(<=5 train occurrences)',
-                     'target:common', 'target:boundary-token']
-    _nb = len(_bucket_names)
-    _bsum = torch.zeros(_nb, dtype=torch.float64, device=device)
-    _bcnt = torch.zeros(_nb, dtype=torch.long, device=device)
-    _freq_t = None
-    if freq is not None:
-        try:
-            _freq_t = torch.as_tensor(freq, dtype=torch.long, device=device)
-        except Exception:
-            _freq_t = None
-    _kk = min(max(1, int(topk)), int(V))
-    for r0 in range(0, n_rows, max(1, int(chunk))):
-        r1 = min(n_rows, r0 + max(1, int(chunk)))
-        ids = torch.as_tensor(np.ascontiguousarray(vb[r0:r1]), dtype=torch.long, device=device)
-        h = model.trunk(ids)
-        row_nll = np.zeros(r1 - r0, dtype=np.float64)
-        row_ok = np.zeros(r1 - r0, dtype=np.int64)
-        for s0 in range(0, span, 64):
-            s1 = min(s0 + 64, span)
-            lg = model.head(h[:, s0:s1, :])
-            tg = ids[:, s0 + 1:s1 + 1]
-            ce = F.cross_entropy(lg.transpose(1, 2), tg, reduction='none')
-            _b, _s = int(ce.shape[0]), int(ce.shape[1])
-            ce_f = ce.detach().float()
-            finite = torch.isfinite(ce_f)
-            if not bool(finite.all()):
-                n_nonfinite += int((~finite).sum())
-            ce_safe = torch.where(finite, ce_f, torch.zeros_like(ce_f))
-            row_nll += ce_safe.double().sum(dim=1).cpu().numpy()
-            row_ok += finite.sum(dim=1).cpu().numpy().astype(np.int64)
-            # Entropy from one log_softmax table; top-k works directly on the
-            # fp32 logits.
-            lg_work = lg.float()
-            logp = torch.log_softmax(lg_work, dim=-1)
-            ent = -(logp * logp.exp()).sum(-1)
-            del logp
-            topv, topi = torch.topk(lg_work, _kk, dim=-1)
-            pred = topi[..., 0]
-            margin = (topv[..., 0] - topv[..., 1]) if _kk > 1 else torch.zeros_like(topv[..., 0])
-            del lg_work, topv
-            # Bucket ids for every token at once.
-            pos = torch.arange(s0, s1, device=device, dtype=torch.float64)[None, :]
+        def _bucket(pos, tgt):
             frac = pos / max(1, span)
-            bidx = ((frac >= 0.1).to(torch.long) + (frac >= 0.5).to(torch.long)
-                    + (frac >= 0.9).to(torch.long)).expand(_b, _s)
-            if _freq_t is not None:
-                _ft = _freq_t[tg.clamp(0, _freq_t.numel() - 1)]
-                rare = _ft <= 5
+            if frac < 0.1:
+                b = 'position:first10%'
+            elif frac < 0.5:
+                b = 'position:10-50%'
+            elif frac < 0.9:
+                b = 'position:50-90%'
             else:
-                rare = torch.zeros((_b, _s), dtype=torch.bool, device=device)
-            if bnd_np is not None and bnd_np.shape == vb.shape:
-                _bnd = torch.as_tensor(np.ascontiguousarray(bnd_np[r0:r1, s0 + 1:s1 + 1]),
-                                       dtype=torch.bool, device=device)
-            else:
-                _bnd = torch.zeros((_b, _s), dtype=torch.bool, device=device)
-            _flat_b = bidx.reshape(-1)
-            _flat_ce = ce_safe.reshape(-1).double()
-            _flat_rare = rare.reshape(-1)
-            _flat_finite = finite.reshape(-1)
-            _flat_bnd = _bnd.reshape(-1)
-            # Non-finite CE is counted in n_nonfinite and excluded from BOTH
-            # numerator and denominator, so only finite targets contribute.
-            _bsum[:4] += torch.bincount(_flat_b[_flat_finite],
-                                        weights=_flat_ce[_flat_finite], minlength=4)
-            _bcnt[:4] += torch.bincount(_flat_b[_flat_finite], minlength=4)
-            _sel_rare = _flat_finite & _flat_rare
-            _bsum[4] += _flat_ce[_sel_rare].sum()
-            _bcnt[4] += int(_sel_rare.sum())
-            _sel_common = _flat_finite & ~_flat_rare
-            _bsum[5] += _flat_ce[_sel_common].sum()
-            _bcnt[5] += int(_sel_common.sum())
-            _sel_bnd = _flat_finite & _flat_bnd
-            _bsum[6] += _flat_ce[_sel_bnd].sum()
-            _bcnt[6] += int(_sel_bnd.sum())
-            n_targets += int(_flat_finite.sum())
-            # Select at most top_tokens candidates.
-            _sel_n = min(int(top_tokens), _b * _s)
-            _pick_val, _pick_idx = torch.topk(torch.where(finite.reshape(-1), ce_f.reshape(-1),
-                                                          torch.full_like(ce_f.reshape(-1), float('inf'))),
-                                              _sel_n)
-            _finite_pick = torch.isfinite(_pick_val)
-            if bool(_finite_pick.any()):
-                _pick_idx = _pick_idx[_finite_pick]
-                _pi = _pick_idx.cpu().numpy()
-                _pv = _pick_val[_finite_pick].cpu().numpy()
-                _pr = (pred.reshape(-1).index_select(0, _pick_idx)).cpu().numpy()
-                _pe = (ent.reshape(-1).index_select(0, _pick_idx)).cpu().numpy()
-                _pm = (margin.reshape(-1).index_select(0, _pick_idx)).cpu().numpy()
-                _pt = (tg.reshape(-1).index_select(0, _pick_idx)).cpu().numpy()
-                _prr = (rare.reshape(-1).index_select(0, _pick_idx)).cpu().numpy()
-                _ptop = (topi.reshape(-1, _kk).index_select(0, _pick_idx)).cpu().numpy()
-                for _k in range(len(_pi)):
-                    _lin = int(_pi[_k])
-                    _pos = s0 + (_lin % _s)
-                    rec = (float(_pv[_k]), r0 + (_lin // _s), _pos, int(_pt[_k]),
-                           int(_pr[_k]), float(_pe[_k]), float(_pm[_k]),
-                           [int(x) for x in _ptop[_k]], bool(_prr[_k]))
-                    if len(tok_heap) < int(top_tokens):
-                        _heapq.heappush(tok_heap, rec)
-                    elif rec[0] > tok_heap[0][0]:
-                        _heapq.heapreplace(tok_heap, rec)
-            del lg, tg, ce, ce_f, ce_safe, finite, pred, margin, topi, ent
-            del bidx, rare, _bnd, _flat_b, _flat_ce
-        for i in range(r1 - r0):
-            n = int(row_ok[i])
-            ce_mean = float(row_nll[i] / n) if n else float('nan')
-            seq_rows.append((ce_mean, r0 + i, float(row_nll[i]), n))
-        del h, ids
-    _bsum_cpu = _bsum.detach().cpu().tolist()
-    _bcnt_cpu = _bcnt.detach().cpu().tolist()
-    for _name, _n, _sm in zip(_bucket_names, _bcnt_cpu, _bsum_cpu):
-        buckets[_name] = {'n': int(_n), 'ce_sum': float(_sm)}
-    seq_rows.sort(key=lambda t: (not math.isfinite(t[0]), -t[0] if math.isfinite(t[0]) else 0.0))
-    worst_seqs = []
-    for ce_mean, row, nll, n in seq_rows[:max(1, int(top_n))]:
-        recs = [t for t in tok_heap if t[1] == row]
-        worst_seqs.append({'row': int(row), 'mean_ce': ce_mean, 'nll': nll, 'n_tokens': int(n),
-                           'top_worst_token_from_sample': (max(recs)[0] if recs else None),
-                           'context': _decode(vb[row].tolist()),
-                           'ids': [int(x) for x in vb[row].tolist()]})
-    worst_tokens = []
-    for rec in sorted(tok_heap, key=lambda t: t[0], reverse=True)[:max(1, int(top_tokens))]:
-        c, row, pos, tgt, pred, ent, margin, tids, rare = rec
-        lo = max(0, pos - int(context_tokens))
-        hi = min(span, pos + int(context_tokens) + 1)
-        ctx_ids = [int(x) for x in vb[row, lo:hi + 1].tolist()]
-        ctgt = int(vb[row, pos + 1])
-        worst_tokens.append({
-            'row': int(row), 'position': int(pos), 'ce': c, 'target_id': tgt,
-            'pred_id': pred, 'entropy': ent, 'margin': margin,
-            'topk_ids': tids, 'topk_text': [_decode([x]) for x in tids],
-            'rare_target': bool(rare),
-            'target_text': _decode([ctgt]),
-            'pred_text': _decode([pred]),
-            'context_text': _decode(ctx_ids),
-            'context_ids': ctx_ids,
-            'is_boundary_token': (bool(bnd_np[row, pos + 1]) if (bnd_np is not None and bnd_np.shape == vb.shape) else None),
-        })
-    out_buckets = {}
-    for k, v in buckets.items():
-        out_buckets[k] = {'n': int(v['n']),
-                          'mean_ce': (v['ce_sum'] / v['n']) if v['n'] else None,
-                          'perplexity': (math.exp(min(v['ce_sum'] / v['n'], 700.0)) if v['n'] else None)}
-    ent_vals = [t[5] for t in tok_heap if math.isfinite(t[5])]
-    model.train(was_training)
-    _pooled_ce = (sum(x[2] for x in seq_rows) / n_targets) if n_targets else None
-    return {'kind': 'token_error_analysis', 'rows': n_rows, 'seq_len': seq,
-            'n_targets': int(n_targets), 'n_nonfinite_tokens': int(n_nonfinite),
-            'mean_ce': _pooled_ce,
-            'pooled_ppl': (math.exp(min(_pooled_ce, 700.0)) if _pooled_ce is not None else None),
-            'buckets': out_buckets,
-            'worst_sequences': worst_seqs,
-            'worst_tokens': worst_tokens,
-            'entropy_of_worst_tokens': {'max': (max(ent_vals) if ent_vals else None),
-                                        'mean': (sum(ent_vals) / len(ent_vals) if ent_vals else None)},
-            'tokenizer_available': tok is not None,
-            'label_check': {'next_token_shift': 'target = ids[t+1]; checked range [0, vocab) before scoring',
-                            'n_targets': int(n_targets), 'n_out_of_range': 0}}
+                b = 'position:last10%'
+            return b
+
+        # Vectorised bucket accumulation.
+        _bucket_names = ['position:first10%', 'position:10-50%', 'position:50-90%',
+                         'position:last10%', 'target:rare(<=5 train occurrences)',
+                         'target:common', 'target:boundary-token']
+        _nb = len(_bucket_names)
+        _bsum = torch.zeros(_nb, dtype=torch.float64, device=device)
+        _bcnt = torch.zeros(_nb, dtype=torch.long, device=device)
+        _freq_t = None
+        if freq is not None:
+            try:
+                _freq_t = torch.as_tensor(freq, dtype=torch.long, device=device)
+            except Exception:
+                _freq_t = None
+        _kk = min(max(1, int(topk)), int(V))
+        for r0 in range(0, n_rows, max(1, int(chunk))):
+            r1 = min(n_rows, r0 + max(1, int(chunk)))
+            ids = torch.as_tensor(np.ascontiguousarray(vb[r0:r1]), dtype=torch.long, device=device)
+            h = model.trunk(ids)
+            row_nll = np.zeros(r1 - r0, dtype=np.float64)
+            row_ok = np.zeros(r1 - r0, dtype=np.int64)
+            for s0 in range(0, span, 64):
+                s1 = min(s0 + 64, span)
+                lg = model.head(h[:, s0:s1, :])
+                tg = ids[:, s0 + 1:s1 + 1]
+                ce = F.cross_entropy(lg.transpose(1, 2), tg, reduction='none')
+                _b, _s = int(ce.shape[0]), int(ce.shape[1])
+                ce_f = ce.detach().float()
+                finite = torch.isfinite(ce_f)
+                if not bool(finite.all()):
+                    n_nonfinite += int((~finite).sum())
+                ce_safe = torch.where(finite, ce_f, torch.zeros_like(ce_f))
+                row_nll += ce_safe.double().sum(dim=1).cpu().numpy()
+                row_ok += finite.sum(dim=1).cpu().numpy().astype(np.int64)
+                # Entropy from one log_softmax table; top-k works directly on the
+                # fp32 logits.
+                lg_work = lg.float()
+                logp = torch.log_softmax(lg_work, dim=-1)
+                ent = -(logp * logp.exp()).sum(-1)
+                del logp
+                topv, topi = torch.topk(lg_work, _kk, dim=-1)
+                pred = topi[..., 0]
+                margin = (topv[..., 0] - topv[..., 1]) if _kk > 1 else torch.zeros_like(topv[..., 0])
+                del lg_work, topv
+                # Bucket ids for every token at once.
+                pos = torch.arange(s0, s1, device=device, dtype=torch.float64)[None, :]
+                frac = pos / max(1, span)
+                bidx = ((frac >= 0.1).to(torch.long) + (frac >= 0.5).to(torch.long)
+                        + (frac >= 0.9).to(torch.long)).expand(_b, _s)
+                if _freq_t is not None:
+                    _ft = _freq_t[tg.clamp(0, _freq_t.numel() - 1)]
+                    rare = _ft <= 5
+                else:
+                    rare = torch.zeros((_b, _s), dtype=torch.bool, device=device)
+                if bnd_np is not None and bnd_np.shape == vb.shape:
+                    _bnd = torch.as_tensor(np.ascontiguousarray(bnd_np[r0:r1, s0 + 1:s1 + 1]),
+                                           dtype=torch.bool, device=device)
+                else:
+                    _bnd = torch.zeros((_b, _s), dtype=torch.bool, device=device)
+                _flat_b = bidx.reshape(-1)
+                _flat_ce = ce_safe.reshape(-1).double()
+                _flat_rare = rare.reshape(-1)
+                _flat_finite = finite.reshape(-1)
+                _flat_bnd = _bnd.reshape(-1)
+                # Non-finite CE is counted in n_nonfinite and excluded from BOTH
+                # numerator and denominator, so only finite targets contribute.
+                _bsum[:4] += torch.bincount(_flat_b[_flat_finite],
+                                            weights=_flat_ce[_flat_finite], minlength=4)
+                _bcnt[:4] += torch.bincount(_flat_b[_flat_finite], minlength=4)
+                _sel_rare = _flat_finite & _flat_rare
+                _bsum[4] += _flat_ce[_sel_rare].sum()
+                _bcnt[4] += int(_sel_rare.sum())
+                _sel_common = _flat_finite & ~_flat_rare
+                _bsum[5] += _flat_ce[_sel_common].sum()
+                _bcnt[5] += int(_sel_common.sum())
+                _sel_bnd = _flat_finite & _flat_bnd
+                _bsum[6] += _flat_ce[_sel_bnd].sum()
+                _bcnt[6] += int(_sel_bnd.sum())
+                n_targets += int(_flat_finite.sum())
+                # Select at most top_tokens candidates.
+                _sel_n = min(int(top_tokens), _b * _s)
+                _pick_val, _pick_idx = torch.topk(torch.where(finite.reshape(-1), ce_f.reshape(-1),
+                                                              torch.full_like(ce_f.reshape(-1), float('inf'))),
+                                                  _sel_n)
+                _finite_pick = torch.isfinite(_pick_val)
+                if bool(_finite_pick.any()):
+                    _pick_idx = _pick_idx[_finite_pick]
+                    _pi = _pick_idx.cpu().numpy()
+                    _pv = _pick_val[_finite_pick].cpu().numpy()
+                    _pr = (pred.reshape(-1).index_select(0, _pick_idx)).cpu().numpy()
+                    _pe = (ent.reshape(-1).index_select(0, _pick_idx)).cpu().numpy()
+                    _pm = (margin.reshape(-1).index_select(0, _pick_idx)).cpu().numpy()
+                    _pt = (tg.reshape(-1).index_select(0, _pick_idx)).cpu().numpy()
+                    _prr = (rare.reshape(-1).index_select(0, _pick_idx)).cpu().numpy()
+                    _ptop = (topi.reshape(-1, _kk).index_select(0, _pick_idx)).cpu().numpy()
+                    for _k in range(len(_pi)):
+                        _lin = int(_pi[_k])
+                        _pos = s0 + (_lin % _s)
+                        rec = (float(_pv[_k]), r0 + (_lin // _s), _pos, int(_pt[_k]),
+                               int(_pr[_k]), float(_pe[_k]), float(_pm[_k]),
+                               [int(x) for x in _ptop[_k]], bool(_prr[_k]))
+                        if len(tok_heap) < int(top_tokens):
+                            _heapq.heappush(tok_heap, rec)
+                        elif rec[0] > tok_heap[0][0]:
+                            _heapq.heapreplace(tok_heap, rec)
+                del lg, tg, ce, ce_f, ce_safe, finite, pred, margin, topi, ent
+                del bidx, rare, _bnd, _flat_b, _flat_ce
+            for i in range(r1 - r0):
+                n = int(row_ok[i])
+                ce_mean = float(row_nll[i] / n) if n else float('nan')
+                seq_rows.append((ce_mean, r0 + i, float(row_nll[i]), n))
+            del h, ids
+        _bsum_cpu = _bsum.detach().cpu().tolist()
+        _bcnt_cpu = _bcnt.detach().cpu().tolist()
+        for _name, _n, _sm in zip(_bucket_names, _bcnt_cpu, _bsum_cpu):
+            buckets[_name] = {'n': int(_n), 'ce_sum': float(_sm)}
+        seq_rows.sort(key=lambda t: (not math.isfinite(t[0]), -t[0] if math.isfinite(t[0]) else 0.0))
+        worst_seqs = []
+        for ce_mean, row, nll, n in seq_rows[:max(1, int(top_n))]:
+            recs = [t for t in tok_heap if t[1] == row]
+            worst_seqs.append({'row': int(row), 'mean_ce': ce_mean, 'nll': nll, 'n_tokens': int(n),
+                               'top_worst_token_from_sample': (max(recs)[0] if recs else None),
+                               'context': _decode(vb[row].tolist()),
+                               'ids': [int(x) for x in vb[row].tolist()]})
+        worst_tokens = []
+        for rec in sorted(tok_heap, key=lambda t: t[0], reverse=True)[:max(1, int(top_tokens))]:
+            c, row, pos, tgt, pred, ent, margin, tids, rare = rec
+            lo = max(0, pos - int(context_tokens))
+            hi = min(span, pos + int(context_tokens) + 1)
+            ctx_ids = [int(x) for x in vb[row, lo:hi + 1].tolist()]
+            ctgt = int(vb[row, pos + 1])
+            worst_tokens.append({
+                'row': int(row), 'position': int(pos), 'ce': c, 'target_id': tgt,
+                'pred_id': pred, 'entropy': ent, 'margin': margin,
+                'topk_ids': tids, 'topk_text': [_decode([x]) for x in tids],
+                'rare_target': bool(rare),
+                'target_text': _decode([ctgt]),
+                'pred_text': _decode([pred]),
+                'context_text': _decode(ctx_ids),
+                'context_ids': ctx_ids,
+                'is_boundary_token': (bool(bnd_np[row, pos + 1]) if (bnd_np is not None and bnd_np.shape == vb.shape) else None),
+            })
+        out_buckets = {}
+        for k, v in buckets.items():
+            out_buckets[k] = {'n': int(v['n']),
+                              'mean_ce': (v['ce_sum'] / v['n']) if v['n'] else None,
+                              'perplexity': (math.exp(min(v['ce_sum'] / v['n'], 700.0)) if v['n'] else None)}
+        ent_vals = [t[5] for t in tok_heap if math.isfinite(t[5])]
+        _pooled_ce = (sum(x[2] for x in seq_rows) / n_targets) if n_targets else None
+        return {'kind': 'token_error_analysis', 'rows': n_rows, 'seq_len': seq,
+                'n_targets': int(n_targets), 'n_nonfinite_tokens': int(n_nonfinite),
+                'mean_ce': _pooled_ce,
+                'pooled_ppl': (math.exp(min(_pooled_ce, 700.0)) if _pooled_ce is not None else None),
+                'buckets': out_buckets,
+                'worst_sequences': worst_seqs,
+                'worst_tokens': worst_tokens,
+                'entropy_of_worst_tokens': {'max': (max(ent_vals) if ent_vals else None),
+                                            'mean': (sum(ent_vals) / len(ent_vals) if ent_vals else None)},
+                'tokenizer_available': tok is not None,
+                'label_check': {'next_token_shift': 'target = ids[t+1]; checked range [0, vocab) before scoring',
+                                'n_targets': int(n_targets), 'n_out_of_range': 0}}
+    finally:
+        model.train(was_training)
 
 
 @torch.inference_mode()

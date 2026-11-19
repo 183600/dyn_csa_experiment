@@ -2613,32 +2613,36 @@ def measure_prefill_decode(model, ids, device, warmup=1, iters=3):
         res.update({'status': 'refused_empty_sequence',
                     'error': 'empty token sequence: prefill/decode timing is undefined'})
         return res
+    was = model.training
     model.eval()
-    with torch.inference_mode():
-        for _ in range(warmup):
-            model(ids)
-        if device.type == 'cuda':
-            torch.cuda.reset_peak_memory_stats()
-            torch.cuda.synchronize()
-        t0 = _t.perf_counter()
-        for _ in range(iters):
-            model(ids)
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        res['prefill_ms_per_iter'] = (_t.perf_counter() - t0) * 1000.0 / iters
-        t0 = _t.perf_counter()
-        n_dec = min(32, n_tokens)
-        for t in range(1, n_dec + 1):
-            model(ids[:, :t])
-        _per_tok = (_t.perf_counter() - t0) * 1000.0 / n_dec
-        res['prefix_prefill_ms_per_token'] = _per_tok
-        # Backwards-compatible alias, but the name must not be read as an
-        # incremental decode measurement: there is no KV cache in this path.
-        res['decode_ms_per_token_avg'] = _per_tok
-        res['decode_has_kv_cache'] = False
-        res['decode_metric'] = 'prefix_prefill (no KV cache; re-runs the whole prefix)'
-        if device.type == 'cuda':
-            res['peak_mem_mb'] = torch.cuda.max_memory_allocated() / (1 << 20)
+    try:
+        with torch.inference_mode():
+            for _ in range(warmup):
+                model(ids)
+            if device.type == 'cuda':
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.synchronize()
+            t0 = _t.perf_counter()
+            for _ in range(iters):
+                model(ids)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            res['prefill_ms_per_iter'] = (_t.perf_counter() - t0) * 1000.0 / iters
+            t0 = _t.perf_counter()
+            n_dec = min(32, n_tokens)
+            for t in range(1, n_dec + 1):
+                model(ids[:, :t])
+            _per_tok = (_t.perf_counter() - t0) * 1000.0 / n_dec
+            res['prefix_prefill_ms_per_token'] = _per_tok
+            # Backwards-compatible alias, but the name must not be read as an
+            # incremental decode measurement: there is no KV cache in this path.
+            res['decode_ms_per_token_avg'] = _per_tok
+            res['decode_has_kv_cache'] = False
+            res['decode_metric'] = 'prefix_prefill (no KV cache; re-runs the whole prefix)'
+            if device.type == 'cuda':
+                res['peak_mem_mb'] = torch.cuda.max_memory_allocated() / (1 << 20)
+    finally:
+        model.train(was)
     return res
 
 

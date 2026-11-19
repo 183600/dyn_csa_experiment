@@ -268,7 +268,12 @@ def _child_env(slot, seed=None):
     env["CUDA_VISIBLE_DEVICES"] = str(slot)
     env["PYTHONUNBUFFERED"] = "1"
     if seed is not None:
-        env["PYTHONHASHSEED"] = str(int(seed))
+        # CPython only accepts PYTHONHASHSEED in [0, 2**32-1] (or `random`);
+        # anything else aborts the worker with `Fatal Python error:
+        # config_init_hash_seed` before the job runs.  Planned seed ids may be
+        # negative or above 2**32, so fold exactly like exp_lib.set_seed does.
+        _hs = int(seed)
+        env["PYTHONHASHSEED"] = str(_hs if 0 <= _hs < 2 ** 32 else _hs % (2 ** 32))
     return env
 
 
