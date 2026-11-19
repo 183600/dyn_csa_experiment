@@ -1671,7 +1671,7 @@ def t_freeze_lock():
             del os.environ['V12_REFREEZE']
 
 
-def t_review5_js_gate_and_floor_denominator():
+def t_js_gate_and_floor_denominator():
     # 1) The JS hard gate is REACHABLE on the normalized scale: two disjoint
     #    token distributions (js = ln2) hit normalized 1.0 and hard-fail at
     #    the shipped 0.75 threshold.  A nats-scale 0.75 threshold would be
@@ -1717,7 +1717,7 @@ def t_review5_js_gate_and_floor_denominator():
     assert art['best_ppl_matched'] is not None, 'the floor artifact must carry the matched-denominator PPL'
 
 
-def t_review5_dedup_attribution():
+def t_dedup_attribution():
     # test-internal duplicates are attributed to test_internal_*, never
     # miscounted as train/val contamination (peek/snapshot are read-only).
     d = L._DocDeduplicator()
@@ -1747,7 +1747,7 @@ def t_review5_dedup_attribution():
     assert frozen2.stats() == before
 
 
-def t_review5_freeze_lock_mirror():
+def t_freeze_lock_mirror():
     # The git-tracked mirror makes renaming/deleting the canonical results
     # directory non-reversible: mirror present + local lock absent -> REFUSE
     # (V12_REFREEZE=1 proceeds and keeps the superseded history).
@@ -1795,7 +1795,7 @@ def t_review5_freeze_lock_mirror():
         'tests must never write the repo-level freeze-lock mirror'
 
 
-def t_review5_p5c_post_access_guard():
+def t_p5c_post_access_guard():
     # P5C refuses to (re)train frozen arms once the freeze lock/mirror exists;
     # V12_REFREEZE=1 is the explicit, loud exit.
     with tempfile.TemporaryDirectory() as root:
@@ -1822,7 +1822,7 @@ def t_review5_p5c_post_access_guard():
             V12.FREEZE_MANIFEST = _old_manifest
 
 
-def t_review5_power_enumeration():
+def t_power_enumeration():
     # Equal magnitudes reduce the exact enumeration to the symbol-test
     # projection: n=10, m=4, alpha=0.05 -> only 10/10 same-sign clears the
     # conservative Holm slot alpha/4 = 0.0125 (9/10 gives 22/1024 ~ 0.0215).
@@ -1876,7 +1876,7 @@ def t_review5_power_enumeration():
     assert abs(_res_dir['fraction_patterns_confirming_holm'] - _want_nd / len(_null)) < 1e-12, _res_dir
 
 
-def t_review5_rope_kernel_guard():
+def t_rope_kernel_guard():
     # A rope csa/hca layer under a kernel-ENABLED process must refuse loudly:
     # silently running the eager per-row path would stamp eager numbers with
     # the -tk1 kernel suffix (a false kernel-vs-eager pairing).
@@ -2846,7 +2846,7 @@ def t_eval_per_seq():
 # E. 可复现性与实验追踪（随机种子 / 小批量过拟合 / provenance）
 # ---------------------------------------------------------------------------
 
-def t_review3_evidence_metadata():
+def t_evidence_metadata():
     assert os.path.exists(os.path.join(REPO, 'DECISION_LOG.md')), 'DECISION_LOG.md must be tracked'
     assert 'requirements.txt' in open(os.path.join(REPO, 'archive_release.py'), encoding='utf-8').read(), 'archive must pack the dependency declaration'
     assert 'DECISION_LOG.md' in open(os.path.join(REPO, 'archive_release.py'), encoding='utf-8').read()
@@ -2874,7 +2874,7 @@ def t_review3_evidence_metadata():
         BR.load = old_load
     assert '| flag | 1.00 | n/a | 1.0000 |' in txt, txt
 
-def t_review3_pooled_aggregate():
+def t_pooled_aggregate():
     summary = {}
     for s, nll in ((0, 100.0), (1, 140.0)):
         summary[f'csa::seed{s}'] = {'variant': 'csa', 'seed': s, 'ppl': math.exp(nll / 100.0),
@@ -3031,7 +3031,7 @@ def t_combined_seed_doc_uncertainty():
     cc = agg['csa'].get('ppl_ci_seed_doc_combined')
     assert isinstance(cc, dict) and cc['status'] == 'ok' and cc['ci95_ppl'] is not None, cc
 
-def t_review3_holm_family_size():
+def t_holm_family_size():
     comps = {'a': {'p_exact_signflip': 0.01}, 'b': {'omitted': 'missing arm'}, 'c': {'p_exact_signflip': 0.04}}
     fam = L.attach_holm(comps)
     assert fam['declared_slots'] == 3 and fam['tested'] == 2, fam
@@ -3039,13 +3039,13 @@ def t_review3_holm_family_size():
     # The omitted slot must inflate m: Holm(a)=3*0.01=0.03, not 2*0.01=0.02.
     assert abs(comps['a']['p_holm'] - 0.03) < 1e-12, comps
 
-def t_review3_span_clean_key():
+def t_span_clean_key():
     pp = {'n_seq': 16, 'span_len': 32, 'target': 512}
     clean = V10._clean_probe_params(pp)
     assert 'span_len' not in clean and clean['n_seq'] == 16, clean
     assert pp['span_len'] == 32, 'the measured cell must keep span_len'
 
-def t_review3_boundary_arm_and_objective():
+def t_boundary_arm_and_objective():
     cfg = L.make_layer_cfgs(1, 'csa_dynamic_task')[0]
     assert getattr(cfg, 'boundary_policy', None) == 'reinforce', cfg
     obj = L.train_objective(type('M', (), {'blocks': [], 'named_parameters': lambda self: iter([])})(), comp_lambda=0.05, delta_lr_mult=10.0)
@@ -9154,7 +9154,7 @@ def t_v12_frozen_rule_helper():
 
 
 
-def t_review7_report_pair_boolean_fingerprints():
+def t_report_pair_boolean_fingerprints():
     # The zero-GPU report builder is a twin of exp_lib.pair_reason: a boolean
     # on BOTH sides must not collapse to the absent-vs-absent permissive path.
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
@@ -9174,7 +9174,7 @@ def t_review7_report_pair_boolean_fingerprints():
     assert why is not None and 'unverifiable run_cfg' in why, why
 
 
-def t_review7_frozen_rule_malformed_inputs():
+def t_frozen_rule_malformed_inputs():
     ok_holm = {'p_holm': 0.001}
     ok_comp = {'direction_ok': True, 'param_matched': True,
                'n_effective': 12, 'min_seeds_for_confirmation': 8}
@@ -9214,7 +9214,7 @@ def t_review7_frozen_rule_malformed_inputs():
                                                'n': 8}, 0.05, 8) is True
 
 
-def t_review7_label_shift_uses_normalized_js():
+def t_label_shift_uses_normalized_js():
     import data_guard as DG
     X = np.arange(12, dtype=float).reshape(6, 2)
     y = [0, 0, 0, 1, 1, 1]
@@ -9259,7 +9259,7 @@ def t_review7_label_shift_uses_normalized_js():
                 raise AssertionError(f'audit accepted unreachable JS thresholds {bad}')
 
 
-def t_review7_load_wikitest_local_path_needs_no_datasets():
+def t_load_wikitest_local_path_needs_no_datasets():
     # A cold build from local dumps must not require the HF Hub client.  Block
     # the module: the build may fail later for a missing train cache, but the
     # failure must not be the entry-point import.
@@ -9296,7 +9296,7 @@ def t_review7_load_wikitest_local_path_needs_no_datasets():
 
 
 
-def t_review8_pair_train_knobs_descriptor_type():
+def t_pair_train_knobs_descriptor_type():
     # `train_knobs` is a structured descriptor.  Two equal booleans/lists mean
     # neither record carries one; they must not pair as if controlled.
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
@@ -9323,7 +9323,7 @@ def t_review8_pair_train_knobs_descriptor_type():
     assert 'unverifiable train_knobs' in (BR._pair_reason(a, dict(base, variant='b', train_knobs=True)) or '')
 
 
-def t_review8_g0_certificate_requires_boolean_flags():
+def t_g0_certificate_requires_boolean_flags():
     cert = {'status': 'pass', 'numeric_pass': True, 'benchmark_pass': True,
             'training_tost_pass': True, 'code_semantics': L.CODE_SEMANTICS,
             'kernel_stamp': L._kernel_stamp()}
@@ -9337,7 +9337,7 @@ def t_review8_g0_certificate_requires_boolean_flags():
             assert why is not None and 'did not pass' in why, (key, bad, why)
 
 
-def t_review8_js_norm_handles_missing_normalized_field():
+def t_js_norm_handles_missing_normalized_field():
     import data_guard as DG
     import audit_gates as A
     X = np.arange(12, dtype=float).reshape(6, 2)
@@ -9387,7 +9387,7 @@ def t_review8_js_norm_handles_missing_normalized_field():
             DG.categorical_shift_report = old_rep
 
 
-def t_review8_fuse_masks_numpy_sampled_baseline():
+def t_fuse_masks_numpy_sampled_baseline():
     import fuse_analysis as FA
     old_rec, old_layers = FA.rec, FA.layers_of
     try:
@@ -9417,7 +9417,7 @@ def t_review8_fuse_masks_numpy_sampled_baseline():
 
 
 
-def t_review8_classify_requires_exact_seed_count():
+def t_classify_requires_exact_seed_count():
     base = {'controlled': True, 'significant_global': True,
             'within_seed_noise': False, 'param_controlled': True,
             'p_exact_signflip': 0.01, 'p_holm_component': 0.01}
@@ -9438,7 +9438,7 @@ def t_review8_classify_requires_exact_seed_count():
 
 
 
-def t_review8_relaxed_tuned_pairing_rejects_flags():
+def t_relaxed_tuned_pairing_rejects_flags():
     # The tuned-arm pairing rule is a separate gate; it must not become a back
     # door for boolean descriptors/fingerprints that the strict rule rejects.
     base = dict(variant='a', seed=0, steps=1, tokens_seen=1,
@@ -9463,7 +9463,7 @@ def t_review8_relaxed_tuned_pairing_rejects_flags():
 
 
 
-def t_review8_controlled_variables_rejects_boolean_descriptors():
+def t_controlled_variables_rejects_boolean_descriptors():
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
     def rec(v, tk):
         return {'variant': v, 'seed': 0, 'ppl': 10.0, 'run_cfg': fp,
@@ -9488,7 +9488,7 @@ def t_review8_controlled_variables_rejects_boolean_descriptors():
 
 
 
-def t_review9_freeze_mirror_missing_local_is_not_a_reset():
+def t_freeze_mirror_missing_local_is_not_a_reset():
     # Nulling the local lock fields must not reset the mirrored one-shot
     # slice/corpus binding; only an explicit V12_REFREEZE may do that.
     with tempfile.TemporaryDirectory() as root:
@@ -9519,7 +9519,7 @@ def t_review9_freeze_mirror_missing_local_is_not_a_reset():
             V12.TEST_OUTDIR, V12.FREEZE_MANIFEST = _old_outdir, _old_manifest
 
 
-def t_review9_preaccess_lock_is_not_test_access():
+def t_preaccess_lock_is_not_test_access():
     # A pre-access attestation must not claim/behave like a test read: P5C
     # stays available for the seed revision the power gate may require.
     with tempfile.TemporaryDirectory() as root:
@@ -9551,7 +9551,7 @@ def t_review9_preaccess_lock_is_not_test_access():
             V12.TEST_OUTDIR, V12.FREEZE_MANIFEST = _old_outdir, _old_manifest
 
 
-def t_review9_power_artifact_must_match_the_manifest():
+def t_power_artifact_must_match_the_manifest():
     man = {'manifest_sha256': 'M', 'seeds': [0, 1],
            'statistics': {'alpha': 0.05},
            'primary_comparisons': [{'name': 'c1'}, {'name': 'c2'}]}
@@ -9578,7 +9578,7 @@ def t_review9_power_artifact_must_match_the_manifest():
         del os.environ['V12_SKIP_POWER']
 
 
-def t_review9_probe_requires_manifest_hash():
+def t_probe_requires_manifest_hash():
     root = tempfile.mkdtemp()
     try:
         path = os.path.join(root, 'probe.json')
@@ -9607,7 +9607,7 @@ def t_review9_probe_requires_manifest_hash():
         shutil.rmtree(root, ignore_errors=True)
 
 
-def t_review9_open_block_pilot_uses_its_own_outdir():
+def t_open_block_pilot_uses_its_own_outdir():
     import open_block_supp as OB
     old = OB.run_panel
     seen = {}
@@ -9629,7 +9629,7 @@ def t_review9_open_block_pilot_uses_its_own_outdir():
         sys.argv = old_argv
 
 
-def t_review9_run_cfg_must_be_a_string():
+def t_run_cfg_must_be_a_string():
     fp = 'steps1_d8_L1_csX'
     base = dict(variant='a', seed=0, run_cfg=fp, steps=1, tokens_seen=1,
                 ppl=10.0, train_knobs=None, data_fp='d', val_fp='v',
@@ -9646,7 +9646,7 @@ def t_review9_run_cfg_must_be_a_string():
         assert cv['run_cfg_equal'] is None, (bad, cv)
 
 
-def t_review9_leakage_src_fp_checks_fallback_file():
+def t_leakage_src_fp_checks_fallback_file():
     cache = tempfile.mkdtemp(prefix='leak_fallback_')
     try:
         train = np.arange(60, dtype=np.int64)
@@ -9664,7 +9664,7 @@ def t_review9_leakage_src_fp_checks_fallback_file():
         shutil.rmtree(cache, ignore_errors=True)
 
 
-def t_review9_tokenizer_identity_checks_encoding():
+def t_tokenizer_identity_checks_encoding():
     from tokenizers import Tokenizer, models
     cache = tempfile.mkdtemp(prefix='tok_enc_')
     try:
@@ -9694,7 +9694,7 @@ def t_review9_tokenizer_identity_checks_encoding():
         shutil.rmtree(cache, ignore_errors=True)
 
 
-def t_review9_m0_cross_scale_uses_pair_gate():
+def t_m0_cross_scale_uses_pair_gate():
     fp = 'steps10_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
     knobs = L.training_knobs()
     def panel(steps_dyn=10, seeds=range(4)):
@@ -9726,7 +9726,7 @@ def t_review9_m0_cross_scale_uses_pair_gate():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def t_review9_error_compare_validates_token_space():
+def t_error_compare_validates_token_space():
     import error_analysis as EA
     base = {'vocab': 100, 'd': 8, 'n_layers': 1, 'n_heads': 1, 'd_head': 8,
             'mlp_ratio': 4.0, 'cfg': ['c'], 'train_fp': 'T', 'eval_fp': 'E',
@@ -9739,7 +9739,7 @@ def t_review9_error_compare_validates_token_space():
     assert EA._compare_reason(base, dict(base, eval_fp=None), 8) is not None
 
 
-def t_review9_sink_softmax_broadcasts_shapes():
+def t_sink_softmax_broadcasts_shapes():
     torch.manual_seed(0)
     def _ref(logits, sink):
         _s = sink.reshape((1,) * (logits.dim() - 1) + (1,)) if sink.numel() == 1 else sink
@@ -9756,7 +9756,7 @@ def t_review9_sink_softmax_broadcasts_shapes():
         assert torch.allclose(got, _ref(logits, sink), atol=1e-6), (shape, sshape)
 
 
-def t_review9_gathered_attention_zero_block_rows():
+def t_gathered_attention_zero_block_rows():
     torch.manual_seed(1)
     n, h, d, w = 5, 2, 3, 3
     q, k, v = (torch.randn(n, h, d) for _ in range(3))
@@ -9789,7 +9789,7 @@ def t_review9_gathered_attention_zero_block_rows():
         assert torch.equal(a, b), 'impossible soft lanes changed the gradient'
 
 
-def t_review9_kernel_ref_zero_block_rows():
+def t_kernel_ref_zero_block_rows():
     import csa_kernels as CK
     torch.manual_seed(2)
     R, T, nh, hd, w = 1, 4, 1, 2, 2
@@ -9838,7 +9838,7 @@ def t_kernel_zero_block_soft_backward_shape():
         'dropped block lanes cannot depend on the soft prior'
 
 
-def t_review9_adaptive_threshold_nan_prefix_is_causal():
+def t_adaptive_threshold_nan_prefix_is_causal():
     x = torch.tensor([[1., 2., float('nan'), 3., 4., 5., 6., 7.,
                        float('inf'), 9., 10., 11.]])
     full = L.causal_adaptive_threshold(x, 1)
@@ -9846,7 +9846,7 @@ def t_review9_adaptive_threshold_nan_prefix_is_causal():
     torch.testing.assert_close(full[:, :9], sub, rtol=0.0, atol=0.0, equal_nan=True)
 
 
-def t_review9_batch_iter_accepts_one_window():
+def t_batch_iter_accepts_one_window():
     ids = np.arange(33, dtype=np.int64)
     x, y = next(L.batch_iter(ids, 32, 2, torch.device('cpu'), seed=0))
     assert tuple(x.shape) == (2, 32) and tuple(y.shape) == (2, 32)
@@ -9859,7 +9859,7 @@ def t_review9_batch_iter_accepts_one_window():
         raise AssertionError('a corpus shorter than seq_len+1 must still be refused')
 
 
-def t_review9_pool_geometry_int32_guard():
+def t_pool_geometry_int32_guard():
     n = 2 ** 31
     assert L._pool_parts_flat([n - 1, 1], 2, None, n) is None
     assert L._pool_geom_flat_var([n - 1, 1], 2, 2, n, 4, 4, 4, 4) is None
@@ -9875,7 +9875,7 @@ def t_review9_pool_geometry_int32_guard():
         raise AssertionError('kernel PoolGeometry must refuse an int32-overflow table')
 
 
-def t_review9_v8_uncalibrated_source_is_not_called_calibrated():
+def t_v8_uncalibrated_source_is_not_called_calibrated():
     import v8_supp as V8
     old_cwd = os.getcwd()
     tmp = tempfile.mkdtemp()
@@ -11510,12 +11510,12 @@ def main():
     _check('C3 admission gate refusals', t_admission_refuses)
     _check('C4 recipe signature', t_recipe_signature)
     _check('C4b P1L checkpoint recipe signature', t_p1l_recipe_signature)
-    _check('R5a review-5 guards: reachable JS gate + matched floor denominator', t_review5_js_gate_and_floor_denominator)
-    _check('R5b review-5 guards: dedup attribution (test-internal vs train)', t_review5_dedup_attribution)
-    _check('R5c review-5 guards: freeze-lock mirror survives a results-dir rename', t_review5_freeze_lock_mirror)
-    _check('R5d review-5 guards: P5C post-access retraining refused', t_review5_p5c_post_access_guard)
-    _check('R5e review-5 guards: pre-access power enumeration', t_review5_power_enumeration)
-    _check('R5f review-5 guards: rope layer refuses under CSA_KERNEL', t_review5_rope_kernel_guard)
+    _check('R5a guards: reachable JS gate + matched floor denominator', t_js_gate_and_floor_denominator)
+    _check('R5b guards: dedup attribution (test-internal vs train)', t_dedup_attribution)
+    _check('R5c guards: freeze-lock mirror survives a results-dir rename', t_freeze_lock_mirror)
+    _check('R5d guards: P5C post-access retraining refused', t_p5c_post_access_guard)
+    _check('R5e guards: pre-access power enumeration', t_power_enumeration)
+    _check('R5f guards: rope layer refuses under CSA_KERNEL', t_rope_kernel_guard)
     _check('C5 freeze lock', t_freeze_lock)
     _check('C5b final test decision rule matches the frozen manifest', t_finaltest_decision_rule_matches_frozen_manifest)
     _check('C9 aggregate seed normalization', t_aggregate_seed_normalization)
@@ -11556,14 +11556,14 @@ def main():
     _check('C8 doc-level analysis', t_doc_level_analysis)
     _check('D1 eval per-seq ppl', t_eval_per_seq)
     _check('D1a eval length rejects invalid/non-integer lengths', t_eval_length_invalid_lengths)
-    _check('J1 evidence metadata + significance gate', t_review3_evidence_metadata)
-    _check('J2 pooled aggregation', t_review3_pooled_aggregate)
+    _check('J1 evidence metadata + significance gate', t_evidence_metadata)
+    _check('J2 pooled aggregation', t_pooled_aggregate)
     _check('J2a aggregate capacity/KV details require every seed', t_aggregate_common_dict_fields)
     _check('J2b pooled PPL rejects malformed counts', t_pooled_ppl_rejects_malformed_counts)
     _check('J2c document CI token counts are exact integers', t_nll_doc_ci_exact_token_counts)
-    _check('J3 Holm declared-family slots', t_review3_holm_family_size)
-    _check('J4 task-boundary arm + objective descriptor', t_review3_boundary_arm_and_objective)
-    _check('J5 span clean-baseline key', t_review3_span_clean_key)
+    _check('J3 Holm declared-family slots', t_holm_family_size)
+    _check('J4 task-boundary arm + objective descriptor', t_boundary_arm_and_objective)
+    _check('J5 span clean-baseline key', t_span_clean_key)
     _check('E1 seed reproducibility', t_seed_reproducible)
     _check('E1a seed/variant axis normalisation', t_seed_axis_normalization)
     _check('E1b explicit RNG seed contract', t_seed_contract_check)
@@ -11744,35 +11744,35 @@ def main():
     _check('M5 report accepts integral-float length spellings', t_sec_p1l_accepts_integral_float_spelling)
     _check('M6 driver paired contrasts carry param-control disclosure', t_driver_paired_param_disclosure)
     _check('M7 v12 frozen decision rule helper (single implementation)', t_v12_frozen_rule_helper)
-    _check('M8 report pair_reason refuses boolean fingerprints on both sides', t_review7_report_pair_boolean_fingerprints)
-    _check('M9 v12 frozen decision rule fails closed on malformed inputs', t_review7_frozen_rule_malformed_inputs)
-    _check('M10 label-shift gate uses normalized JS', t_review7_label_shift_uses_normalized_js)
-    _check('M11 load_wikitest local/cache path needs no datasets', t_review7_load_wikitest_local_path_needs_no_datasets)
-    _check('M12 train_knobs must be an object descriptor on both sides', t_review8_pair_train_knobs_descriptor_type)
-    _check('M13 G0 certificate pass flags must be real booleans', t_review8_g0_certificate_requires_boolean_flags)
-    _check('M14 normalized JS gate fails closed instead of crashing', t_review8_js_norm_handles_missing_normalized_field)
-    _check('M15 fuse analysis masks a NumPy sampled baseline flag', t_review8_fuse_masks_numpy_sampled_baseline)
-    _check('M16 group status reads seed counts exactly', t_review8_classify_requires_exact_seed_count)
-    _check('M17 tuned pairing rejects boolean descriptors/fingerprints', t_review8_relaxed_tuned_pairing_rejects_flags)
-    _check('M18 controlled-variable audit rejects boolean descriptors', t_review8_controlled_variables_rejects_boolean_descriptors)
-    _check('N1 freeze mirror: missing local fields are not a reset', t_review9_freeze_mirror_missing_local_is_not_a_reset)
-    _check('N2 pre-access attestation is not a test access', t_review9_preaccess_lock_is_not_test_access)
-    _check('N3 power artifact binds to the current manifest/seed panel', t_review9_power_artifact_must_match_the_manifest)
-    _check('N4 probe rows require the frozen manifest hash', t_review9_probe_requires_manifest_hash)
-    _check('N5 open-block pilot has its own outdir', t_review9_open_block_pilot_uses_its_own_outdir)
-    _check('N6 run_cfg is a non-empty configuration string', t_review9_run_cfg_must_be_a_string)
-    _check('N7 leakage src_fp checks the fallback cache file', t_review9_leakage_src_fp_checks_fallback_file)
-    _check('N8 tokenizer identity checks the encoding, not only vocab', t_review9_tokenizer_identity_checks_encoding)
-    _check('N9 M0 cross-scale pairs arms through pair_reason', t_review9_m0_cross_scale_uses_pair_gate)
-    _check('N10 error comparison validates token space/geometry', t_review9_error_compare_validates_token_space)
-    _check('N11 sink softmax broadcasts 1-D/2-D/non-head sinks', t_review9_sink_softmax_broadcasts_shapes)
-    _check('N12 zero block rows + non-empty top-k stays window-only', t_review9_gathered_attention_zero_block_rows)
-    _check('N12b kernel reference zero block rows + non-empty top-k', t_review9_kernel_ref_zero_block_rows)
+    _check('M8 report pair_reason refuses boolean fingerprints on both sides', t_report_pair_boolean_fingerprints)
+    _check('M9 v12 frozen decision rule fails closed on malformed inputs', t_frozen_rule_malformed_inputs)
+    _check('M10 label-shift gate uses normalized JS', t_label_shift_uses_normalized_js)
+    _check('M11 load_wikitest local/cache path needs no datasets', t_load_wikitest_local_path_needs_no_datasets)
+    _check('M12 train_knobs must be an object descriptor on both sides', t_pair_train_knobs_descriptor_type)
+    _check('M13 G0 certificate pass flags must be real booleans', t_g0_certificate_requires_boolean_flags)
+    _check('M14 normalized JS gate fails closed instead of crashing', t_js_norm_handles_missing_normalized_field)
+    _check('M15 fuse analysis masks a NumPy sampled baseline flag', t_fuse_masks_numpy_sampled_baseline)
+    _check('M16 group status reads seed counts exactly', t_classify_requires_exact_seed_count)
+    _check('M17 tuned pairing rejects boolean descriptors/fingerprints', t_relaxed_tuned_pairing_rejects_flags)
+    _check('M18 controlled-variable audit rejects boolean descriptors', t_controlled_variables_rejects_boolean_descriptors)
+    _check('N1 freeze mirror: missing local fields are not a reset', t_freeze_mirror_missing_local_is_not_a_reset)
+    _check('N2 pre-access attestation is not a test access', t_preaccess_lock_is_not_test_access)
+    _check('N3 power artifact binds to the current manifest/seed panel', t_power_artifact_must_match_the_manifest)
+    _check('N4 probe rows require the frozen manifest hash', t_probe_requires_manifest_hash)
+    _check('N5 open-block pilot has its own outdir', t_open_block_pilot_uses_its_own_outdir)
+    _check('N6 run_cfg is a non-empty configuration string', t_run_cfg_must_be_a_string)
+    _check('N7 leakage src_fp checks the fallback cache file', t_leakage_src_fp_checks_fallback_file)
+    _check('N8 tokenizer identity checks the encoding, not only vocab', t_tokenizer_identity_checks_encoding)
+    _check('N9 M0 cross-scale pairs arms through pair_reason', t_m0_cross_scale_uses_pair_gate)
+    _check('N10 error comparison validates token space/geometry', t_error_compare_validates_token_space)
+    _check('N11 sink softmax broadcasts 1-D/2-D/non-head sinks', t_sink_softmax_broadcasts_shapes)
+    _check('N12 zero block rows + non-empty top-k stays window-only', t_gathered_attention_zero_block_rows)
+    _check('N12b kernel reference zero block rows + non-empty top-k', t_kernel_ref_zero_block_rows)
     _check('N12c kernel zero block rows + soft prior keeps gradient shape', t_kernel_zero_block_soft_backward_shape)
-    _check('N13 adaptive threshold is causal with a NaN prefix', t_review9_adaptive_threshold_nan_prefix_is_causal)
-    _check('N14 batch_iter accepts exactly one causal window', t_review9_batch_iter_accepts_one_window)
-    _check('N15 host pooling geometry refuses int32 overflow', t_review9_pool_geometry_int32_guard)
-    _check('N16 v8 does not call an empty calibration calibrated', t_review9_v8_uncalibrated_source_is_not_called_calibrated)
+    _check('N13 adaptive threshold is causal with a NaN prefix', t_adaptive_threshold_nan_prefix_is_causal)
+    _check('N14 batch_iter accepts exactly one causal window', t_batch_iter_accepts_one_window)
+    _check('N15 host pooling geometry refuses int32 overflow', t_pool_geometry_int32_guard)
+    _check('N16 v8 does not call an empty calibration calibrated', t_v8_uncalibrated_source_is_not_called_calibrated)
     _check('N17 no-B-lane pooling is total (sorted or unsorted ids)', t_round10_pool_without_b_lane)
     _check('N18 prefix reference honours use_overlap=False', t_round10_prefix_reference_honours_use_overlap)
     _check('N19 power artifact / confirmatory geometry require exact counts', t_round10_power_artifact_requires_exact_counts)
