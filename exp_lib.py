@@ -4115,7 +4115,7 @@ def sink_softmax(logits, sink_logits, dim=-1):
 def _sink_aligned(sink_logits, logits):
     """Broadcast a sink-logit table against ``logits[..., lanes]``.
 
-    The historical internal layout is ``[rows, heads, lanes]`` with one sink
+    The internal layout is ``[rows, heads, lanes]`` with one sink
     per head, but the helper is public and must also handle a 1-D/2-D logits
     table or a sink vector along any non-lane axis.  A one-element sink means
     one shared sink; otherwise a vector of length ``logits.shape[-2]`` is
@@ -9777,7 +9777,7 @@ def open_block_config(m):
             'fingerprint': hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]}
 
 def train_objective(m, *, comp_lambda=0.0, delta_lr_mult=1.0):
-    """Describe the ACTUAL optimisation objective of an arm.
+    """Describe the ACTUAL objective of an arm.
 
     Dense and sparse arms do not share an objective — sparse arms
     add `comp_lambda * comp_reg` and give `delta_logit` a different LR.  A
@@ -13709,7 +13709,7 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     DENOMINATOR POLICY (two coexisting scales, both returned):
 
     - ``ppl`` / ``nll`` / ``n_tokens`` score EVERY evaluation token including
-      each row's first token (the historical scale).  This is NOT the neural
+      each row's first token (the full scale).  This is NOT the neural
       LM's denominator: ``eval_ppl`` scores only positions with a left
       context (R x (L-1) tokens), and a row-first token has no context, so
       including it systematically inflates the baseline NLL by roughly
@@ -13717,7 +13717,7 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     - ``ppl_matched_denominator`` / ``nll_matched`` / ``n_tokens_matched``
       exclude every row's first token, i.e. they score exactly the positions
       a from-scratch LM is scored on.  Panel-vs-floor comparisons should use
-      the matched scale (``methodology_audit`` does); the historical scale is
+      the matched scale (``methodology_audit`` does); the full scale is
       kept for continuity with existing artifacts.
     """
     _raw_train = np.asarray(train_ids)
@@ -16455,7 +16455,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 _floor_scale = 'matched (excludes row-first tokens; equal to the panel denominator)'
                 if _floor_ppl is None:
                     _floor_ppl = _finite_scalar(_sb.get('best_ppl'))
-                    _floor_scale = 'historical (includes row-first tokens; slightly inflated vs the panel scale)'
+                    _floor_scale = 'full (includes row-first tokens; slightly inflated vs the panel scale)'
                 report['simple_baseline'].update({
                     'panel_reference_arm': _ref_key,
                     'panel_reference_ppl': _ref_ppl(_ref),
@@ -17205,7 +17205,7 @@ def _gpu_names():
 
 def _gpu_identity():
     """Per-visible-GPU identity used to explain (not eliminate) cross-machine
-    drift: name, UUID, device capacity and compute capability.  Never raises."""
+    variation: name, UUID, device capacity and compute capability.  Never raises."""
     out = []
     if not torch.cuda.is_available():
         return out
@@ -18888,7 +18888,7 @@ BOUNDARY_PG_COEF = 1.0
 LR_COSINE_AMP = 0.45
 
 def training_knobs(*, amp_dtype='auto', eager_batch='auto'):
-    """Canonical, JSON-safe descriptor of the optimisation / schedule /
+    """Canonical, JSON-safe descriptor of the training / schedule /
     gradient-clipping / augmentation / precision settings shared by every arm
     of a controlled panel.
 

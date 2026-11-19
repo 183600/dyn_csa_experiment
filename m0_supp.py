@@ -315,7 +315,7 @@ def _training_tost_check(ck, *, seeds=(0, 1, 2, 3, 4, 5), steps=40,
     """Training-level kernel/eager equivalence (G0 layer 3).
 
     Operator and model checks certify one forward/backward; they do not prove
-    that the two implementations follow the same optimisation trajectory.  Run
+    that the two implementations follow the same training trajectory.  Run
     the same tiny model on the same fixed tokens with the torch reference and
     the Triton backend, then apply the pre-registered paired TOST: the mean PPL
     difference must lie inside a +/-1% relative margin at 90% confidence.  The
