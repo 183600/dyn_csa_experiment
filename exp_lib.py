@@ -11698,7 +11698,7 @@ def _f_sf(f, df1, df2):
         _big1 = df1 > 1e8
         _big2 = df2 > 1e8
         if _big1 and _big2:
-            return 1.0 if f < 1.0 else (0.5 if f == 1.0 else 0.0)
+            return 1.0 if f < 1.0 else (0.5 if abs(f - 1.0) < 1e-12 else 0.0)
         if _big2:
             try:
                 _x = df1 * f
@@ -19428,10 +19428,11 @@ def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
                'device': str(device), 'torch': torch.__version__,
                'prefill_ms_p50': _percentile(pre, 0.50), 'prefill_ms_p95': _percentile(pre, 0.95),
                'prefix_prefill_ms_p50': _percentile(dec, 0.50),
-               'prefix_prefill_ms_p95': _percentile(dec, 0.95),
-               'tokens_per_s_prefill': (1000.0 * int(ids.shape[0]) * int(ids.shape[1]) / _percentile(pre, 0.50)) if _percentile(pre, 0.50) else None,
-               'decode_has_kv_cache': False,
-               'decode_metric': 'prefix_prefill (no KV cache; re-runs the whole prefix)'}
+               'prefix_prefill_ms_p95': _percentile(dec, 0.95)}
+        _p50 = _percentile(pre, 0.50)
+        out['tokens_per_s_prefill'] = (1000.0 * int(ids.shape[0]) * int(ids.shape[1]) / _p50) if _p50 else None
+        out['decode_has_kv_cache'] = False
+        out['decode_metric'] = 'prefix_prefill (no KV cache; re-runs the whole prefix)'
         if device.type == 'cuda':
             out['peak_mem_allocated_mb'] = torch.cuda.max_memory_allocated(device) / (1 << 20)
             out['peak_mem_reserved_mb'] = torch.cuda.max_memory_reserved(device) / (1 << 20)
@@ -19464,6 +19465,9 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
     _lengths = [_as_seed_int(x) for x in lengths]
     if not _lengths or any(x is None or x <= 0 for x in _lengths):
         raise ValueError(f'measure_efficiency_sweep: lengths must be a non-empty iterable of positive exact integers, got {lengths!r}')
+    _batches = [_as_seed_int(b) for b in batches]
+    if not _batches or any(x is None or x < 1 for x in _batches):
+        raise ValueError(f'measure_efficiency_sweep: batches must be a non-empty iterable of positive exact integers, got {batches!r}')
     max_len = int(min(arr.shape[1], max(_lengths)))
     out = {'status': 'ok', 'device': str(device), 'torch': torch.__version__,
            'triton': None, 'tf32': None, 'rows': [],
@@ -19480,21 +19484,29 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
     except Exception:
         pass
     try:
-        for bs in [int(b) for b in batches if int(b) >= 1]:
-            for L in [int(x) for x in lengths if 0 < int(x) <= max_len]:
+        _warmup = _as_seed_int(warmup)
+        if _warmup is None or _warmup < 0:
+            raise ValueError(f'measure_efficiency_sweep: warmup must be a non-negative exact integer, got {warmup!r}')
+        _iters = _as_seed_int(iters)
+        if _iters is None or _iters < 1:
+            raise ValueError(f'measure_efficiency_sweep: iters must be a positive exact integer, got {iters!r}')
+        for bs in _batches:
+            for L in _lengths:
+                if L > max_len:
+                    continue
                 base = arr[:, :L]
                 if base.shape[0] < bs:
                     reps = (bs + base.shape[0] - 1) // base.shape[0]
                     batch = base.repeat(reps, 1)[:bs]
                 else:
                     batch = base[:bs]
-                for _ in range(max(0, int(warmup))):
+                for _ in range(max(0, _warmup)):
                     model(batch)
                 times = []
                 if device.type == 'cuda':
                     torch.cuda.synchronize(device)
                     torch.cuda.reset_peak_memory_stats(device)
-                for _ in range(max(1, int(iters))):
+                for _ in range(max(1, _iters)):
                     if device.type == 'cuda':
                         _s = torch.cuda.Event(enable_timing=True)
                         _e = torch.cuda.Event(enable_timing=True)
@@ -21652,10 +21664,19 @@ class TimeGuard:
 
     @classmethod
     def _depth_factor(cls, n_layers):
+        if not isinstance(n_layers, (int, np.integer)) or isinstance(n_layers, (bool, np.bool_)):
+            raise ValueError(f'TimeGuard._depth_factor: n_layers must be an exact integer, got {n_layers!r}')
+        if n_layers <= 0:
+            raise ValueError(f'TimeGuard._depth_factor: n_layers must be positive, got {n_layers}')
         return n_layers / 6.0
 
     @classmethod
     def _compute_factor(cls, d, n_layers, seq_len, batch_size):
+        for _name, _v in (('d', d), ('n_layers', n_layers), ('seq_len', seq_len), ('batch_size', batch_size)):
+            if not isinstance(_v, (int, np.integer)) or isinstance(_v, (bool, np.bool_)):
+                raise ValueError(f'TimeGuard._compute_factor: {_name} must be an exact integer, got {_v!r}')
+            if _v <= 0:
+                raise ValueError(f'TimeGuard._compute_factor: {_name} must be positive, got {_v}')
         return (d / 256.0) ** 2 * cls._depth_factor(n_layers) * (seq_len / 512.0) ** 1.5 * (batch_size / 12.0)
 
     @classmethod
