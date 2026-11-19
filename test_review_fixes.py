@@ -9905,7 +9905,7 @@ def t_v8_uncalibrated_source_is_not_called_calibrated():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def t_round10_pool_without_b_lane():
+def t_pool_without_b_lane():
     # The documented "no B lane" spelling (Xb = Zb = None, overlap None/0)
     # must not index the absent overlap tensors.  It is exactly the A-only
     # pooling, for monotonic and unsorted block-id rows.
@@ -9932,7 +9932,7 @@ def t_round10_pool_without_b_lane():
         raise AssertionError('one-sided Xb/Zb pair was accepted')
 
 
-def t_round10_prefix_reference_honours_use_overlap():
+def t_prefix_reference_honours_use_overlap():
     # The oracle and the reference implementation must agree on the
     # no-overlap configuration as well as the overlap one.
     n, Fd = 12, 3
@@ -9956,7 +9956,7 @@ def t_round10_prefix_reference_honours_use_overlap():
         assert torch.allclose(got, ref, atol=1e-6), (use_ov, (got - ref).abs().max())
 
 
-def t_round12_signal_to_noise_exact_zero():
+def t_signal_to_noise_exact_zero():
     # A zero-variance contrast with a tiny but nonzero mean is infinite
     # signal-to-noise, not "no effect"; an absolute 1e-12 floor would make the
     # reported ratio depend on the effect unit.
@@ -9986,7 +9986,7 @@ def t_round12_signal_to_noise_exact_zero():
     assert _r['components']['c'][0]['signal_to_noise'] == 0.0
 
 
-def t_round12_power_enumeration_scale_invariance():
+def t_power_enumeration_scale_invariance():
     # A pure change of effect unit must not change the pre-access power
     # simulation: the exact enumeration uses fixed |d_i|, so the confirming
     # pattern set and every q-model probability are scale-free.  A tiny panel
@@ -10004,7 +10004,7 @@ def t_round12_power_enumeration_scale_invariance():
         assert got['min_same_sign_for_holm_confirmation'] == base['min_same_sign_for_holm_confirmation'], _c
 
 
-def t_round10_power_artifact_requires_exact_counts():
+def t_power_artifact_requires_exact_counts():
     man = {'manifest_sha256': 'abc', 'statistics': {'alpha': 0.05},
            'primary_comparisons': [{'name': 'x'}], 'seeds': [0, 1, 2]}
     good = {'status': 'ok', 'manifest': 'abc', 'alpha': 0.05,
@@ -10026,7 +10026,7 @@ def t_round10_power_artifact_requires_exact_counts():
     assert not L._is_confirmatory_cfg({'d': 512.5, 'seeds': [0, 1]})
 
 
-def t_round11_effect_scale_invariance():
+def t_effect_scale_invariance():
     # A pure change of effect unit (log10 -> ln -> percent, or a near-limit
     # rescaling) must not change a p-value, a trend verdict or a
     # random-effects summary.  Raw squares overflow/underflow at the float
@@ -10099,7 +10099,7 @@ def t_round11_effect_scale_invariance():
                             rel_tol=1e-12, abs_tol=1e-15), (_c, mscaled)
 
 
-def t_round11b_saddlepoint_and_tost_scale():
+def t_saddlepoint_and_tost_scale():
     # The private saddlepoint helper must be scale-invariant on its own, not
     # only through exact_signflip_p's normalisation: direct near-limit inputs
     # would otherwise overflow x*x / t*T and return a different tail.
@@ -10137,7 +10137,7 @@ def t_round11b_saddlepoint_and_tost_scale():
 
 
 
-def t_round13_kernel_soft_invalid_lane_gradients():
+def t_kernel_soft_invalid_lane_gradients():
     # A row whose usable soft lanes are all zero must not send S-path
     # gradients to non-causal blocks (the kernel reference must match eager).
     import csa_kernels as CK
@@ -10185,7 +10185,7 @@ def t_round13_kernel_soft_invalid_lane_gradients():
     assert not bool(g_k[3][0, 1, 1]), 'non-causal block received a soft gradient'
 
 
-def t_round13_paired_log_ratio_no_cancellation():
+def t_paired_log_ratio_no_cancellation():
     a = 1e300 * (1.0 + 1e-14)
     r = L.paired_log_ratio([a], [1e300])
     _want = math.log1p((a - 1e300) / 1e300)
@@ -10197,7 +10197,7 @@ def t_round13_paired_log_ratio_no_cancellation():
                    - (math.log(x) - math.log(y))) < 1e-12
 
 
-def t_round13_seed_t_ci_scale_invariance():
+def t_seed_t_ci_scale_invariance():
     vals = [0.9e200, 1.0e200, 1.1e200]
     ci = L._seed_t_ci(vals)
     assert ci is not None and all(math.isfinite(x) for x in ci), ci
@@ -10208,14 +10208,14 @@ def t_round13_seed_t_ci_scale_invariance():
         assert abs(got[0] / c - base[0]) < 1e-9 and abs(got[1] / c - base[1]) < 1e-9, (c, got, base)
 
 
-def t_round13_power_refuses_nonfinite_deltas():
+def t_power_refuses_nonfinite_deltas():
     for bad in ([float('nan'), 1.0], [float('inf'), 1.0], [1.0, float('-inf')]):
         r = V12._power_enumeration(bad, 'positive', 0.05, 4)
         assert r['status'] != 'ok', (bad, r)
         assert 'power_holm_conservative' not in r, (bad, r)
 
 
-def t_round13_corpus_shift_none_normalized_is_a_failure():
+def t_corpus_shift_none_normalized_is_a_failure():
     import data_guard as DG
     orig = DG.categorical_shift_report
     DG.categorical_shift_report = lambda a, b, **k: {
@@ -10230,7 +10230,7 @@ def t_round13_corpus_shift_none_normalized_is_a_failure():
         DG.categorical_shift_report = orig
 
 
-def t_round13_malformed_artifacts_fail_closed():
+def t_malformed_artifacts_fail_closed():
     with tempfile.TemporaryDirectory() as d:
         good = os.path.join(d, 'good')
         bad = os.path.join(d, 'bad')
@@ -10260,7 +10260,7 @@ def t_round13_malformed_artifacts_fail_closed():
         assert A.audit_leakage(cache_dir=cache)['status'] == 'fail'
 
 
-def t_round13_stamped_name_stays_in_outdir():
+def t_stamped_name_stays_in_outdir():
     with tempfile.TemporaryDirectory() as d:
         out = os.path.join(d, 'panel')
         os.makedirs(out)
@@ -10275,7 +10275,7 @@ def t_round13_stamped_name_stays_in_outdir():
         assert os.path.exists(os.path.join(out, 'ok.json'))
 
 
-def t_round13_tuning_rejects_duplicate_seed_aliases():
+def t_tuning_rejects_duplicate_seed_aliases():
     r = L.tuning_selection_stability([
         {'config': {'lr': 1}, 'seed_ppls': {0: 1.0, '0': 100.0, 1: 1.0, 2: 1.0}},
         {'config': {'lr': 2}, 'seed_ppls': {0: 50.0, 1: 50.0, 2: 50.0}},
@@ -10286,7 +10286,7 @@ def t_round13_tuning_rejects_duplicate_seed_aliases():
 
 
 
-def t_round13_f_sf_large_degrees_of_freedom():
+def t_f_sf_large_degrees_of_freedom():
     # The incomplete-beta continued fraction must converge when both dfs are
     # huge; F(1; N, N) has upper tail 0.5 by symmetry.
     for df in (1e6, 1e8):
@@ -10308,7 +10308,7 @@ def t_round13_f_sf_large_degrees_of_freedom():
 
 
 
-def t_round13_cache_probe_rejects_corrupt_meta_and_arrays():
+def t_cache_probe_rejects_corrupt_meta_and_arrays():
     with tempfile.TemporaryDirectory() as d:
         good = os.path.join(d, 'good.npy')
         np.save(good, np.arange(4, dtype=np.int32))
@@ -10329,7 +10329,7 @@ def t_round13_cache_probe_rejects_corrupt_meta_and_arrays():
 
 
 
-def t_round13_cached_boundary_mask_is_fingerprinted():
+def t_cached_boundary_mask_is_fingerprinted():
     tr = np.arange(8, dtype=np.int64)
     va = np.arange(8, 16, dtype=np.int64).reshape(1, -1)
     bnd = np.zeros_like(va, dtype=bool)
@@ -10346,7 +10346,7 @@ def t_round13_cached_boundary_mask_is_fingerprinted():
                                     fingerprints_trusted=True) == []
 
 
-def t_round14_attention_mask_uses_logit_dtype():
+def t_attention_mask_uses_logit_dtype():
     # The invalid-lane sentinel must be the logits' (promoted q/k) dtype, not
     # k_blk's dtype: with fp64 q and fp32 k, a float32 MIN (-3.4e38) is a
     # *higher* logit than a valid -1e39 lane, so a future block would win the
@@ -10363,7 +10363,7 @@ def t_round14_attention_mask_uses_logit_dtype():
     assert torch.allclose(out, torch.full((1, 1, 1), 3.0, dtype=out.dtype)), out
 
 
-def t_round14_soft_prior_dtype_mismatch_is_safe():
+def t_soft_prior_dtype_mismatch_is_safe():
     # A lower-precision prior must not raise when the logits use a wider dtype.
     torch.manual_seed(14)
     n, h, d, w, nb = 4, 2, 3, 1, 2
@@ -10383,7 +10383,7 @@ def t_round14_soft_prior_dtype_mismatch_is_safe():
     assert torch.equal(ref, got), 'a lower-precision prior changed the forward value'
 
 
-def t_round14_scale_interaction_is_scale_invariant():
+def t_scale_interaction_is_scale_invariant():
     # Opposite-sign effects near the float limit overflow the raw subtraction;
     # the interaction must not turn into "no data" after rescaling.
     lo = [1e308] * 6
@@ -10397,7 +10397,7 @@ def t_round14_scale_interaction_is_scale_invariant():
     assert math.isclose(big['std'], base['std'] * 1e300, rel_tol=1e-12), (base, big)
 
 
-def t_round14_doc_log_ratio_keeps_tiny_relative_effects():
+def t_doc_log_ratio_keeps_tiny_relative_effects():
     # Per-document log ratios must use the same cancellation-safe form as the
     # panel-level paired_log_ratio.
     hi = 1e300 * (1.0 + 1e-14)
@@ -10414,7 +10414,7 @@ def t_round14_doc_log_ratio_keeps_tiny_relative_effects():
     assert res['per_doc_log_ratio_mean'] > 0.0, res
 
 
-def t_round14_driver_readers_refuse_malformed_summaries():
+def t_driver_readers_refuse_malformed_summaries():
     import open_block_supp as OB
     with tempfile.TemporaryDirectory() as d:
         sp = os.path.join(d, 'summary.json')
@@ -10443,7 +10443,7 @@ def t_round14_driver_readers_refuse_malformed_summaries():
         assert V10._tokens_per_step(d) is None
 
 
-def t_round14_locked_json_requires_object():
+def t_locked_json_requires_object():
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, 'state.json')
         with open(p, 'w', encoding='utf-8') as f:
@@ -10468,7 +10468,7 @@ def t_round14_locked_json_requires_object():
             raise AssertionError('_read_summary_json accepted a list')
 
 
-def t_round14_leakage_nonobject_metadata_fails():
+def t_leakage_nonobject_metadata_fails():
     with tempfile.TemporaryDirectory() as d:
         for name in ('meta_x.json', 'test_meta_y.json'):
             with open(os.path.join(d, name), 'w', encoding='utf-8') as f:
@@ -10478,7 +10478,7 @@ def t_round14_leakage_nonobject_metadata_fails():
         assert any('not an object' in p for p in rep.get('problems') or []), rep
 
 
-def t_round15_timeguard_state_requires_wellformed_object():
+def t_timeguard_state_requires_wellformed_object():
     # The TimeGuard ledger decides whether a panel may start.  A valid-JSON
     # non-object (or a malformed numeric field) must fail closed instead of
     # silently resetting/inflating the booked time.
@@ -10517,7 +10517,7 @@ def t_round15_timeguard_state_requires_wellformed_object():
         assert g.state['runs'] == 2 and g.state['sps_by_class'] == {'x': 1.0}, g.state
 
 
-def t_round15_power_enumeration_requires_exact_plan():
+def t_power_enumeration_requires_exact_plan():
     # A bool/fractional family size or an invalid alpha is not a plan: the
     # conservative Holm threshold would otherwise be computed for a different
     # family, certifying power the frozen panel does not have.
@@ -10536,7 +10536,7 @@ def t_round15_power_enumeration_requires_exact_plan():
     assert abs(ok['threshold_holm_conservative'] - 0.05 / 4) < 1e-15, ok
 
 
-def t_round15_power_and_admission_refuse_nonobject_inputs():
+def t_power_and_admission_refuse_nonobject_inputs():
     assert isinstance(V12._power_artifact_problem([], {}), str)
     assert isinstance(V12._power_artifact_problem(
         {'statistics': []}, {'status': 'ok'}), str)
@@ -10554,7 +10554,7 @@ def t_round15_power_and_admission_refuse_nonobject_inputs():
             pass
 
 
-def t_round15_panel_reader_requires_object():
+def t_panel_reader_requires_object():
     with tempfile.TemporaryDirectory() as d:
         bad = os.path.join(d, 'summary.json')
         with open(bad, 'w', encoding='utf-8') as f:
@@ -10570,7 +10570,7 @@ def t_round15_panel_reader_requires_object():
         assert BT._load_json_object(good) == {'x': 1}
 
 
-def t_round15_structural_geometry_counts_are_exact():
+def t_structural_geometry_counts_are_exact():
     # n_blocks/overlap/window are exact structural counts.  A boolean or
     # fractional spelling must not be truncated into a different geometry
     # (int(True)=1, int(2.9)=2) at any entry point.
@@ -10618,7 +10618,7 @@ def t_round15_structural_geometry_counts_are_exact():
             pass
 
 
-def t_round15_corpus_audit_meta_must_be_object():
+def t_corpus_audit_meta_must_be_object():
     tr = np.arange(100, dtype=np.int64) % 10
     va = (np.arange(100, 110, dtype=np.int64) % 10).reshape(1, -1)
     for _bad in ('x', 3, []):
@@ -10637,7 +10637,7 @@ def t_round15_corpus_audit_meta_must_be_object():
         assert 'document-id' in str(e), e
 
 
-def t_round15_distribution_helpers_reject_boolean_arguments():
+def t_distribution_helpers_reject_boolean_arguments():
     # Boolean flags are not statistics/degrees of freedom; treating True as 1
     # would report a probability for a test the caller never specified.
     assert math.isnan(L._student_t_sf(True, 5))
@@ -10650,7 +10650,7 @@ def t_round15_distribution_helpers_reject_boolean_arguments():
     assert L._f_sf(1.0, 3.0, np.bool_(True)) is None
 
 
-def t_round16_f_sf_and_trend_fail_closed():
+def t_f_sf_and_trend_fail_closed():
     # NaN is not an F statistic: the tail probability must be unavailable, not
     # the smallest possible p-value.
     assert L._f_sf(float('nan'), 3.0, 7.0) is None
@@ -10688,7 +10688,7 @@ def t_round16_f_sf_and_trend_fail_closed():
     assert L.reportable_claim(st3)['allowed'] is True, st3
 
 
-def t_round16_leakage_overlap_gate_fails_closed():
+def t_leakage_overlap_gate_fails_closed():
     cache = tempfile.mkdtemp(prefix='leak_gate_')
     old_s, old_r = (os.environ.get('CSA_MAX_TEST_SHINGLE_OVERLAP'),
                     os.environ.get('CSA_MAX_TEST_ROW_OVERLAP'))
@@ -10727,7 +10727,7 @@ def t_round16_leakage_overlap_gate_fails_closed():
         shutil.rmtree(cache, ignore_errors=True)
 
 
-def t_round16_split_audit_rejects_flat_validation():
+def t_split_audit_rejects_flat_validation():
     with tempfile.TemporaryDirectory() as d:
         tag = 'tiny'
         tr = np.arange(40, dtype=np.int64)
@@ -10744,7 +10744,7 @@ def t_round16_split_audit_rejects_flat_validation():
         assert any('not 2-D' in w for w in out['warnings']), out
 
 
-def t_round16_seed_recovery_keeps_seed_averaged_fields_consistent():
+def t_seed_recovery_keeps_seed_averaged_fields_consistent():
     import run_gapfill as RG
     with tempfile.TemporaryDirectory() as td:
         agg_path = os.path.join(td, 'aggregate.json')
@@ -10791,7 +10791,7 @@ def t_round16_seed_recovery_keeps_seed_averaged_fields_consistent():
         assert 'ppl_curve' not in mh and 'avg_dyn_block_len' not in mh, mh
 
 
-def t_round17_error_compare_and_archive_fail_closed():
+def t_error_compare_and_archive_fail_closed():
     import error_analysis as EA
     base = {'vocab': 100, 'd': 8, 'n_layers': 1, 'n_heads': 1, 'd_head': 8,
             'mlp_ratio': 4.0, 'cfg': ['c'], 'train_fp': 'T', 'eval_fp': 'E',
@@ -10833,7 +10833,7 @@ def t_round17_error_compare_and_archive_fail_closed():
         shutil.rmtree(root, ignore_errors=True)
 
 
-def t_round17_report_keeps_key_only_variant():
+def t_report_keeps_key_only_variant():
     # A legacy by-length record may name its arm only in the summary key.
     # The table must include it instead of emitting an empty variant list.
     rec = {'csa_fixed::seed0': {
@@ -10848,7 +10848,7 @@ def t_round17_report_keeps_key_only_variant():
     assert 'csa_fixed' in txt and 'PPL@4096' in txt and '20.0' in txt, txt[:800]
 
 
-def t_round18_fail_closed_edge_cases():
+def t_fail_closed_edge_cases():
     # A float cache with NaN/Inf must produce a failing report (and a strict
     # RuntimeError), not crash inside the overlap scan's int(max(...)).
     tr = np.arange(100000, dtype=float)
@@ -11003,7 +11003,7 @@ def t_round18_fail_closed_edge_cases():
             pass
 
 
-def t_round19_composite_identity_and_checkpoint_geometry():
+def t_composite_identity_and_checkpoint_geometry():
     # Composite group ids must use the scalar group contract recursively: the
     # same instant stored in different datetime units is ONE group.  Otherwise
     # a whole group can be split across train/validation (leakage).
@@ -11058,7 +11058,7 @@ def t_round19_composite_identity_and_checkpoint_geometry():
         assert L.student_t_two_sided_p(10 ** 400, _df) == 0.0, _df
 
 
-def t_round19b_ngram_public_entry_points_reject_float_ids():
+def t_ngram_public_entry_points_reject_float_ids():
     # The count-table helper rejects float ids, so the public entry points
     # must reject them too instead of casting to int64 (which would remap
     # 1.9 -> 1).  The guard must be reachable from the public APIs.
@@ -11085,7 +11085,7 @@ def t_round19b_ngram_public_entry_points_reject_float_ids():
     assert L.ngram_lm_score([1, 2], np.array([[1, 2]]), 8)['n_tokens'] == 2
 
 
-def t_round19c_categorical_fingerprint_uses_encoder_identity():
+def t_categorical_fingerprint_uses_encoder_identity():
     # The training fingerprint must follow the SAME category identity the
     # encoder learns from: numerically equal scalar spellings are one level,
     # but a boolean flag is not the integer it happens to equal.
@@ -11131,7 +11131,7 @@ def t_round19c_categorical_fingerprint_uses_encoder_identity():
         assert DG._matrix_fingerprint(x1) == DG._matrix_fingerprint(x2), (a, b)
 
 
-def t_round20_category_order_and_cap_exactness():
+def t_category_order_and_cap_exactness():
     # Numerically equal categories are ONE encoder level, so the learned
     # category order (and hence the ordinal code) must not depend on whether
     # the column spells a value as `1` or `1.0`.
@@ -11177,7 +11177,7 @@ def t_round20_category_order_and_cap_exactness():
         assert L.TimeGuard(dict(total_hours=2, state_path=path)).total_hours == 2.0
 
 
-def t_round20b_ngram_count_helper_requires_exact_vocab():
+def t_ngram_count_helper_requires_exact_vocab():
     # The count-table helper is reachable directly; a boolean/fractional
     # vocabulary must not be coerced into a different token space.
     for bad in (True, 8.9, float('nan'), -1, 0):
@@ -11193,7 +11193,7 @@ def t_round20b_ngram_count_helper_requires_exact_vocab():
     assert len(uniq) == len(counts) == 2, (uniq, counts)
 
 
-def t_round21_temporal_values_and_exact_full_range():
+def t_temporal_values_and_exact_full_range():
     # NumPy duration scalars register as numbers.Integral/Real, but they are
     # temporal values, not counts/measurements.  Every shared scalar contract
     # must fail closed (return None / raise ValueError) instead of calling
@@ -11320,7 +11320,7 @@ def t_round21_temporal_values_and_exact_full_range():
         assert loaded == {'ppl': None, 'ok': 1.0, 'arr': [1.0, None]}, loaded
 
 
-def t_round22_nonmeasurement_scalars_in_measurement_paths():
+def t_nonmeasurement_scalars_in_measurement_paths():
     # Temporal/complex scalar spellings are never PPL/effect/scale/tuning
     # measurements.  Every shared contract must refuse them instead of
     # discarding the imaginary part or interpreting a duration's ns count as
@@ -11773,53 +11773,53 @@ def main():
     _check('N14 batch_iter accepts exactly one causal window', t_batch_iter_accepts_one_window)
     _check('N15 host pooling geometry refuses int32 overflow', t_pool_geometry_int32_guard)
     _check('N16 v8 does not call an empty calibration calibrated', t_v8_uncalibrated_source_is_not_called_calibrated)
-    _check('N17 no-B-lane pooling is total (sorted or unsorted ids)', t_round10_pool_without_b_lane)
-    _check('N18 prefix reference honours use_overlap=False', t_round10_prefix_reference_honours_use_overlap)
-    _check('N19 power artifact / confirmatory geometry require exact counts', t_round10_power_artifact_requires_exact_counts)
-    _check('N20 effect-unit rescaling keeps p/trend/meta summaries invariant', t_round11_effect_scale_invariance)
-    _check('N20b saddlepoint + TOST margin stay scale-invariant', t_round11b_saddlepoint_and_tost_scale)
-    _check('N20c power enumeration stays scale-invariant', t_round12_power_enumeration_scale_invariance)
-    _check('N20d signal-to-noise treats only exact zero as no effect', t_round12_signal_to_noise_exact_zero)
-    _check('N21 kernel soft path masks non-causal lanes', t_round13_kernel_soft_invalid_lane_gradients)
-    _check('N22 paired log ratio keeps tiny relative effects', t_round13_paired_log_ratio_no_cancellation)
-    _check('N23 seed-t CI is finite and scale-invariant', t_round13_seed_t_ci_scale_invariance)
-    _check('N24 power enumeration refuses non-finite deltas', t_round13_power_refuses_nonfinite_deltas)
-    _check('N25 corpus shift with no normalized value is not a pass', t_round13_corpus_shift_none_normalized_is_a_failure)
-    _check('N26 malformed audit artifacts fail closed', t_round13_malformed_artifacts_fail_closed)
-    _check('N27 stamped analysis keeps its artifact inside outdir', t_round13_stamped_name_stays_in_outdir)
-    _check('N28 tuning stability rejects duplicate seed aliases', t_round13_tuning_rejects_duplicate_seed_aliases)
-    _check('N29 F tail converges at large dfs', t_round13_f_sf_large_degrees_of_freedom)
-    _check('N30 corrupt cache meta/array is not a cache hit', t_round13_cache_probe_rejects_corrupt_meta_and_arrays)
-    _check('N31 boundary mask fingerprint is checked when present', t_round13_cached_boundary_mask_is_fingerprinted)
-    _check('N32 invalid-lane sentinel uses the promoted logit dtype', t_round14_attention_mask_uses_logit_dtype)
-    _check('N33 lower-precision soft prior is safe on wide logits', t_round14_soft_prior_dtype_mismatch_is_safe)
-    _check('N34 scale interaction stays finite/invariant at the float limit', t_round14_scale_interaction_is_scale_invariant)
-    _check('N35 document log ratio keeps tiny relative effects', t_round14_doc_log_ratio_keeps_tiny_relative_effects)
-    _check('N36 driver readers reject malformed summaries', t_round14_driver_readers_refuse_malformed_summaries)
-    _check('N37 locked JSON helpers require an object', t_round14_locked_json_requires_object)
-    _check('N38 non-object cache metadata fails the leakage audit', t_round14_leakage_nonobject_metadata_fails)
+    _check('N17 no-B-lane pooling is total (sorted or unsorted ids)', t_pool_without_b_lane)
+    _check('N18 prefix reference honours use_overlap=False', t_prefix_reference_honours_use_overlap)
+    _check('N19 power artifact / confirmatory geometry require exact counts', t_power_artifact_requires_exact_counts)
+    _check('N20 effect-unit rescaling keeps p/trend/meta summaries invariant', t_effect_scale_invariance)
+    _check('N20b saddlepoint + TOST margin stay scale-invariant', t_saddlepoint_and_tost_scale)
+    _check('N20c power enumeration stays scale-invariant', t_power_enumeration_scale_invariance)
+    _check('N20d signal-to-noise treats only exact zero as no effect', t_signal_to_noise_exact_zero)
+    _check('N21 kernel soft path masks non-causal lanes', t_kernel_soft_invalid_lane_gradients)
+    _check('N22 paired log ratio keeps tiny relative effects', t_paired_log_ratio_no_cancellation)
+    _check('N23 seed-t CI is finite and scale-invariant', t_seed_t_ci_scale_invariance)
+    _check('N24 power enumeration refuses non-finite deltas', t_power_refuses_nonfinite_deltas)
+    _check('N25 corpus shift with no normalized value is not a pass', t_corpus_shift_none_normalized_is_a_failure)
+    _check('N26 malformed audit artifacts fail closed', t_malformed_artifacts_fail_closed)
+    _check('N27 stamped analysis keeps its artifact inside outdir', t_stamped_name_stays_in_outdir)
+    _check('N28 tuning stability rejects duplicate seed aliases', t_tuning_rejects_duplicate_seed_aliases)
+    _check('N29 F tail converges at large dfs', t_f_sf_large_degrees_of_freedom)
+    _check('N30 corrupt cache meta/array is not a cache hit', t_cache_probe_rejects_corrupt_meta_and_arrays)
+    _check('N31 boundary mask fingerprint is checked when present', t_cached_boundary_mask_is_fingerprinted)
+    _check('N32 invalid-lane sentinel uses the promoted logit dtype', t_attention_mask_uses_logit_dtype)
+    _check('N33 lower-precision soft prior is safe on wide logits', t_soft_prior_dtype_mismatch_is_safe)
+    _check('N34 scale interaction stays finite/invariant at the float limit', t_scale_interaction_is_scale_invariant)
+    _check('N35 document log ratio keeps tiny relative effects', t_doc_log_ratio_keeps_tiny_relative_effects)
+    _check('N36 driver readers reject malformed summaries', t_driver_readers_refuse_malformed_summaries)
+    _check('N37 locked JSON helpers require an object', t_locked_json_requires_object)
+    _check('N38 non-object cache metadata fails the leakage audit', t_leakage_nonobject_metadata_fails)
 
-    _check('N39 TimeGuard state must be a well-formed object', t_round15_timeguard_state_requires_wellformed_object)
-    _check('N40 power enumeration requires an exact plan/effects', t_round15_power_enumeration_requires_exact_plan)
-    _check('N41 power/admission refuse non-object inputs', t_round15_power_and_admission_refuse_nonobject_inputs)
-    _check('N42 panel readers require an object', t_round15_panel_reader_requires_object)
-    _check('N43 structural geometry counts are exact integers', t_round15_structural_geometry_counts_are_exact)
-    _check('N44 corpus-audit metadata must be an object', t_round15_corpus_audit_meta_must_be_object)
-    _check('N45 distribution helpers reject boolean args', t_round15_distribution_helpers_reject_boolean_arguments)
-    _check('N46 F-tail NaN + trend within-noise + meta seed floor', t_round16_f_sf_and_trend_fail_closed)
-    _check('N47 overlap gate rejects NaN thresholds / unmeasurable shingles', t_round16_leakage_overlap_gate_fails_closed)
-    _check('N48 split audit rejects a flat validation batch', t_round16_split_audit_rejects_flat_validation)
-    _check('N49 seed recovery keeps seed-averaged fields consistent', t_round16_seed_recovery_keeps_seed_averaged_fields_consistent)
-    _check('N50 error-analysis provenance + archive required-file symlinks', t_round17_error_compare_and_archive_fail_closed)
-    _check('N51 report keeps key-only legacy variant records', t_round17_report_keeps_key_only_variant)
-    _check('N52 fail-closed edges: corpus/TimeGuard/seed metadata/audits/merge/kernel', t_round18_fail_closed_edge_cases)
-    _check('N53 composite temporal identity + exact checkpoint geometry', t_round19_composite_identity_and_checkpoint_geometry)
-    _check('N54 ngram public entry points reject float token ids', t_round19b_ngram_public_entry_points_reject_float_ids)
-    _check('N55 categorical fingerprint follows encoder identity', t_round19c_categorical_fingerprint_uses_encoder_identity)
-    _check('N56 category order / one-sided clip / TimeGuard cap exactness', t_round20_category_order_and_cap_exactness)
-    _check('N57 ngram count helper requires an exact vocabulary', t_round20b_ngram_count_helper_requires_exact_vocab)
-    _check('N58 temporal scalars fail closed; exact full-range quantile; strict open-block JSON', t_round21_temporal_values_and_exact_full_range)
-    _check('N59 temporal/complex scalars refused in PPL/effect/report paths', t_round22_nonmeasurement_scalars_in_measurement_paths)
+    _check('N39 TimeGuard state must be a well-formed object', t_timeguard_state_requires_wellformed_object)
+    _check('N40 power enumeration requires an exact plan/effects', t_power_enumeration_requires_exact_plan)
+    _check('N41 power/admission refuse non-object inputs', t_power_and_admission_refuse_nonobject_inputs)
+    _check('N42 panel readers require an object', t_panel_reader_requires_object)
+    _check('N43 structural geometry counts are exact integers', t_structural_geometry_counts_are_exact)
+    _check('N44 corpus-audit metadata must be an object', t_corpus_audit_meta_must_be_object)
+    _check('N45 distribution helpers reject boolean args', t_distribution_helpers_reject_boolean_arguments)
+    _check('N46 F-tail NaN + trend within-noise + meta seed floor', t_f_sf_and_trend_fail_closed)
+    _check('N47 overlap gate rejects NaN thresholds / unmeasurable shingles', t_leakage_overlap_gate_fails_closed)
+    _check('N48 split audit rejects a flat validation batch', t_split_audit_rejects_flat_validation)
+    _check('N49 seed recovery keeps seed-averaged fields consistent', t_seed_recovery_keeps_seed_averaged_fields_consistent)
+    _check('N50 error-analysis provenance + archive required-file symlinks', t_error_compare_and_archive_fail_closed)
+    _check('N51 report keeps key-only legacy variant records', t_report_keeps_key_only_variant)
+    _check('N52 fail-closed edges: corpus/TimeGuard/seed metadata/audits/merge/kernel', t_fail_closed_edge_cases)
+    _check('N53 composite temporal identity + exact checkpoint geometry', t_composite_identity_and_checkpoint_geometry)
+    _check('N54 ngram public entry points reject float token ids', t_ngram_public_entry_points_reject_float_ids)
+    _check('N55 categorical fingerprint follows encoder identity', t_categorical_fingerprint_uses_encoder_identity)
+    _check('N56 category order / one-sided clip / TimeGuard cap exactness', t_category_order_and_cap_exactness)
+    _check('N57 ngram count helper requires an exact vocabulary', t_ngram_count_helper_requires_exact_vocab)
+    _check('N58 temporal scalars fail closed; exact full-range quantile; strict open-block JSON', t_temporal_values_and_exact_full_range)
+    _check('N59 temporal/complex scalars refused in PPL/effect/report paths', t_nonmeasurement_scalars_in_measurement_paths)
     _check('N60 variant_mlp_ratio bool-flag handling incl. NumPy bools', t_variant_mlp_ratio_bool_flag)
     _check('N61 baseline_tuning_audit compares a NumPy boolean stability flag', t_baseline_tuning_audit_np_bool_stability)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
