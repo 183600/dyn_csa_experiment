@@ -3857,7 +3857,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     # columns are NOT narrowed to the readable prefix.  Narrowing changes the
     # GEMM shape, and a GEMM is not bitwise column-independent across shapes:
     # the prefix scores (and therefore the log-sum-exp and near-tie ordering)
-    # can drift by ULPs.  The repo's comparability contract requires the same
+    # can differ by ULPs.  The repo's comparability contract requires the same
     # inputs to produce the same bits as the un-narrowed implementation, so the
     # score/soft path stays full width; top-k selection goes through the
     # stable top-k in `_rank_blocks`.
@@ -10827,7 +10827,7 @@ def _stable_mean_std(values, ddof=1):
     if a.size == 0:
         return float('nan'), float('nan')
     if not np.all(np.isfinite(a)):
-        # Preserve the historical non-finite propagation: callers validate
+        # Preserve the non-finite propagation: callers validate
         # measurements before reaching here, and inf/nan has no finite
         # rescaling that would make the summary meaningful.
         ref = float(a[0])
@@ -13913,7 +13913,7 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
         'best_ppl': float(trials_by_arm[best_arm]['selected_metric_value']),
         # Matched-denominator PPL of the SAME selected config (excludes every
         # row's first token — exactly the positions a neural LM is scored on).
-        # Selection stays on the historical ``ppl`` scale so the audit's
+        # Selection stays on the ``ppl`` scale so the audit's
         # "selected is the best trial" check is unchanged; this field exists so
         # panel-vs-floor comparisons can be made on equal denominators.
         'best_ppl_matched': trials_by_arm[best_arm].get('selected_ppl_matched'),
@@ -16448,7 +16448,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 # panel: the neural panel scores R x (L-1) positions, so use
                 # the matched-denominator floor (excludes row-first tokens)
                 # whenever the artifact provides it.  An earlier artifact without
-                # the field falls back to the historical scale, which is
+                # the field falls back to the fallback scale, which is
                 # slightly INFLATED (row-first tokens have no context) — the
                 # fallback makes "beats the floor" easier, so it is labelled.
                 _floor_ppl = _finite_scalar(_sb.get('best_ppl_matched'))
@@ -21482,7 +21482,7 @@ class TimeGuard:
                                 raise ValueError(f'bookings[{_tok!r}].ts={_ts!r} is not a positive finite timestamp')
                         elif _b.get('ts') is None:
                             # A booking without a timestamp cannot be aged out
-                            # safely; keep the historical dead-pid fallback
+                            # safely; keep the dead-pid fallback
                             # only (no phantom-age refund).
                             pass
             except Exception as e:
@@ -23034,7 +23034,7 @@ def _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch, devi
     # affects threshold VALUES when the segmenter runs past the exact limit
     # (n > _ae).  Record it in the fingerprint only in that case (or when the
     # env var is explicitly set); when it is irrelevant the fingerprint string
-    # stays byte-identical to the historical form so no existing record is
+    # stays byte-identical to the prior form so no existing record is
     # invalidated.
     _ag_env = os.environ.get('CSA_ADAPTIVE_MAX_TOKENS', '').strip()
     try:

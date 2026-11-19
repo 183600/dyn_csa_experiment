@@ -1888,7 +1888,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 # trained-with-that-selection control at the same (L, rho).
                 # For losses the positive direction means the intervention
                 # scores WORSE than retraining that selection — a gap that MAY
-                # itself contain train/test-mismatch effects (plus optimisation
+                # itself contain train/test-mismatch effects (plus solver
                 # adaptation and parameter differences), so it must be read as
                 # a raw difference, never as 'the part that cannot be
                 # attributed to mismatch'.

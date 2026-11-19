@@ -672,7 +672,7 @@ def _pair_reason(ra, rb):
     # The run_cfg string does not carry the optimizer identity / schedule
     # shape / clipping / augmentation or the AMP/eager implementation mode.
     # Mirror exp_lib.pair_reason so a zero-GPU report cannot pair cells that
-    # ran under different numerical or optimisation settings.
+    # ran under different numerical or solver settings.
     _ka, _kb = (ra.get('train_knobs'), rb.get('train_knobs'))
     if (_ka is None) != (_kb is None):
         return 'unverifiable train_knobs (only one record carries the optimizer / lr-schedule / augmentation descriptor)'
@@ -1517,7 +1517,7 @@ def sec_p1l():
                 or not any((isinstance(c, dict) and _ppl_ok(c.get('ppl'))
                             for c in _r['by_len'].values()))):
             continue
-        # A legacy record may name its arm only in the summary-key prefix.
+        # A record may name its arm only in the summary-key prefix.
         # Admit it with the canonical name so the later grouping (which reads
         # `variant`) does not silently drop it again.
         recs.append(_r if _r.get('variant') is not None

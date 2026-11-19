@@ -1746,7 +1746,7 @@ def exact_sign_permutation(deltas):
         return _extras({'n': 0, 'mean': float('nan'), 'std': float('nan'), 'p_exact_signflip': float('nan'), 'n_flips': 0, 'n_dropped': n_dropped}, d, n)
     # One exact implementation for every n: exp_lib enumerates n<=20,
     # meet-in-the-middle to n=40 and uses a deterministic saddlepoint tail
-    # beyond that.  Delegating avoids a second copy whose arithmetic can drift
+    # beyond that.  Delegating avoids a second copy whose arithmetic can differ
     # (and lets exp_lib's power-of-two normalisation keep tiny/huge effects
     # from overflowing the variance while the p stays exact).
     _r = L.exact_signflip_p(d)

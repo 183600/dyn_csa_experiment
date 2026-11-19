@@ -744,7 +744,7 @@ def _recipe_signature(manifest, arm=None):
     _bind = manifest.get('binding') or {}
     if not isinstance(_bind, dict):
         return None
-    # The new and legacy spellings are aliases for ONE frozen recipe.  If both
+    # The two spellings are aliases for ONE frozen recipe.  If both
     # are present with different content, the training recipe is ambiguous;
     # refuse the binding.
     _sig_new = _bind.get('training_recipe_signature')
@@ -2661,7 +2661,7 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             why = 'recipe does not match the frozen training_recipe signature (including the per-arm mr)'
         elif (manifest.get('manifest_sha256') is not None
               and r.get('manifest_sha256') != manifest.get('manifest_sha256')):
-            # A missing hash is not a match: legacy/hand-edited probe rows
+            # A missing hash is not a match: hand-edited probe rows
             # must not enter evidence for this freeze revision.
             why = (f"manifest_sha256 {str(r.get('manifest_sha256'))[:12]}… does not match the "
                    f"frozen manifest {str(manifest.get('manifest_sha256'))[:12]}… — the probe was "

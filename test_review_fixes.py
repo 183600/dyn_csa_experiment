@@ -1701,13 +1701,13 @@ def t_js_gate_and_floor_denominator():
         except ValueError:
             pass
     # 2) The ngram floor carries a MATCHED denominator alongside the
-    #    historical one: only positions with a left context (R x (L-1)) are
+    #    original one: only positions with a left context (R x (L-1)) are
     #    scored there, exactly the positions a neural LM is scored on.
     train = np.array([0, 1, 2, 0, 1, 2, 1, 0, 2, 1], dtype=np.int64)
     ev = np.array([[0, 1, 2, 0], [1, 2, 0, 1]], dtype=np.int64)
     uni = L.ngram_lm_score(train, ev, 4, order=1, alpha=0.5)
     assert uni['n_tokens'] == 8 and uni['n_tokens_matched'] == 6, uni
-    # matched nll is the historical nll with the row-first terms removed;
+    # matched nll is the full nll with the row-first terms removed;
     # train counts are 0->3, 1->4 (alpha=0.5, vocab=4, 10 tokens)
     first_nll = -math.log((3 + 0.5) / 12.0) - math.log((4 + 0.5) / 12.0)
     assert abs(uni['nll_matched'] * 6 - (uni['nll'] * 8 - first_nll)) < 1e-9, uni
@@ -7519,7 +7519,7 @@ def _global_multiplicity_random_cases():
 
 def t_global_multiplicity_twin_consistency():
     # The report builder keeps a dependency-free local twin; the two must
-    # agree exactly so the printed global table cannot drift from the library
+    # agree exactly so the printed global table cannot differ from the library
     # the driver-side audits use.
     for named in _global_multiplicity_random_cases():
         a1 = L.global_multiplicity_audit(named, alpha=0.05)
@@ -10834,7 +10834,7 @@ def t_error_compare_and_archive_fail_closed():
 
 
 def t_report_keeps_key_only_variant():
-    # A legacy by-length record may name its arm only in the summary key.
+    # A by-length record may name its arm only in the summary key.
     # The table must include it instead of emitting an empty variant list.
     rec = {'csa_fixed::seed0': {
         'seed': 0, '_code': BR._CUR_CS, 'run_cfg': 'CFG',
