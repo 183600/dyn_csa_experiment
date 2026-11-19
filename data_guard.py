@@ -34,6 +34,7 @@ import hashlib
 import json
 import math
 import numbers
+import decimal
 from fractions import Fraction
 
 import numpy as np
@@ -152,6 +153,8 @@ def _unhashable_identity(value):
         # value, while 2**53 + 1 stays distinct from float(2**53 + 1).
         return ('num', int(value))
     if isinstance(value, (float, np.floating)):
+        if isinstance(value, np.longdouble):
+            return _longdouble_identity(value)
         f = float(value)
         if math.isnan(f):
             return ('nan',)
@@ -160,6 +163,12 @@ def _unhashable_identity(value):
         if f.is_integer():
             return ('num', int(f))
         return ('num', f)
+    if isinstance(value, decimal.Decimal):
+        if value.is_nan():
+            return ('nan',)
+        if value.is_infinite():
+            return ('inf', 1 if value > 0 else -1)
+        return _decimal_identity(value)
     if isinstance(value, (complex, np.complexfloating)):
         # Canonicalise signed zero and missing/overflowed components exactly
         # like the row-key/fingerprint paths, so a composite group id does not
@@ -240,6 +249,21 @@ def _explicit_count(name, value):
     return _check_count(f'{name}_size', value)
 
 
+def _exact_frac(v):
+    """Fraction of a checked Real fraction, parsing decimals exactly.
+
+    ``Fraction(0.7)`` is the exact *binary* value 0.6999... and
+    ``int(Fraction(10) * Fraction(0.7))`` is 6, not the requested 7.
+    Parsing through the shortest round-trip decimal spelling recovers
+    7/10 for decimal inputs; integral inputs pass through exactly.
+    """
+    if isinstance(v, Fraction):
+        return v
+    if isinstance(v, numbers.Integral):
+        return Fraction(int(v))
+    return Fraction(str(v))
+
+
 def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
                    train_size=None, val_size=None, test_size=None):
     """Return deterministic (n_train, n_val, n_test) sizes summing to ``n``.
@@ -270,7 +294,7 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
         # otherwise overdraw it (the last split then takes whatever is left).
         # Evaluate n*frac exactly: a float product can overflow or lose the
         # low bits of an exact integer count.
-        fracs = (Fraction(train_frac), Fraction(val_frac), Fraction(test_frac))
+        fracs = (_exact_frac(train_frac), _exact_frac(val_frac), _exact_frac(test_frac))
         unspecified = [i for i in range(3) if sizes[i] is None]
         remaining = n - sum(v for v in sizes if v is not None)
         for i in unspecified[:-1]:
@@ -283,24 +307,26 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
             raise ValueError(f'could not reconcile split sizes {sizes} with n={n}')
         return tuple(int(v) for v in sizes)
 
-    if n == 0:
-        # An empty dataset splits into three empty (non-overlapping) parts;
-        # requiring one row per non-empty split would be impossible.
-        return (0, 0, 0)
+    # Validate the fractions before the (valid) empty-set short cut: a
+    # malformed ratio must be refused for every n, not only non-empty data.
     frac_sum = train_frac + val_frac + test_frac
     if frac_sum <= 0:
         raise ValueError('at least one split fraction must be positive')
     if abs(frac_sum - 1.0) > 1e-6:
         raise ValueError(
             f'train_frac + val_frac + test_frac must sum to 1, got {frac_sum}')
+    if n == 0:
+        # An empty dataset splits into three empty (non-overlapping) parts;
+        # requiring one row per non-empty split would be impossible.
+        return (0, 0, 0)
     # The tolerance accepts sums within 1e-6 of 1.  At scale, n*frac can then
     # overshoot n by thousands of rows and the floor sum could exceed n
     # (negative remainder).  Renormalising the accepted fractions keeps the
     # targets summing to n exactly for every n; the deviation is already
     # inside the declared tolerance.
-    _frac_total = (Fraction(train_frac) + Fraction(val_frac)
-                   + Fraction(test_frac))
-    fracs = tuple(Fraction(f) / _frac_total
+    _frac_total = (_exact_frac(train_frac) + _exact_frac(val_frac)
+                   + _exact_frac(test_frac))
+    fracs = tuple(_exact_frac(f) / _frac_total
                   for f in (train_frac, val_frac, test_frac))
     requested = [f > 0 for f in fracs]
     if n < sum(requested):
@@ -918,6 +944,58 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
         purge=purge)
 
 
+def _decimal_identity(v):
+    """Exact canonical identity for a finite Decimal cell.
+
+    ``normalize()`` collapses numerically equal Decimals (1.50 vs 1.5) and
+    preserves numeric-equality/hash compatibility with int/float twins for
+    values representable as float64; anything wider keeps its exact
+    normalised spelling.
+    """
+    try:
+        f = float(v)
+    except (OverflowError, ValueError):
+        f = None
+    if f is not None and math.isfinite(f):
+        try:
+            if Decimal(f) == v:
+                # float64-exact round trip: share the numeric identity.
+                if f.is_integer() and abs(f) <= 2 ** 53:
+                    return ('num', int(f))
+                if f.is_integer():
+                    return ('num', int(f))
+                return ('num', f)
+        except Exception:
+            pass
+    return ('wide', str(v.normalize()))
+
+
+def _longdouble_identity(v):
+    """Exact canonical identity for an extended-precision float cell.
+
+    The float64 conversion path collapses out-of-range finite longdoubles to
+    ``inf`` (merging distinct values) and rounds inexact-but-in-range ones;
+    folding zero, NaN and Inf keeps the common spellings identical, and the
+    16-byte payload keeps the rest exact.
+    """
+    if v == 0:
+        return ('num', 0)
+    f = float(v)  # never raises; overflows to inf
+    if math.isnan(f):
+        return ('nan',)
+    if math.isinf(f):
+        if np.isinf(v):
+            return ('inf', 1 if v > 0 else -1)
+        # Finite but out of float64 range: keep the exact payload.
+        return ('wide', v.tobytes())
+    if np.float64(f) == v:
+        # Exactly representable in float64: share the float64 identity.
+        if f.is_integer():
+            return ('num', int(f))
+        return ('num', f)
+    return ('wide', v.tobytes())
+
+
 def _contains_missing_marker(value):
     """True if a composite group id embeds a NaN/NaT that breaks identity."""
     if isinstance(value, (float, np.floating)):
@@ -933,6 +1011,21 @@ def _contains_missing_marker(value):
     if isinstance(value, (np.datetime64, np.timedelta64)):
         try:
             return bool(np.isnat(value))
+        except TypeError:
+            return False
+    if isinstance(value, decimal.Decimal):
+        try:
+            return value.is_nan()
+        except Exception:
+            return False
+    if isinstance(value, np.longdouble):
+        try:
+            return bool(np.isnan(value))
+        except TypeError:
+            return False
+    if isinstance(value, np.clongdouble):
+        try:
+            return bool(np.isnan(value.real) or np.isnan(value.imag))
         except TypeError:
             return False
     if isinstance(value, (tuple, list, set, frozenset)):
@@ -958,6 +1051,22 @@ def _group_key(value):
         f = float(value)
         if math.isnan(f):
             return _MISSING_GROUP_NAN
+        if isinstance(value, np.longdouble):
+            if np.isinf(value) or np.float64(f) == value:
+                # inf == inf; an exactly representable value IS its float
+                # twin.  Fall through to the verbatim hashable path.
+                pass
+            else:
+                # Finite but out of float64 range (or inexact in it):
+                # keep the exact payload so distinct rows never collapse.
+                return ('wide', value.tobytes())
+    if isinstance(value, decimal.Decimal):
+        # normalize() preserves numeric-equality/hash compatibility with
+        # int/float group ids (Decimal('2') == 2); NaN/Inf are the
+        # non-finite cases Python keeps distinct, handled explicitly.
+        if value.is_nan():
+            return _MISSING_GROUP_NAN
+        return value.normalize()
     if isinstance(value, (np.datetime64, np.timedelta64)) and np.isnat(value):
         return _MISSING_GROUP_NAT
     try:
@@ -1779,6 +1888,13 @@ def _canonical_complex_cell(v):
     canonicalisation as the real path so a missing/overflowed component is one
     identity and ``-0.0`` matches ``0.0``.
     """
+    if isinstance(v, np.clongdouble):
+        # Extended-precision parts may overflow float64; keep exact parts.
+        def _part_wide(x):
+            return _longdouble_identity(x)
+        if v.imag == 0:
+            return _part_wide(v.real)
+        return ('cplx', _part_wide(v.real), _part_wide(v.imag))
     z = complex(v)
     def _part(x):
         if math.isnan(x):
@@ -1871,6 +1987,9 @@ def _canonical_object_cell(v):
         return ('num', int(v))
     if isinstance(v, (int, np.integer)):
         return ('num', int(v))
+    if isinstance(v, np.longdouble):
+        # float64 conversion would overflow/collapse; keep the exact identity.
+        return _longdouble_identity(v)
     if isinstance(v, (float, np.floating)):
         f = float(v)
         if math.isnan(f):
@@ -1880,6 +1999,12 @@ def _canonical_object_cell(v):
         if f.is_integer():
             return ('num', int(f))
         return ('num', f)
+    if isinstance(v, decimal.Decimal):
+        if v.is_nan():
+            return ('nan',)
+        if v.is_infinite():
+            return ('inf', 1 if v > 0 else -1)
+        return _decimal_identity(v)
     if isinstance(v, (complex, np.complexfloating)):
         return _canonical_complex_cell(v)
     if isinstance(v, tuple):
@@ -1930,6 +2055,10 @@ def _matrix_fingerprint(X):
     # Fixed-width Unicode/bytes and complex tables use the canonical per-cell
     # identity: float64 conversion would discard a complex imaginary part.
     _obj_canon = arr.dtype.kind in ('U', 'S', 'c')
+    if arr.dtype.kind == 'f' and arr.dtype.itemsize > 8:
+        # longdouble tables: float64 cast would overflow out-of-range finite
+        # values to inf, merging distinct tables; use exact canonical cells.
+        _obj_canon = True
     # Native datetime/timedelta tables share the canonical temporal identity
     # of an object column of np.datetime64/np.timedelta64 scalars.
     _temporal = arr.dtype.kind in ('M', 'm')
@@ -1971,6 +2100,9 @@ def _matrix_fingerprint(X):
         elif any(isinstance(v, numbers.Integral) and abs(int(v)) > 2 ** 53
                  for v in _vals):
             _obj_canon = True
+        elif any(isinstance(v, np.longdouble) for v in _vals):
+            # Extended-precision cells are not float64-exact in general.
+            _obj_canon = True
     _integral = _integral or _obj_int
     _wide_int = False
     _wide_neg = False
@@ -2008,7 +2140,9 @@ def _matrix_fingerprint(X):
             continue
         if _obj_canon:
             h.update(b'OBJ_CANON')
-            for v in _blk.reshape(-1).tolist():
+            # Iterate the native scalars: .tolist() converts extended-precision
+            # floats through float() (overflow to inf) and would merge them.
+            for v in _blk.reshape(-1):
                 _s = repr(_canonical_object_cell(v)).encode('utf-8', 'backslashreplace')
                 h.update(len(_s).to_bytes(8, 'little'))
                 h.update(_s)
@@ -2097,9 +2231,31 @@ def _row_keys(X):
                 or isinstance(v, (bool, np.bool_))
                 or v is None
                 for v in _flat_obj):
-            _real_exact = all(v is None or not isinstance(v, numbers.Integral)
-                              or abs(int(v)) <= 2 ** 53
-                              for v in _flat_obj)
+            def _real_representable(v):
+                # float64 must round-trip the value exactly, or the row-key
+                # would merge distinct cells (huge finite values overflow to
+                # inf; inexact values silently round).
+                if v is None:
+                    return True
+                if isinstance(v, numbers.Integral):
+                    return abs(int(v)) <= 2 ** 53
+                try:
+                    f = float(v)
+                except (OverflowError, TypeError, ValueError):
+                    return False
+                if math.isnan(f):
+                    return True
+                if math.isinf(f):
+                    # True infinities twin-match; overflowed finite values do not.
+                    try:
+                        return bool(v == f)
+                    except Exception:
+                        return False
+                try:
+                    return bool(v == f)
+                except Exception:
+                    return False
+            _real_exact = all(_real_representable(v) for v in _flat_obj)
             if _real_exact:
                 return _row_keys(np.asarray(_flat_obj, dtype=np.float64).reshape(src.shape))
         # A pure string object table is the logical twin of a fixed-width
@@ -2141,6 +2297,8 @@ def _row_keys(X):
                 return ('num', int(v))
             if isinstance(v, (int, np.integer)):
                 return ('num', int(v))
+            if isinstance(v, np.longdouble):
+                return _longdouble_identity(v)
             if isinstance(v, (float, np.floating)):
                 f = float(v)
                 if math.isnan(f):
@@ -2148,6 +2306,12 @@ def _row_keys(X):
                 if math.isinf(f):
                     return ('inf', 1 if f > 0 else -1)
                 return ('num', 0.0 if f == 0.0 else f)
+            if isinstance(v, decimal.Decimal):
+                if v.is_nan():
+                    return ('nan',)
+                if v.is_infinite():
+                    return ('inf', 1 if v > 0 else -1)
+                return _decimal_identity(v)
             if isinstance(v, (complex, np.complexfloating)):
                 return _canonical_complex_cell(v)
             if isinstance(v, tuple):
@@ -2173,6 +2337,12 @@ def _row_keys(X):
 
         return [tuple(_cell_key(v) for v in row) for row in src]
     keys = []
+    if src.dtype.kind == 'f' and src.dtype.itemsize > 8:
+        # Extended-precision floats (longdouble): the float64 cast below
+        # would overflow out-of-range finite values to inf and round
+        # inexact ones, merging distinct rows.  Route through the object
+        # table's exact per-cell identity instead.
+        return _row_keys(src.astype(object))
     if src.dtype.kind == 'c':
         # A complex cell is a pair (real, imaginary); the raw-byte path below
         # is width-dependent and the float path discards the imaginary part.
@@ -2341,7 +2511,29 @@ def _label_key(v):
     # like "nan"/"inf" into missing targets and also conflated numeric
     # strings with their numeric twins.  Numbers.Real includes NumPy scalar
     # types but excludes complex/bool.
-    if not isinstance(v, numbers.Real) or isinstance(v, (bool, np.bool_)):
+    if isinstance(v, (bool, np.bool_)):
+        return v
+    if isinstance(v, (complex, np.complexfloating)):
+        # Complex NaN/Inf is not a valid target either; returning the raw
+        # atom would split NaN != NaN into "different labels" on duplicate
+        # rows and hide the corruption from the non-finite audit.
+        try:
+            _re = float(v.real)
+            _im = float(v.imag)
+        except (TypeError, ValueError, OverflowError):
+            return v
+        if not (math.isfinite(_re) and math.isfinite(_im)):
+            return None
+        return v
+    if isinstance(v, decimal.Decimal):
+        # Decimals are numbers.Number but not numbers.Real.
+        try:
+            if not v.is_finite():
+                return None
+        except Exception:
+            return v
+        return v
+    if not isinstance(v, numbers.Real):
         return v
     try:
         f = float(v)

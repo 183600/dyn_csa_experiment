@@ -129,12 +129,26 @@ def _load_model(path):
     d = dict(d)
     sd = d['sd']
     sd = {(k[7:] if k.startswith('module.') else k): v for k, v in sd.items()}
-    vocab = int(d.get('vocab', 8192))
-    dim = int(d.get('d', 256))
-    n_layers = int(d.get('n_layers', 6))
-    n_heads = int(d.get('n_heads', 8))
-    d_head = int(d.get('d_head', 32))
-    max_seq = int(d.get('train_len') or d.get('max_seq') or 512)
+
+    def _exact_positive_int(_k, _default):
+        # Architecture dimensions are exact positive integer counts (same
+        # contract as _compare_reason): a bool/fractional/out-of-range value
+        # must not be rounded to a different architecture.
+        _raw = d.get(_k, _default)
+        _v = L._as_seed_int(_raw)
+        if _v is None or _v <= 0:
+            raise SystemExit(f'[errors] REFUSE: checkpoint {_k}={_raw!r} is not a positive exact integer')
+        return _v
+
+    vocab = _exact_positive_int('vocab', 8192)
+    dim = _exact_positive_int('d', 256)
+    n_layers = _exact_positive_int('n_layers', 6)
+    n_heads = _exact_positive_int('n_heads', 8)
+    d_head = _exact_positive_int('d_head', 32)
+    _ms_raw = d.get('train_len') or d.get('max_seq') or 512
+    max_seq = L._as_seed_int(_ms_raw)
+    if max_seq is None or max_seq <= 0:
+        raise SystemExit(f'[errors] REFUSE: checkpoint train_len/max_seq={_ms_raw!r} is not a positive exact integer')
     cfgs = d.get('cfg')
     if not cfgs:
         raise SystemExit(f'[errors] REFUSE: {path} carries no layer configs')
@@ -187,7 +201,13 @@ def _compare_reason(meta_a, meta_b, seq_len, max_seq_a=None, max_seq_b=None):
     if meta_a.get('cfg') != meta_b.get('cfg'):
         return 'layer configuration differs between the checkpoints'
     for _k in ('train_fp',):
+        # Mirror of exp_lib.pair_reason: a boolean/temporal/complex flag is
+        # not a corpus fingerprint, so both-boolean must be refused rather
+        # than pair two garbage-provenance checkpoints as token-aligned.
         _va, _vb = meta_a.get(_k), meta_b.get(_k)
+        if (isinstance(_va, (bool, np.bool_)) or L._is_nonmeasurement_scalar(_va)
+                or isinstance(_vb, (bool, np.bool_)) or L._is_nonmeasurement_scalar(_vb)):
+            return f'unverifiable {_k} (a non-measurement value is not a corpus fingerprint)'
         if (_va is None) != (_vb is None):
             return f'unverifiable {_k} (only one checkpoint records it)'
         if _va is not None and str(_va) != str(_vb):
@@ -204,12 +224,18 @@ def _compare_reason(meta_a, meta_b, seq_len, max_seq_a=None, max_seq_b=None):
 
     _ka, _va = _eval_slice_fp(meta_a)
     _kb, _vb = _eval_slice_fp(meta_b)
+    if (isinstance(_va, (bool, np.bool_)) or L._is_nonmeasurement_scalar(_va)
+            or isinstance(_vb, (bool, np.bool_)) or L._is_nonmeasurement_scalar(_vb)):
+        return 'unverifiable evaluation-slice fingerprint (a non-measurement value is not an evaluation-slice fingerprint)'
     if (_va is None) != (_vb is None):
         return 'unverifiable evaluation-slice fingerprint (only one checkpoint records it)'
     if _va is not None and str(_va) != str(_vb):
         return (f'the checkpoints were measured on different evaluation slices '
                 f'({_ka}={_va!r} vs {_kb}={_vb!r})')
     _ca, _cb = meta_a.get('code'), meta_b.get('code')
+    if (isinstance(_ca, (bool, np.bool_)) or L._is_nonmeasurement_scalar(_ca)
+            or isinstance(_cb, (bool, np.bool_)) or L._is_nonmeasurement_scalar(_cb)):
+        return 'unverifiable code semantics (a non-measurement value is not a code-semantics fingerprint)'
     if (_ca is None) != (_cb is None):
         return 'unverifiable code semantics (only one checkpoint records it)'
     if _ca is not None and str(_ca) != str(_cb):
@@ -262,12 +288,32 @@ def main(argv=None):
     os.makedirs(args.outdir, exist_ok=True)
     model, meta = _load_model(args.ckpt)
     model.to(device)
-    seq_len = int(args.seq_len or meta.get('train_len') or meta.get('max_seq') or 512)
+    if args.seq_len is not None:
+        seq_len = args.seq_len
+    else:
+        _ms = meta.get('train_len') or meta.get('max_seq')
+        if _ms is None:
+            seq_len = 512
+        else:
+            seq_len = L._as_seed_int(_ms)
+            if seq_len is None or seq_len <= 0:
+                raise SystemExit(f'[errors] REFUSE: checkpoint train_len/max_seq={_ms!r} is not a positive exact integer')
+    # Refuse before any corpus work when the requested evaluation length
+    # exceeds the checkpoint's position-table capacity (the paired path's
+    # capacity check only covers --compare-ckpt).
+    _cap = L._as_seed_int(meta.get('train_len') or meta.get('max_seq'))
+    if _cap is not None and seq_len > _cap:
+        raise SystemExit(f'[errors] REFUSE: requested seq_len={seq_len} exceeds checkpoint position-table capacity (max_seq={_cap})')
+    _vocab_cfg = L._as_seed_int(meta.get('vocab', 8192))
+    if _vocab_cfg is None or _vocab_cfg <= 0:
+        raise SystemExit(f"[errors] REFUSE: checkpoint vocab={meta.get('vocab', 8192)!r} is not a positive exact integer")
     cfg = {'dataset': args.dataset, 'seq_len': seq_len, 'n_train_tokens': args.n_train_tokens,
-           'val_seqs': args.val_seqs, 'vocab_size': int(meta.get('vocab', 8192))}
+           'val_seqs': args.val_seqs, 'vocab_size': _vocab_cfg}
     train_ids, val_batch, vocab, tok, val_bnd = L.load_run_corpus(cfg)
     if args.dataset != 'wikitext':
         tok = None
+    if val_batch.shape[1] < seq_len:
+        raise SystemExit(f'[errors] REFUSE: corpus rows are {int(val_batch.shape[1])} tokens wide, fewer than seq_len={seq_len} — refusing instead of scoring (and labelling) truncated rows')
     n_rows = min(int(args.max_rows), int(val_batch.shape[0]))
     val_batch = np.ascontiguousarray(val_batch[:n_rows, :seq_len])
     if val_bnd is not None:

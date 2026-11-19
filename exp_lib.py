@@ -12499,6 +12499,14 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
             _df_pe += len(_eff) - 1
         _ss_lof = float((n * resid ** 2).sum())
         _c = float(n.sum() - (n ** 2).sum() / n.sum())
+        # Double-precision roundoff, not lack of fit: log10(scale) and the
+        # slope are not exactly representable, so an exactly linear zero-
+        # variance ladder leaves SS ~ eps^2 * sum(n*y^2) (e.g. ~1e-33 for
+        # y ~ 1).  Scaling the tolerance by eps^2 keeps the comparison
+        # against true float noise while any real misfit (SS >> 1e-24)
+        # still registers.
+        _ss_lof_tol = (1024.0 * float(np.finfo(float).eps) ** 2
+                       * max(1.0, float((n * y ** 2).sum())))
         if dfh > 0 and _df_pe > 0 and _ss_pe > 0.0:
             _s2 = _ss_pe / _df_pe
             q = _ss_lof / _s2
@@ -12520,7 +12528,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
             # Exact zero within-scale variance with a nonzero residual SS:
             # the lack-of-fit F diverges (infinitely strong evidence against
             # the single slope).  Report the limit, not a fake finite Q.
-            if _ss_lof > 0.0:
+            if _ss_lof > _ss_lof_tol:
                 out['heterogeneity'] = {'Q': None, 'df': int(dfh), 'df_pure_error': int(_df_pe),
                                         'F': None, 'p': 0.0, 'I2_percent': 100.0, 'tau2': None,
                                         'method': 'lack-of-fit F with zero pure error',
@@ -12555,6 +12563,8 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         _rp = (_yc - _yc_bar) - _sp * (x - _x_bar_p)
         _cp = float(len(complete))
         _q_p = float((_cp * _rp ** 2).sum())
+        _q_p_tol = (1024.0 * float(np.finfo(float).eps) ** 2
+                    * max(1.0, float((_cp * _yc ** 2).sum())))
         _df_p = k - 2
         # Same pure-error normalisation as the all-seed Q above: the complete
         # seeds' within-scale deviations are the only replication this path
@@ -12580,11 +12590,11 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         elif _df_p > 0 and _ss_pe_p == 0.0:
             # Zero within-scale variance: every complete seed walks the same
             # ladder, so the residual SS decides in the limit.
-            _p_p = 0.0 if _q_p > 0.0 else 1.0
-            _i2_p = 100.0 if _q_p > 0.0 else 0.0
-            _qn_p = 0.0 if _q_p <= 0.0 else None
-            _f_p = None if _q_p > 0.0 else 0.0
-            _tau2_p = None if _q_p > 0.0 else 0.0
+            _p_p = 0.0 if _q_p > _q_p_tol else 1.0
+            _i2_p = 100.0 if _q_p > _q_p_tol else 0.0
+            _qn_p = 0.0 if _q_p <= _q_p_tol else None
+            _f_p = None if _q_p > _q_p_tol else 0.0
+            _tau2_p = None if _q_p > _q_p_tol else 0.0
             _het_method_p = 'lack-of-fit F with zero pure error'
         else:
             _qn_p = _f_p = _p_p = _i2_p = _tau2_p = None

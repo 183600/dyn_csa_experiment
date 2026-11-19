@@ -44,7 +44,7 @@ TOST 等检查都由 `kernel` 子命令写出并绑定代码/内核戳/git 树�
 `full` 还会在真实面板几何上做短校准，使解析外推的单元开销与真实运行一致，
 避免因估计偏差而使单元被 cap 跳过。
 """
-import gc, json, os, shutil, subprocess, sys, time, traceback
+import gc, json, math, os, shutil, subprocess, sys, time, traceback
 import numpy as np
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
@@ -62,7 +62,13 @@ def git_push(msg):
     if os.environ.get('M0_NO_PUSH'):
         print(f'[git] push skipped (M0_NO_PUSH): {msg}')
         return True
-    run = lambda *a: subprocess.run(a, cwd=REPO, capture_output=True, text=True, encoding='utf-8', errors='replace')
+    def run(*a):
+        try:
+            return subprocess.run(a, cwd=REPO, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=600)
+        except subprocess.TimeoutExpired:
+            # A network stall must not hang the driver forever with nothing
+            # pushed and no shutdown scheduled.
+            return subprocess.CompletedProcess(a, -9, '', 'git command timed out after 600s')
     ra = run('git', 'add', '-A')
     if ra.returncode != 0:
         print(f'[git] add FAILED: {(ra.stdout + ra.stderr)[-300:]} — NOT pushing (a commit could miss unstaged work); leaving the tree for inspection')
@@ -74,12 +80,17 @@ def git_push(msg):
         if run('git', 'status', '--porcelain').stdout.strip():
             print('[git] the commit failed while changes are still uncommitted — NOT pushing (a push would publish stale history and report success); leaving the tree for inspection')
             return False
-    _branch = run('git', 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
+    _branch_cp = run('git', 'rev-parse', '--abbrev-ref', 'HEAD')
+    if _branch_cp.returncode != 0:
+        print(f'[git] could not resolve the current branch: {(_branch_cp.stdout + _branch_cp.stderr)[-300:]} — NOT pushing (refusing to guess where this belongs); the work is committed locally only')
+        return False
+    _branch = _branch_cp.stdout.strip()
     if _branch != 'HEAD':
         rb = run('git', 'pull', '--rebase', '--autostash', 'origin', _branch)
         if rb.returncode != 0:
-            print(f'[git] rebase onto origin failed: {(rb.stdout + rb.stderr)[-300:]}')
+            print(f'[git] rebase onto origin failed: {(rb.stdout + rb.stderr)[-300:]} — aborting and NOT pushing (a push would publish an un-rebased commit)')
             run('git', 'rebase', '--abort')
+            return False
         r = run('git', 'push', 'origin', 'HEAD')
     else:
         _up = run('git', 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD').stdout.strip()
@@ -867,7 +878,13 @@ def run_full():
     _env = os.environ.get(cap_env)
     if _env:
         print(f'[m0] {cap_env}={_env} 覆盖默认上限 {cap["total_hours"]} 小时')
-        cap['total_hours'] = float(_env)
+        try:
+            _env_f = float(_env)
+        except (TypeError, ValueError, OverflowError):
+            raise SystemExit(f'[m0] {cap_env}={_env!r} is not a number — refusing to start with an unverifiable time cap')
+        if not math.isfinite(_env_f) or _env_f <= 0:
+            raise SystemExit(f'[m0] {cap_env}={_env!r} must be a finite positive number of hours — refusing to start (a non-finite/negative cap would silently turn every cell into skipped_cap)')
+        cap['total_hours'] = _env_f
     guard = L.TimeGuard(cap)
     guard.report()
     _what = f'{panel} 主面板（B 档，{len(run_cfg["variants"])} 臂 × {len(run_cfg["seeds"])} seeds × {run_cfg["n_train_tokens"] / 1e9:g}B token）'

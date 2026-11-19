@@ -1410,8 +1410,10 @@ def _hist_by_seed(outdir, variant, raw=None):
             _groups.setdefault(json.dumps(cfg_of.get(s), sort_keys=True, default=str), []).append(s)
         if len(_groups) > 1:
             _cur_sfx = f'_cs{L.code_stamp()}'
-            _ranked = sorted(_groups.values(), key=lambda g: (not any((isinstance(cfg_of.get(_s), str) and cfg_of[_s].endswith(_cur_sfx) for _s in g)), -len(g)))
-            _keep = _ranked[0]
+            # Tie-break on the group's serialised run_cfg bytes: summary.json
+            # iteration order must not decide which tied group is kept.
+            _ranked = sorted(_groups.items(), key=lambda kv: (not any((isinstance(cfg_of.get(_s), str) and cfg_of[_s].endswith(_cur_sfx) for _s in kv[1])), -len(kv[1]), kv[0]))
+            _keep = _ranked[0][1]
             _dropped = sorted((s for s in out if s not in set(_keep)))
             print(f'[stats] {sp}: `{variant}` curves span {len(_groups)} distinct run_cfg groups — pooling across configurations is not allowed, so the trajectory keeps only one group ({len(_keep)}/{len(out)} seeds, preferring the one stamped with the current code semantics) and drops seeds {_dropped}')
             if sum((1 for g in _groups.values() if len(g) == len(_keep))) > 1:
@@ -1623,7 +1625,11 @@ def _panel_convergence(hists):
             if len(pts) < 4:
                 per_seed[s] = {'rel_improve_last_quarter': float('nan'), 'plateaued': None}
                 continue
-            q = pts[max(0, int(len(pts) * 0.75) - 1)]
+            # Point nearest the 75th-percentile step (ties break to the
+            # earlier point): the window stays a true final quarter and
+            # never collapses to zero width on short grids.
+            _t_mark = pts[0][0] + 0.75 * (pts[-1][0] - pts[0][0])
+            q = min(pts, key=lambda p: abs(p[0] - _t_mark))
             last = pts[-1]
             denom = max(abs(last[1]), 1e-9)
             rel = (q[1] - last[1]) / denom

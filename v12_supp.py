@@ -1512,7 +1512,32 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         if _prior_sha is not None and _now_sha is not None and _prior_sha != _now_sha:
             print(f'[v12] WARNING: V12_REFREEZE=1 — {v} s{seed} is re-measured on different weights; the prior measurement (ckpt {str(_prior_sha)[:12]}…) is replaced and the earlier round is downgraded to exploratory')
             out['replaced_prior_ckpt_sha256'] = _prior_sha
-    _arch = (int(d.get('d', 256)), int(d.get('n_layers', 6)), int(d.get('n_heads', 8)), int(d.get('d_head', 32)))
+    def _exact_arch_int(x):
+        # Exact-integer contract for architecture knobs: bools are not
+        # dimensions, floats must be finite and integral (int(256.9) silently
+        # truncates otherwise), and temporals/complex/strings are refused.
+        if isinstance(x, bool):
+            return None
+        if isinstance(x, numbers.Integral):
+            i = int(x)
+            return i if abs(i) <= 2 ** 53 else None
+        if isinstance(x, numbers.Real):
+            f = float(x)
+            if math.isfinite(f) and f.is_integer() and abs(f) <= 2 ** 53:
+                return int(f)
+        return None
+
+    _arch_parts = []
+    for _k, _dflt in (('d', 256), ('n_layers', 6), ('n_heads', 8), ('d_head', 32)):
+        _raw = d.get(_k, _dflt)
+        _part = _exact_arch_int(_raw)
+        if _part is None:
+            del d
+            raise SystemExit(
+                f'[v12] REFUSE {v} s{seed}: checkpoint architecture field {_k}={_raw!r} '
+                'is not an exact integer — refusing to load a malformed checkpoint.')
+        _arch_parts.append(_part)
+    _arch = tuple(_arch_parts)
     # Explicit architecture / MLP-width verification against the frozen
     # binding.  The recipe string is decoded from injected constants on the
     # p1l path, so a matching recipe alone cannot prove the checkpoint's real
@@ -1520,9 +1545,20 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     # mirror that check for the confirmatory by-length cells.
     _bind = manifest.get('binding') or {}
     _arch_sig = _bind.get('training_recipe_signature') or {}
-    if all(isinstance(_arch_sig.get(_k), (int, float)) and not isinstance(_arch_sig.get(_k), bool)
-           for _k in ('d', 'L', 'H', 'Dh')):
-        _want_arch = (int(_arch_sig['d']), int(_arch_sig['L']), int(_arch_sig['H']), int(_arch_sig['Dh']))
+    _present = [_k for _k in ('d', 'L', 'H', 'Dh') if _k in _arch_sig]
+    if _present:
+        # A mangled frozen binding must not silently disable the shape check
+        # it exists for: refuse rather than continue with no verification.
+        _want_parts = [_exact_arch_int(_arch_sig.get(_k)) for _k in ('d', 'L', 'H', 'Dh')]
+        if any(_w is None for _w in _want_parts):
+            del d
+            raise SystemExit(
+                f'[v12] REFUSE {v} s{seed}: the frozen training_recipe_signature declares '
+                f'architecture knob(s) {_present} but not as exact integral numbers '
+                f'(values: {[_arch_sig.get(_k) for _k in ("d", "L", "H", "Dh")]!r}) — the '
+                'architecture verification cannot be performed, so the checkpoint is '
+                'refused instead of waved through unverified.')
+        _want_arch = tuple(_want_parts)
         if _arch != _want_arch:
             del d
             raise SystemExit(

@@ -555,14 +555,17 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             # Compare the fingerprint with the file ACTUALLY paired below, not
             # only with the canonical tag path: the unique-fallback branch may
             # select a differently spelled tag, and skipping the hash there
-            # would bless bytes whose provenance was never checked.
-            if train_meta.get('src_fp'):
+            # would bless bytes whose provenance was never checked.  The echo
+            # check at the top accepts `src_fp or train_fp` — verify the same
+            # effective spelling here, not only `src_fp`.
+            _train_fp_effective = train_meta.get('src_fp') or train_meta.get('train_fp')
+            if _train_fp_effective:
                 try:
                     _L = _import_exp_lib()
-                    if str(train_meta.get('src_fp')) != _L._ids_fp(np.asarray(tr)):
-                        _fp_bad.append('train src_fp does not match the train_ids content')
+                    if str(_train_fp_effective) != _L._ids_fp(np.asarray(tr)):
+                        _fp_bad.append('train src_fp/train_fp does not match the train_ids content')
                 except Exception as _fe:
-                    _fp_bad.append(f'train src_fp could not be recomputed ({type(_fe).__name__}: {_fe})')
+                    _fp_bad.append(f'train src_fp/train_fp could not be recomputed ({type(_fe).__name__}: {_fe})')
             if test_meta.get('src_fp'):
                 try:
                     _L = _import_exp_lib()
@@ -758,10 +761,23 @@ def _sample_tokens(arr, cap=1000000, seed=0):
     _seed = seed
     if isinstance(_seed, (bool,)):
         raise ValueError('seed must be an integer, not a bool')
-    try:
+    # Exact-integer contract (same as exp_lib._as_seed_int): int(1.9) == 1
+    # would silently fold fractional seeds onto the same deterministic sample.
+    if isinstance(_seed, numbers.Integral):
         _seed = int(_seed)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'seed must be an integer, got {seed!r}') from None
+    elif isinstance(_seed, numbers.Real):
+        try:
+            _f = float(_seed)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'seed must be an integer, got {seed!r}') from None
+        if not math.isfinite(_f) or _f != math.floor(_f) or abs(_f) >= 2 ** 53:
+            raise ValueError(f'seed must be an exact integer, got {seed!r}')
+        _seed = int(_f)
+    else:
+        try:
+            _seed = int(_seed)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'seed must be an integer, got {seed!r}') from None
     rng = np.random.default_rng(_seed % (2 ** 64))
     # Above the threshold the same uniform without-replacement sample is
     # drawn by rejection: every K-subset remains equally likely and the draw
@@ -1657,18 +1673,32 @@ def audit_attribution(outdirs=None):
                     _vals = e.pop(_src, [])
                     e[_dst] = (float(np.mean(_vals)) if _vals else None)
             _pairs = {'csa_fixed': 'csa_dynamic', 'hybrid_fixed': 'hybrid_dynamic'}
+
+            def _pos_num(v):
+                # A finite measured ZERO/NEGATIVE block count or length is not
+                # a usable scale for a ratio; treat it as missing instead of
+                # emitting a negative ratio or a nonsense verdict.
+                if v is None or isinstance(v, (bool, np.bool_)):
+                    return False
+                if not isinstance(v, (int, float, np.number)):
+                    return False
+                try:
+                    return math.isfinite(float(v)) and float(v) > 0.0
+                except (TypeError, ValueError, OverflowError):
+                    return False
+
             for a, b in _pairs.items():
                 if a in panel and b in panel:
                     _ba, _bb = panel[a].get('blocks_mean'), panel[b].get('blocks_mean')
                     _la, _lb = panel[a].get('block_len_mean'), panel[b].get('block_len_mean')
                     rec = {'a': a, 'b': b, 'blocks_a': _ba, 'blocks_b': _bb, 'block_len_a': _la, 'block_len_b': _lb}
-                    if _ba and _bb:
+                    if _pos_num(_ba) and _pos_num(_bb):
                         _r = max(_ba, _bb) / min(_ba, _bb)
                         rec['block_count_ratio'] = float(_r)
                         rec['block_count_matched'] = bool(_r <= 1.10)
                     else:
                         rec['block_count_matched'] = None
-                    if _la and _lb:
+                    if _pos_num(_la) and _pos_num(_lb):
                         rec['block_len_ratio'] = float(max(_la, _lb) / min(_la, _lb))
                     out.setdefault('blocking_contrasts', {})[f'{a} vs {b}'] = rec
             out['panels'][d] = panel
@@ -2587,9 +2617,15 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
             else:
                 _run_count = st.get('run_count')
             out.setdefault('measured', {})[sf] = {'booked_seconds': st.get('booked_seconds'), 'run_count': _run_count}
-    if all(not isinstance(x, dict) for x in out['panels'].values()) and out['status'] == 'ok':
+    # Any requested panel that did not reconcile (missing / unusable records)
+    # must downgrade the top-level status — otherwise one reconciled panel
+    # would wave the unaudited allocation through as "ok".
+    _unreconciled = sorted(d for d, x in out['panels'].items() if not isinstance(x, dict))
+    if _unreconciled and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
-        out['note'] = 'scale panels not present locally; estimates + TimeGuard bookkeeping run on the experiment machine'
+        out['note'] = (f'{len(_unreconciled)} of {len(out["panels"])} requested panel(s) could not be reconciled locally '
+                       f'({", ".join(_unreconciled)}) — only the reconciled panel(s) carry an audited allocation; '
+                       'the rest need the experiment machine')
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 

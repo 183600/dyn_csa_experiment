@@ -2272,18 +2272,24 @@ def sec_efficiency():
     for name, key, rec, eff in rows[:200]:
         p = rec.get('params')
         pm = (p / 1e6) if (isinstance(p, (int, float))
-                           and not isinstance(p, (bool, np.bool_))) else None
+                           and not isinstance(p, (bool, np.bool_))
+                           and math.isfinite(p) and p > 0) else None
         lines.append('| %s | `%s` | %s | %s / %s | %s | %s | %s | %s |' % (
             name, key, fm(pm), fm(eff.get('prefill_ms_p50'), 2), fm(eff.get('prefill_ms_p95'), 2),
             fm(eff.get('tokens_per_s_prefill'), 1), fm(eff.get('prefix_prefill_ms_p50'), 2),
             fm(eff.get('peak_mem_allocated_mb'), 1), fm(eff.get('peak_mem_reserved_mb'), 1)))
     # Simple Pareto frontier over (PPL, prefill p50): keep points that are not
-    # dominated by another measured arm.
+    # dominated by another measured arm.  Admission uses the same measurability
+    # contract as the rest of the report (finite, positive, non-synthesized
+    # PPL; non-negative latency) — an anti-signal or corrupt record must not
+    # be crowned the frontier.
     _pts = []
     for name, key, rec, eff in rows:
+        if not _measurable(rec):
+            continue
         ppl = _as_finite(rec.get('ppl'))
         lat = _as_finite(eff.get('prefill_ms_p50'))
-        if ppl is not None and lat is not None:
+        if ppl is not None and ppl > 0.0 and lat is not None and lat >= 0.0:
             _pts.append((lat, ppl, name, key))
     _pts.sort()
     _frontier = []
@@ -2312,7 +2318,11 @@ def sec_stats():
         print(f'[report] sec_stats: analysis comparisons is {type(items).__name__}, not an object — section omitted')
         items = {}
     if not items and isinstance(d, dict):
-        items = {k: v for k, v in d.items() if isinstance(v, dict) and (v.get('mean') is not None or v.get('delta') is not None)}
+        # Keep the dummy-slot rule intact for the fallback path too: an entry
+        # that carries a p-value but no mean/delta must stay in the family
+        # (as an invalid p=1 slot), not vanish from the Holm family.
+        items = {k: v for k, v in d.items() if isinstance(v, dict) and (v.get('mean') is not None or v.get('delta') is not None
+                                                                        or v.get('p_exact_signflip') is not None or v.get('p') is not None)}
     _pairs = []
     for k, v in items.items():
         _pv = None

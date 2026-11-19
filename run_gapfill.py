@@ -743,7 +743,36 @@ def run_full():
     _a, _p = _push_phase('v6: results_lm_v5_scale — model-scale probe (d=384, 8L, seq1024, 5 variants x 3 seeds)', 'results_lm_v5_scale', L.RUN_SCALE['variants'], [0, 1, 2])
     push_ok &= _p
     panels_ok &= _a
+    # The narrowed plan below makes _plan_run DROP every summary.json record
+    # outside LONG_GAP_VARIANTS (including the non-gap arms reconstructed from
+    # the aggregate snapshot).  Stash those records first and fold them back
+    # in afterwards so downstream per-seed paired analyses keep their inputs.
+    _long_summary_path = os.path.join(REPO, 'results_lm_v3_long', 'summary.json')
+    _stashed_long = {}
+    if os.path.exists(_long_summary_path):
+        try:
+            with open(_long_summary_path, encoding='utf-8') as _jf:
+                _prev_long = json.load(_jf)
+            if isinstance(_prev_long, dict):
+                _stashed_long = {k: v for k, v in _prev_long.items()
+                                 if isinstance(v, dict) and v.get('variant') not in LONG_GAP_VARIANTS}
+        except Exception as _e:
+            print(f'[v6-long] WARNING: cannot read {_long_summary_path} before the run ({type(_e).__name__}: {_e}) — non-gap records will NOT be restored afterwards')
+        else:
+            if _stashed_long:
+                print(f'[v6-long] stashed {len(_stashed_long)} non-gap record(s) before the narrowed run')
     L.run({**L.RUN_LONG, 'variants': LONG_GAP_VARIANTS}, seeds=[0, 1, 2], guard=guard, label='P-LONG hybrid 3-seed long-run table (results_lm_v3_long)')
+    if _stashed_long:
+        def _restore_non_gap(s):
+            _restored = 0
+            for _k, _v in _stashed_long.items():
+                if _k not in s:
+                    s[_k] = _v
+                    _restored += 1
+            if _restored:
+                print(f'[v6-long] restored {_restored} non-gap record(s) into summary.json (kept out of the narrowed plan so they are not retrained, but never deleted)')
+            return s
+        L.locked_json_update(_long_summary_path, _restore_non_gap)
     merge_long_aggregate(os.path.join(REPO, 'results_lm_v3_long'), _long_snapshot)
     _a, _p = _push_phase('v6: results_lm_v3_long hybrid variants at seeds 0-2 — 3-seed long-run table complete', 'results_lm_v3_long', LONG_GAP_VARIANTS, [0, 1, 2])
     push_ok &= _p
