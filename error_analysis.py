@@ -21,6 +21,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 import time
 
 for _stream in (sys.stdout, sys.stderr):
@@ -29,6 +30,10 @@ for _stream in (sys.stdout, sys.stderr):
             _stream.reconfigure(encoding='utf-8', errors='replace')
         except (ValueError, OSError):
             pass
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+os.chdir(REPO)
+sys.path.insert(0, REPO)
 
 import numpy as np
 import torch
@@ -39,6 +44,36 @@ try:  # installs the RoPE / v7 layer variants used by the frozen checkpoints
     import v7_supp  # noqa: F401
 except Exception as _v7e:
     print(f'[errors] NOTE: v7_supp not importable ({type(_v7e).__name__}: {_v7e}); only built-in layer variants can be loaded')
+
+
+def _atomic_write_lines(path, lines):
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + '.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            for _line in lines:
+                f.write(_line)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _fmt_num(v, fmt, fallback='n/a'):
+    return fmt.format(v) if isinstance(v, (int, float)) and math.isfinite(v) else fallback
+
+
+def _pooled_line(res):
+    _mc = res.get('mean_ce')
+    if _mc is None:
+        return '- pooled CE: n/a'
+    return f'- pooled CE: {_fmt_num(_mc, "{:.4f}")}; pooled PPL: {_fmt_num(res.get("pooled_ppl"), "{:.3f}")}'
 
 
 def _nonnegative_int(text):
@@ -82,10 +117,15 @@ def _sha256(path, cap=None):
 def _load_model(path):
     try:
         d = torch.load(path, map_location='cpu', weights_only=False, mmap=True)
-    except (TypeError, RuntimeError, ValueError):
+    except Exception:
         # mmap=True cannot read non-zip serialisation (RuntimeError), a
-        # non-mmap-able file (TypeError), or a corrupt archive (ValueError).
-        d = torch.load(path, map_location='cpu', weights_only=False)
+        # non-mmap-able file (TypeError), a corrupt archive (ValueError), a
+        # truncated/corrupt pickle (UnpicklingError/EOFError/BadZipFile): fall
+        # back to a plain load, and if that also fails let the caller refuse.
+        try:
+            d = torch.load(path, map_location='cpu', weights_only=False)
+        except Exception as _e:
+            raise SystemExit(f'[errors] REFUSE: {path} cannot be loaded as a checkpoint ({type(_e).__name__}: {_e})') from _e
     if not isinstance(d, dict) or 'sd' not in d:
         raise SystemExit(f'[errors] REFUSE: {path} is not a CSA checkpoint (no state_dict)')
     d = dict(d)
@@ -270,23 +310,23 @@ def main(argv=None):
         paired['checkpoint_b_sha256'] = _sha256(args.compare_ckpt)
         paired['split'] = 'validation'
         L.atomic_write_json(os.path.join(args.outdir, 'paired_errors.json'), paired, indent=2)
-        with open(os.path.join(args.outdir, 'paired_bad_cases.jsonl'), 'w', encoding='utf-8') as f:
-            for i, rec in enumerate(paired.get('worst_tokens_for_b') or []):
-                f.write(json.dumps(L._json_clean({'kind': 'paired_token', 'rank': i + 1, **rec}), ensure_ascii=False, allow_nan=False) + '\n')
+        _lines = [json.dumps(L._json_clean({'kind': 'paired_token', 'rank': i + 1, **rec}), ensure_ascii=False, allow_nan=False) + '\n'
+                  for i, rec in enumerate(paired.get('worst_tokens_for_b') or [])]
+        _atomic_write_lines(os.path.join(args.outdir, 'paired_bad_cases.jsonl'), _lines)
         del model_b
     # JSONL: one line per bad case, easiest to filter/grep downstream.
     jsonl = os.path.join(args.outdir, 'bad_cases.jsonl')
-    with open(jsonl, 'w', encoding='utf-8') as f:
-        for i, rec in enumerate(res.get('worst_tokens') or []):
-            f.write(json.dumps(L._json_clean({'kind': 'token', 'rank': i + 1, **rec}), ensure_ascii=False, allow_nan=False) + '\n')
-        for i, rec in enumerate(res.get('worst_sequences') or []):
-            f.write(json.dumps(L._json_clean({'kind': 'sequence', 'rank': i + 1, **rec}), ensure_ascii=False, allow_nan=False) + '\n')
+    _lines = [json.dumps(L._json_clean({'kind': 'token', 'rank': i + 1, **rec}), ensure_ascii=False, allow_nan=False) + '\n'
+              for i, rec in enumerate(res.get('worst_tokens') or [])]
+    _lines += [json.dumps(L._json_clean({'kind': 'sequence', 'rank': i + 1, **rec}), ensure_ascii=False, allow_nan=False) + '\n'
+               for i, rec in enumerate(res.get('worst_sequences') or [])]
+    _atomic_write_lines(jsonl, _lines)
     L.atomic_write_json(os.path.join(args.outdir, 'summary.json'), res, indent=2)
     lines = ['# Bad-case analysis', '',
              f'- checkpoint: `{os.path.abspath(args.ckpt)}`',
              f'- sha256: `{res["checkpoint_sha256"]}`',
              f'- split: **validation only** ({n_rows} rows x {seq_len} tokens)',
-             f'- pooled CE: {res.get("mean_ce"):.4f}; pooled PPL: {res.get("pooled_ppl"):.3f}' if res.get('mean_ce') is not None else '- pooled CE: n/a',
+             _pooled_line(res),
              f'- checkpoint health: `{(meta.get("curve_health") or {}).get("status", "unknown")}`', '']
     lines += ['## Position / target buckets', '',
               '| bucket | n | mean CE | PPL |', '|---|---|---|---|']
@@ -307,7 +347,7 @@ def main(argv=None):
         lines.append(f'| {i + 1} | {s["row"]} | {s["mean_ce"]:.3f} | {s["nll"]:.2f} | {ctx} |')
     if paired:
         lines += ['', '## Paired arm comparison', '',
-                  f'- B `{paired.get("checkpoint_b")}` minus A `{paired.get("checkpoint_a")}` mean CE: **{paired.get("mean_delta_b_minus_a"):+.4f}**',
+                  f'- B `{paired.get("checkpoint_b")}` minus A `{paired.get("checkpoint_a")}` mean CE: **{_fmt_num(paired.get("mean_delta_b_minus_a"), "{:+.4f}")}**',
                   f'- B worse at {paired.get("b_worse_at_n")} token positions; A worse at {paired.get("a_worse_at_n")}.', '',
                   '| # | row | pos | target | CE A | CE B | delta (B−A) |', '|---|---|---|---|---|---|---|']
         for i, t in enumerate(paired.get('worst_tokens_for_b') or []):

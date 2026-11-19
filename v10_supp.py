@@ -25,7 +25,18 @@ V8 = V9.V8
 REPO = V9.REPO
 DEVICE = L.DEVICE
 RUN_CAP_V10 = dict(L.RUN_CAP)
-RUN_CAP_V10.update(total_hours=float(os.environ.get('V10_CAP_HOURS', 25.0)), state_path='run_time_state_v10.json', already_hours=0.0)
+
+
+def _cap_hours(_name, _default):
+    try:
+        _v = float(os.environ.get(_name, _default))
+    except (TypeError, ValueError, OverflowError):
+        raise SystemExit(f'[driver] {_name}={os.environ.get(_name)!r} is not a number — set it to finite hours (or unset it for the default)') from None
+    if not (_v == _v) or _v in (float('inf'), float('-inf')) or _v <= 0:
+        raise SystemExit(f'[driver] {_name}={os.environ.get(_name)!r} must be a positive finite number of hours')
+    return _v
+
+RUN_CAP_V10.update(total_hours=_cap_hours('V10_CAP_HOURS', 25.0), state_path='run_time_state_v10.json', already_hours=0.0)
 
 def make_guard():
     g = L.TimeGuard(RUN_CAP_V10)
@@ -2106,10 +2117,12 @@ def v10_analysis(out='analysis_v10/stats.json'):
                         if (learned.get('_pp'), learned.get('_code'), learned.get('_recipe')) != (other.get('_pp'), other.get('_code'), other.get('_recipe')):
                             print(f'[v10 stats] NIAH-nat L{Ln} {cond}: {arm} and learned were measured under different probe_params/code/recipe — contrast omitted')
                             continue
-                        common = sorted(set(learned['acc_by_seed']) & set(other['acc_by_seed']))
+                        common = sorted(set(learned['nll_by_seed']) & set(other['nll_by_seed']))
                         if len(common) >= 2:
-                            res = V.exact_sign_permutation([other['nll_by_seed'][s] - learned['nll_by_seed'][s] for s in common])
-                            res['seeds'] = common
+                            _deltas = [other['nll_by_seed'][s] - learned['nll_by_seed'][s] for s in common]
+                            _keep = [s for s, _d in zip(common, _deltas) if L._finite_scalar(_d) is not None]
+                            res = V.exact_sign_permutation(_deltas)
+                            res['seeds'] = _keep
                             niah_contrasts[_cname] = res
                     for tag, ov in (('csa_randtrain', 'csa_fixed_rope_randidx'), ('csa_alltrain', 'csa_fixed_rope_allblocks')):
                         _cname = f'NIAH-nat L{Ln} {cond}: {tag} - learned (answer NLL)'
@@ -2127,8 +2140,10 @@ def v10_analysis(out='analysis_v10/stats.json'):
                             continue
                         common = sorted(set(learned['nll_by_seed']) & set(other['nll_by_seed']))
                         if len(common) >= 2:
-                            res = V.exact_sign_permutation([other['nll_by_seed'][s] - learned['nll_by_seed'][s] for s in common])
-                            res['seeds'] = common
+                            _deltas = [other['nll_by_seed'][s] - learned['nll_by_seed'][s] for s in common]
+                            _keep = [s for s, _d in zip(common, _deltas) if L._finite_scalar(_d) is not None]
+                            res = V.exact_sign_permutation(_deltas)
+                            res['seeds'] = _keep
                             niah_contrasts[_cname] = res
             probe['niah_natural'] = {'cells': niah_cells, 'contrasts': niah_contrasts}
             # NIAH contrasts are built AFTER the corruption family was
@@ -2241,8 +2256,11 @@ def _fmt_pm(cell, std=None):
 
 def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     v10_analysis(out=stats_p)
-    with open(stats_p, encoding='utf-8') as _jf:
-        st = json.load(_jf)
+    try:
+        with open(stats_p, encoding='utf-8') as _jf:
+            st = json.load(_jf)
+    except Exception as _pe:
+        raise RuntimeError(f'{stats_p} cannot be parsed ({type(_pe).__name__}: {_pe}); refusing to build a report over it') from _pe
     if not isinstance(st, dict):
         raise RuntimeError(f'{stats_p} is valid JSON but not an object ({type(st).__name__}); refusing to build a report over it')
     probe = st['probe']
@@ -2253,8 +2271,12 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     mech_sum = {}
     mp = os.path.join(P3MT_PAYLOAD['outdir'], 'summary.json')
     if os.path.exists(mp):
-        with open(mp, encoding='utf-8') as _jf:
-            mech_sum = json.load(_jf)
+        try:
+            with open(mp, encoding='utf-8') as _jf:
+                mech_sum = json.load(_jf)
+        except Exception as _pe:
+            print(f'[report] WARNING: {mp} cannot be parsed ({type(_pe).__name__}: {_pe}) — the mechanism records are omitted')
+            mech_sum = {}
         if not isinstance(mech_sum, dict):
             print(f'[report] WARNING: {mp} is valid JSON but not an object ({type(mech_sum).__name__}) — the mechanism records are omitted')
             mech_sum = {}

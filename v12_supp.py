@@ -74,7 +74,18 @@ L = V10.L
 REPO = V10.REPO
 DEVICE = L.DEVICE
 RUN_CAP_V12 = dict(L.RUN_CAP)
-RUN_CAP_V12.update(total_hours=float(os.environ.get('V12_CAP_HOURS', 30.0)), state_path='run_time_state_v12.json', already_hours=0.0)
+
+
+def _cap_hours(_name, _default):
+    try:
+        _v = float(os.environ.get(_name, _default))
+    except (TypeError, ValueError, OverflowError):
+        raise SystemExit(f'[driver] {_name}={os.environ.get(_name)!r} is not a number — set it to finite hours (or unset it for the default)') from None
+    if not (_v == _v) or _v in (float('inf'), float('-inf')) or _v <= 0:
+        raise SystemExit(f'[driver] {_name}={os.environ.get(_name)!r} must be a positive finite number of hours')
+    return _v
+
+RUN_CAP_V12.update(total_hours=_cap_hours('V12_CAP_HOURS', 30.0), state_path='run_time_state_v12.json', already_hours=0.0)
 
 def make_guard():
     g = L.TimeGuard(RUN_CAP_V12)
@@ -1333,10 +1344,16 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         return out
     mech_summ = {}
     if os.path.exists(cfg['mech_summary']):
-        with open(cfg['mech_summary'], encoding='utf-8') as _jf:
-            mech_summ = json.load(_jf)
+        try:
+            with open(cfg['mech_summary'], encoding='utf-8') as _jf:
+                mech_summ = json.load(_jf)
+        except Exception as _pe:
+            raise SystemExit(
+                f'[p5t] REFUSE {v} s{seed}: {cfg["mech_summary"]} cannot be parsed '
+                f'({type(_pe).__name__}: {_pe}) — the training records cannot attest '
+                'the checkpoint; fix the file before re-running P5T') from _pe
         if not isinstance(mech_summ, dict):
-            raise RuntimeError(
+            raise SystemExit(
                 f'[p5t] REFUSE {v} s{seed}: {cfg["mech_summary"]} is valid JSON '
                 f'but not an object ({type(mech_summ).__name__}) — the training '
                 'records cannot attest the checkpoint')
@@ -2133,8 +2150,19 @@ def run_finaltest(cfg=None, guard=None):
     pcfg = dict(V10.PROBE, outdir=outdir, ckpt_dir=cfg['ckpt_dir'], summary=cfg['probe_summary'], variants=list(manifest['arms']), seeds=[int(s) for s in manifest['seeds']], eval_lens=[int(x) for x in (_probe_eval.get('eval_lens') or [2048, 4096])], rhos=_probe_rhos, modes={_probe_mode: _probe_rhos}, niah=None, arm_overrides={v: ['learned'] for v in V10.SCRATCH_CONTROLS}, target=int(_probe_eval.get('target', cfg.get('target', 512))), n_seq=int(_probe_eval.get('n_seq', _nseq_clean)), chunk=int(cfg.get('chunk', 4)), manifest_sha256=manifest.get('manifest_sha256'))
     mech_summ = {}
     if os.path.exists(cfg['mech_summary']):
-        with open(cfg['mech_summary'], encoding='utf-8') as _jf:
-            mech_summ = json.load(_jf)
+        try:
+            with open(cfg['mech_summary'], encoding='utf-8') as _jf:
+                mech_summ = json.load(_jf)
+        except Exception as _pe:
+            raise SystemExit(
+                f'[v12] REFUSE: {cfg["mech_summary"]} cannot be parsed '
+                f'({type(_pe).__name__}: {_pe}) — the probe cells would read '
+                'unattested checkpoints') from _pe
+        if not isinstance(mech_summ, dict):
+            raise SystemExit(
+                f'[v12] REFUSE: {cfg["mech_summary"]} is valid JSON but not an object '
+                f'({type(mech_summ).__name__}) — the probe cells would read '
+                'unattested checkpoints')
     for v in pcfg['variants']:
         for seed in pcfg['seeds']:
             _cell_status = _bylen_cell_status.get((v, int(seed)))
@@ -2795,8 +2823,13 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     probe_path = probe_path or os.path.join(TEST_OUTDIR, 'distractor.json')
     raw = {}
     if os.path.exists(bylen_path):
-        with open(bylen_path, encoding='utf-8') as _jf:
-            raw = json.load(_jf)
+        try:
+            with open(bylen_path, encoding='utf-8') as _jf:
+                raw = json.load(_jf)
+        except Exception as _pe:
+            raise SystemExit(
+                f'[v12] REFUSE: {bylen_path} cannot be parsed ({type(_pe).__name__}: {_pe}) '
+                '— the confirmation records cannot be admitted') from _pe
         if not isinstance(raw, dict):
             raise SystemExit(f'[v12] REFUSE: {bylen_path} is valid JSON but not an object ({type(raw).__name__}) — the confirmation records cannot be admitted')
     admitted, unified_fp = _admit_confirmation_records(raw, manifest)
@@ -3123,8 +3156,13 @@ def v12_analysis(out='analysis_v12/stats.json'):
     """Zero-GPU aggregate: the shared v10 analysis over the extended probe +
     the frozen final-test statistics (when they exist on disk)."""
     V10.v10_analysis(out=out)
-    with open(out, encoding='utf-8') as _jf:
-        st = json.load(_jf)
+    try:
+        with open(out, encoding='utf-8') as _jf:
+            st = json.load(_jf)
+    except Exception as _pe:
+        raise RuntimeError(f'{out} cannot be parsed ({type(_pe).__name__}: {_pe}); refusing to analyse over it') from _pe
+    if not isinstance(st, dict):
+        raise RuntimeError(f'{out} is valid JSON but not an object ({type(st).__name__}); refusing to analyse over it')
     if os.path.exists(os.path.join(TEST_OUTDIR, 'bylen.json')):
         st['finaltest'] = finaltest_stats()
         # this file's LAST writer is v12_analysis: re-stamp so the trace names
@@ -3141,8 +3179,11 @@ def _fmt_pm(cell):
 
 def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     v12_analysis(out=stats_p)
-    with open(stats_p, encoding='utf-8') as _jf:
-        st = json.load(_jf)
+    try:
+        with open(stats_p, encoding='utf-8') as _jf:
+            st = json.load(_jf)
+    except Exception as _pe:
+        raise RuntimeError(f'{stats_p} cannot be parsed ({type(_pe).__name__}: {_pe}); refusing to build a report over it') from _pe
     if not isinstance(st, dict):
         raise RuntimeError(
             f'{stats_p} is valid JSON but not an object ({type(st).__name__}); '

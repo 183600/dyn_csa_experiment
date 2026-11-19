@@ -60,8 +60,9 @@ def git_push(msg):
     if _branch != 'HEAD':
         rb = run('git', 'pull', '--rebase', '--autostash', 'origin', _branch)
         if rb.returncode != 0:
-            print(f'[git] rebase onto origin failed: {(rb.stdout + rb.stderr)[-300:]}')
+            print(f'[git] rebase onto origin failed: {(rb.stdout + rb.stderr)[-300:]} — aborting and NOT pushing (a push would publish an un-rebased commit)')
             run('git', 'rebase', '--abort')
+            return False
         r = run('git', 'push', 'origin', 'HEAD')
     else:
         _up = run('git', 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD').stdout.strip()

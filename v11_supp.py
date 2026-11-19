@@ -23,7 +23,18 @@ L = V10.L
 REPO = V10.REPO
 DEVICE = L.DEVICE
 RUN_CAP_V11 = dict(L.RUN_CAP)
-RUN_CAP_V11.update(total_hours=float(os.environ.get('V11_CAP_HOURS', 12.5)), state_path='run_time_state_v11.json', already_hours=0.0)
+
+
+def _cap_hours(_name, _default):
+    try:
+        _v = float(os.environ.get(_name, _default))
+    except (TypeError, ValueError, OverflowError):
+        raise SystemExit(f'[driver] {_name}={os.environ.get(_name)!r} is not a number — set it to finite hours (or unset it for the default)') from None
+    if not (_v == _v) or _v in (float('inf'), float('-inf')) or _v <= 0:
+        raise SystemExit(f'[driver] {_name}={os.environ.get(_name)!r} must be a positive finite number of hours')
+    return _v
+
+RUN_CAP_V11.update(total_hours=_cap_hours('V11_CAP_HOURS', 12.5), state_path='run_time_state_v11.json', already_hours=0.0)
 
 def make_guard():
     g = L.TimeGuard(RUN_CAP_V11)
@@ -303,8 +314,11 @@ def _one_record_per_seed(rows, label=''):
 
 def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     v11_analysis(out=stats_p)
-    with open(stats_p, encoding='utf-8') as _jf:
-        st = json.load(_jf)
+    try:
+        with open(stats_p, encoding='utf-8') as _jf:
+            st = json.load(_jf)
+    except Exception as _pe:
+        raise RuntimeError(f'{stats_p} cannot be parsed ({type(_pe).__name__}: {_pe}); refusing to build a report over it') from _pe
     if not isinstance(st, dict):
         raise RuntimeError(f'{stats_p} is valid JSON but not an object ({type(st).__name__}); refusing to build a report over it')
     probe = st['probe']
@@ -315,8 +329,12 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     mech_sum = {}
     mp = os.path.join(V10.P3MT_PAYLOAD['outdir'], 'summary.json')
     if os.path.exists(mp):
-        with open(mp, encoding='utf-8') as _jf:
-            mech_sum = json.load(_jf)
+        try:
+            with open(mp, encoding='utf-8') as _jf:
+                mech_sum = json.load(_jf)
+        except Exception as _pe:
+            print(f'[report] WARNING: {mp} cannot be parsed ({type(_pe).__name__}: {_pe}) — the mechanism records are omitted')
+            mech_sum = {}
         if not isinstance(mech_sum, dict):
             print(f'[report] WARNING: {mp} is valid JSON but not an object ({type(mech_sum).__name__}) — the mechanism records are omitted')
             mech_sum = {}

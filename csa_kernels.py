@@ -384,6 +384,8 @@ class PoolGeometry:
 
     def b_off(self, bposb_rows):
         """[R, Bm, W_b] 的 B 泳道位置嵌入行号（带 eager 同款截断）。"""
+        if int(bposb_rows) <= 0:
+            raise ValueError('b_off: B_pos_b has 0 rows (position_capacity must be >= 1)')
         if self._b_off is not None and self._bposb_rows == int(bposb_rows):
             return self._b_off
         j = torch.arange(self.W_b, device=self.starts.device, dtype=torch.int32)
@@ -553,6 +555,10 @@ def _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
         # the empty-lane softmax result (nan_to_num -> 0).  Returning zeros
         # directly avoids a -1 gather into a zero-length dimension.
         return torch.zeros((R, Bm, c), device=dev, dtype=dtype)
+    if int(B_pos_a.shape[0]) == 0:
+        raise ValueError('_pool_fwd_ref: B_pos_a has 0 rows (position_capacity must be >= 1)')
+    if Xb is not None and W > 0 and int(B_pos_b.shape[0]) == 0:
+        raise ValueError('_pool_fwd_ref: B_pos_b has 0 rows while a B lane is requested (position_capacity must be >= 1)')
     # 每个块列都被下方的分块循环恰好写一次，故直接 empty。
     comp = torch.empty((R, Bm, c), device=dev, dtype=dtype)
     jA = torch.arange(L, device=dev)
@@ -630,6 +636,10 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
         # there is nothing to gather.
         gBpb = torch.zeros_like(B_pos_b) if need_bpb else None
         return gXa, gXb, gZa, gZb, gBpa, gBpb
+    if int(B_pos_a.shape[0]) == 0:
+        raise ValueError('_pool_bwd_ref: B_pos_a has 0 rows (position_capacity must be >= 1)')
+    if Xb is not None and W > 0 and int(B_pos_b.shape[0]) == 0:
+        raise ValueError('_pool_bwd_ref: B_pos_b has 0 rows while a B lane is requested (position_capacity must be >= 1)')
     jA = torch.arange(L, device=dev)
     g_a, av_all = geom.gather_geom()
     pos_a = jA.clamp(max=int(B_pos_a.shape[0]) - 1)

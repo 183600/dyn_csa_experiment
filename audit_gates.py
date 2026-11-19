@@ -866,6 +866,23 @@ def _row_overlap_count(train, rows, chunk_tokens=1 << 20):
     import data_guard as DG
     train = np.asarray(train)
     rows = np.asarray(rows)
+    try:
+        train_int = bool(np.issubdtype(train.dtype, np.integer) or np.issubdtype(train.dtype, np.bool_))
+    except TypeError:
+        train_int = False
+    try:
+        rows_int = bool(np.issubdtype(rows.dtype, np.integer) or np.issubdtype(rows.dtype, np.bool_))
+    except TypeError:
+        rows_int = False
+    if not (train_int and rows_int):
+        if train.ndim == 2 and rows.ndim == 2:
+            # Exact row-key overlap is well defined for any dtype via
+            # data_guard._row_keys (str/bytes/object included).
+            return len(set(DG._row_keys(train)) & set(DG._row_keys(rows)))
+        # The rolling-hash subsequence match is only defined over integer
+        # token tables; a str/bytes 1-D cache must not silently report "no
+        # overlap". The caller fails the verdict closed.
+        raise ValueError(f'_row_overlap_count: subsequence overlap is defined only over integer token tables, got dtype {train.dtype} / {rows.dtype}')
     if rows.ndim == 1:
         rows = rows.reshape(1, -1)
     if rows.size == 0:
@@ -1052,10 +1069,23 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             # duplicates inside the holdout are reported.  Integer token caches
             # cannot represent NaN/Inf, so only float caches are scanned.
             for _name, _arr in (('train', tr), ('val', va)):
-                if np.issubdtype(np.asarray(_arr).dtype, np.integer):
+                try:
+                    _dt = np.asarray(_arr).dtype
+                    _is_int = bool(np.issubdtype(_dt, np.integer))
+                except TypeError:
+                    _dt, _is_int = (getattr(np.asarray(_arr), 'dtype', None), False)
+                if _is_int:
                     rec[f'nonfinite_{_name}'] = 0
                     continue
-                _bad = int(np.size(_arr) - np.isfinite(_arr).sum())
+                try:
+                    _bad = int(np.size(_arr) - np.isfinite(_arr).sum())
+                except TypeError:
+                    # str/bytes/datetime/structured caches: unverifiable, fail
+                    # closed rather than crash the whole report.
+                    rec[f'nonfinite_{_name}'] = None
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: {_name} split has non-numeric or uninspectable dtype {_dt} — treating the cache as malformed')
+                    continue
                 rec[f'nonfinite_{_name}'] = _bad
                 if _bad:
                     rec['status'] = 'fail'
@@ -1131,9 +1161,18 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
 
             # Exact duplicate rows across train/val/test.  This is row-level
             # leakage regardless of how the split was generated.
-            shared_val = _row_overlap_count(tr, va)
-            rec['exact_row_overlap_train_val'] = int(shared_val)
-            if shared_val:
+            try:
+                shared_val = _row_overlap_count(tr, va)
+                rec['exact_row_overlap_train_val'] = int(shared_val)
+                _overlap_exc = None
+            except ValueError as _ove:
+                shared_val = 0
+                _overlap_exc = _ove
+                rec['exact_row_overlap_train_val'] = None
+            if _overlap_exc is not None:
+                rec['status'] = 'fail'
+                _fail(f'{cd}/{tag}: train/validation row overlap cannot be verified ({_overlap_exc}) — treating the split contract as unverified')
+            elif shared_val:
                 rec['status'] = 'fail'
                 _fail(f'{cd}/{tag}: {shared_val} validation rows exactly duplicate a training row')
             # The test cache filename carries its own seq_len/vocab/ns tag.
@@ -1253,11 +1292,20 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 _warn(f'{cd}/{tag}: no test cache matches this protocol — the held-out split was NOT audited')
             if te is not None:
                 rec['test_shape'] = list(te.shape)
-                if np.issubdtype(np.asarray(te).dtype, np.integer):
+                try:
+                    _te_is_int = bool(np.issubdtype(np.asarray(te).dtype, np.integer))
+                except TypeError:
+                    _te_is_int = False
+                if _te_is_int:
                     rec['nonfinite_test'] = 0
                 else:
-                    _bad_te = int(np.size(te) - np.isfinite(te).sum())
-                    rec['nonfinite_test'] = _bad_te
+                    try:
+                        _bad_te = int(np.size(te) - np.isfinite(te).sum())
+                    except TypeError:
+                        rec['nonfinite_test'] = None
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: test split has non-numeric or uninspectable dtype {np.asarray(te).dtype} — treating the cache as malformed')
+                        _bad_te = 0
                     if _bad_te:
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: {_bad_te} NaN/Inf values in the test split')
@@ -1266,10 +1314,21 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     rec['duplicate_rows_within_test'] = _dup_te
                     if _dup_te:
                         _warn(f'{cd}/{tag}: {_dup_te} duplicate test rows')
-                shared_test = _row_overlap_count(tr, te)
-                shared_val_test = _row_overlap_count(va, te)
-                rec['exact_row_overlap_train_test'] = int(shared_test)
-                rec['exact_row_overlap_val_test'] = int(shared_val_test)
+                try:
+                    shared_test = _row_overlap_count(tr, te)
+                    shared_val_test = _row_overlap_count(va, te)
+                    _ov_exc = None
+                except ValueError as _ove:
+                    shared_test = shared_val_test = 0
+                    _ov_exc = _ove
+                    rec['exact_row_overlap_train_test'] = None
+                    rec['exact_row_overlap_val_test'] = None
+                if _ov_exc is not None:
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test-split row overlap cannot be verified ({_ov_exc}) — treating the held-out contract as unverified')
+                else:
+                    rec['exact_row_overlap_train_test'] = int(shared_test)
+                    rec['exact_row_overlap_val_test'] = int(shared_val_test)
                 if shared_test:
                     rec['status'] = 'fail'
                     _fail(f'{cd}/{tag}: {shared_test} test rows exactly duplicate a training row')
@@ -2417,8 +2476,8 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
                     _tok_vals_set.add(_ti)
                 continue
             _si = _exact_int_scalar(_r.get('steps'))
-            _bi = _exact_int_scalar(_r.get('batch_size', 12))
-            _qi = _exact_int_scalar(_r.get('seq_len', 512))
+            _bi = _exact_int_scalar(_r.get('batch_size'))
+            _qi = _exact_int_scalar(_r.get('seq_len'))
             if (_si is not None and _si > 0 and _bi is not None and _bi > 0
                     and _qi is not None and _qi > 0):
                 _tok_vals_set.add(_si * _bi * _qi)
@@ -2472,12 +2531,12 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
                 out['panels'][d] = {'params': p0, 'steps': _steps, 'tokens': None, 'estimate': None}
                 continue
         elif _steps_i is not None:
-            _batch = _exact_int_scalar(r0.get('batch_size', 12))
-            _seq = _exact_int_scalar(r0.get('seq_len', 512))
+            _batch = _exact_int_scalar(r0.get('batch_size'))
+            _seq = _exact_int_scalar(r0.get('seq_len'))
             if _batch is None or _batch <= 0 or _seq is None or _seq <= 0:
                 out['status'] = 'fail'
                 out.setdefault('problems', []).append(
-                    f'{d}: batch_size/seq_len {r0.get("batch_size", 12)!r}/{r0.get("seq_len", 512)!r} are not positive integers — the token count cannot be derived')
+                    f'{d}: batch_size/seq_len {r0.get("batch_size")!r}/{r0.get("seq_len")!r} are not recorded positive integers — the token count cannot be derived')
                 out['panels'][d] = {'params': p0, 'steps': _steps, 'tokens': None, 'estimate': None}
                 continue
             tok = _steps_i * _batch * _seq
@@ -3058,16 +3117,21 @@ def _aggregate_audit_status(results):
 
 
 def _run_audit(fn, *args, **kwargs):
+    name = getattr(fn, '__name__', 'audit')
     try:
         return fn(*args, **kwargs)
     except ModuleNotFoundError as e:
-        name = getattr(fn, '__name__', 'audit')
         return {'status': 'not_verifiable_locally',
                 'note': f'missing optional dependency {e.name!r} required by {name} — {e}'}
     except ImportError as e:
-        name = getattr(fn, '__name__', 'audit')
         return {'status': 'not_verifiable_locally',
                 'note': f'cannot import dependency required by {name} — {type(e).__name__}: {e}'}
+    except Exception as e:
+        # A defect in one audit must not abort the whole report and lose every
+        # other verdict; surface it as a hard error for this section instead.
+        return {'status': 'error',
+                'note': f'{name} raised {type(e).__name__}: {e} — the audit did not complete; treat as unverifiable, not as pass',
+                'error_type': type(e).__name__}
 
 
 def _json_fallback_clean(obj):

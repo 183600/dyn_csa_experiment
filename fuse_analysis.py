@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, math, os, sys, functools, warnings
+import json, math, os, sys, functools, warnings, re
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -103,7 +103,13 @@ def _seeds_common(*variants):
     return sorted(common)
 
 def layer_idx(layers):
-    return [int(lk.split('_')[0][1:]) for lk in layers]
+    return [_layer_sort_key(lk) for lk in layers]
+
+_LAYER_KEY_RE = re.compile(r'^L(\d+)_')
+
+def _layer_sort_key(k):
+    m = _LAYER_KEY_RE.match(k)
+    return int(m.group(1)) if m else 0
 
 def rec(variant, seed):
     r = _variant_records(variant).get(seed)
@@ -118,13 +124,13 @@ def layers_of(variant, seeds, dyn_only=True):
     st = r.get('stats')
     if not isinstance(st, dict):
         raise ValueError(f'fuse_analysis: {variant}::seed{seeds[0]} carries no usable `stats` table (got {type(st).__name__}) — the per-layer boundary statistics cannot be read')
-    ks = [k for k in st if k.startswith('L')]
+    ks = [k for k in st if _LAYER_KEY_RE.match(k)]
     if dyn_only:
         ks = [k for k in ks if 'dyn' in k]
     # Sort numerically by layer index: stats-dict insertion order is not
     # guaranteed to be layer order; an unsorted list would connect per-layer
     # plot points in the wrong x order.
-    return sorted(ks, key=lambda k: int(k.split('_')[0][1:]))
+    return sorted(ks, key=_layer_sort_key)
 
 @functools.lru_cache(maxsize=None)
 def per_seed_layer(variant, key, seeds):
@@ -347,7 +353,9 @@ def main(argv=None):
             _ppl_floor0 = L.signflip_p_floor(_n_ppl_eff)
             _floor_txt = (f'（n={_n_ppl}，非零配对 {_n_ppl_eff}；p 分辨率下限 {_ppl_floor0:.3g}）'
                           if math.isfinite(_ppl_floor0) and _ppl_floor0 > 0
-                          else f'（n={_n_ppl}，非零配对 {_n_ppl_eff}；使用确定性鞍点近似，p 已钳制在精确下限之上）')
+                          else (f'（n={_n_ppl}，全零配对；p ≡ 1 by construction）'
+                                if _n_ppl_eff == 0
+                                else f'（n={_n_ppl}，非零配对 {_n_ppl_eff}；p 下限 2/2^n 低于浮点分辨率）'))
             lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {sample_std(d_ppl):.2f}，p({_rppl["method"]}) = {p_ppl:.3f}{_floor_txt}\n')
         elif not _ok_seeds:
             p_f1 = p_ppl = None

@@ -19,7 +19,18 @@ L = V.L
 REPO = V.REPO
 DEVICE = L.DEVICE
 RUN_CAP_V8 = dict(L.RUN_CAP)
-RUN_CAP_V8.update(total_hours=float(os.environ.get('V8_CAP_HOURS', 18.75)), state_path='run_time_state_v8.json', already_hours=0.0)
+
+
+def _cap_hours(_name, _default):
+    try:
+        _v = float(os.environ.get(_name, _default))
+    except (TypeError, ValueError, OverflowError):
+        raise SystemExit(f'[driver] {_name}={os.environ.get(_name)!r} is not a number — set it to finite hours (or unset it for the default)') from None
+    if not (_v == _v) or _v in (float('inf'), float('-inf')) or _v <= 0:
+        raise SystemExit(f'[driver] {_name}={os.environ.get(_name)!r} must be a positive finite number of hours')
+    return _v
+
+RUN_CAP_V8.update(total_hours=_cap_hours('V8_CAP_HOURS', 18.75), state_path='run_time_state_v8.json', already_hours=0.0)
 
 def make_guard():
     g = L.TimeGuard(RUN_CAP_V8)

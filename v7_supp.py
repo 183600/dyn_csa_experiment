@@ -40,7 +40,18 @@ finally:
 DEVICE = L.DEVICE
 OVERLAP = L.OVERLAP
 RUN_CAP_V7 = dict(L.RUN_CAP)
-RUN_CAP_V7.update(total_hours=float(os.environ.get('V7_CAP_HOURS', 44.583333333333336)), state_path='run_time_state_v7.json')
+
+
+def _cap_hours(_name, _default):
+    try:
+        _v = float(os.environ.get(_name, _default))
+    except (TypeError, ValueError, OverflowError):
+        raise SystemExit(f'[driver] {_name}={os.environ.get(_name)!r} is not a number — set it to finite hours (or unset it for the default)') from None
+    if not (_v == _v) or _v in (float('inf'), float('-inf')) or _v <= 0:
+        raise SystemExit(f'[driver] {_name}={os.environ.get(_name)!r} must be a positive finite number of hours')
+    return _v
+
+RUN_CAP_V7.update(total_hours=_cap_hours('V7_CAP_HOURS', 44.583333333333336), state_path='run_time_state_v7.json')
 RUN_CAP_V7['already_hours'] = 0.0
 _ROPE_CS_CACHE = {}
 _ROPE_INV_CACHE = {}
@@ -127,8 +138,11 @@ def _atomic_torch_save(obj, path):
 def _load_ckpt(path):
     try:
         return torch.load(path, map_location='cpu', weights_only=False, mmap=True)
-    except (RuntimeError, TypeError, ValueError):
-        return torch.load(path, map_location='cpu', weights_only=False)
+    except Exception:
+        try:
+            return torch.load(path, map_location='cpu', weights_only=False)
+        except Exception as _e:
+            raise SystemExit(f'[v7] REFUSE: {path} cannot be loaded as a checkpoint ({type(_e).__name__}: {_e})') from _e
 
 class HybridAttentionRoPE(L.HybridAttention):
 
@@ -2012,7 +2026,18 @@ def git_push(msg):
     if os.environ.get('V7_NO_PUSH'):
         print(f'[git] push skipped (V7_NO_PUSH): {msg}')
         return True
-    run = lambda *a: subprocess.run(a, cwd=REPO, capture_output=True, text=True, encoding='utf-8', errors='replace')
+    def run(*a):
+        try:
+            return subprocess.run(a, cwd=REPO, capture_output=True, text=True,
+                                 encoding='utf-8', errors='replace', timeout=600)
+        except subprocess.TimeoutExpired:
+            print(f'[git] {a[0]} {a[1] if len(a) > 1 else ""} timed out after 600s')
+
+            class _Timeout:
+                returncode = 124
+                stdout = ''
+                stderr = 'timed out'
+            return _Timeout()
     ra = run('git', 'add', '-A')
     if ra.returncode != 0:
         print(f'[git] add FAILED: {(ra.stdout + ra.stderr)[-300:]} — NOT pushing (a commit could miss unstaged work); leaving the tree for inspection')
@@ -2027,9 +2052,10 @@ def git_push(msg):
     _branch = run('git', 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
     if _branch != 'HEAD':
         rb = run('git', 'pull', '--rebase', '--autostash', 'origin', _branch)
-        if committed and rb.returncode != 0:
-            print(f'[git] rebase onto origin FAILED: {(rb.stdout + rb.stderr)[-300:]}')
+        if rb.returncode != 0:
+            print(f'[git] rebase onto origin FAILED: {(rb.stdout + rb.stderr)[-300:]} — aborting and NOT pushing (a push would publish an un-rebased commit)')
             run('git', 'rebase', '--abort')
+            return False
     r = run('git', 'push', 'origin', 'HEAD')
     ok = r.returncode == 0
     if not ok:

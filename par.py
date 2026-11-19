@@ -513,6 +513,10 @@ def run_jobs(jobs, ctx, phase_label="phase"):
     elif any(slots):
         raise ValueError("CPU context must use empty CUDA visibility.")
 
+    for index, job in enumerate(jobs):
+        if not isinstance(job, dict):
+            raise TypeError(f"Job {index} must be a dict.")
+
     os.makedirs(JOBS_DIR, exist_ok=True)
     prefix = (
         _slug(phase_label)
@@ -560,7 +564,7 @@ def run_jobs(jobs, ctx, phase_label="phase"):
 
     _reconcile_guards(jobs)
 
-    pending = list(entries)
+    pending = collections.deque(entries)
     running = []
     results = [None] * len(entries)
     started = time.monotonic()
@@ -576,7 +580,7 @@ def run_jobs(jobs, ctx, phase_label="phase"):
             for worker in free_workers:
                 if not pending:
                     break
-                entry = pending.pop(0)
+                entry = pending.popleft()
                 entry["worker"] = worker
                 entry["t_start"] = time.monotonic()
                 entry["log_f"] = open(
@@ -804,10 +808,11 @@ def run_child(job_path, result_path):
             raise ValueError("Cell result must contain a nonempty status.")
 
     except SystemExit as exc:
-        # A cell-level sys.exit() is a normal experiment failure, not an
-        # infrastructure failure: record it and exit 0 so the dispatcher
-        # continues the phase (re-raising here would abort every sibling
-        # cell).
+        # A cell-level sys.exit() is recorded as a fatal result and the child
+        # exits 0 so the result payload reaches disk for post-mortem; the
+        # dispatcher deliberately fails closed on status='fatal' (or
+        # 'empty_exit'), terminating the phase rather than publishing an
+        # incomplete panel — resume re-runs the cell afterwards.
         code = exc.code if isinstance(exc.code, int) else 1
         if code != 0:
             result["status"] = "fatal"

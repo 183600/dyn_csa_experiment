@@ -5382,7 +5382,7 @@ class HybridAttention(nn.Module):
             self._stats.add_segmentation(bid, _seg_cuts, cfg.max_block)
             if self._cuts is not None:
                 _cpu = getattr(bid, '_pool_cpu', None)
-                if _cpu is not None and sum(_cpu[0]) == T:
+                if _cpu is not None and int(np.asarray(_cpu[0], dtype=np.int64).sum()) == int(T):
                     # host-side integer equivalence (design notes §6.2): cut
                     # positions are the prefix sums of the same counts table
                     # that generated bid — the identical integers to the
@@ -6598,7 +6598,11 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                 _problems.append(
                     'cache does not attest exact/near-duplicate cleanup of the '
                     'validation split against the tokenizer-fit and training documents')
-            _vs = (_dd_meta.get('splits') or {}).get('validation')
+            _splits = _dd_meta.get('splits')
+            if _splits is not None and not isinstance(_splits, dict):
+                _problems.append('cache metadata dedup.splits is not an object')
+                _splits = {}
+            _vs = (_splits or {}).get('validation')
             if not isinstance(_vs, dict) or not {'exact', 'near'} <= set(_vs):
                 _problems.append(
                     'cache does not record validation duplicate-removal counts '
@@ -6874,7 +6878,18 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         # persist the exact tokenizer that produced this cache so the held-out
         # test split can be verified against it by full vocab identity (size
         # alone is not identity: different merges can share a vocab size).
-        tok.save(os.path.join(cache_dir, f'tok_{tag}.json'))
+        _tok_target = os.path.join(cache_dir, f'tok_{tag}.json')
+        _fd, _tmp = tempfile.mkstemp(dir=cache_dir, prefix=f'tok_{tag}.', suffix='.tmp')
+        os.close(_fd)
+        try:
+            tok.save(_tmp)
+            os.replace(_tmp, _tok_target)
+        except BaseException:
+            try:
+                os.unlink(_tmp)
+            except OSError:
+                pass
+            raise
     except Exception as _te:
         print(f'[data] NOTE: could not persist the train tokenizer ({type(_te).__name__}: {_te})')
     print('[data] cached token ids to disk (resume-safe)')
@@ -7072,6 +7087,9 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         # sidecars on every hit, exactly like the train/val cache does.
         import glob as _glob2
         _mdoc = meta.get('doc_ids')
+        if _mdoc is not None and not isinstance(_mdoc, dict):
+            _problems.append('test cache metadata doc_ids is not an object')
+            _mdoc = None
         if _mdoc:
             if test_doc_ids is None:
                 _problems.append('test cache metadata records document ids but the sidecar is missing')
@@ -7281,6 +7299,16 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                 'object — the train cache metadata is corrupt; rebuild the cache')
         _train_meta_objs.append(_mobj)
         _train_meta_paths.append(_mp)
+    for _m in _train_meta_objs:
+        if _m.get('doc_ids') is not None and not isinstance(_m.get('doc_ids'), dict):
+            raise RuntimeError(
+                'load_wikitest: a train cache metadata doc_ids is '
+                f'{type(_m.get("doc_ids")).__name__}, not a JSON object — the '
+                'train cache metadata is corrupt; rebuild the cache')
+
+    def _doc_ids_of(_m):
+        _d = _m.get('doc_ids')
+        return _d if isinstance(_d, dict) else {}
     # Exact-integer protocol fields: a boolean/fractional spelling is
     # malformed metadata, not a different cap that may be silently truncated.
     _caps = {_c for _m in _train_meta_objs
@@ -7359,8 +7387,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         try:
             from tokenizers import Tokenizer as _Tok
             _tt = _Tok.from_file(_tp)
-        except Exception:
-            continue
+        except Exception as _te:
+            raise RuntimeError(f'load_wikitest: could not load the persisted train tokenizer ({_tp}: {type(_te).__name__}: {_te}); the full-vocabulary identity check cannot be run and the splits cannot be paired — rebuild the train cache') from _te
         if dict(_tt.get_vocab()) != _test_vocab:
             raise RuntimeError(f'load_wikitest: the freshly fitted test tokenizer is not identical to the cached train tokenizer ({_tp}) — same-size vocabularies can still use different merges, so the splits cannot be paired; delete wt103_cache/ and rebuild both')
     for _mp in _glob.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
@@ -7446,8 +7474,14 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             _mtag = os.path.basename(_mpath)[len('meta_'):-len('.json')]
             with open(_mpath, encoding='utf-8') as _jf:
                 _mobj = json.load(_jf)
-        except Exception:
-            continue
+        except Exception as _me:
+            raise RuntimeError(
+                f'load_wikitest: {_mpath} cannot be parsed ({type(_me).__name__}: {_me}) '
+                '— the train cache metadata is corrupt; rebuild the cache') from _me
+        if not isinstance(_mobj, dict):
+            raise RuntimeError(
+                f'load_wikitest: {_mpath} is not a JSON object — the train cache '
+                'metadata is corrupt; rebuild the cache')
         if _mobj.get('fit_fp') and _mobj['fit_fp'] != _fit_fp_build:
             continue
         _vpath = os.path.join(cache_dir, f'val_doc_ids_{_mtag}.npy')
@@ -7608,7 +7642,18 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     # space.
     _tok_sha = None
     try:
-        tok.save(tk_path)
+        _fd, _tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(tk_path)),
+                                     prefix=os.path.basename(tk_path) + '.', suffix='.tmp')
+        os.close(_fd)
+        try:
+            tok.save(_tmp)
+            os.replace(_tmp, tk_path)
+        except BaseException:
+            try:
+                os.unlink(_tmp)
+            except OSError:
+                pass
+            raise
         _tok_sha = file_sha256(tk_path)
     except Exception as _e:
         print(f'[data] NOTE: could not persist the test tokenizer ({type(_e).__name__}: {_e}) — a rebuild will re-fit it deterministically')
@@ -7662,13 +7707,13 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             'disjoint': True,
             'policy': 'test_whole_documents_disjoint_from_train_and_validation',
             'paired_train_doc_fps': sorted(
-                {(_m.get('doc_ids') or {}).get('train_fp')
+                {_doc_ids_of(_m).get('train_fp')
                  for _m in _train_meta_objs
-                 if (_m.get('doc_ids') or {}).get('train_fp')}),
+                 if _doc_ids_of(_m).get('train_fp')}),
             'paired_validation_doc_fps': sorted(
-                {(_m.get('doc_ids') or {}).get('validation_fp')
+                {_doc_ids_of(_m).get('validation_fp')
                  for _m in _train_meta_objs
-                 if (_m.get('doc_ids') or {}).get('validation_fp')}),
+                 if _doc_ids_of(_m).get('validation_fp')}),
         },
         'test_sequences': int(test_batch.shape[0]),
         'seq_len': int(seq_len),
@@ -8218,7 +8263,11 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                         'validation document-id sidecar does not match the fingerprint in the cache metadata')
             except Exception as _de:
                 _problems.append(f'document-id sidecars unreadable ({type(_de).__name__}: {_de})')
-            if (meta.get('validation_region') or {}).get('policy') != 'per_cap_closed_no_cross_cap_reuse':
+            _vreg = meta.get('validation_region')
+            if _vreg is not None and not isinstance(_vreg, dict):
+                _problems.append('cache metadata validation_region is not an object')
+                _vreg = {}
+            if (_vreg or {}).get('policy') != 'per_cap_closed_no_cross_cap_reuse':
                 _problems.append('cache does not declare a closed per-cap validation region')
             if (meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget'
                     or meta.get('tokenizer_fit_docs_in_train_prefix') is not True):
@@ -9276,6 +9325,11 @@ def _ids_narrow(train_ids):
             _path = os.fsdecode(_path)
         except (TypeError, ValueError):
             _path = None
+    if _path and train_ids.size and bool(getattr(train_ids.flags, 'writeable', True)):
+        # A writeable mapping can change under the same id; the on-disk
+        # sidecar binds to the file as of cache build time, so it can be
+        # stale. Recompute instead of serving a cached narrowing.
+        _path = None
     if _path and train_ids.size:
         # A disk-backed corpus is mapped read-only.  Workers share one int32
         # sidecar next to the cache.
@@ -9328,7 +9382,8 @@ def _ids_narrow(train_ids):
     _mx = int(train_ids.max()) if train_ids.size else -1
     if train_ids.size and _mn >= 0 and _mx < 2 ** 31:
         _n = train_ids.astype(np.int32)
-        _narrow_memo_put(_key, train_ids, _n)
+        if _ids_fp_memo_safe(train_ids):
+            _narrow_memo_put(_key, train_ids, _n)
         return _n
     return train_ids
 
@@ -12599,7 +12654,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     return _unscale_effect_fields(out, _effect_exp)
 
 
-def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
+def scale_ladder_audit(tiers, *, policy=None, tolerance=None, alpha=0.05):
     """Pre-flight audit of the scale ladder's allocation and transfer assumptions.
 
     A width/depth comparison is not controlled if the larger model also saw a
@@ -12614,6 +12669,11 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
     study may deliberately change allocation), never a silent "matched" claim.
     """
     problems, warnings, rows = [], [], []
+    _alpha_f = _finite_scalar(alpha)
+    if _alpha_f is None or not (0.0 < _alpha_f < 1.0):
+        problems.append(f'alpha={alpha!r} is not a finite level in (0, 1); using 0.05')
+        _alpha_f = 0.05
+    alpha = _alpha_f
     if policy is None:
         policy = dict(SCALE_TRANSFER_POLICY)
     elif not isinstance(policy, dict):
@@ -12780,7 +12840,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             'warmup_fraction': _safe_ratio(warmup, steps),
             'n_seeds': len(set(seeds)),
             'p_floor': signflip_p_floor(len(set(seeds))),
-            'min_seeds_for_family_significance': signflip_min_n_for_holm(family_m, 0.05),
+            'min_seeds_for_family_significance': signflip_min_n_for_holm(family_m, alpha),
         })
         if params is None:
             warnings.append(f'{name}: params missing — tokens-per-parameter and allocation matching are unverifiable')
@@ -13220,7 +13280,7 @@ def variant_presence(outdir):
         if v not in refused:
             continue
         if v in kept:
-            out[v] = f'present with {kept[v]} measurable record(s) (+{refused[v]} refused) — no shared usable seed'
+            out[v] = f'present with {kept[v]} measurable record(s) (+{refused[v]} refused as unmeasured)'
         else:
             out[v] = f'present but ALL {refused[v]} record(s) refused as unmeasured (synthesized / error / nan ppl / no seed)'
     return out
@@ -13300,7 +13360,17 @@ def _as_seed_int(v):
     # int(' 4 ') are exact, while int('4.9') already raises.
     if isinstance(v, (str, bytes)):
         try:
-            return int(v)
+            _s = v.decode() if isinstance(v, bytes) else v
+        except (UnicodeDecodeError, TypeError, ValueError):
+            return None
+        # int() also honours underscores and non-ASCII digits (int('4_0')==40,
+        # int('１２３')==123), which would make textually distinct JSON seed
+        # spellings collide; accept only plain ASCII decimal with optional
+        # sign and surrounding whitespace.
+        if not re.fullmatch(r'\s*[+-]?[0-9]+\s*', _s):
+            return None
+        try:
+            return int(_s)
         except (TypeError, ValueError, OverflowError):
             return None
     # Other number-like objects (e.g. Decimal) are not numbers.Real.  int()
@@ -13777,7 +13847,10 @@ def simple_baseline_fit(train_ids, eval_ids, vocab_size, protocol=None):
                              'n_tokens_matched': sc.get('n_tokens_matched')})
         if not rows:
             raise RuntimeError(f'simple baseline {arm}: empty declared grid')
-        best = min(rows, key=lambda r: float(r['ppl']))
+        _finite_rows = [r for r in rows if math.isfinite(float(r['ppl']))]
+        if not _finite_rows:
+            raise RuntimeError(f'simple baseline {arm}: every trial scored a non-finite ppl (empty or invalid evaluation set); refusing to report an arbitrary config as selected')
+        best = min(_finite_rows, key=lambda r: float(r['ppl']))
         trials_by_arm[arm] = {'selected': dict(best['config']),
                               'selected_metric_value': float(best['ppl']),
                               'selected_ppl_matched': (float(best['ppl_matched']) if isinstance(best.get('ppl_matched'), (int, float)) else None),
@@ -14818,6 +14891,9 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     if selected.get('search_complete') is False:
         warnings.append('the search grid was truncated (search_complete=False); it is equal across arms, but describe it as a bounded search, not the full declared grid')
     final_records = selected.get('final_records') or {}
+    if not isinstance(final_records, dict):
+        problems.append('final_records is not an object')
+        final_records = {}
 
     def _as_seed_values(_raw, _label):
         # A scalar seed (including 0) is a one-element list; only an absent
@@ -14833,7 +14909,11 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         if isinstance(_raw, numbers.Integral):
             return [int(_raw)]
         if isinstance(_raw, (str, bytes)):
-            _raw = normalize_seed_list(_raw, default=())
+            try:
+                _raw = normalize_seed_list(_raw, default=())
+            except (ValueError, TypeError) as _ne:
+                problems.append(f'{_label} is not a valid seed list ({_ne})')
+                return []
         try:
             return list(_raw)
         except TypeError:
@@ -14919,13 +14999,12 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 hp = r.get('hyperparams') or {}
                 for _kn in ('lr', 'weight_decay', 'warmup'):
                     if _kn in chosen and hp.get(_kn) is not None:
-                        try:
-                            _hpv = float(hp[_kn])
-                            _selv = float(chosen[_kn])
-                        except (TypeError, ValueError, OverflowError):
+                        _hpv = _finite_scalar(hp[_kn])
+                        _selv = _finite_scalar(chosen[_kn])
+                        if _hpv is None or _selv is None:
                             problems.append(
                                 f'{arm}: final record {_kn}={hp[_kn]!r} or the '
-                                f'selected value {chosen[_kn]!r} is not numeric')
+                                f'selected value {chosen[_kn]!r} is not a finite numeric measurement')
                             break
                         if _hpv != _selv:
                             problems.append(f'{arm}: final record {_kn}={hp[_kn]} does not match the selected {chosen[_kn]}')
@@ -14963,7 +15042,11 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             warnings.append(f'{final_min_seed_count} final seeds per arm cannot reach a Holm-corrected p<0.05 for {_m_tuned} tuned contrast(s) (needs n>={_final_family_floor}); the tuned contrast is resolution-limited, not a null')
     # Coverage: an arm is covered either by its own tuned record or by the arm
     # whose recipe it inherits (allocation-matched intervention controls).
-    _inherits = protocol.get('inherits_tuning') or {}
+    _inherits = protocol.get('inherits_tuning')
+    if _inherits is not None and not isinstance(_inherits, dict):
+        problems.append('inherits_tuning is not an object')
+        _inherits = {}
+    _inherits = _inherits or {}
     coverage = {a: a for a in arms}
     for _arm, _ref in _inherits.items():
         if _ref in arms:
@@ -16214,11 +16297,15 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 if any(v is None for v in _vals):
                     _ok = False
                     break
-                try:
-                    if any(float(v) != float(_sel[_kn]) for v in _vals):
-                        _ok = False
-                        break
-                except (TypeError, ValueError, OverflowError):
+                _sel_v = _finite_scalar(_sel[_kn])
+                if _sel_v is None:
+                    _ok = False
+                    break
+                _vals_f = [_finite_scalar(v) for v in _vals]
+                if any(v is None for v in _vals_f):
+                    _ok = False
+                    break
+                if any(v != _sel_v for v in _vals_f):
                     _ok = False
                     break
             _panel_cfg_ok[_arm] = _ok
@@ -16336,10 +16423,10 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 # the field falls back to the historical scale, which is
                 # slightly INFLATED (row-first tokens have no context) — the
                 # fallback makes "beats the floor" easier, so it is labelled.
-                _floor_ppl = _sb.get('best_ppl_matched')
+                _floor_ppl = _finite_scalar(_sb.get('best_ppl_matched'))
                 _floor_scale = 'matched (excludes row-first tokens; equal to the panel denominator)'
-                if not isinstance(_floor_ppl, (int, float)) or not math.isfinite(float(_floor_ppl)):
-                    _floor_ppl = _sb.get('best_ppl')
+                if _floor_ppl is None:
+                    _floor_ppl = _finite_scalar(_sb.get('best_ppl'))
                     _floor_scale = 'historical (includes row-first tokens; slightly inflated vs the panel scale)'
                 report['simple_baseline'].update({
                     'panel_reference_arm': _ref_key,
@@ -16349,10 +16436,10 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     'panel_eval_fp': (sorted(_panel_eval_fps)[:3] or None),
                     'simple_eval_fp': _sb_eval_fp,
                     'comparable_to_panel': _comparable,
-                    'simple_floor_ppl': (float(_floor_ppl) if isinstance(_floor_ppl, (int, float)) else None),
+                    'simple_floor_ppl': _floor_ppl,
                     'simple_floor_scale': _floor_scale,
-                    'panel_beats_simple_floor': (bool(_ref_ppl(_ref) < float(_floor_ppl))
-                                                 if _comparable is True and isinstance(_floor_ppl, (int, float))
+                    'panel_beats_simple_floor': (bool(_ref_ppl(_ref) < _floor_ppl)
+                                                 if _comparable is True and _floor_ppl is not None
                                                  else None),
                 })
                 if _comparable is False:
@@ -17447,13 +17534,17 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
             _seed_ok += 1
         else:
             _seed_mismatch.append(_key)
+    _malformed_seeds = []
     try:
-        _declared_seeds = [int(x) for x in (cfg.get('seeds') or [])]
+        _raw_decl = cfg.get('seeds') or []
+        _declared_seeds = [_s for _x in _raw_decl if (_s := _as_seed_int(_x)) is not None]
+        _malformed_seeds = [repr(x) for x in _raw_decl if _as_seed_int(x) is None]
     except (TypeError, ValueError, OverflowError):
         _declared_seeds = []
     _integrity = {
         'n_cells': len(cells),
         'seeds_declared': _declared_seeds,
+        'seeds_declared_malformed': _malformed_seeds,
         'seeds_unique': bool(len(_declared_seeds) == len(set(_declared_seeds))),
         'with_seed_metadata': _seed_ok,
         'seed_metadata_mismatch': _seed_mismatch[:20],
@@ -17610,10 +17701,10 @@ def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
         return out
     valid = (idx >= 0) & (idx < int(n_rows))
     if not bool(valid.all()):
-        idx = idx[valid]
-        vals = vals[valid]
-        if idx.numel() == 0:
-            return out
+        # A dropped destination would silently shrink a per-document
+        # denominator; every caller builds in-range indices, so an invalid one
+        # is an internal inconsistency and must be loud.
+        raise ValueError('_det_segment_sum: indices out of range for the destination tensor')
     if sorted_indices:
         idx_s = idx
         val_s = vals.to(out_dtype)
@@ -18712,7 +18803,7 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
     if int(n_sample) < 1:
         raise ValueError(f'compression_report: n_sample must be >= 1, got {n_sample!r}; the report is an average over the sequences it scores, so there is nothing to measure with no sequence scored')
     n_used = min(n_sample, val_batch.shape[0])
-    _row_chunk = _eval_adaptive_chunk(model, np.asarray(val_batch), device,
+    _row_chunk = _eval_adaptive_chunk(model, val_batch, device,
                                       min(16, _EVAL_TOKENS_PER_CHUNK // max(seq_len, 1)))
     _row_chunk = max(1, min(_row_chunk, n_used))
     # inference_mode (the decorator) already covers the forward pass.  The
@@ -18725,11 +18816,12 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
         # (the stats hook runs layer by layer).  Snapshot them so the retry
         # cannot count the partially-processed rows twice.
         _stats_snap = _snapshot_block_stats(model)
-        # as_tensor accepts numpy arrays AND torch tensors (eval_ppl already
-        # uses it).
+        # as_tensor accepts numpy arrays AND torch tensors (CPU, CUDA, mixed)
+        # without an explicit np.asarray round-trip (which raises on CUDA
+        # tensors).
         ids = None
         try:
-            ids = torch.as_tensor(np.asarray(val_batch[_r0:_r0 + _cur])).to(device)
+            ids = torch.as_tensor(val_batch[_r0:_r0 + _cur]).to(device)
             _ = model(ids, logits_tail=1)
         except RuntimeError as _oe:
             del ids
@@ -19130,8 +19222,10 @@ def _check_token_batch(x, y, vocab, *, step=None):
     try:
         lo = int(x.min().item())
         hi = int(x.max().item())
-    except Exception:
-        return
+    except Exception as _be:
+        # This guard's contract is fail-closed; skipping the range check on any
+        # error (e.g. CUDA OOM surfacing here) would serve a corrupt batch.
+        raise RuntimeError(f'_check_token_batch: could not read the token id range (step={step}): {type(_be).__name__}: {_be}') from _be
     if lo < 0 or hi >= int(vocab):
         raise ValueError(f'batch token id range [{lo}, {hi}] outside vocab [0, {int(vocab)}) at step={step}')
     if bool((y < 0).any().item()) or int(y.max().item()) >= int(vocab):
@@ -19234,10 +19328,15 @@ def _atomic_torch_save(obj, path, hash_out=None):
     h = hashlib.sha256() if hash_out is not None else None
     try:
         if h is None:
-            torch.save(obj, tmp)
+            with open(tmp, 'wb') as f:
+                torch.save(obj, f)
+                f.flush()
+                os.fsync(f.fileno())
         else:
             with open(tmp, 'wb') as f:
                 torch.save(obj, _HashingWriter(f, h))
+                f.flush()
+                os.fsync(f.fileno())
         os.replace(tmp, path)
         if hash_out is not None:
             hash_out.append(h.hexdigest())
@@ -19370,7 +19469,10 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
     if arr.ndim == 1:
         arr = arr[None, :]
     arr = arr.to(device)
-    max_len = int(min(arr.shape[1], max(int(x) for x in lengths)))
+    _lengths = [_as_seed_int(x) for x in lengths]
+    if not _lengths or any(x is None or x <= 0 for x in _lengths):
+        raise ValueError(f'measure_efficiency_sweep: lengths must be a non-empty iterable of positive exact integers, got {lengths!r}')
+    max_len = int(min(arr.shape[1], max(_lengths)))
     out = {'status': 'ok', 'device': str(device), 'torch': torch.__version__,
            'triton': None, 'tf32': None, 'rows': [],
            'decode_has_kv_cache': False,
@@ -19613,10 +19715,20 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         gc.disable()
     try:
         for step in range(steps):
-            if deadline_ts is not None and time.time() > deadline_ts:
-                print(f'  [cap] HARD cap reached before step {step} - truncating; this run is NOT recorded (raise RUN_CAP and re-run to retry it)')
-                truncated = True
-                break
+            if deadline_ts is not None:
+                # Rank-unanimous stop, like the non-finite-loss path: a
+                # wall-clock deadline voted independently per rank lets one
+                # rank exit while its peer enters DDP's backward collective
+                # in the same step and hangs the job.
+                _stop_now = time.time() > deadline_ts
+                if _dist and _world > 1:
+                    _st_t = torch.tensor([1 if _stop_now else 0], dtype=torch.int32, device=device)
+                    torch.distributed.all_reduce(_st_t, op=torch.distributed.ReduceOp.MAX)
+                    _stop_now = bool(int(_st_t.item()))
+                if _stop_now:
+                    print(f'  [cap] HARD cap reached before step {step} - truncating; this run is NOT recorded (raise RUN_CAP and re-run to retry it)')
+                    truncated = True
+                    break
             if device.type == 'cuda' and step and step % 256 == 0:
                 _attb_bump_epoch()
             base = lr_at(step)
@@ -19885,13 +19997,19 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         if device.type == 'cuda':
             torch.cuda.empty_cache()
         return {'variant': variant, 'seed': seed, 'cap_truncated': True, 'steps_done': step, 'train_time_s': wall}
-    if deadline_ts is not None and time.time() > deadline_ts:
-        print('  [cap] HARD cap reached before the final evaluation - truncating; this run is NOT recorded (raise RUN_CAP and re-run to retry it)')
-        del model, opt, bpe
-        gc.collect()
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-        return {'variant': variant, 'seed': seed, 'cap_truncated': True, 'steps_done': steps, 'train_time_s': wall}
+    if deadline_ts is not None:
+        _prefin_stop = time.time() > deadline_ts
+        if _dist and _world > 1:
+            _pf_t = torch.tensor([1 if _prefin_stop else 0], dtype=torch.int32, device=device)
+            torch.distributed.all_reduce(_pf_t, op=torch.distributed.ReduceOp.MAX)
+            _prefin_stop = bool(int(_pf_t.item()))
+        if _prefin_stop:
+            print('  [cap] HARD cap reached before the final evaluation - truncating; this run is NOT recorded (raise RUN_CAP and re-run to retry it)')
+            del model, opt, bpe
+            gc.collect()
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            return {'variant': variant, 'seed': seed, 'cap_truncated': True, 'steps_done': steps, 'train_time_s': wall}
     if _dist and _world > 1 and _rank != 0:
         # Non-zero ranks have no file-writing role; wait for rank 0's final
         # evaluation so the whole job exits together.
@@ -20268,7 +20386,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     _bcnt_cpu = _bcnt.detach().cpu().tolist()
     for _name, _n, _sm in zip(_bucket_names, _bcnt_cpu, _bsum_cpu):
         buckets[_name] = {'n': int(_n), 'ce_sum': float(_sm)}
-    seq_rows.sort(key=lambda t: t[0], reverse=True)
+    seq_rows.sort(key=lambda t: (not math.isfinite(t[0]), -t[0] if math.isfinite(t[0]) else 0.0))
     worst_seqs = []
     for ce_mean, row, nll, n in seq_rows[:max(1, int(top_n))]:
         recs = [t for t in tok_heap if t[1] == row]
@@ -20309,8 +20427,8 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             'buckets': out_buckets,
             'worst_sequences': worst_seqs,
             'worst_tokens': worst_tokens,
-            'entropy': {'max': (max(ent_vals) if ent_vals else None),
-                        'mean': (sum(ent_vals) / len(ent_vals) if ent_vals else None)},
+            'entropy_of_worst_tokens': {'max': (max(ent_vals) if ent_vals else None),
+                                        'mean': (sum(ent_vals) / len(ent_vals) if ent_vals else None)},
             'tokenizer_available': tok is not None,
             'label_check': {'next_token_shift': 'target = ids[t+1]; checked range [0, vocab) before scoring',
                             'n_targets': int(n_targets), 'n_out_of_range': 0}}
@@ -21394,7 +21512,17 @@ class TimeGuard:
                     # would then never fill in parallel mode.
                     self.state['booked_untracked'] = max(0.0, float(self.state.get('booked_seconds', 0.0)) - sum(float(b.get('seconds', 0.0)) for b in bookings.values()))
                 if seconds > 0:
-                    bookings[str(token)] = {'seconds': float(seconds), 'pid': int(os.getpid()), 'ts': time.time()}
+                    # A second reservation under the same token must not drop
+                    # the first one from the recomputed total below (that
+                    # would overstate the remaining headroom); accumulate.
+                    _tok = str(token)
+                    _b = bookings.get(_tok)
+                    if _b is not None:
+                        _b['seconds'] = float(_b.get('seconds', 0.0)) + float(seconds)
+                        _b['pid'] = int(os.getpid())
+                        _b['ts'] = time.time()
+                    else:
+                        bookings[_tok] = {'seconds': float(seconds), 'pid': int(os.getpid()), 'ts': time.time()}
                 else:
                     # A negative value is a refund MAGNITUDE, not "erase this
                     # token": subtract it from the outstanding booking.  A full
@@ -22195,7 +22323,11 @@ def aggregate(summary, *, outdir=None):
     def _paired(recs, base_recs):
         self_map, dup_a = _by_seed(recs)
         base_map, dup_b = _by_seed(base_recs)
-        assert not dup_a and (not dup_b), (sorted(set(dup_a)), sorted(set(dup_b)))
+        if dup_a or dup_b:
+            # The duplicate detection above must have fired; under `python -O`
+            # asserts vanish, and keeping the later record would silently
+            # mislabel the pairing.
+            raise ValueError(f'aggregate: duplicate seeds reached the paired comparison ({sorted(set(dup_a))}, {sorted(set(dup_b))}) — fix the summary instead of letting one record mask the other')
         out, skipped = ([], [])
         for s, r in self_map.items():
             b = base_map.get(s)
@@ -22886,7 +23018,7 @@ def _plan_run(cfg, summary_path, fp):
             key = f'{v}::seed{seed}'
             _drop_msg = None
             _drop_is_stale = False
-            if key in summary and 'ppl' in summary.get(key, {}):
+            if key in summary and isinstance(summary.get(key), dict) and 'ppl' in summary[key]:
                 old = summary[key]
                 # A completed cell must identify the seed it was run with.
                 # A record whose `seed` is missing/malformed is invisible to
@@ -22897,7 +23029,7 @@ def _plan_run(cfg, summary_path, fp):
                 _old_seed = _as_seed_int(old.get('seed'))
                 _want_seed = _as_seed_int(seed)
                 _identity_bad = (
-                    (old.get('variant') is not None and old.get('variant') != v)
+                    old.get('variant') != v
                     or _old_seed != _want_seed)
                 if _identity_bad:
                     _drop_msg = (f'[resume] {key} holds a record whose own '
@@ -23010,7 +23142,8 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
 
             def _apply(summary):
                 if rec.get('cap_truncated'):
-                    _prev_ok = ppl_is_usable((summary.get(key) or {}).get('ppl'))
+                    _prev = summary.get(key)
+                    _prev_ok = isinstance(_prev, dict) and ppl_is_usable(_prev.get('ppl'))
                     print(f'[cap] {key} was truncated after {rec.get('steps_done')} steps — its partial record is DISCARDED (it holds no `ppl`); ' + ('keeping the previous record instead.' if _prev_ok else 'the key is left ABSENT, not written as a stub.') + ' Raise RUN_CAP and re-run to retry this cell.')
                     if not _prev_ok:
                         summary.pop(key, None)
@@ -23018,7 +23151,8 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                 else:
                     rec['run_cfg'] = fp
                     rec['_code'] = code_stamp()
-                    assert fp.endswith(f'_cs{rec['_code']}'), (fp, rec['_code'])
+                    if not fp.endswith(f'_cs{rec["_code"]}'):
+                        raise RuntimeError(f'run fingerprint {fp!r} does not bind the code stamp {rec["_code"]!r}')
                     rec['provenance'] = _prov
                     rec['hyperparams'] = _hp
                     rec['data_fp'] = _prov['data'].get('train_fp')
@@ -23074,7 +23208,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
             out['error'] = f'{_err}'
 
             def _apply_err(summary):
-                if key in summary and ppl_is_usable((summary.get(key) or {}).get('ppl')):
+                if key in summary and isinstance(summary.get(key), dict) and ppl_is_usable(summary[key].get('ppl')):
                     print(f'[{key}] FAILED: {_err} — keeping the previous MEASURED record (the error record holds no `ppl` and must not replace it); the failed attempt is still booked to the guard below.')
                     print(_err_tb, file=_sys.stderr)
                 else:

@@ -134,14 +134,23 @@ def _run_fingerprint(cfg, *, matrix, outdir, synthetic=None, data_fp=None):
 def _atomic_json(path, obj):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + f'.tmp{os.getpid()}'
-    # Use the repository's strict JSON contract: non-finite floats become null
-    # and NumPy scalars/arrays are converted, so a diagnostic value (e.g. a
-    # failed timing measurement) cannot leave an invalid NaN/Infinity token in
-    # summary.json that no strict reader can parse.
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(L._json_clean(obj), f, indent=2, ensure_ascii=False,
-                  default=str, allow_nan=False)
-    os.replace(tmp, path)
+    try:
+        # Use the repository's strict JSON contract: non-finite floats become null
+        # and NumPy scalars/arrays are converted, so a diagnostic value (e.g. a
+        # failed timing measurement) cannot leave an invalid NaN/Infinity token in
+        # summary.json that no strict reader can parse.
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(L._json_clean(obj), f, indent=2, ensure_ascii=False,
+                      default=str, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _load_summary(outdir):
@@ -560,11 +569,6 @@ def _controlled_reason(a, b):
                 continue
             if x.get(k) != y.get(k):
                 return f'layer {i} differs in undeclared field {k}'
-    # The fingerprint is an equality shortcut only after the structure above
-    # has been checked; an equal/missing fingerprint must not hide a layer
-    # descriptor that differs in an undeclared field.
-    if oa.get('fingerprint') is not None and oa.get('fingerprint') == ob.get('fingerprint'):
-        return None
     return None
 
 
@@ -774,8 +778,7 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     }
     _atomic_json(os.path.join(analysis_dir, 'stats.json'), stats)
     md = _render_markdown(stats)
-    with open(os.path.join(analysis_dir, 'OPEN_BLOCK_REPORT.md'), 'w', encoding='utf-8') as f:
-        f.write(md)
+    L.atomic_write_text(os.path.join(analysis_dir, 'OPEN_BLOCK_REPORT.md'), md)
     print(md)
     return stats
 
