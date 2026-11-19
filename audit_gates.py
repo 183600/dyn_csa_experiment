@@ -755,7 +755,14 @@ def _sample_tokens(arr, cap=1000000, seed=0):
     if a.size <= cap:
         return a
     n = int(a.size)
-    rng = np.random.default_rng(seed)
+    _seed = seed
+    if isinstance(_seed, (bool,)):
+        raise ValueError('seed must be an integer, not a bool')
+    try:
+        _seed = int(_seed)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'seed must be an integer, got {seed!r}') from None
+    rng = np.random.default_rng(_seed % (2 ** 64))
     # Above the threshold the same uniform without-replacement sample is
     # drawn by rejection: every K-subset remains equally likely and the draw
     # stays seed-deterministic.

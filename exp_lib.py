@@ -19479,6 +19479,8 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
     prefill, and `decode_has_kv_cache=False` is recorded rather than pretending
     this is incremental decoding.
     """
+    was = model.training
+    model.eval()
     arr = torch.as_tensor(ids)
     if arr.ndim == 1:
         arr = arr[None, :]
@@ -19504,8 +19506,6 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
         out['tf32'] = bool(torch.backends.cuda.matmul.allow_tf32) if device.type == 'cuda' else None
     except Exception:
         pass
-    was = model.training
-    model.eval()
     try:
         _warmup = _as_seed_int(warmup)
         if _warmup is None or _warmup < 0:

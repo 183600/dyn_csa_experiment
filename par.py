@@ -272,7 +272,19 @@ def _child_env(slot, seed=None):
         # anything else aborts the worker with `Fatal Python error:
         # config_init_hash_seed` before the job runs.  Planned seed ids may be
         # negative or above 2**32, so fold exactly like exp_lib.set_seed does.
-        _hs = int(seed)
+        if isinstance(seed, (bool, np.bool_)):
+            raise ValueError(f'seed must be an integer, not a bool: {seed!r}')
+        if isinstance(seed, (float, np.floating)):
+            _f = float(seed)
+            if (not _f.is_integer()) or not math.isfinite(_f):
+                raise ValueError(f'seed must be an exact integer, got {seed!r}')
+        try:
+            _hs = int(seed)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'seed must be an integer, got {seed!r}') from None
+        # Strings are not valid seeds for this env var.
+        if isinstance(seed, (str, bytes)):
+            raise ValueError(f'seed must be an integer, got {seed!r}')
         env["PYTHONHASHSEED"] = str(_hs if 0 <= _hs < 2 ** 32 else _hs % (2 ** 32))
     return env
 
