@@ -3199,15 +3199,16 @@ def cuda_healthy():
 def run_full():
     guard = L.TimeGuard(RUN_CAP_V7)
     guard.report()
-    print(f'[v7] headroom {max(guard.remaining_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
+    print(f'[v7] headroom {max(guard.headroom_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
     git_push('v7: supplementary experiment library (RoPE+QK-norm, dense->sparse warmup, NIAH probe, topk sweep, analytic FLOPs)')
     import par
     _ctx = par.resolve_ctx(label='v7')
     all_ok = True
     for pname, kind, payload in PHASES:
-        rem = guard.remaining_hours()
+        rem = guard.headroom_hours()
         if rem < 0.4166666666666667:
-            print(f'[v7] stopping before {pname}: headroom exhausted ({rem:.2f} h)')
+            print(f'[v7] stopping before {pname}: headroom exhausted ({rem:.2f} h usable under the run cap) — earlier phases did not complete; re-run to resume')
+            all_ok = False
             break
         if not cuda_healthy():
             print(f'[v7] CUDA context poisoned before {pname} -- restart the process to continue (resume will skip completed runs).  Aborting phase loop.')
@@ -3228,8 +3229,13 @@ def run_full():
         all_ok = False
     all_ok &= git_push('v7: analytic FLOPs/KV-cache + paired sign-flip stats')
     guard.report()
-    print('\n[v7] ALL PHASES DONE.')
+    if all_ok:
+        print('\n[v7] ALL PHASES DONE.')
+    else:
+        print('\n[v7] INCOMPLETE — not every planned phase ran cleanly; re-run to resume (checkpoints make the re-run cheap).')
     schedule_shutdown(120 if all_ok else 2400)
+    if not all_ok:
+        sys.exit(1)
 
 def run_smoke():
     print('[smoke] 1) RoPE variant forward/backward')

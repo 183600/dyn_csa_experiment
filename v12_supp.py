@@ -3425,15 +3425,16 @@ def run_full():
     plan_check()
     guard = make_guard()
     guard.report()
-    print(f'[v12] headroom {max(guard.remaining_hours(), 0.0):.2f} h left (booked {guard.state["booked_seconds"] / 3600:.2f} h)')
+    print(f'[v12] headroom {max(guard.headroom_hours(), 0.0):.2f} h left (booked {guard.state["booked_seconds"] / 3600:.2f} h)')
     git_push('v12: confirmation driver (frozen-manifest v3: zero-GPU plan gate + strict record admission + freeze-lock binding; P5C covers all four frozen arms at manifest seeds)')
     import par
     _ctx = par.resolve_ctx(label='v12')
     all_ok = True
     for pname, _kind, _payload, _seeds in PHASES:
-        rem = guard.remaining_hours()
+        rem = guard.headroom_hours()
         if rem < 0.4166666666666667:
-            print(f'[v12] stopping before {pname}: headroom exhausted ({rem:.2f} h)')
+            print(f'[v12] stopping before {pname}: headroom exhausted ({rem:.2f} h usable under the run cap) — earlier phases did not complete; re-run to resume')
+            all_ok = False
             break
         if not V.cuda_healthy():
             print(f'[v12] CUDA context poisoned before {pname} — aborting (re-run resumes).')
@@ -3458,8 +3459,13 @@ def run_full():
         all_ok = False
     all_ok &= git_push('v12: stats + REPORT_v12.md (analysis_v12)')
     guard.report()
-    print('\n[v12] ALL PHASES DONE.')
+    if all_ok:
+        print('\n[v12] ALL PHASES DONE.')
+    else:
+        print('\n[v12] INCOMPLETE — not every planned phase ran cleanly; re-run to resume (checkpoints make the re-run cheap).')
     schedule_shutdown(120 if all_ok else 2400)
+    if not all_ok:
+        sys.exit(1)
 
 def _plan_recipe(manifest, arm, mr):
     """Build a P1L-format recipe string carrying the frozen signature.

@@ -290,6 +290,19 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                            'different training cache instead')
             return out
         _pairs = _pref
+    if _parse_failures:
+        # Corrupt metadata fails the provenance gate even if some other
+        # pair verified — a clean pair must not vouch for an unreadable one.
+        out['status'] = 'fail'
+        out['checks']['parse_failures'] = sorted(set(_parse_failures))
+        out.setdefault('problems', []).append(
+            'cache metadata exists but cannot be parsed: ' +
+            ', '.join(sorted(set(_parse_failures))) +
+            ' — tokenizer/split provenance cannot be audited')
+        out['note'] = ('cache metadata exists but cannot be parsed: ' +
+                       ', '.join(sorted(set(_parse_failures))) +
+                       ' — the audit refuses to report a verdict from the surviving pair alone')
+        return out
     if not _pairs:
         if _parse_failures:
             out['status'] = 'fail'
@@ -3262,3 +3275,6 @@ if __name__ == '__main__':
     _r = _run_audit(_cmds[_arg])
     if isinstance(_r, dict) and _r.get('status') == 'fail':
         raise SystemExit(1)
+    if isinstance(_r, dict) and _r.get('status') == 'error':
+        print(f'[audit] {_arg} did not complete: {_r.get("note")}')
+        raise SystemExit(3)

@@ -339,20 +339,30 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
     if mode == 'span':
         # contiguous sentence-like segments from the donor row: local syntax
         # inside each span survives, cross-span coherence is destroyed.
-        # actual coverage = len(starts) * seg (recomputable from the same
-        # deterministic formula — rho is nominal for this mode).
+        # Spans are disjoint by construction (one span per equal-width tile
+        # of the far zone), so the realised coverage is exactly n_seg * seg
+        # replaced tokens; rho is nominal beyond that granularity.
         rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(_rho * 1048576)))
         seg = max(1, int(span_len))
-        n_seg = max(1, int(math.ceil(k / seg)))
         seg = min(seg, n_far)
+        n_seg = max(1, int(math.ceil(k / seg)))
+        # Disjoint spans by construction: split the far zone into n_seg
+        # equal tiles and draw one span uniformly inside each tile, so the
+        # realised coverage is exactly n_seg * seg replaced tokens (the
+        # previously independent starts overlapped and replaced ~20 % fewer
+        # tokens at rho=0.5, silently under-dosing the probe against its own
+        # documented accounting).
+        max_disjoint = max(1, n_far // seg)
+        if n_seg > max_disjoint:
+            n_seg = max_disjoint
+        tile = n_far // n_seg
         _row_len = min(val_ids.shape[1], eval_len + 1)
-        _starts_hi = n_far - seg + 1
-        starts = rng.choice(_starts_hi, size=min(n_seg, _starts_hi), replace=False)
         _src = (jj + max(1, val_ids.shape[0] // 2)) % val_ids.shape[0]
         _off_hi = _row_len - seg + 1
-        for s in starts:
+        for i in range(n_seg):
+            s = int(i * tile + rng.integers(0, tile - seg + 1))
             o = int(rng.integers(0, _off_hi)) if _off_hi > 1 else 0
-            ids[int(s):int(s) + seg] = np.asarray(val_ids[_src, o:o + seg], dtype=np.int64)
+            ids[s:s + seg] = np.asarray(val_ids[_src, o:o + seg], dtype=np.int64)
         return ids
     raise ValueError(f'_corrupt_row: unknown corruption mode {mode!r} (expected one of {_CORRUPT_MODES})')
 
@@ -1054,7 +1064,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             continue
         _row_cache = _BoundedRowCache()
         if guard is not None and not guard.can_start(0):
-            print(f'[cap] SKIP probe {v} s{seed} arm {arm}: headroom exhausted ({max(guard.remaining_hours(), 0.0):.2f} h left) — re-run the phase to continue')
+            print(f'[cap] SKIP probe {v} s{seed} arm {arm}: headroom exhausted ({max(guard.headroom_hours(), 0.0):.2f} h left) — re-run the phase to continue')
             if model is None:
                 out['status'] = 'skipped_cap'
             break
@@ -2716,15 +2726,16 @@ def schedule_shutdown(delay_s=120):
 def run_full():
     guard = make_guard()
     guard.report()
-    print(f'[v10] headroom {max(guard.remaining_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
+    print(f'[v10] headroom {max(guard.headroom_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
     git_push('v10: supplementary driver (P3M distractor-injection mechanism + P3S crossover scaling + P3T topk seeds 2/3 + scratch selector controls, corruption modes/NIAH, token/compute-matched scale arms)')
     import par
     _ctx = par.resolve_ctx(label='v10')
     all_ok = True
     for pname, _kind, _payload, _seeds in PHASES:
-        rem = guard.remaining_hours()
+        rem = guard.headroom_hours()
         if rem < 0.4166666666666667:
-            print(f'[v10] stopping before {pname}: headroom exhausted ({rem:.2f} h)')
+            print(f'[v10] stopping before {pname}: headroom exhausted ({rem:.2f} h usable under the run cap) — earlier phases did not complete; re-run to resume')
+            all_ok = False
             break
         if not V.cuda_healthy():
             print(f'[v10] CUDA context poisoned before {pname} — aborting (re-run resumes).')
@@ -2744,8 +2755,13 @@ def run_full():
         all_ok = False
     all_ok &= git_push('v10: stats + REPORT_v10.md (analysis_v10)')
     guard.report()
-    print('\n[v10] ALL PHASES DONE.')
+    if all_ok:
+        print('\n[v10] ALL PHASES DONE.')
+    else:
+        print('\n[v10] INCOMPLETE — not every planned phase ran cleanly; re-run to resume (checkpoints make the re-run cheap).')
     schedule_shutdown(120 if all_ok else 2400)
+    if not all_ok:
+        sys.exit(1)
 
 def run_smoke():
     print('[smoke] 1) tiny lenphase ckpts + extended distractor probe roundtrip (all modes + NIAH + a scratch control)')

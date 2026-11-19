@@ -853,6 +853,31 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
     return report
 
 
+def _panel_missing_cells(outdir, variants, seeds):
+    """Planned cells with no usable, non-synthesized record in the panel's
+    summary.json.  Returns (missing_keys, why); why is None on success.  A
+    missing/unreadable summary returns (None, reason) — treat that as
+    not-complete, not as complete."""
+    path = os.path.join(REPO, outdir, 'summary.json')
+    try:
+        with open(path, encoding='utf-8') as _jf:
+            summary = json.load(_jf)
+    except FileNotFoundError:
+        return None, 'summary.json is missing'
+    except Exception as _e:
+        return None, f'summary.json unreadable ({type(_e).__name__}: {_e})'
+    if not isinstance(summary, dict):
+        return None, f'summary.json is {type(summary).__name__}, not an object'
+    _missing = []
+    for seed in seeds:
+        for v in variants:
+            key = f'{v}::seed{int(seed)}'
+            rec = summary.get(key)
+            if not isinstance(rec, dict) or not L.ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
+                _missing.append(key)
+    return _missing, None
+
+
 def run_full():
     panel = (os.environ.get('M0_PANEL') or 'S1').strip().upper()
     if panel not in ('S1', 'S2'):
@@ -894,6 +919,18 @@ def run_full():
     L.run(run_cfg, guard=guard, label=f'M0/{_what}')
     push_ok &= git_push(f'm0: {_what}完成一轮（{run_cfg["outdir"]} 为本地实验产物，不入库；量值以 summary.json 现算为准）')
     guard.report()
+    _missing, _why = _panel_missing_cells(run_cfg['outdir'], run_cfg['variants'], run_cfg['seeds'])
+    if _missing is None:
+        print(f'\n[m0] INCOMPLETE — panel {panel}: completeness could not be verified ({_why}). NOT reporting success.')
+        schedule_shutdown(2400)
+        sys.exit(1)
+    if _missing:
+        print(f'\n[m0] INCOMPLETE — panel {panel}: {len(_missing)} planned cell(s) missing/unusable after the run:')
+        for _k in _missing:
+            print(f'    {_k}')
+        print('[m0] NOT reporting success — re-run to resume (checkpoints keep the re-run cheap); cells skipped by the cap leave no partial measurement.')
+        schedule_shutdown(2400)
+        sys.exit(1)
     print('\n[m0] DONE.')
     schedule_shutdown(90 if push_ok else 2400)
     if not push_ok:

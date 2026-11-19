@@ -912,12 +912,17 @@ def main():
     run_panel(cfg, matrix, device=L.DEVICE, synthetic=False,
               max_hours=args.max_hours,
               label='pilot' if args.command == 'pilot' else args.command)
+    _analysis_failed = None
     if args.command in ('main', 'aux', 'extended'):
         try:
             analyse(cfg['outdir'], seeds=cfg['seeds'], analysis_dir=args.analysis_dir)
         except SystemExit as e:
-            print(f'[open-block] report skipped: {e}')
-    return 0
+            # The pre-registered analysis refused (fail-closed: unusable
+            # records, mixed fingerprints, invalid seeds).  The training
+            # panel is on disk, but "analysis refused" is NOT success.
+            print(f'[open-block] report refused: {e}')
+            _analysis_failed = e
+    return 1 if _analysis_failed is not None else 0
 
 
 if __name__ == '__main__':

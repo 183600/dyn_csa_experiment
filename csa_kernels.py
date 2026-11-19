@@ -549,7 +549,12 @@ def _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
     dtype = Xa.dtype
     L, W = geom.max_len, geom.W_b
     has_b = Xb is not None and W > 0
-    assert Za.shape[-1] == c, 'pool 语义要求 X 与 Z 同宽（kv_dim）'
+    if Za.shape[-1] != c:
+        raise ValueError(
+            f'pool semantics require X and Z to share width (kv_dim): Xa.shape[-1]={c}, Za.shape[-1]={Za.shape[-1]}')
+    if Xb is not None and Zb is not None and Zb.shape[-1] != c:
+        raise ValueError(
+            f'pool semantics require X and Z to share width (kv_dim): Xb.shape[-1]={Xb.shape[-1]}, Zb.shape[-1]={Zb.shape[-1]}')
     if T == 0:
         # No tokens means no readable lanes: every block's compressed value is
         # the empty-lane softmax result (nan_to_num -> 0).  Returning zeros
@@ -949,7 +954,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk, need_soft=True):
         # where 的标量分支与 full_like/zeros_like 逐位同值（标量按 dtype
         # 精确表示、元素级选择同一比较结果）。
         if need_soft:
-            masked_lse = torch.where(causal_c, scores, _NEG_INF)
+            masked_lse = torch.where(causal_c, scores.to(acc), _NEG_INF)
             lse = torch.logsumexp(masked_lse, dim=-1)
             # Only lse survives.
             del masked_lse
@@ -2481,13 +2486,36 @@ def _attach_attn_kernels(ns):
 # ============================================================================
 
 def _pool_fwd_triton(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
-    K = _kernels()
-    triton = K.triton
     R, T, C = Xa.shape
     Bm = geom.Bm
+    L, W = geom.max_len, geom.W_b
+    # Same contract as `_pool_fwd_ref`/`exp_lib.pool_variable_blocks`: a
+    # one-sided (Xb, Zb) pair is malformed and refused rather than silently
+    # dropping a lane (or crashing on a bare None dereference).
+    if (Xb is None) != (Zb is None):
+        raise ValueError(
+            'pool_variable_blocks: Xb and Zb must both be tensors or both '
+            'be None (the previous-block overlap lane needs both)')
+    if Zb is not None and Zb.shape[-1] != C:
+        raise ValueError(
+            f'pool semantics require X and Z to share width (kv_dim): Xa.shape[-1]={C}, Zb.shape[-1]={Zb.shape[-1]}')
+    if Xb is not None and Xb.shape[-1] != C:
+        raise ValueError(
+            f'pool semantics require X and Z to share width (kv_dim): Xa.shape[-1]={C}, Xb.shape[-1]={Xb.shape[-1]}')
+    if Za.shape[-1] != C:
+        raise ValueError(
+            f'pool semantics require X and Z to share width (kv_dim): Xa.shape[-1]={C}, Za.shape[-1]={Za.shape[-1]}')
+    if int(B_pos_a.shape[0]) == 0:
+        raise ValueError('_pool_fwd_triton: B_pos_a has 0 rows (position_capacity must be >= 1)')
+    if Xb is not None and W > 0 and int(B_pos_b.shape[0]) == 0:
+        raise ValueError('_pool_fwd_triton: B_pos_b has 0 rows while a B lane is requested (position_capacity must be >= 1)')
+    if R == 0:
+        # Zero rows: nothing to compute, and a zero-sized grid launch is invalid.
+        return torch.empty((0, Bm, C), device=Xa.device, dtype=Xa.dtype)
     if T == 0:
         return torch.zeros((R, Bm, C), device=Xa.device, dtype=Xa.dtype)
-    L, W = geom.max_len, geom.W_b
+    K = _kernels()
+    triton = K.triton
     has_b = Xb is not None and W > 0
     Xa = Xa.contiguous()
     Za = Za.contiguous()
@@ -2578,10 +2606,17 @@ def _indexer_topk_chunked(scores, last_tok, t0, T, Bm, k_out, need_soft, out_dty
 
 
 def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=True):
-    K = _kernels()
-    triton = K.triton
     R, T, nIH, hd = qI.shape
     Bm = kI.shape[1]
+    if R == 0 or T == 0:
+        # Zero-sized grid launches are invalid; the result is empty anyway.
+        k_out0 = max(0, min(int(topk), Bm))
+        idx0 = torch.zeros((R, T, k_out0), device=qI.device, dtype=torch.int32)
+        valid0 = torch.zeros((R, T, k_out0), device=qI.device, dtype=torch.bool)
+        soft0 = torch.zeros((R, T, k_out0), device=qI.device, dtype=qI.dtype) if need_soft else None
+        return idx0, valid0, soft0
+    K = _kernels()
+    triton = K.triton
     qI = qI.contiguous()
     kI = kI.contiguous()
     w_idx = w_idx.contiguous()

@@ -747,7 +747,42 @@ def run_full():
     # outside LONG_GAP_VARIANTS (including the non-gap arms reconstructed from
     # the aggregate snapshot).  Stash those records first and fold them back
     # in afterwards so downstream per-seed paired analyses keep their inputs.
+    # The stash is ALSO written to a sidecar file before the run starts: the
+    # in-memory copy alone vanishes on a watchdog kill/OOM between the drop
+    # inside _plan_run and the restore below, permanently losing the AB arms'
+    # records (results_lm_v3_long is a local artifact, not git-tracked).
     _long_summary_path = os.path.join(REPO, 'results_lm_v3_long', 'summary.json')
+    _stash_path = _long_summary_path + '.non_gap_stash.json'
+    # Crash recovery: a leftover sidecar means a previous invocation died
+    # between the drop and the restore.  Fold it back in BEFORE doing anything
+    # else; if that fails, abort rather than narrow the plan against an
+    # unrecoverable summary.
+    if os.path.exists(_stash_path):
+        try:
+            with open(_stash_path, encoding='utf-8') as _sf:
+                _sidecar = json.load(_sf)
+            if not isinstance(_sidecar, dict) or not _sidecar:
+                raise ValueError('stash sidecar is empty or not a JSON object')
+
+            def _recover_non_gap(s):
+                _rec = 0
+                for _k, _v in _sidecar.items():
+                    if isinstance(_v, dict) and _k not in s:
+                        s[_k] = _v
+                        _rec += 1
+                if _rec:
+                    print(f'[v6-long] recovered {_rec} non-gap record(s) from the stash sidecar left by an interrupted run')
+                return s
+
+            L.locked_json_update(_long_summary_path, _recover_non_gap)
+            try:
+                os.remove(_stash_path)
+                print('[v6-long] stash sidecar consumed; removed')
+            except OSError as _e:
+                print(f'[v6-long] WARNING: could not remove consumed stash sidecar {_stash_path} ({_e}) — delete it manually')
+        except Exception as _e:
+            print(f'[v6-long] FATAL: stash sidecar {_stash_path} exists but could not be applied ({type(_e).__name__}: {_e}) — refusing to run the narrowed plan, which would make the drop irreversible')
+            sys.exit(1)
     _stashed_long = {}
     if os.path.exists(_long_summary_path):
         try:
@@ -757,10 +792,16 @@ def run_full():
                 _stashed_long = {k: v for k, v in _prev_long.items()
                                  if isinstance(v, dict) and v.get('variant') not in LONG_GAP_VARIANTS}
         except Exception as _e:
-            print(f'[v6-long] WARNING: cannot read {_long_summary_path} before the run ({type(_e).__name__}: {_e}) — non-gap records will NOT be restored afterwards')
+            print(f'[v6-long] FATAL: cannot read {_long_summary_path} before the narrowed run ({type(_e).__name__}: {_e}) — running on would drop the non-gap records with no way to restore them; fix the file first')
+            sys.exit(1)
         else:
             if _stashed_long:
                 print(f'[v6-long] stashed {len(_stashed_long)} non-gap record(s) before the narrowed run')
+                try:
+                    L.atomic_write_json(_stash_path, _stashed_long, indent=2)
+                except Exception as _e:
+                    print(f'[v6-long] FATAL: could not write the stash sidecar {_stash_path} ({type(_e).__name__}: {_e}) — refusing to run the narrowed plan without a crash-safe backup')
+                    sys.exit(1)
     L.run({**L.RUN_LONG, 'variants': LONG_GAP_VARIANTS}, seeds=[0, 1, 2], guard=guard, label='P-LONG hybrid 3-seed long-run table (results_lm_v3_long)')
     if _stashed_long:
         def _restore_non_gap(s):
@@ -773,6 +814,10 @@ def run_full():
                 print(f'[v6-long] restored {_restored} non-gap record(s) into summary.json (kept out of the narrowed plan so they are not retrained, but never deleted)')
             return s
         L.locked_json_update(_long_summary_path, _restore_non_gap)
+        try:
+            os.remove(_stash_path)
+        except OSError:
+            pass
     merge_long_aggregate(os.path.join(REPO, 'results_lm_v3_long'), _long_snapshot)
     _a, _p = _push_phase('v6: results_lm_v3_long hybrid variants at seeds 0-2 — 3-seed long-run table complete', 'results_lm_v3_long', LONG_GAP_VARIANTS, [0, 1, 2])
     push_ok &= _p

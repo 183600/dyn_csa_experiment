@@ -452,15 +452,16 @@ def schedule_shutdown(delay_s=120):
 def run_full():
     guard = make_guard()
     guard.report()
-    print(f'[v9] headroom {max(guard.remaining_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
+    print(f'[v9] headroom {max(guard.headroom_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
     git_push('v9: supplementary driver (P2T topk sweep completion @bs1 + P2S3 RoPE-20k third seed)')
     import par
     _ctx = par.resolve_ctx(label='v9')
     all_ok = True
     for pname, _cfg, _seeds in PHASES:
-        rem = guard.remaining_hours()
+        rem = guard.headroom_hours()
         if rem < 0.4166666666666667:
-            print(f'[v9] stopping before {pname}: headroom exhausted ({rem:.2f} h)')
+            print(f'[v9] stopping before {pname}: headroom exhausted ({rem:.2f} h usable under the run cap) — earlier phases did not complete; re-run to resume')
+            all_ok = False
             break
         if not V.cuda_healthy():
             print(f'[v9] CUDA context poisoned before {pname} — aborting (re-run resumes).')
@@ -480,8 +481,13 @@ def run_full():
         all_ok = False
     all_ok &= git_push('v9: paired sign-flip stats + REPORT_v9.md (analysis_v9)')
     guard.report()
-    print('\n[v9] ALL PHASES DONE.')
+    if all_ok:
+        print('\n[v9] ALL PHASES DONE.')
+    else:
+        print('\n[v9] INCOMPLETE — not every planned phase ran cleanly; re-run to resume (checkpoints make the re-run cheap).')
     schedule_shutdown(120 if all_ok else 2400)
+    if not all_ok:
+        sys.exit(1)
 
 def run_smoke():
     print('[smoke] 1) topk128/512 forward/backward (seq 2048, bs 1)')

@@ -76,6 +76,7 @@ CODE_SEMANTICS = 'v11.128'
 CKPT_CODE = CODE_SEMANTICS
 # ---- 三算子内核路径（M0 工作包；实现与数值契约
 # 见 csa_kernels.py）。CSA_KERNEL 未设置时本模块的执行路径与指纹逐字节不变。
+_CK_ERR = None
 try:
     import csa_kernels as _CK
 except Exception as _ck_err:
@@ -83,15 +84,31 @@ except Exception as _ck_err:
     _CK_ERR = _ck_err
 
 
+def _kernel_requested_but_unavailable():
+    req = os.environ.get('CSA_KERNEL', '').strip().lower()
+    return req not in ('', '0', 'off', 'none', 'false')
+
 def _kernel_stamp():
     """内核变体标识（进入 run_cfg 指纹与 `_code` 戳）。eager 模式返回空串，
-    既有记录的指纹逐字节不变；内核模式下记录只与同模式记录配对（§3.1）。"""
+    既有记录的指纹逐字节不变；内核模式下记录只与同模式记录配对（§3.1）。
+
+    Fail closed: if a kernel backend was requested but the kernel module is
+    missing or its stamp raises, refuse loudly instead of returning the eager
+    stamp — an empty stamp would pair kernel-mode records with eager ones (and
+    would open the frozen eager-only plan gate to a kernel run)."""
     if _CK is None:
+        if _kernel_requested_but_unavailable():
+            raise RuntimeError(
+                f'CSA_KERNEL={os.environ.get("CSA_KERNEL")!r} is set but '
+                f'csa_kernels failed to import ({type(_CK_ERR).__name__}: {_CK_ERR}) '
+                '— refusing to run as eager')
         return ''
     try:
         return _CK.kernel_stamp()
-    except Exception:
-        return ''
+    except Exception as _e:
+        raise RuntimeError(
+            f'kernel mode is requested/available but kernel_stamp() raised '
+            f'{type(_e).__name__}: {_e} — refusing to look like eager') from _e
 
 def _eager_batch_active(device=None, batch_size=None):
     """True when the batched reference twin should be used.
@@ -112,13 +129,17 @@ def _eager_batch_active(device=None, batch_size=None):
     if v in ('0', 'false', 'no', 'off'):
         return False
     if _CK is None:
+        if _kernel_requested_but_unavailable():
+            raise RuntimeError(
+                f'CSA_KERNEL={os.environ.get("CSA_KERNEL")!r} is set but '
+                f'csa_kernels failed to import ({type(_CK_ERR).__name__}: {_CK_ERR}) '
+                '— refusing to run as eager')
         return False
-    try:
-        if _CK.kernel_enabled():
-            # The kernel backend replaces the eager twin entirely.
-            return False
-    except Exception:
-        pass
+    if _CK.kernel_enabled():
+        # The kernel backend replaces the eager twin entirely.  Let a kernel
+        # module that is present but broken raise rather than silently
+        # selecting the eager twin under a kernel stamp.
+        return False
     if device is None:
         device = DEVICE
     if getattr(device, 'type', str(device)) != 'cuda':
@@ -2266,11 +2287,19 @@ def causal_mask(T, device):
 
 def window_band(T, window, device):
     if window <= 0 or window >= T:
-        return _mask_buffer(T, device, 'zero')
+        base = causal_mask(T, device)
+        m = torch.zeros((T, T), device=device)
+        m.masked_fill_(base, float('-inf'))
+        return m
     key = (_dev_str(device), 'bandw', int(T), int(window))
     buf = _cache_get(_MASK_CACHE, key)
     if buf is None:
-        buf = _tri_full(T, device, -int(window))
+        with torch.inference_mode(False):
+            pos = _arange_cache(T, device)
+            q = pos[:, None]
+            j = pos[None, :]
+            buf = torch.zeros((T, T), device=device)
+            buf.masked_fill_((j > q) | (j <= q - int(window)), float('-inf'))
         _cache_put(_MASK_CACHE, key, buf, _mask_budget(T), _mask_cache_total)
     return buf
 
@@ -4420,7 +4449,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
                 # Width-0 soft prior or empty block table: no K lanes to project
                 # onto.  Skip the einsum and return zero attention directly,
                 # avoiding the dimension mismatch that occurs when k_all has 0 rows.
-                out[s:e] = qseg.new_zeros_like(qseg)
+                out[s:e] = torch.zeros_like(qseg)
                 continue
             Kset = _tk2(k_all, _rows)
             logits = _einsum('qhd,qmhd->qhm', qseg, Kset)
@@ -4795,6 +4824,31 @@ class AttnCfg:
         # float (e.g. c_index=8.0) would otherwise survive into torch.empty /
         # nn.Linear, and a float sliding_window would build a float index
         # table instead of an integer one.
+        def _cfg_float(label, value, *, lo=None, lo_open=False, hi=None):
+            # Numerical knobs must be finite reals in range; NaN/+inf would
+            # otherwise pass construction and silently degenerate the
+            # adaptive blocking (all-false comparison -> uniform blocking).
+            if isinstance(value, (bool, np.bool_)) or _is_nonmeasurement_scalar(value):
+                raise ValueError(f'{label} must be a real number, got {value!r}')
+            try:
+                f = float(value)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(f'{label} must be a real number, got {value!r}') from None
+            if not math.isfinite(f):
+                raise ValueError(f'{label} must be finite, got {value!r}')
+            if lo is not None:
+                if lo_open:
+                    if not f > lo:
+                        raise ValueError(f'{label} must be > {lo}, got {value!r}')
+                elif not f >= lo:
+                    raise ValueError(f'{label} must be >= {lo}, got {value!r}')
+            if hi is not None and not f <= hi:
+                raise ValueError(f'{label} must be <= {hi}, got {value!r}')
+            return f
+
+        self.cos_threshold = _cfg_float('cos_threshold', self.cos_threshold, lo=-1.0, hi=1.0)
+        self.temperature = _cfg_float('temperature', self.temperature, lo=0.0, lo_open=True)
+
         self.pool_position_capacity = _cfg_int(
             'pool_position_capacity', self.pool_position_capacity, 1)
         # Non-negative/positive structural bounds.  A negative window or
@@ -4809,8 +4863,8 @@ class AttnCfg:
         self.sliding_window = _cfg_int('sliding_window', self.sliding_window, 0)
         self.window = _cfg_int('window', self.window, 0)
         self.index_topk = _cfg_int('index_topk', self.index_topk, 0)
-        self.c_kv = _cfg_int('c_kv', self.c_kv, 0)
-        self.c_index = _cfg_int('c_index', self.c_index, 0)
+        self.c_kv = _cfg_int('c_kv', self.c_kv, 1)
+        self.c_index = _cfg_int('c_index', self.c_index, 1)
         self.n_index_heads = _cfg_int('n_index_heads', self.n_index_heads, 1)
         self.fuse_kernel = _cfg_int('fuse_kernel', self.fuse_kernel, 1)
         if self.c_index % self.n_index_heads != 0:
@@ -10611,6 +10665,10 @@ def exact_signflip_p(deltas):
     `method`); it uses the null variance ``sum(d_i**2)`` and is therefore
     neither a Monte-Carlo draw nor the anti-conservative centered-SD normal
     approximation.  Non-finite deltas are dropped (the count is returned).
+    The returned ``n`` counts every finite delta (zeros included);
+    ``n_nonzero`` counts only the non-zero deltas and is the replication
+    size the 2/2**m attainable floor depends on — quote that one for
+    resolution limits.
     Pure function over its input — used by the aggregate audit so the core
     panel reports the same p the per-phase suites do, rather than a bare
     mean±std that could be mistaken for evidence.
@@ -10631,8 +10689,13 @@ def exact_signflip_p(deltas):
     d = np.asarray([x for x in d_in if math.isfinite(x)], dtype=float)
     n = int(d.size)
     n_dropped = len(d_in) - n
+    # Exact-zero deltas double the 2**n null multiplicity without moving the
+    # statistic, so the attainable p floor is 2/2**m with m the number of
+    # NONZERO deltas.  `n` keeps the all-finite count for compatibility; the
+    # replication-relevant count is `n_nonzero`.
+    n_nonzero = int((d != 0.0).sum()) if n else 0
     if n == 0:
-        return {'n': 0, 'p': float('nan'), 'n_dropped': n_dropped, 'method': 'none'}
+        return {'n': 0, 'n_nonzero': 0, 'p': float('nan'), 'n_dropped': n_dropped, 'method': 'none'}
     # The test is invariant to a common positive scale.  Rescaling by an exact
     # power of two keeps the sign-assignment comparison unchanged (the mantissas
     # are untouched) while preventing overflow of sum(|d|) / fsum for very large
@@ -10657,12 +10720,12 @@ def exact_signflip_p(deltas):
             masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
             signs = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
             cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - _tol_mean).sum())
-        return {'n': n, 'p': float(cnt / total), 'n_dropped': n_dropped, 'method': 'exact'}
+        return {'n': n, 'n_nonzero': n_nonzero, 'p': float(cnt / total), 'n_dropped': n_dropped, 'method': 'exact'}
     if n <= _SIGNFLIP_MITM_MAX_N:
         cnt = _signflip_mitm_count(d)
-        return {'n': n, 'p': float(cnt / float(1 << n)), 'n_dropped': n_dropped, 'method': 'exact-mitm'}
+        return {'n': n, 'n_nonzero': n_nonzero, 'p': float(cnt / float(1 << n)), 'n_dropped': n_dropped, 'method': 'exact-mitm'}
     p, method = _signflip_saddlepoint_p(d.tolist())
-    return {'n': n, 'p': float(p), 'n_dropped': n_dropped, 'method': method}
+    return {'n': n, 'n_nonzero': n_nonzero, 'p': float(p), 'n_dropped': n_dropped, 'method': method}
 
 def _percentile_ci(vals, lo=2.5, hi=97.5):
     v = [f for f in (_finite_scalar(x) for x in vals) if f is not None]
@@ -21656,6 +21719,12 @@ class TimeGuard:
 
     def cap_hours(self):
         return self.total_hours * self.margin
+
+    def headroom_hours(self):
+        """Usable headroom under the run cap (margin applied) — the same
+        quantity `can_start` and `deadline_ts` gate on.  Negative once the cap
+        is exhausted, unlike `remaining_hours()` which ignores the margin."""
+        return self.cap_hours() - self.spent_hours()
 
     def record_run(self, seconds, steps_done, d, n_layers, seq_len, batch_size, calib_seconds=None, variant=None):
         try:

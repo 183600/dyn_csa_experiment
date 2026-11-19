@@ -770,15 +770,16 @@ def run_full():
     atexit.register(lambda: sys.stdout.flush())
     guard = make_guard()
     guard.report()
-    print(f'[v11] headroom {max(guard.remaining_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
+    print(f'[v11] headroom {max(guard.headroom_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
     git_push('v11: supplementary driver (probe n=6 + crossover panels n=4 + d384 full-arm seed completion)')
     import par
     _ctx = par.resolve_ctx(label='v11')
     all_ok = True
     for pname, _kind, _payload, _seeds in PHASES:
-        rem = guard.remaining_hours()
+        rem = guard.headroom_hours()
         if rem < 0.4166666666666667:
-            print(f'[v11] stopping before {pname}: headroom exhausted ({rem:.2f} h)')
+            print(f'[v11] stopping before {pname}: headroom exhausted ({rem:.2f} h usable under the run cap) — earlier phases did not complete; re-run to resume')
+            all_ok = False
             break
         if not V.cuda_healthy():
             print(f'[v11] CUDA context poisoned before {pname} — aborting (re-run resumes).')
@@ -798,8 +799,13 @@ def run_full():
         all_ok = False
     all_ok &= git_push('v11: stats + REPORT_v11.md (analysis_v11)')
     guard.report()
-    print('\n[v11] ALL PHASES DONE.')
+    if all_ok:
+        print('\n[v11] ALL PHASES DONE.')
+    else:
+        print('\n[v11] INCOMPLETE — not every planned phase ran cleanly; re-run to resume (checkpoints make the re-run cheap).')
     schedule_shutdown(120 if all_ok else 2400)
+    if not all_ok:
+        sys.exit(1)
 
 def run_smoke():
     print('[smoke] 1) tiny P4MT train + probe roundtrip (seed 9, 30 steps)')
