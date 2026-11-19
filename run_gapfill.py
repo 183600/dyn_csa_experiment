@@ -522,13 +522,20 @@ def merge_long_aggregate(adir, snapshot_agg):
                     # seeds, so weighting by the two set sizes is the union.
                     w_old = n_old_all / (n_old_all + n_fresh)
                     sentry[_f] = _vo * w_old + _vn * (1.0 - w_old)
+                else:
+                    # Disjoint union but only one side carries a valid mean for
+                    # this field (e.g. snapshot predates the field); keep the
+                    # measured value instead of dropping it.
+                    sentry[_f] = _vn
             _co, _cn = (sentry.get('ppl_curve'), fentry.get('ppl_curve'))
             if _fresh_covers:
                 if _cn:
                     sentry['ppl_curve'] = _cn
                 else:
                     sentry.pop('ppl_curve', None)
-            elif _co and _cn and not _overlap_warn:
+            elif _overlap_warn:
+                print(f'[v6-merge] NOTE: `{key}` has overlapping seeds and only seed-averaged secondary/curve fields in the snapshot — those fields are left at their snapshot values instead of publishing a double-counted blend; per-seed PPL fields are exact.')
+            elif _co and _cn:
                 _cm = {}
                 for _pt in _co:
                     try:
@@ -544,8 +551,11 @@ def merge_long_aggregate(adir, snapshot_agg):
                     _acc[0] += _v * n_fresh
                     _acc[1] += n_fresh
                 sentry['ppl_curve'] = [[_s, _a / _w] for _s, (_a, _w) in sorted(_cm.items()) if _w]
-            elif _overlap_warn:
-                print(f'[v6-merge] NOTE: `{key}` has overlapping seeds and only seed-averaged secondary/curve fields in the snapshot — those fields are left at their snapshot values instead of publishing a double-counted blend; per-seed PPL fields are exact.')
+            elif _cn:
+                # Disjoint union but only the fresh aggregate carries a curve.
+                sentry['ppl_curve'] = _cn
+            elif not _co:
+                sentry.pop('ppl_curve', None)
     if _folded_keys:
         _base_full_entry = merged.get('full')
         _base_sw_entry = merged.get('full_sw128_matched')
