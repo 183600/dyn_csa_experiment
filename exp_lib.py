@@ -18922,7 +18922,7 @@ def training_knobs(*, amp_dtype='auto', eager_batch='auto'):
     }
 
 def training_knobs_fingerprint(*, amp_dtype='auto', eager_batch='auto'):
-    """Short, stable digest of the shared optimisation/training descriptor.
+    """Short, stable digest of the shared training descriptor.
 
     `run_cfg` already pins lr / wd / warmup / steps / tokens / architecture /
     data, but it deliberately does not carry the optimizer identity, betas,
