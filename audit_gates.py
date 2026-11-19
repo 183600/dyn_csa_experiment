@@ -880,8 +880,8 @@ def _row_overlap_count(train, rows, chunk_tokens=1 << 20):
             # data_guard._row_keys (str/bytes/object included).
             return len(set(DG._row_keys(train)) & set(DG._row_keys(rows)))
         # The rolling-hash subsequence match is only defined over integer
-        # token tables; a str/bytes 1-D cache must not silently report "no
-        # overlap". The caller fails the verdict closed.
+        # token tables; the caller fails the verdict closed for any other
+        # dtype.
         raise ValueError(f'_row_overlap_count: subsequence overlap is defined only over integer token tables, got dtype {train.dtype} / {rows.dtype}')
     if rows.ndim == 1:
         rows = rows.reshape(1, -1)
@@ -1080,8 +1080,8 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 try:
                     _bad = int(np.size(_arr) - np.isfinite(_arr).sum())
                 except TypeError:
-                    # str/bytes/datetime/structured caches: unverifiable, fail
-                    # closed rather than crash the whole report.
+                    # str/bytes/datetime/structured caches: unverifiable, so
+                    # record the field as absent and fail the status.
                     rec[f'nonfinite_{_name}'] = None
                     rec['status'] = 'fail'
                     _fail(f'{cd}/{tag}: {_name} split has non-numeric or uninspectable dtype {_dt} — treating the cache as malformed')
@@ -3127,8 +3127,8 @@ def _run_audit(fn, *args, **kwargs):
         return {'status': 'not_verifiable_locally',
                 'note': f'cannot import dependency required by {name} — {type(e).__name__}: {e}'}
     except Exception as e:
-        # A defect in one audit must not abort the whole report and lose every
-        # other verdict; surface it as a hard error for this section instead.
+        # An exception here is scoped to this section: report it as an error
+        # verdict and keep the remaining sections running.
         return {'status': 'error',
                 'note': f'{name} raised {type(e).__name__}: {e} — the audit did not complete; treat as unverifiable, not as pass',
                 'error_type': type(e).__name__}

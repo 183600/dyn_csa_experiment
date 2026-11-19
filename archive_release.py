@@ -371,10 +371,6 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
                 tf.add(p, arcname=rel)
                 _st2 = os.stat(p)
                 if (_st2.st_mtime_ns, _st2.st_size, _st2.st_ctime_ns, _st2.st_ino) != (_st.st_mtime_ns, _st.st_size, _st.st_ctime_ns, _st.st_ino):
-                    # The manifest is hashed before/while the member is read;
-                    # a file rewritten during packing would land in the
-                    # archive with a manifest hash of its pre-write bytes and
-                    # fail verification later. Refuse to publish instead.
                     raise RuntimeError(f'{rel} changed while the archive was being written — refusing to publish a torn release; re-run')
                 man['files'][rel] = {'sha256': _fp, 'bytes': int(_st.st_size)}
             man_bytes = json.dumps(man, ensure_ascii=False, indent=2).encode('utf-8')

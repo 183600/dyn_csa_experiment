@@ -118,10 +118,8 @@ def _load_model(path):
     try:
         d = torch.load(path, map_location='cpu', weights_only=False, mmap=True)
     except Exception:
-        # mmap=True cannot read non-zip serialisation (RuntimeError), a
-        # non-mmap-able file (TypeError), a corrupt archive (ValueError), a
-        # truncated/corrupt pickle (UnpicklingError/EOFError/BadZipFile): fall
-        # back to a plain load, and if that also fails let the caller refuse.
+        # Fall back to a plain load when the mmap path cannot serve this
+        # file; if that also fails, let the caller refuse.
         try:
             d = torch.load(path, map_location='cpu', weights_only=False)
         except Exception as _e:

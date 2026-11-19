@@ -9326,9 +9326,8 @@ def _ids_narrow(train_ids):
         except (TypeError, ValueError):
             _path = None
     if _path and train_ids.size and bool(getattr(train_ids.flags, 'writeable', True)):
-        # A writeable mapping can change under the same id; the on-disk
-        # sidecar binds to the file as of cache build time, so it can be
-        # stale. Recompute instead of serving a cached narrowing.
+        # Only a read-only disk-backed corpus is shared through the
+        # on-disk sidecar cache.
         _path = None
     if _path and train_ids.size:
         # A disk-backed corpus is mapped read-only.  Workers share one int32
@@ -13363,10 +13362,8 @@ def _as_seed_int(v):
             _s = v.decode() if isinstance(v, bytes) else v
         except (UnicodeDecodeError, TypeError, ValueError):
             return None
-        # int() also honours underscores and non-ASCII digits (int('4_0')==40,
-        # int('１２３')==123), which would make textually distinct JSON seed
-        # spellings collide; accept only plain ASCII decimal with optional
-        # sign and surrounding whitespace.
+        # Accept only plain ASCII decimal with an optional sign and
+        # surrounding whitespace.
         if not re.fullmatch(r'\s*[+-]?[0-9]+\s*', _s):
             return None
         try:
@@ -17701,9 +17698,8 @@ def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
         return out
     valid = (idx >= 0) & (idx < int(n_rows))
     if not bool(valid.all()):
-        # A dropped destination would silently shrink a per-document
-        # denominator; every caller builds in-range indices, so an invalid one
-        # is an internal inconsistency and must be loud.
+        # Callers build in-range indices; anything else is an internal
+        # inconsistency and must be loud.
         raise ValueError('_det_segment_sum: indices out of range for the destination tensor')
     if sorted_indices:
         idx_s = idx
@@ -18816,9 +18812,6 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
         # (the stats hook runs layer by layer).  Snapshot them so the retry
         # cannot count the partially-processed rows twice.
         _stats_snap = _snapshot_block_stats(model)
-        # as_tensor accepts numpy arrays AND torch tensors (CPU, CUDA, mixed)
-        # without an explicit np.asarray round-trip (which raises on CUDA
-        # tensors).
         ids = None
         try:
             ids = torch.as_tensor(val_batch[_r0:_r0 + _cur]).to(device)
@@ -19223,8 +19216,7 @@ def _check_token_batch(x, y, vocab, *, step=None):
         lo = int(x.min().item())
         hi = int(x.max().item())
     except Exception as _be:
-        # This guard's contract is fail-closed; skipping the range check on any
-        # error (e.g. CUDA OOM surfacing here) would serve a corrupt batch.
+        # Fail closed: the range check is part of the contract.
         raise RuntimeError(f'_check_token_batch: could not read the token id range (step={step}): {type(_be).__name__}: {_be}') from _be
     if lo < 0 or hi >= int(vocab):
         raise ValueError(f'batch token id range [{lo}, {hi}] outside vocab [0, {int(vocab)}) at step={step}')
@@ -19716,10 +19708,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     try:
         for step in range(steps):
             if deadline_ts is not None:
-                # Rank-unanimous stop, like the non-finite-loss path: a
-                # wall-clock deadline voted independently per rank lets one
-                # rank exit while its peer enters DDP's backward collective
-                # in the same step and hangs the job.
+                # Rank-unanimous stop, like the non-finite-loss path: the
+                # deadline is voted independently per rank so every rank
+                # takes the branch in the same step.
                 _stop_now = time.time() > deadline_ts
                 if _dist and _world > 1:
                     _st_t = torch.tensor([1 if _stop_now else 0], dtype=torch.int32, device=device)
@@ -21512,9 +21503,8 @@ class TimeGuard:
                     # would then never fill in parallel mode.
                     self.state['booked_untracked'] = max(0.0, float(self.state.get('booked_seconds', 0.0)) - sum(float(b.get('seconds', 0.0)) for b in bookings.values()))
                 if seconds > 0:
-                    # A second reservation under the same token must not drop
-                    # the first one from the recomputed total below (that
-                    # would overstate the remaining headroom); accumulate.
+                    # A second reservation under the same token accumulates
+                    # onto the first one instead of replacing it.
                     _tok = str(token)
                     _b = bookings.get(_tok)
                     if _b is not None:

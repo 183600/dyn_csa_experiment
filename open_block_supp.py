@@ -135,10 +135,9 @@ def _atomic_json(path, obj):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + f'.tmp{os.getpid()}'
     try:
-        # Use the repository's strict JSON contract: non-finite floats become null
-        # and NumPy scalars/arrays are converted, so a diagnostic value (e.g. a
-        # failed timing measurement) cannot leave an invalid NaN/Infinity token in
-        # summary.json that no strict reader can parse.
+        # Use the repository's strict JSON contract: non-finite floats become
+        # null and NumPy scalars/arrays are converted, so summary.json always
+        # holds tokens every strict reader can parse.
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(L._json_clean(obj), f, indent=2, ensure_ascii=False,
                       default=str, allow_nan=False)
