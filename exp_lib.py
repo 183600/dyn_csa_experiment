@@ -20767,7 +20767,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     loss_decreased = bool(math.isfinite(initial_loss) and math.isfinite(final_loss) and final_loss < initial_loss)
     _chance = math.log(max(int(vocab), 2))
     _initial_near_chance = bool(math.isfinite(initial_loss) and abs(float(initial_loss) - _chance) <= max(0.5 * _chance, 1.0))
-    _finite_curve = all(math.isfinite(float(v)) for v in loss_curve)
+    _loss_curve_all_finite = all(math.isfinite(float(v)) for v in loss_curve)
     # A wrong label shift or an initial loss nowhere near log(vocab) is a data
     # plumbing problem even if the model can still memorise the fixed batch, so
     # these diagnostics are part of the verdict for the next-token paths (the
@@ -20777,7 +20777,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         math.isfinite(final_loss) and final_loss <= float(target_loss)
         and final_acc >= float(target_acc) and grad_finite and params_changed
         and math.isfinite(best_loss) and best_loss <= float(target_loss)
-        and loss_decreased and _finite_curve and _nonfinite_step is None
+        and loss_decreased and _loss_curve_all_finite and _nonfinite_step is None
         and _batch_contract is not False
         and (not _label_shift_required or bool(_label_shift_ok))
         and (not _initial_chance_required or _initial_near_chance))
@@ -20838,7 +20838,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
             'parameters_changed': bool(params_changed),
             'best_loss_below_target': bool(math.isfinite(best_loss) and best_loss <= float(target_loss)),
             'loss_decreased': bool(loss_decreased),
-            'loss_curve_all_finite': bool(_finite_curve and _nonfinite_step is None),
+            'loss_curve_all_finite': bool(_loss_curve_all_finite and _nonfinite_step is None),
             'batch_contract_not_failed': bool(_batch_contract is not False),
             'labels_are_next_token_shift': (bool(_label_shift_ok) if _label_shift_required else None),
             'initial_loss_near_log_vocab': (bool(_initial_near_chance) if _initial_chance_required else None),
@@ -20847,7 +20847,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
             'labels_are_next_token_shift': _label_shift_ok,
             'batch_contract_ok': _batch_contract,
             'initial_loss_near_log_vocab': _initial_near_chance,
-            'loss_curve_all_finite': bool(_finite_curve),
+            'loss_curve_all_finite': bool(_loss_curve_all_finite),
             'grad_all_finite': bool(grad_finite),
             'params_changed': bool(params_changed),
             'loss_decreased': bool(loss_decreased),
@@ -20868,7 +20868,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         report['diagnosis'] = 'initial loss is far from log(vocab) (wrong label map, vocabulary mismatch or invalid initialisation)'
     elif _batch_contract is False:
         report['diagnosis'] = 'the explicit batch violates the shape/label contract'
-    elif not (_finite_curve and _nonfinite_step is None):
+    elif not (_loss_curve_all_finite and _nonfinite_step is None):
         report['diagnosis'] = 'the loss/gradient curve became non-finite before the target was reached'
     else:
         report['diagnosis'] = 'loss did not converge on a single repeated batch within the step limit'
