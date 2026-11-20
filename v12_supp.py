@@ -376,7 +376,8 @@ def _load_manifest(path):
             raise SystemExit(f'[v12] REFUSE: {_fld} must be an object ({_val!r})')
 
     def _int_field(value, label):
-        if isinstance(value, (bool, np.bool_)):
+        if isinstance(value, (bool, np.bool_, np.datetime64, np.timedelta64,
+                             complex, np.complexfloating)):
             raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an integer')
         if isinstance(value, numbers.Integral):
             _iv = int(value)

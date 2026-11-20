@@ -222,7 +222,8 @@ def _check_fraction(name, value):
 
 def _check_count(name, value, *, positive=False):
     """Validate an integer count without silently coercing/truncating it."""
-    if isinstance(value, (bool, np.bool_, np.datetime64, np.timedelta64)):
+    if isinstance(value, (bool, np.bool_, np.datetime64, np.timedelta64,
+                      complex, np.complexfloating)):
         raise ValueError(f'{name} must be an integer, got {value!r}')
     if isinstance(value, numbers.Integral):
         value = int(value)
@@ -257,10 +258,15 @@ def _exact_frac(v):
     Parsing through the shortest round-trip decimal spelling recovers
     7/10 for decimal inputs; integral inputs pass through exactly.
     """
+    if isinstance(v, (bool, np.bool_, np.datetime64, np.timedelta64,
+                     complex, np.complexfloating)):
+        raise ValueError(f'{v!r} is not a valid fraction')
     if isinstance(v, Fraction):
         return v
     if isinstance(v, numbers.Integral):
         return Fraction(int(v))
+    if not isinstance(v, numbers.Real):
+        raise ValueError(f'{v!r} is not a valid fraction')
     return Fraction(str(v))
 
 
