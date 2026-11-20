@@ -28,7 +28,6 @@
   methodology  受控对比 / 消融完整性 / 统计可靠性：逐臂全种子设置一致性、
                每个创新点的留一对照是否完整、n 与 mean±std（零 GPU）
   failures     失败与缺失：error 记录按臂集中度（选择偏差读数，零 GPU）
-  budget       规模核算：6ND 估算 + TimeGuard 记录对账（零 GPU）
   efficiency   prefill/decode/容量读数工具（需要模型；给出可复用函数
                与 CPU 微型演示——不是实验，是测量代码自检）
   report       汇总运行本地可执行的全部审计，输出 audit_report.json
@@ -2429,15 +2428,7 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
     return out
 
 
-# ---------------------------------------------------------------------------
-# 8) 规模核算：6ND 估算 + TimeGuard 记录对账
-# ---------------------------------------------------------------------------
-
 def train_flops_estimate(params, tokens, attn_overhead=0.35):
-    """6ND 估算 + 注意力项系数。
-
-    6·N·D 是前向+反向的常用近似；稀疏选择/池化/激活重算与长序列注意力
-    不与参数量成比例，因此用一个**显式声明的**注意力项系数。"""
     import numpy as np
     # Parameters and tokens are exact positive counts.
     n = _exact_int_scalar(params)
@@ -2468,7 +2459,6 @@ def train_flops_estimate(params, tokens, attn_overhead=0.35):
 
 
 def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.json'), panels=(('results_lm_v10_scale_s', 'csa_fixed', 8000), ('results_lm_v10_scale_l8k', 'csa_fixed', 8000), ('results_lm_v10_scale_lflop', 'csa_fixed', None))):
-    """规模核算（零 GPU）：每面板 6ND 估算与记录对账。"""
     out = {'status': 'ok', 'panels': {}}
     for d, v, steps in panels:
         _sp = os.path.join(_repo_path(d), 'summary.json')
@@ -2591,9 +2581,9 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
                 continue
             tok = _steps_i * _batch * _seq
         else:
-            # No measured token count and no derivable steps/geometry: the
-            # 6ND allocation cannot be reconciled.  Reporting status "ok"
-            # with estimate=None would present an unauditable panel as clean.
+            # No measured token count and no derivable steps/geometry:
+            # reporting status "ok" with estimate=None would present an
+            # unauditable panel as clean.
             out['status'] = 'fail'
             out.setdefault('problems', []).append(
                 f'{d}: records carry params but neither tokens_seen nor a positive step count — the FLOP allocation cannot be derived')
