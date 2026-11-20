@@ -613,12 +613,11 @@ def _run_final(base, outdir, protocol, selected):
     # would make the remaining tests look better than the study design allows.
     _named = []
     for name, st in comparison['contrasts'].items():
-        _p = st.get('p_exact_signflip')
-        try:
-            _p = float(_p)
-        except (TypeError, ValueError, OverflowError):
-            _p = float('nan')
-        _named.append((name, _p if np.isfinite(_p) else 1.0))
+        # Pass the raw measurement: holm_adjust's `_finite_scalar` contract
+        # refuses booleans/numeric strings/non-finite values and keeps an
+        # invalid declared slot in the family as p=1.  Coercing with float()
+        # here would manufacture a valid p from a stringified artifact.
+        _named.append((name, st.get('p_exact_signflip')))
     _holm = L.holm_adjust(_named, alpha=0.05) if _named else {}
     _m = len(plan)
     for name, st in comparison['contrasts'].items():

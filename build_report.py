@@ -2235,7 +2235,7 @@ def sec_training_health():
     lines = ['## Training-curve health (train/validation gap, over/under-fitting)', '',
              '> Diagnostic only. `best_val_ppl` / `best_step` are reported alongside the final number; they do not replace the pre-registered final-step endpoint.', '',
              '| panel | cell | status | best PPL @ step | final PPL | final−best | tail train slope | tail val slope | gap | curve rows | last curve 95% CI |', '|---|---|---|---|---|---|---|---|---|---|---|']
-    for name, key, rec, h in rows[:200]:
+    for name, key, rec, h in rows:
         # A malformed history is an ABSENT curve: a truthy scalar (1.5) or a
         # list whose last element is not an object is not a usable curve.
         _hist = rec.get('health_history')
@@ -2269,7 +2269,7 @@ def sec_efficiency():
     lines = ['## Measured efficiency (not analytic FLOPs)', '',
              '> Measured on the actual checkpoint/architecture with warmup + repeated runs. `prefix_prefill` is **not** incremental decode: the model has no KV cache, so each step re-runs the whole prefix.', '',
              '| panel | cell | params (M) | prefill p50/p95 ms | tokens/s | prefix-prefill p50 ms | peak alloc MB | peak reserved MB |', '|---|---|---|---|---|---|---|---|']
-    for name, key, rec, eff in rows[:200]:
+    for name, key, rec, eff in rows:
         p = rec.get('params')
         pm = (p / 1e6) if (isinstance(p, (int, float))
                            and not isinstance(p, (bool, np.bool_))

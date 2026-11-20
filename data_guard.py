@@ -958,7 +958,7 @@ def _decimal_identity(v):
         f = None
     if f is not None and math.isfinite(f):
         try:
-            if Decimal(f) == v:
+            if decimal.Decimal(f) == v:
                 # float64-exact round trip: share the numeric identity.
                 if f.is_integer() and abs(f) <= 2 ** 53:
                     return ('num', int(f))

@@ -1345,8 +1345,13 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     group = max(1, min(int(nh), int(_slab_budget) // max(1, int(_per_head_bytes))))
     dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else None
     dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else None
-    dk_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dksw else None
-    dv_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dvsw else None
+    # The returned gradient must have the exact shape of the input it belongs
+    # to.  Normally k_sw/v_sw have T rows, but with w == 0 the window lane is
+    # unused and callers may pass an empty (R, 0, nh, hd) table; autograd still
+    # requires a (R, 0, nh, hd) gradient.  Allocate from the input shape and
+    # only fold in the window contributions when the table is T rows.
+    dk_sw = torch.zeros_like(k_sw) if need_dksw else None
+    dv_sw = torch.zeros_like(v_sw) if need_dvsw else None
     dk_slab = torch.zeros((group, R * Bm, hd), device=dev, dtype=_wdt) if need_dkb else None
     dv_slab = torch.zeros((group, R * Bm, hd), device=dev, dtype=_wdt) if need_dvb else None
     dksw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=_wdt) if need_dksw else None
@@ -1502,9 +1507,9 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             dk_blk[:, :, h0:h1, :] = dk_slab[:_hg].view(_hg, R, Bm, hd).permute(1, 2, 0, 3).to(dtype)
         if dv_blk is not None:
             dv_blk[:, :, h0:h1, :] = dv_slab[:_hg].view(_hg, R, Bm, hd).permute(1, 2, 0, 3).to(dtype)
-        if dk_sw is not None:
+        if dk_sw is not None and int(dk_sw.shape[1]) == T:
             dk_sw[:, :, h0:h1, :] = dksw_slab[:_hg].view(_hg, R, T, hd).permute(1, 2, 0, 3).to(dtype)
-        if dv_sw is not None:
+        if dv_sw is not None and int(dv_sw.shape[1]) == T:
             dv_sw[:, :, h0:h1, :] = dvsw_slab[:_hg].view(_hg, R, T, hd).permute(1, 2, 0, 3).to(dtype)
     if dsink is not None:
         # The forward sanitises sink with nan_to_num; eager autograd gives
@@ -1891,8 +1896,8 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
         dq = torch.zeros_like(q) if need_dq else None
         dk_blk = torch.zeros((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else None
         dv_blk = torch.zeros((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else None
-        dk_sw = torch.zeros((R, T, nh, hd), device=dev, dtype=dtype) if need_dksw else None
-        dv_sw = torch.zeros((R, T, nh, hd), device=dev, dtype=dtype) if need_dvsw else None
+        dk_sw = torch.zeros_like(k_sw) if need_dksw else None
+        dv_sw = torch.zeros_like(v_sw) if need_dvsw else None
         dsoft = torch.zeros((R, T, nb), device=dev, dtype=dtype) if need_dsoft else None
         dsink = torch.zeros_like(sink) if need_dsink else None
         return (dq, dk_blk, dv_blk, dk_sw, dv_sw, dsoft, dsink)

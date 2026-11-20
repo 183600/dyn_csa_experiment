@@ -461,25 +461,46 @@ def run_kernel():
         print('[kernel] 基准需要 CUDA + triton（本机跳过；G0 基准判据未测量，不算通过）')
     print(f'[kernel] 数值判据：{"PASS" if not fail else "FAIL"}')
     print('[kernel] 说明：内核路径是独立变体（CSA_KERNEL 开启后 run_cfg 指纹追加 -tk1:<backend>）；S1 主面板在 G0 双判据通过前仍被 TimeGuard 拒绝启动')
-    if fail:
-        sys.exit(1)
     # The training-level layer is the one that can certify a whole panel; run
     # it only on a machine that actually has the Triton backend, and require
     # the benchmark itself to reach the gate.
-    benchmark_pass = bool(best is not None and best >= 150.0)
+    benchmark_measured = bool(tflops)
+    benchmark_pass = bool(benchmark_measured and best >= 150.0)
+    benchmark_failed = benchmark_measured and not benchmark_pass
     if 'triton' in backends:
         print('[kernel] G0 layer 3: training-level kernel/eager TOST')
         _tost = _training_tost_check(ck)
+        tost_measured = True
     else:
         _tost = {'passed': False, 'error': 'CUDA+triton not available; training-level TOST not measured'}
-    if benchmark_pass and _tost.get('passed') and not fail:
+        tost_measured = False
+    tost_pass = bool(_tost.get('passed'))
+    tost_failed = tost_measured and not tost_pass
+    if not fail and benchmark_pass and tost_pass:
         _write_g0_certificate(ck, numeric_pass=True, benchmark_pass=True,
                               best_tflops=best, training_tost=_tost)
-    else:
-        print('[kernel] G0 certificate NOT written/overwritten: ' +
-              ('numeric checks failed; ' if fail else '') +
-              ('benchmark below threshold; ' if not benchmark_pass else '') +
-              ('training-level TOST did not pass' if not _tost.get('passed') else ''))
+        return
+    reasons = []
+    if fail:
+        reasons.append('numeric checks failed')
+    if benchmark_failed:
+        reasons.append('benchmark below threshold')
+    if tost_failed:
+        reasons.append('training-level TOST did not pass')
+    if not benchmark_measured:
+        reasons.append('benchmark not measured (CUDA+triton required)')
+    if not tost_measured:
+        reasons.append('training-level TOST not measured')
+    print('[kernel] G0 certificate NOT written/overwritten: ' + '; '.join(reasons))
+    # A *measured* gate failure must downgrade any earlier passing certificate:
+    # require_g0 only inspects the file on disk, so leaving a stale "pass" there
+    # would admit an unverified panel.  Gates that were merely not measured on
+    # this machine (no CUDA/triton) do not invalidate a certificate produced on
+    # a capable machine.
+    if fail or benchmark_failed or tost_failed:
+        _write_g0_certificate(ck, numeric_pass=not fail, benchmark_pass=benchmark_pass,
+                              best_tflops=best, training_tost=_tost)
+        sys.exit(1)
 
 
 def _calibrate_panel(run_cfg, guard, panel):
