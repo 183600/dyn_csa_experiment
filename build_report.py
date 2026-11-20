@@ -544,7 +544,7 @@ def _prefer_one_cfg(items, cfg_of, who=''):
         if len(gl) == 1:
             kept.extend(gl[0][1])
             continue
-        gl.sort(key=lambda kv: (not (isinstance(kv[0], str) and _CUR_CS and kv[0].endswith(f'_cs{_CUR_CS}')), -len(kv[1])))
+        gl.sort(key=lambda kv: (not (isinstance(kv[0], str) and _CUR_CS and kv[0].endswith(f'_cs{_CUR_CS}')), -len(kv[1]), str(kv[0])))
         kept.extend(gl[0][1])
         for _cfg, lst in gl[1:]:
             dropped.extend(lst)
@@ -966,7 +966,7 @@ def sec_p0w():
     rows = _prefer_one_cfg(rows, lambda row: ((row[0], row[1]), (s.get(row[-1]) or {}).get('run_cfg')), who='sec_p0w')
     _kept_keys = {row[-1] for row in rows}
     rec_by_s = collections.defaultdict(dict)
-    for _k, _r in s.items():
+    for _k, _r in sorted(s.items()):
         if _k not in _kept_keys:
             continue
         if not (isinstance(_r, dict) and _measurable(_r)):
@@ -1139,7 +1139,7 @@ def sec_p0e():
         who='sec_p0e')
     trajs = collections.defaultdict(lambda: collections.defaultdict(dict))
     _dropped_pts = 0
-    for _k, r in _s_items:
+    for _k, r in sorted(_s_items, key=lambda kv: str(kv[0])):
         if not isinstance(r, dict):
             continue
         if not _measurable(r):

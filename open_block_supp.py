@@ -868,6 +868,17 @@ def _parse_seeds(s):
     return [int(x) for x in str(s).split(',') if str(x).strip()]
 
 
+def _analysis_dir_for(outdir):
+    # Each panel owns a distinct results_*/ directory, so it must also own a
+    # distinct analysis directory: sharing one would let a later `aux` /
+    # `extended` / `report` run silently overwrite an earlier panel's
+    # stats.json and OPEN_BLOCK_REPORT.md.
+    name = os.path.basename(str(outdir).rstrip('/'))
+    if name.startswith('results_'):
+        name = name[len('results_'):]
+    return 'analysis_' + name
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('command', choices=['smoke', 'pilot', 'main', 'aux', 'extended', 'report'])
@@ -876,7 +887,7 @@ def main():
     ap.add_argument('--seq-len', type=int, default=None)
     ap.add_argument('--outdir', default=None)
     ap.add_argument('--max-hours', type=float, default=None)
-    ap.add_argument('--analysis-dir', default='analysis_open_block')
+    ap.add_argument('--analysis-dir', default=None)
     args = ap.parse_args()
 
     if args.command == 'smoke':
@@ -885,7 +896,7 @@ def main():
     if args.command == 'report':
         outdir = args.outdir or BASE_CFG['outdir']
         analyse(outdir, seeds=_parse_seeds(args.seeds) if args.seeds else None,
-                analysis_dir=args.analysis_dir)
+                analysis_dir=args.analysis_dir or _analysis_dir_for(outdir))
         return 0
 
     if args.command in ('pilot', 'main'):
@@ -919,7 +930,8 @@ def main():
     _analysis_failed = None
     if args.command in ('main', 'aux', 'extended'):
         try:
-            analyse(cfg['outdir'], seeds=cfg['seeds'], analysis_dir=args.analysis_dir)
+            analyse(cfg['outdir'], seeds=cfg['seeds'],
+                    analysis_dir=args.analysis_dir or _analysis_dir_for(cfg['outdir']))
         except SystemExit as e:
             # The pre-registered analysis refused (fail-closed: unusable
             # records, mixed fingerprints, invalid seeds).  The training

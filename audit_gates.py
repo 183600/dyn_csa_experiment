@@ -3024,18 +3024,13 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
                 f'cell {i} ({c.get("arm")}): boolean values in numeric fields {_bool_fields}')
             continue
         def _exact_int(v):
-            if isinstance(v, (bool, np.bool_)):
+            # Canonical JSON spelling (rejects "1e1"/"1.0"/leading zeros),
+            # plus the 2**53 exactness bound that the module helper only
+            # applies to non-Integral Reals, not to plain Python ints.
+            iv = _exact_int_scalar(v)
+            if iv is None or abs(iv) >= 2 ** 53:
                 return None
-            try:
-                f = float(v)
-            except (TypeError, ValueError, OverflowError):
-                return None
-            if (not (math.isfinite(f) and f == math.floor(f))
-                    or abs(f) >= 2 ** 53):
-                # Beyond 2**53 a float cannot represent every integer, so
-                # the recorded geometry count may denote a different value.
-                return None
-            return int(f)
+            return iv
 
         _ints = {name: _exact_int(c[name]) for name in
                  ('eval_len', 'k', 'n_blocks', 'n_queries')}

@@ -281,6 +281,13 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
         return np.asarray(val_ids[jj, eval_len - target:eval_len + 1], dtype=np.int64).copy()
     ids = np.asarray(val_ids[jj, :eval_len + 1], dtype=np.int64).copy()
     k = int(round(_rho * n_far))
+    if _rho > 0.0:
+        # round() yields 0 for small far contexts and fractional rho, which
+        # would record a byte-identical (clean) row as a corrupted condition
+        # and silently make every delta-NLL/PPL contrast zero.  Any positive
+        # corruption fraction must replace at least one far token.
+        k = max(1, k)
+    k = min(k, n_far)
     if mode == 'mask':
         ids[:n_far] = MASK_TOKEN_ID
         return ids

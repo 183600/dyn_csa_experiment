@@ -18042,7 +18042,12 @@ class _PrefixStats:
         self.n_seq = 0
         self.age_sum = 0.0
         self.age_max = 0
-        self.age_p95 = []
+        # Exact integer-age histogram instead of one tensor per forward: the
+        # old list grew as O(forwards * layers * T) and forced a full cat+sort
+        # of ~100M elements at summary time.  A histogram is O(distinct ages),
+        # bounded by the position capacity, and yields the same quantiles up
+        # to float precision (the histogram form is in fact more precise).
+        self.age_p95 = {}
         self.outside_len_sum = 0.0
         self.outside_nonzero = 0
         self.prefix_len_sum = 0.0
@@ -18060,7 +18065,7 @@ class _PrefixStats:
 
     def snapshot(self):
         d = dict(self.__dict__)
-        d['age_p95'] = list(self.age_p95)
+        d['age_p95'] = dict(self.age_p95)
         return d
 
     def append_from_layer(self, geo, T, topk_idx, sel_valid, cfg, prefix_mass=None, closed_blocks=0):
@@ -18092,7 +18097,9 @@ class _PrefixStats:
             self.age_max = max(self.age_max, int(age.max().item()))
             # Ages are exact integers; store the diagnostic values as int32
             # (the summary casts to float32 only when computing the quantiles).
-            self.age_p95.append(age.detach().to(torch.int32).cpu())
+            _uv, _uc = torch.unique(age.reshape(-1).long(), return_counts=True)
+            for _v, _c in zip(_uv.tolist(), _uc.tolist()):
+                self.age_p95[int(_v)] = self.age_p95.get(int(_v), 0) + int(_c)
             self.outside_len_sum += float(outside_len.sum().item())
             self.outside_nonzero += int((outside_len > 0).sum().item())
             self.prefix_len_sum += float(geo['plen'].sum().item())
@@ -18117,9 +18124,36 @@ class _PrefixStats:
         if self.n_tok <= 0:
             return None
         try:
-            flat = torch.cat([x.reshape(-1) for x in self.age_p95]) if self.age_p95 else torch.empty(0)
-            p95 = float(torch.quantile(flat.float(), 0.95).item()) if flat.numel() else None
-            p50 = float(torch.quantile(flat.float(), 0.50).item()) if flat.numel() else None
+            if isinstance(self.age_p95, dict) and self.age_p95:
+                items = sorted(self.age_p95.items())
+                vals = [float(k) for k, _ in items]
+                counts = [int(c) for _, c in items]
+                total = sum(counts)
+
+                def _wq(q):
+                    # torch.quantile's default 'linear' rule: q*(N-1) with
+                    # interpolation between the two neighbouring order stats.
+                    pos = (total - 1) * q
+                    lo, hi = int(math.floor(pos)), int(math.ceil(pos))
+                    cum = 0
+                    vlo = vhi = None
+                    for v, c in zip(vals, counts):
+                        nxt = cum + c
+                        if vlo is None and lo < nxt:
+                            vlo = v
+                        if hi < nxt:
+                            vhi = v
+                            break
+                        cum = nxt
+                    if vlo is None:
+                        vlo = vals[-1]
+                    if vhi is None:
+                        vhi = vals[-1]
+                    return vlo + (vhi - vlo) * (pos - lo)
+
+                p95, p50 = _wq(0.95), _wq(0.50)
+            else:
+                p95 = p50 = None
         except Exception:
             p95 = p50 = None
         return {

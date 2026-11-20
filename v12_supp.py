@@ -128,6 +128,10 @@ TEST_OUTDIR = 'results_lm_test'
 FREEZE_MANIFEST = 'confirmation_frozen.json'
 PHASES = [('P5C', 'lenphase', P5C_CFG, None), ('P5MP', 'probe', P5MP_CFG, None), ('P5S2', 'run', P5S2_CFG, None), ('P5S3', 'run', P5S3_CFG, None), ('P5H', 'health', None, None), ('P5T', 'finaltest', None, None)]
 _PLAN_DONE = False
+# Keyed by the manifest that was actually preflighted: a successful check of
+# manifest A says nothing about manifest B, so a global boolean would let a
+# different (possibly rejecting) plan skip its own zero-GPU preflight.
+_PLAN_DONE_FOR = set()
 
 def run_training_health(cfg=None):
     """Pre-test health gate over the frozen arms/seeds.
@@ -302,8 +306,7 @@ def _p5c_post_access_guard():
 
 
 def run_phase(name, guard, par=None):
-    global _PLAN_DONE
-    if name in ('P5C', 'P5MP', 'P5T') and not _PLAN_DONE:
+    if name in ('P5C', 'P5MP', 'P5T') and os.path.abspath(FREEZE_MANIFEST) not in _PLAN_DONE_FOR:
         # A direct phase must not start under a plan that the P5T admission
         # gate would reject.  In particular `phase P5T` reads the held-out
         # split, so the zero-GPU plan preflight has to run before that access,
@@ -597,6 +600,12 @@ def _load_manifest(path):
         _es = comp.get('expected_sign')
         if _es is not None and str(_es).lower() not in ('positive', 'negative'):
             raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} has expected_sign={_es!r} (expected "positive", "negative", or null)')
+        if _es is not None:
+            # Validation is case-insensitive, but _power_enumeration compares
+            # the raw string with exact ==.  Canonicalise once here so the
+            # pre-access power artifact and the confirmatory direction check
+            # agree on whether the comparison is directional.
+            comp['expected_sign'] = str(_es).lower()
         if comp.get('a') not in m['arms'] or comp.get('b') not in m['arms']:
             raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} names arms {comp.get("a")!r}/{comp.get("b")!r} outside the frozen arms {m["arms"]}')
         if comp.get('a') == comp.get('b'):
@@ -618,7 +627,7 @@ def _load_manifest(path):
     _n = len(m['seeds'])
     _m_family = len(m['primary_comparisons'])
     _min_holm = L.holm_min_attainable_p(_n, _m_family, _alpha)
-    if math.isfinite(_min_holm) and _min_holm > _alpha and not _stat.get('descriptive_only'):
+    if math.isfinite(_min_holm) and _min_holm >= _alpha and not _stat.get('descriptive_only'):
         _kmin = L.signflip_min_consistency(_n, _m_family, _alpha)
         raise SystemExit(f'[v12] REFUSE: the frozen plan cannot confirm ANYTHING by construction — with n={_n} seeds, a two-sided exact sign-flip and a Holm family of m={_m_family}, the smallest attainable Holm p is {_min_holm:.4g} > alpha={_alpha} (all {_n} seeds one-sided still gives {_kmin is None and "insufficient" or f"k_min={_kmin} needed"}). This is a resolution ceiling, NOT a conservative design. Revise the plan BEFORE any test-split evaluation (add seeds / shrink the family / change the test) and record the revision in the manifest history. ({_stat.get("descriptive_only")!r})')
     if not isinstance(m.get('seeds'), list) or not all(isinstance(s, int) and (not isinstance(s, bool)) for s in m['seeds']) or len(set(m['seeds'])) != len(m['seeds']):
@@ -632,7 +641,7 @@ def _load_manifest(path):
         if _n_min < 2 or _n_min > _n:
             raise SystemExit(f'[v12] REFUSE: statistics.min_seeds_for_confirmation={_n_min} is outside [2, {_n}] — the declared confirmation floor must be reachable with the frozen seed list')
         _min_holm_floor = L.holm_min_attainable_p(_n_min, _m_family, _alpha)
-        if math.isfinite(_min_holm_floor) and _min_holm_floor > _alpha and not _stat.get('descriptive_only'):
+        if math.isfinite(_min_holm_floor) and _min_holm_floor >= _alpha and not _stat.get('descriptive_only'):
             raise SystemExit(f'[v12] REFUSE: the declared confirmation floor n={_n_min} cannot attain Holm significance (min p={_min_holm_floor:.4g} > alpha={_alpha}); raise the floor or add seeds BEFORE any test access')
     # ---- binding block.  Optional but validated when present;
     #     every record written under this manifest carries the manifest's sha256.
@@ -1761,8 +1770,11 @@ def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
         # every rejection counts.
         _same = sum(1 for s_i in signs if s_i == _power_dir)
         _dir_ok = (exp_dir is None) or (_signed * exp_dir > 0.0)
-        _rej_h = _p <= _thr_holm and _dir_ok
-        _rej_m = _p <= _thr_marginal and _dir_ok
+        # The confirmatory rule rejects on strict p < alpha (and Holm's
+        # adjusted p = m*p is likewise strict against alpha), so equality with
+        # the Holm/marginal threshold must not count as a confirmation.
+        _rej_h = _p < _thr_holm and _dir_ok
+        _rej_m = _p < _thr_marginal and _dir_ok
         if _rej_h:
             _n_reject_holm += 1
         if _rej_m:
@@ -1997,8 +2009,9 @@ def run_finaltest(cfg=None, guard=None):
     # plan_check would reject cannot consume the one-shot test.  Smoke runs use injected
     # data and are not the frozen confirmation, so they skip it.
     _smoke = L._as_bool_flag(cfg.get('smoke')) is True
-    if not _PLAN_DONE and not _smoke:
-        plan_check(cfg.get('manifest') or FREEZE_MANIFEST)
+    _manifest_path = cfg.get('manifest') or FREEZE_MANIFEST
+    if os.path.abspath(_manifest_path) not in _PLAN_DONE_FOR and not _smoke:
+        plan_check(_manifest_path)
     manifest = _load_manifest(cfg['manifest'])
     outdir = cfg['outdir']
     os.makedirs(outdir, exist_ok=True)
@@ -2876,8 +2889,15 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # a copied bylen.json alone cannot prove which plan/slice produced it.
     if unified_fp is not None:
         _lock_dir = os.path.dirname(os.path.abspath(bylen_path))
-        if not os.path.exists(_freeze_lock_path(_lock_dir)):
-            raise SystemExit(f'[v12] REFUSE: {bylen_path} has admissible confirmation records but no freeze lock in {_lock_dir} — refuse to analyse a copied result that cannot be tied to the first test-split access')
+        _lp = _freeze_lock_path(_lock_dir)
+        # A bare lock file is not enough: a pre-access attestation (which by
+        # definition does NOT prove a read, see _lock_proves_test_access) can
+        # be left behind by an aborted power gate.  Accepting it here would
+        # let a copied bylen.json launder itself into a "first access" by
+        # merely upgrading that pre-access lock to stage='accessed'.
+        if not (_lock_proves_test_access(_lp)
+                or _lock_proves_test_access(_freeze_lock_mirror_path())):
+            raise SystemExit(f'[v12] REFUSE: {bylen_path} has admissible confirmation records but no freeze lock in {_lock_dir} that proves the first test-split access (a pre-access attestation is not an access) — refuse to analyse a copied result that cannot be tied to the first test-split access')
         _adm_train_fps = {r.get('train_fp') for r in admitted.values() if isinstance(r.get('train_fp'), str) and r.get('train_fp')}
         _check_or_write_freeze_lock(_lock_dir, manifest, unified_fp, stage='accessed',
                                     train_fp=(next(iter(_adm_train_fps)) if len(_adm_train_fps) == 1 else None))
@@ -3561,8 +3581,8 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
     if _n_min < 2 or _n_min > len(seeds):
         errs.append(f'statistics.min_seeds_for_confirmation={_n_min} is outside [2, {len(seeds)}]')
     _min_holm = L.holm_min_attainable_p(_n_min, len(m['primary_comparisons']), _alpha) if _n_min >= 2 else float('inf')
-    if not math.isfinite(_min_holm) or _min_holm > _alpha:
-        errs.append(f'the pre-registered minimum n={_n_min} cannot attain Holm significance (min attainable Holm p={_min_holm:.4g} > alpha={_alpha})')
+    if not math.isfinite(_min_holm) or _min_holm >= _alpha:
+        errs.append(f'the pre-registered minimum n={_n_min} cannot attain Holm significance (min attainable Holm p={_min_holm:.4g} >= alpha={_alpha}; the confirmatory rule is strict p_holm < alpha)')
     # Predict the implementation descriptor exactly as the trainer will.
     _dev = type('_PlanCuda', (), {'type': 'cuda'})()
     _bs = int(sig.get('bs', 12))
@@ -3695,6 +3715,7 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
     for _n in notes:
         print(f'  [plan][note] {_n}')
     globals()['_PLAN_DONE'] = True
+    _PLAN_DONE_FOR.add(os.path.abspath(manifest_path or FREEZE_MANIFEST))
     return report
 
 
