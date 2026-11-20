@@ -348,10 +348,7 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
         n_seg = max(1, int(math.ceil(k / seg)))
         # Disjoint spans by construction: split the far zone into n_seg
         # equal tiles and draw one span uniformly inside each tile, so the
-        # realised coverage is exactly n_seg * seg replaced tokens (the
-        # previously independent starts overlapped and replaced ~20 % fewer
-        # tokens at rho=0.5, silently under-dosing the probe against its own
-        # documented accounting).
+        # realised coverage is exactly n_seg * seg replaced tokens.
         max_disjoint = max(1, n_far // seg)
         if n_seg > max_disjoint:
             n_seg = max_disjoint
