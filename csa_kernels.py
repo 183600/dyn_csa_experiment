@@ -1853,7 +1853,8 @@ def _attn_fwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
     triton = K.triton
     nb = topk_idx.shape[-1]
     Bm = k_blk.shape[1]
-    assert int(w) >= 1 and hd >= 16 and hd & (hd - 1) == 0, 'triton attention 前向要求 w >= 1 且 hd 为 2 的幂且 >= 16（其余形状走 ref 后端）'
+    if not (int(w) >= 1 and hd >= 16 and hd & (hd - 1) == 0):
+        raise AssertionError('triton attention 前向要求 w >= 1 且 hd 为 2 的幂且 >= 16（其余形状走 ref 后端）')
     q = q.contiguous()
     k_blk, v_blk = k_blk.contiguous(), v_blk.contiguous()
     k_sw, v_sw = k_sw.contiguous(), v_sw.contiguous()
@@ -1905,7 +1906,8 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
     if getattr(K, 'attn_fwd', None) is None:
         _attach_attn_kernels(K)
     triton = K.triton
-    assert int(w) >= 1 and hd >= 16 and hd & (hd - 1) == 0
+    if not (int(w) >= 1 and hd >= 16 and hd & (hd - 1) == 0):
+        raise AssertionError
     q = q.contiguous()
     k_blk, v_blk = k_blk.contiguous(), v_blk.contiguous()
     k_sw, v_sw = k_sw.contiguous(), v_sw.contiguous()
@@ -3052,8 +3054,10 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
             ref_i = [idx, soft] + [t.grad for t in L_]
         else:
             ker_i = [idx, soft] + [t.grad for t in L_]
-    assert torch.equal(ref_i[0].to(torch.int64), ker_i[0].to(torch.int64)), 'indexer idx 不一致（选择语义被破坏）'
-    assert torch.equal(valid_e, valid), 'indexer valid 不一致（选择语义被破坏）'
+    if not torch.equal(ref_i[0].to(torch.int64), ker_i[0].to(torch.int64)):
+        raise AssertionError('indexer idx 不一致（选择语义被破坏）')
+    if not torch.equal(valid_e, valid):
+        raise AssertionError('indexer valid 不一致（选择语义被破坏）')
     results['idxer.soft'] = mrel(ker_i[1] * valid, ref_i[1] * valid)
     for i, nm in enumerate(['gH', 'gWDQ', 'gWDK', 'gWw']):
         results[f'idxer.{nm}'] = mrel(ker_i[2 + i], ref_i[2 + i])

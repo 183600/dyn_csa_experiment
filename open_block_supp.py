@@ -851,11 +851,15 @@ def cmd_smoke(args):
     got = {k.split('::')[0] for k in summary if '::' in k}
     want = {_variant(mb, m, sc) for mb, m, sc in MAIN_MATRIX}
     missing = want - got
-    assert not missing, f'smoke cells missing: {missing}'
+    if missing:
+        raise AssertionError(f'smoke cells missing: {missing}')
     for k, r in summary.items():
-        assert isinstance(r.get('open_block_config'), dict), k
-        assert r['open_block_config'].get('layers'), k
-        assert math.isfinite(float(r['ppl'])), k
+        if not isinstance(r.get('open_block_config'), dict):
+            raise AssertionError(k)
+        if not r['open_block_config'].get('layers'):
+            raise AssertionError(k)
+        if not math.isfinite(float(r['ppl'])):
+            raise AssertionError(k)
     print(f'\n[open-block] smoke PASSED ({len(got)}/{len(want)} cells)')
     return 0
 

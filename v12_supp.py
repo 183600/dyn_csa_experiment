@@ -3737,7 +3737,8 @@ def run_smoke():
             f'[smoke] FAILED: results_smoke_v12/bylen.json is valid JSON but '
             f'not an object ({type(_bylen).__name__}); the smoke panel is corrupt')
     got = {r['variant'] for r in _bylen.values() if isinstance(r, dict)}
-    assert {'csa_fixed_rope', 'csa_fixed_rope_allblocks'} <= got, f'finaltest bylen cells missing: {got}'
+    if not ({'csa_fixed_rope', 'csa_fixed_rope_allblocks'} <= got):
+        raise AssertionError(f'finaltest bylen cells missing: {got}')
     _probe = {}
     if os.path.exists('results_smoke_v12/distractor.json'):
         with open('results_smoke_v12/distractor.json', encoding='utf-8') as _jf:
@@ -3749,8 +3750,10 @@ def run_smoke():
     _pgot = {(r.get('mode', 'uniform'), r['arm'], float(r['rho'])) for r in _probe.values() if isinstance(r, dict)}
     _pwant = {('uniform', 'learned', 0.0), ('uniform', 'learned', 0.5), ('uniform', 'dense', 0.0), ('uniform', 'dense', 0.5)}
     _pwant = {w for w in _pwant if w[1] != 'dense'}  # full_rope arm is not in the smoke manifest
-    assert _pwant <= _pgot, f'finaltest probe cells missing: {_pwant - _pgot}'
-    assert 'comparisons' in stats and stats['comparisons'], 'finaltest stats produced no comparison record'
+    if not (_pwant <= _pgot):
+        raise AssertionError(f'finaltest probe cells missing: {_pwant - _pgot}')
+    if not ('comparisons' in stats and stats['comparisons']):
+        raise AssertionError('finaltest stats produced no comparison record')
     print(f'  finaltest roundtrip OK ({len(got)} bylen arms, {len(_probe)} probe cells, {len(stats["comparisons"])} frozen comparison(s))')
     print('[smoke] 2) report builder on the smoke artifacts')
     build_report(out='results_smoke_v12/REPORT_v12.md', stats_p='results_smoke_v12/stats.json')

@@ -1614,7 +1614,8 @@ def build_niah_batch(n_seq, seq_len, n_pairs=4, vocab=8192, seed=0):
             kp = start
             vp = min(start + band // 2, start + band - 1, hay - 1)
             vp = max(vp, kp + 1)
-            assert kp < vp < hay, 'band too small for a (key,value) couple'
+            if not (kp < vp < hay):
+                raise AssertionError('band too small for a (key,value) couple')
             ids[i, kp] = keys[j]
             ids[i, vp] = vals[j]
             key_to_val[int(keys[j])] = int(vals[j])

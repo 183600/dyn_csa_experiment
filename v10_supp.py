@@ -1823,7 +1823,8 @@ def v10_analysis(out='analysis_v10/stats.json'):
         probe_cells = []
         for (v, arm, Ln, rho, mode, _pp, _cd, _recipe, _vfp), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
-            assert means, (v, arm, Ln, rho, mode)
+            if not means:
+                raise RuntimeError(f'v10 probe aggregation: empty seed set for {(v, arm, Ln, rho, mode)}')
             probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'val_fp': _val_fp_value(_vfp), 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
         contrasts = {}
 
@@ -2774,7 +2775,8 @@ def run_smoke():
     s = run_probe(pcfg, guard=None, label='v10 smoke', par=False)
     got = {(r.get('mode', 'uniform'), r['arm'], r['rho']) for r in s.values()}
     _want = {('uniform', 'learned', 0.0), ('uniform', 'learned', 0.5), ('uniform', 'randidx', 0.0), ('uniform', 'randidx', 0.5), ('uniform', 'allblocks', 0.0), ('uniform', 'allblocks', 0.5), ('natural', 'learned', 0.5), ('natural', 'randidx', 0.5), ('natural', 'allblocks', 0.5), ('mask', 'learned', 1.0), ('mask', 'randidx', 1.0), ('mask', 'allblocks', 1.0), ('delete', 'learned', 1.0), ('delete', 'randidx', 1.0), ('delete', 'allblocks', 1.0)}
-    assert _want <= got, f'probe cells missing: {_want - got} (got {sorted(got)})'
+    if not (_want <= got):
+        raise AssertionError(f'probe cells missing: {_want - got} (got {sorted(got)})')
     niah_sum = {}
     _nsp = 'results_smoke_v10/niah_natural.json'
     if os.path.exists(_nsp):
@@ -2782,7 +2784,8 @@ def run_smoke():
             niah_sum = json.load(_jf)
     _niah_got = {(r.get('arm'), r.get('condition')) for r in niah_sum.values() if isinstance(r, dict)}
     _niah_want = {('learned', 'clean'), ('learned', 'distract'), ('randidx', 'clean'), ('randidx', 'distract'), ('allblocks', 'clean'), ('allblocks', 'distract')}
-    assert _niah_want <= _niah_got, f'NIAH cells missing: {_niah_want - _niah_got} (got {sorted(_niah_got)})'
+    if not (_niah_want <= _niah_got):
+        raise AssertionError(f'NIAH cells missing: {_niah_want - _niah_got} (got {sorted(_niah_got)})')
     print(f'  probe roundtrip OK ({len(s)} corruption cells + {len(niah_sum)} NIAH cells)')
     shutil.rmtree('results_smoke_v10', ignore_errors=True)
     print('[smoke] 2) forward/backward at the two new scales + the scratch-control rope variants')
@@ -2814,7 +2817,8 @@ def run_smoke():
     print('[smoke] 2b) flop-matched steps are deterministic')
     _fs1 = _flop_matched_steps(P3SS_CFG, P3SL_CFG)
     _fs2 = _flop_matched_steps(P3SS_CFG, P3SL_CFG)
-    assert _fs1 == _fs2 and _fs1 >= 250, f'flop-matched steps not deterministic: {_fs1} vs {_fs2}'
+    if not (_fs1 == _fs2 and _fs1 >= 250):
+        raise AssertionError(f'flop-matched steps not deterministic: {_fs1} vs {_fs2}')
     print(f'  flop-matched steps OK ({_fs1})')
     print('[smoke] 3) zero-GPU analysis/report on current artifacts (scratch outputs, real artifacts untouched)')
     build_report(out='results_smoke_v10/REPORT_v10.md', stats_p='results_smoke_v10/stats.json')

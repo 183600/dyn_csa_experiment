@@ -5290,7 +5290,8 @@ class HybridAttention(nn.Module):
         self.last_boundary_logp = None
         self.last_boundary_decisions = 0
         T = x.shape[0]
-        assert cfg.kind in ('csa', 'hca'), 'dense layers go through _full_batched'
+        if cfg.kind not in ('csa', 'hca'):
+            raise AssertionError('dense layers go through _full_batched')
         scale = 1.0
         q = (pre['q'] if pre is not None else self.W_q(x)).view(T, self.nh, self.hd)
         q = F.normalize(q, dim=-1)
@@ -6919,8 +6920,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             'near_hamming_threshold': int(_dedup.near_threshold),
             'validation_cleanup': {
                 'policy': 'validation_docs_deduped_against_fit_and_train',
-                'exact_removed': int(_dedup_by_split.get('validation', {}).get('exact', 0)),
-                'near_removed': int(_dedup_by_split.get('validation', {}).get('near', 0)),
+                'exact_removed': int((_dedup_by_split.get('validation') or {}).get('exact', 0)),
+                'near_removed': int((_dedup_by_split.get('validation') or {}).get('near', 0)),
             },
         },
         'group_isolation': 'whole_documents_exact_and_near_duplicate_filtered',
@@ -8296,9 +8297,9 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 _shared_docs = int(np.intersect1d(_trd, _vad, assume_unique=True).size)
                 if _shared_docs:
                     _problems.append(f'{_shared_docs} document ids occur in both train and validation')
-                if meta.get('doc_ids', {}).get('disjoint') is not True:
+                _mdoc = meta.get('doc_ids') if isinstance(meta.get('doc_ids'), dict) else {}
+                if _mdoc.get('disjoint') is not True:
                     _problems.append('cache metadata does not attest document-level disjointness')
-                _mdoc = meta.get('doc_ids') or {}
                 # A missing fingerprint is not a pass: it cannot bind the
                 # sidecar to this cache.  WikiText already fails closed here;
                 # FineWeb must too, or swapped sidecars can be served as long
@@ -16212,7 +16213,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         report['missing_ablation_arms'] = dict(
             report['ablation_completeness'].get('missing_arms') or {})
         for _comp in report['ablation_completeness'].get('incomplete_components') or []:
-            _miss = report['ablation_completeness'].get('missing_arms', {}).get(_comp) or []
+            _miss = (report['ablation_completeness'].get('missing_arms') or {}).get(_comp) or []
             report['warnings'].append('%s: ablation is INCOMPLETE — missing arm(s) %s; this component cannot support a "useful" claim until every declared contrast is present'
                                       % (_comp, ', '.join(_miss) or '(unspecified)'))
     else:
@@ -16591,7 +16592,7 @@ def _print_methodology_audit(report):
         live = [e for e in entries if e['n_shared'] > 0]
         if not live:
             continue
-        _cv = report.get('controlled_variables', {}).get(comp, {})
+        _cv = (report.get('controlled_variables') or {}).get(comp, {}) or {}
         _kn = _cv.get('train_knobs_equal')
         _kn_s = {True: 'optimizer/schedule knobs shared', False: 'OPTIMIZER/SCHEDULE KNOBS DIFFER', None: 'optimizer/schedule knobs not recorded (absent)'}[_kn]
         print('  [%s]  %s; arms=%s' % (comp, _kn_s, ','.join(_cv.get('arms_present') or []) or 'none'))
@@ -16642,7 +16643,7 @@ def _print_methodology_audit(report):
             live = [e for e in entries if e['n_shared'] > 0]
             if not live:
                 continue
-            _pc = report.get('controlled_variables', {}).get(comp, {}).get('param_matched')
+            _pc = ((report.get('controlled_variables') or {}).get(comp, {}) or {}).get('param_matched')
             print('  [%s]  parameter-controlled=%s' % (comp, _pc))
             for e in live:
                 _p = ('%.4f' % e['p_exact_signflip']) if math.isfinite(e['p_exact_signflip']) else 'n/a'
