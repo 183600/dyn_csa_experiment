@@ -17537,7 +17537,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
     def _evidence_for_this_panel(doc, path, what):
         """Only evidence stamped with THIS panel's run_cfg may enter the
         manifest.  A run_cfg-less (hand-written) doc must say
-        ``legacy: true`` explicitly; otherwise a stale pre-flight from a reused
+        an imported-record marker explicitly; otherwise a reused
         outdir could silently certify a new configuration."""
         if doc is None:
             return None
@@ -20766,7 +20766,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     training loader when ``train_ids`` is given, passed explicitly as
     ``batch=(inputs, targets)``, or synthetic ids when neither is supplied),
     disable every regulariser (weight decay = 0, the compression penalty = 0;
-    the model has no dropout), and optimise only that batch.  A correct
+    the model has no dropout), and train only that batch.  A correct
     training path drives the LM loss towards 0 and the next-token accuracy
     towards 100%.  Failure means a serious plumbing problem (loss not connected
     to the graph, gradients not applied, wrong labels, etc.) — do NOT launch a
