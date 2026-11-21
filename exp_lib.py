@@ -22095,8 +22095,10 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     if _n_boot is None or _seed is None:
         return None
     n_boot, seed = _n_boot, _seed
+    if not isinstance(recs, list):
+        return None
     rows = []
-    for r in (recs if recs is not None else []):
+    for r in recs:
         if not isinstance(r, dict):
             return None
         nll = r.get('nll_per_row')
@@ -22184,7 +22186,17 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     component is unmeasurable (S<2, records without per-row NLL, or fewer
     than two scored documents) the status says so explicitly and the missing
     component is never silently treated as zero."""
-    _recs = list(recs) if recs is not None else []
+    if recs is None:
+        _recs = []
+    elif not isinstance(recs, list):
+        return {'status': 'invalid_options', 'n_seeds': None, 'n_docs': None,
+                'n_docs_dropped_zero_token': None, 'se_seed_logppl': None,
+                'se_doc_logppl': None, 'se_combined_logppl': None,
+                'ci95_ppl': None, 'component_ratio_seed_over_doc': None,
+                'conf': float('nan'),
+                'method': 'two-source variance combination on log-PPL (seed training noise x evaluation-document bootstrap); approximation, not a fitted hierarchical model'}
+    else:
+        _recs = recs
     _conf = _valid_alpha01(conf)
     _n_boot = _valid_bootstrap_count(n_boot, minimum=2)
     _seed = _rng_seed_int(seed)
