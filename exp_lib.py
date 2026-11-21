@@ -10744,6 +10744,18 @@ def _percentile_ci(vals, lo=2.5, hi=97.5):
         return v[i] + (v[j] - v[i]) * (pos - i)
     return [_pct(lo), _pct(hi)]
 
+def _bootstrap_power2_scale(a):
+    if a.size == 0:
+        return a, 0
+    amax = float(np.max(np.abs(a)))
+    if not (amax > 0.0 and math.isfinite(amax)):
+        return a, 0
+    _, e = math.frexp(amax)
+    if e == 0:
+        return a, 0
+    return np.ldexp(a, -e), int(e)
+
+
 def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     """Percentile bootstrap CI for the mean of i.i.d. units (e.g. documents).
 
@@ -10769,6 +10781,7 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
         return None
     if not (0.0 < c < 1.0):
         return None
+    v, _e = _bootstrap_power2_scale(v)
     rng = np.random.default_rng(sd)
     means = np.empty(nb, dtype=float)
     _chunk = max(1, min(256, _BOOTSTRAP_MAX_ELEMS // max(1, n)))
@@ -10779,8 +10792,10 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     lo_q = 100.0 * (1.0 - c) / 2.0
     hi_q = 100.0 - lo_q
     lo, hi = np.percentile(means, [lo_q, hi_q])
-    return {'n': n, 'n_boot': nb, 'seed': int(seed), 'mean': float(v.mean()),
-            'ci_low': float(lo), 'ci_high': float(hi), 'conf': c,
+    return {'n': n, 'n_boot': nb, 'seed': int(seed),
+            'mean': _unscale_power2(float(v.mean()), _e),
+            'ci_low': _unscale_power2(float(lo), _e),
+            'ci_high': _unscale_power2(float(hi), _e), 'conf': c,
             'method': 'percentile bootstrap over independent units (chunked, deterministic)'}
 
 
@@ -10794,6 +10809,7 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
     sd = _rng_seed_int(seed)
     if nb is None or sd is None:
         return None
+    d, _e = _bootstrap_power2_scale(d)
     rng = np.random.default_rng(sd)
     means = np.empty(nb, dtype=float)
     chunk = max(1, min(256, _BOOTSTRAP_MAX_ELEMS // max(1, d.size)))
@@ -10801,7 +10817,10 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
         m = min(chunk, nb - off)
         idx = rng.integers(0, d.size, size=(m, d.size))
         means[off:off + m] = d[idx].mean(axis=1)
-    return _percentile_ci(means.tolist())
+    ci = _percentile_ci(means.tolist())
+    if ci is None:
+        return None
+    return [_unscale_power2(ci[0], _e), _unscale_power2(ci[1], _e)]
 
 def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=20261018):
     a = np.asarray([f for f in (_finite_scalar(x) for x in (with_values if with_values is not None else []))
@@ -10814,6 +10833,13 @@ def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=2026
     sd = _rng_seed_int(seed)
     if nb is None or sd is None:
         return None
+    _amax = max(float(np.max(np.abs(a))), float(np.max(np.abs(b))))
+    _e = 0
+    if _amax > 0.0 and math.isfinite(_amax):
+        _, _e = math.frexp(_amax)
+        if _e:
+            a = np.ldexp(a, -_e)
+            b = np.ldexp(b, -_e)
     rng = np.random.default_rng(sd)
     diff = np.empty(nb, dtype=float)
     chunk = max(1, min(256, _BOOTSTRAP_MAX_ELEMS // max(1, max(a.size, b.size))))
@@ -10822,7 +10848,10 @@ def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=2026
         ai = rng.integers(0, a.size, size=(m, a.size))
         bi = rng.integers(0, b.size, size=(m, b.size))
         diff[off:off + m] = a[ai].mean(axis=1) - b[bi].mean(axis=1)
-    return _percentile_ci(diff.tolist())
+    ci = _percentile_ci(diff.tolist())
+    if ci is None:
+        return None
+    return [_unscale_power2(ci[0], _e), _unscale_power2(ci[1], _e)]
 
 _WILCOXON_EXACT_MAX_N = 200
 
@@ -13512,6 +13541,7 @@ def read_panel(outdir):
         return {}
     _legacy_ok = legacy_warm_tags(raw)
     _by_id = {}
+    _ambiguous = set()
     for _k, r in raw.items():
         if not isinstance(r, dict) or r.get('seed') is None:
             continue
@@ -13520,8 +13550,13 @@ def read_panel(outdir):
         _id = _record_identity(r, _k, _legacy_ok)
         if _id is None:
             continue
+        if _id in _ambiguous:
+            print(f'[stats] WARNING: {sp}: more than two measurable records for variant={_id[0]!r} protocol={_id[1]!r} seed={_id[2]} (key {_k!r}) — the slot stays excluded')
+            continue
         if _id in _by_id:
-            print(f'[stats] WARNING: {sp}: two measurable records for variant={_id[0]!r} protocol={_id[1]!r} seed={_id[2]} (keys {_by_id[_id][0]!r}, {_k!r}) — the PPL is AMBIGUOUS and no averaging can resolve it; the earlier key is used, the later one is EXCLUDED')
+            print(f'[stats] WARNING: {sp}: two measurable records for variant={_id[0]!r} protocol={_id[1]!r} seed={_id[2]} (keys {_by_id[_id][0]!r}, {_k!r}) — the PPL is AMBIGUOUS and no averaging can resolve it; the whole slot is EXCLUDED rather than choosing an order-dependent winner')
+            _by_id.pop(_id, None)
+            _ambiguous.add(_id)
             continue
         _by_id[_id] = (_k, r)
     return _by_id

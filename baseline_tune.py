@@ -79,9 +79,9 @@ def _mean_std(values):
     vals = [float(v) for v in values if L.ppl_is_usable(v)]
     if not vals:
         return float('nan'), float('nan')
-    mean = float(np.mean(vals))
-    std = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
-    return mean, std
+    if len(vals) == 1:
+        return vals[0], 0.0
+    return L._stable_mean_std(vals)
 
 
 def _protocol_arm_groups(protocol, base, arms):

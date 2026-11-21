@@ -190,6 +190,8 @@ def _unhashable_identity(value):
     if isinstance(value, (set, frozenset)):
         return ('set', tuple(sorted((_unhashable_identity(x) for x in value),
                                     key=repr)))
+    if isinstance(value, numbers.Real):
+        return _real_identity(value)
     try:
         hash(value)
     except TypeError:
@@ -948,6 +950,59 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
         n, train_frac, val_frac, test_frac,
         train_size=train_size, val_size=val_size, test_size=test_size,
         purge=purge)
+
+
+def _float64_exact(v):
+    """True iff v round-trips exactly through float64 (shares its identity)."""
+    if v is None:
+        return True
+    if isinstance(v, numbers.Integral):
+        return abs(int(v)) <= 2 ** 53
+    try:
+        f = float(v)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    if math.isnan(f):
+        return True
+    if math.isinf(f):
+        try:
+            return bool(v == f)
+        except Exception:
+            return False
+    try:
+        return bool(v == f)
+    except Exception:
+        return False
+
+
+def _real_identity(v):
+    """Canonical identity for a numbers.Real outside int/float/Decimal.
+
+    An exactly float64-representable value shares the ('num', ...) identity of
+    its int/float twin (Fraction(1, 2) == 0.5); a wider or inexact value keeps
+    an exact spelling so distinct values never collapse into one group/cell.
+    """
+    try:
+        f = float(v)
+    except (OverflowError, TypeError, ValueError):
+        return ('wide', repr(v))
+    if math.isnan(f):
+        return ('nan',)
+    if math.isinf(f):
+        try:
+            if not math.isinf(v):
+                return ('wide', repr(v))
+        except Exception:
+            return ('wide', repr(v))
+        return ('inf', 1 if f > 0 else -1)
+    try:
+        if v != f:
+            return ('wide', repr(v))
+    except Exception:
+        return ('wide', repr(v))
+    if f.is_integer():
+        return ('num', int(f))
+    return ('num', f)
 
 
 def _decimal_identity(v):
@@ -2032,6 +2087,8 @@ def _canonical_object_cell(v):
     if isinstance(v, (set, frozenset)):
         return ('set', tuple(sorted((_canonical_object_cell(x) for x in v),
                                     key=repr)))
+    if isinstance(v, numbers.Real):
+        return _real_identity(v)
     try:
         hash(v)
     except TypeError:
@@ -2108,6 +2165,8 @@ def _matrix_fingerprint(X):
             _obj_canon = True
         elif any(isinstance(v, np.longdouble) for v in _vals):
             # Extended-precision cells are not float64-exact in general.
+            _obj_canon = True
+        elif any(not _float64_exact(v) for v in _vals):
             _obj_canon = True
     _integral = _integral or _obj_int
     _wide_int = False
@@ -2335,6 +2394,8 @@ def _row_keys(X):
             if isinstance(v, (set, frozenset)):
                 return ('set', tuple(sorted((_cell_key(x) for x in v),
                                             key=repr)))
+            if isinstance(v, numbers.Real):
+                return _real_identity(v)
             try:
                 hash(v)
             except TypeError:

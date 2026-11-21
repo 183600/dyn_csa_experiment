@@ -161,8 +161,27 @@ def sample_std(vals):
     n = len(vals)
     if n < 2:
         return float('nan')
-    mu = sum(vals) / n
-    return (sum(((v - mu) ** 2 for v in vals)) / (n - 1)) ** 0.5
+    a = np.asarray(vals, dtype=float)
+    if not np.all(np.isfinite(a)):
+        ref = float(a[0])
+        shifted = a - ref
+        mu = float(shifted.mean())
+        ss = float(((shifted - mu) ** 2).sum())
+        return math.sqrt(ss / (n - 1))
+    amax = float(np.max(np.abs(a)))
+    if amax == 0.0:
+        return 0.0
+    _, e = math.frexp(amax)
+    scaled = np.ldexp(a, -e) if e else a
+    mu = float(scaled.mean())
+    ss = float(((scaled - mu) ** 2).sum())
+    std = math.sqrt(ss / (n - 1))
+    if not e:
+        return std
+    try:
+        return math.ldexp(std, e)
+    except OverflowError:
+        return float('inf')
 
 def _signflip_mitm_count(deltas):
     """Exact sign-assignment count by meet-in-the-middle (NumPy).
@@ -1141,6 +1160,7 @@ def sec_p0e():
         lambda kv: (_record_variant(kv[1], kv[0]), kv[1].get('run_cfg')),
         who='sec_p0e')
     trajs = collections.defaultdict(lambda: collections.defaultdict(dict))
+    _ambig_traj = collections.defaultdict(set)
     _dropped_pts = 0
     for _k, r in sorted(_s_items, key=lambda kv: str(kv[0])):
         if not isinstance(r, dict):
@@ -1159,15 +1179,21 @@ def sec_p0e():
             if _vname is None:
                 print(f"[report] sec_p0e: record {_k!r} carries a non-text variant ({r.get('variant')!r}) — skipped")
                 continue
+            _slot = (_vname, int(step))
             _cell = trajs[_vname][int(step)]
+            if _sdv in _ambig_traj[_slot]:
+                continue
             if _sdv in _cell:
-                print(f"[report] sec_p0e: ambiguous (variant, step, seed) = ({_vname!r}, {int(step)}, {_sdv}): two measurable points found; keeping the FIRST")
+                print(f"[report] sec_p0e: ambiguous (variant, step, seed) = ({_vname!r}, {int(step)}, {_sdv}): two measurable points found; the slot is EXCLUDED rather than choosing an order-dependent winner")
+                _cell.pop(_sdv, None)
+                _ambig_traj[_slot].add(_sdv)
                 continue
             _cell[_sdv] = float(pv)
     if _dropped_pts:
         lines += ['', f'> **⚠ 轨迹表剔除了 {_dropped_pts} 个非有限/非正的 PPL 曲线点**（单次失败的 eval），它们不再参与 seed 平均、尾段斜率与下方结论的判定。', '']
     if 'csa_fixed' in trajs and 'full' in trajs:
-        steps = sorted(set(trajs['csa_fixed']) & set(trajs['full']))
+        steps = sorted(st for st in (set(trajs['csa_fixed']) & set(trajs['full']))
+                       if trajs['csa_fixed'][st] and trajs['full'][st])
         if steps:
             lines += ['', '**验证 PPL 轨迹（seed 平均，每 2000 步）**：', '', '| step | csa_fixed | full | gap (csa−full) |', '|---|---|---|---|']
             gaps = {}
@@ -1656,6 +1682,7 @@ def sec_p1l():
         for Ln in lens:
             recs_l = []
             _seen_sd = set()
+            _ambiguous_sd = set()
             for _r in _recs_by_v.get(v, []):
                 _bl = _r.get('by_len') or {}
                 _c = _cell_at(_bl, Ln)
@@ -1664,8 +1691,14 @@ def sec_p1l():
                     if _sd is None:
                         print(f"[report] sec_p1l: {v} L{Ln}: record with a non-integer seed ({_r.get('seed')!r}) is skipped, not counted")
                         continue
+                    if _sd in _ambiguous_sd:
+                        print(f'[report] sec_p1l: ambiguous (variant, seed) = ({v!r}, {_sd}) at L{Ln}: more than two measurable records found; the whole slot stays excluded')
+                        continue
                     if _sd in _seen_sd:
-                        print(f'[report] sec_p1l: ambiguous (variant, seed) = ({v!r}, {_sd}) at L{Ln}: two measurable records found; keeping the FIRST')
+                        print(f'[report] sec_p1l: ambiguous (variant, seed) = ({v!r}, {_sd}) at L{Ln}: two measurable records found; the slot is EXCLUDED rather than choosing an order-dependent winner')
+                        _seen_sd.discard(_sd)
+                        recs_l[:] = [_x for _x in recs_l if _x[0] != _sd]
+                        _ambiguous_sd.add(_sd)
                         continue
                     _seen_sd.add(_sd)
                     recs_l.append((_sd, _c))

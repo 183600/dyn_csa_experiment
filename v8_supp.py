@@ -192,7 +192,8 @@ def _panel_block(panel):
         if not vals:
             out[v] = {'ppls': ppl_map, 'n': 0, **({'_stale_cfg': True} if _stale_cfg else {})}
             continue
-        out[v] = {'ppls': ppl_map, 'mean': float(np.mean(vals)), 'std': float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0, 'n': len(vals), **({'_stale_cfg': True} if _stale_cfg else {})}
+        _m, _sd = L._stable_mean_std(vals) if len(vals) > 1 else (vals[0], 0.0)
+        out[v] = {'ppls': ppl_map, 'mean': _m, 'std': _sd, 'n': len(vals), **({'_stale_cfg': True} if _stale_cfg else {})}
     return out
 
 def v8_analysis(out='analysis_v8/stats.json'):

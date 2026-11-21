@@ -1310,6 +1310,7 @@ def _hist_by_seed(outdir, variant, raw=None):
             self.per_seed_synth = {}
     out = _Curves()
     synth_of = {}
+    _ambiguous = set()
     if raw is None:
         if not os.path.exists(sp):
             return out
@@ -1333,6 +1334,8 @@ def _hist_by_seed(outdir, variant, raw=None):
         s = L._as_seed_int(_s_raw)
         if s is None:
             print(f'[v10 stats] {_k} has no usable `seed` ({_s_raw!r}); its curve cannot be attributed and is skipped')
+            continue
+        if s in _ambiguous:
             continue
         try:
             _fp_parts = []
@@ -1394,7 +1397,14 @@ def _hist_by_seed(outdir, variant, raw=None):
                         seen.pop(_fp_old)
                 print(f'[stats] {sp}: two records with DIFFERENT curves both claim ({variant}, seed {s}); keeping the one stamped with the CURRENT code semantics and dropping the older-stamped one (the older reading would be excluded as stale anyway).')
             else:
-                print(f'[stats] {sp}: two records with DIFFERENT curves both claim ({variant}, seed {s}) — the gap trajectory is ambiguous; the first record is kept and this one is dropped')
+                print(f'[stats] {sp}: two records with DIFFERENT curves both claim ({variant}, seed {s}) — the gap trajectory is ambiguous; the whole seed slot is EXCLUDED rather than choosing an order-dependent winner')
+                out.pop(s, None)
+                synth_of.pop(s, None)
+                cfg_of.pop(s, None)
+                for _fp_old, _s_old in list(seen.items()):
+                    if _s_old == s:
+                        seen.pop(_fp_old)
+                _ambiguous.add(s)
                 continue
         seen[fp] = s
         synth_of[s] = bool(r.get('synthesized'))

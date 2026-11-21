@@ -172,6 +172,34 @@ def _axis_steps(histories):
             return []
     return sorted(common)
 
+def _finite_mean_std(a):
+    if a.size == 0:
+        return float('nan'), float('nan')
+    amax = float(np.max(np.abs(a)))
+    if amax == 0.0:
+        return 0.0, 0.0
+    _, e = math.frexp(amax)
+    scaled = np.ldexp(a, -e) if e else a
+    mu = float(scaled.mean())
+    if not e:
+        mean = mu
+    else:
+        try:
+            mean = math.ldexp(mu, e)
+        except OverflowError:
+            mean = math.copysign(float('inf'), mu)
+    if a.size <= 1:
+        return mean, 0.0
+    ss = float(((scaled - mu) ** 2).sum())
+    std = math.sqrt(ss / (a.size - 1))
+    if not e:
+        return mean, std
+    try:
+        return mean, math.ldexp(std, e)
+    except OverflowError:
+        return mean, math.copysign(float('inf'), std)
+
+
 def sample_std(deltas, axis=None):
     d = np.asarray(deltas, dtype=float)
     if axis is None:
@@ -180,7 +208,7 @@ def sample_std(deltas, axis=None):
         # bitwise-identical.
         if not np.isfinite(d).all():
             d = d[np.isfinite(d)]
-        return float(np.std(d, ddof=1)) if d.size > 1 else 0.0
+        return _finite_mean_std(d)[1] if d.size else 0.0
     if isinstance(axis, (bool, np.bool_)) or not isinstance(axis, (int, np.integer)):
         # A boolean flag is not an axis: int(True) == 1 would silently reduce
         # over the second dimension instead of refusing the malformed request.
@@ -197,7 +225,7 @@ def sample_std(deltas, axis=None):
     out = np.zeros(srt.shape[1])
     for j in range(srt.shape[1]):
         col = srt[:, j][np.isfinite(srt[:, j])]
-        out[j] = float(np.std(col, ddof=1)) if col.size > 1 else 0.0
+        out[j] = _finite_mean_std(col)[1] if col.size else 0.0
     return out.reshape(out_shape)
 
 def _row_nanmean(M):
@@ -223,7 +251,7 @@ def _lay_nanmean(M):
 def _finite_mean(v):
     v = np.asarray(v, dtype=float)
     v = v[np.isfinite(v)]
-    return float(v.mean()) if v.size else float('nan')
+    return _finite_mean_std(v)[0] if v.size else float('nan')
 
 def main(argv=None):
     if argv is None:

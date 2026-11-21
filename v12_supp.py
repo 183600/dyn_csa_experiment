@@ -2560,13 +2560,16 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
                         else math.log(fa) - math.log(fb))
         if not cell:
             continue
-        doc_deltas.append(float(np.mean(cell)))
-        doc_log_ratios.append(float(np.mean(logs)))
-        within.append(float(np.std(cell, ddof=1)) if len(cell) > 1 else 0.0)
+        doc_deltas.append(L._stable_mean_std(cell, ddof=1)[0])
+        doc_log_ratios.append(L._stable_mean_std(logs, ddof=1)[0])
+        within.append(L._stable_mean_std(cell, ddof=1)[1] if len(cell) > 1 else 0.0)
     if len(doc_deltas) < 2:
         return None
     arr = np.asarray(doc_deltas, dtype=float)
     lr = np.asarray(doc_log_ratios, dtype=float)
+    _md, _sdd = L._stable_mean_std(doc_deltas, ddof=1)
+    _mlr, _sdlr = L._stable_mean_std(doc_log_ratios, ddof=1)
+    _mw = L._stable_mean_std(within, ddof=0)[0]
     # Seed-level sign-flip remains the confirmatory test.  These intervals
     # condition on the trained seeds and quantify only DOCUMENT sampling:
     # with n_seqs=16 they are a property of the frozen slice, not of the
@@ -2575,11 +2578,11 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     _ci_ppl = L.bootstrap_mean_ci(arr, seed=20261018)
     _ci_log = L.bootstrap_mean_ci(lr, seed=20261018)
     return {'n_docs': int(len(doc_deltas)), 'n_seeds': len(common),
-            'per_doc_delta_mean': float(arr.mean()),
-            'per_doc_log_ratio_mean': float(lr.mean()),
-            'between_doc_sd': float(arr.std(ddof=1)) if len(doc_deltas) > 1 else 0.0,
-            'between_doc_log_ratio_sd': float(lr.std(ddof=1)) if len(doc_log_ratios) > 1 else 0.0,
-            'mean_within_doc_seed_sd': float(np.mean(within)),
+            'per_doc_delta_mean': _md,
+            'per_doc_log_ratio_mean': _mlr,
+            'between_doc_sd': _sdd if len(doc_deltas) > 1 else 0.0,
+            'between_doc_log_ratio_sd': _sdlr if len(doc_log_ratios) > 1 else 0.0,
+            'mean_within_doc_seed_sd': _mw,
             'per_doc_delta_ppl_ci95': ([_ci_ppl['ci_low'], _ci_ppl['ci_high']] if _ci_ppl else None),
             'per_doc_log_ratio_ci95': ([_ci_log['ci_low'], _ci_log['ci_high']] if _ci_log else None),
             'incomplete_doc_seed_cells': int(incomplete),
