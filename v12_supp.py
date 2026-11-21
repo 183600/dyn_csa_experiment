@@ -95,6 +95,9 @@ def make_guard():
                 try:
                     with open(src, encoding='utf-8') as _jf:
                         st = json.load(_jf)
+                    if not isinstance(st, dict):
+                        print(f'[v12] NOTE: {src} is not a JSON object — leaving calibration unread')
+                        continue
                     sbc = st.get('sps_by_class') or {}
                     norm = st.get('norm_sps')
                     if not sbc and norm is None:
@@ -2043,6 +2046,8 @@ def run_finaltest(cfg=None, guard=None):
         try:
             with open(cfg['mech_summary'], encoding='utf-8') as _jf:
                 _ms = json.load(_jf)
+            if not isinstance(_ms, dict):
+                _ms = {}
         except Exception:
             _ms = {}
         for _v in manifest['arms']:
@@ -3267,6 +3272,8 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         try:
             with open(FREEZE_MANIFEST, encoding='utf-8') as _jf:
                 _mc = json.load(_jf)
+            if not isinstance(_mc, dict):
+                raise TypeError(f'freeze manifest is {type(_mc).__name__}, not an object')
             m = {'frozen_at': _mc.get('frozen_at'), 'manifest_sha256': None, 'arms': _mc.get('arms'), 'seeds': _mc.get('seeds'), 'code_semantics_expected': _mc.get('code_semantics_expected'), 'statistics': _mc.get('statistics'), 'scope': _mc.get('scope'), 'revision': _mc.get('revision')}
         except Exception:
             pass
@@ -3292,8 +3299,11 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         try:
             with open(FREEZE_MANIFEST, encoding='utf-8') as _jf:
                 _mc = json.load(_jf)
-            for c in _mc.get('primary_comparisons', []):
-                A(f"| {c.get('name', '?')} — {c.get('a')} vs {c.get('b')} @ {c.get('endpoint', '?')} |")
+            if not isinstance(_mc, dict):
+                raise TypeError(f'freeze manifest is {type(_mc).__name__}, not an object')
+            for c in _mc.get('primary_comparisons', []) or []:
+                if isinstance(c, dict):
+                    A(f"| {c.get('name', '?')} — {c.get('a')} vs {c.get('b')} @ {c.get('endpoint', '?')} |")
         except Exception:
             A('| （冻结清单不可读——见运行日志） |')
         A('')

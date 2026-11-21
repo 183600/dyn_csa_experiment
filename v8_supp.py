@@ -38,6 +38,9 @@ def make_guard():
         try:
             with open('run_time_state_v7.json', encoding='utf-8') as _jf:
                 st = json.load(_jf)
+            if not isinstance(st, dict):
+                print('[v8] NOTE: run_time_state_v7.json is not a JSON object — leaving the guard uncalibrated')
+                return g
             _sbc = st.get('sps_by_class') or {}
             _norm = st.get('norm_sps')
             if not _sbc and _norm is None:

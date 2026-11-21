@@ -44,6 +44,9 @@ def make_guard():
                 try:
                     with open(src, encoding='utf-8') as _jf:
                         st = json.load(_jf)
+                    if not isinstance(st, dict):
+                        print(f'[v11] NOTE: {src} is not a JSON object — leaving calibration unread')
+                        continue
                     sbc = st.get('sps_by_class') or {}
                     norm = st.get('norm_sps')
                     if not sbc and norm is None:

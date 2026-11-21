@@ -2796,6 +2796,8 @@ def run_smoke():
     if os.path.exists(_nsp):
         with open(_nsp, encoding='utf-8') as _jf:
             niah_sum = json.load(_jf)
+    if not isinstance(niah_sum, dict):
+        raise AssertionError(f'NIAH summary is {type(niah_sum).__name__}, not a JSON object')
     _niah_got = {(r.get('arm'), r.get('condition')) for r in niah_sum.values() if isinstance(r, dict)}
     _niah_want = {('learned', 'clean'), ('learned', 'distract'), ('randidx', 'clean'), ('randidx', 'distract'), ('allblocks', 'clean'), ('allblocks', 'distract')}
     if not (_niah_want <= _niah_got):

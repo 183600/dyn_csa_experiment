@@ -6600,6 +6600,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         train_ids = np.load(tr_path, mmap_mode='r')
         with open(me_path, encoding='utf-8') as _jf:
             meta = json.load(_jf)
+        if not isinstance(meta, dict):
+            meta = {}
         val_batch = np.load(va_path)
         val_bnd = np.load(vp_path)
         _sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path})
@@ -6608,6 +6610,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                                            meta.get('vocab'), seq_len=seq_len,
                                            fingerprints_trusted=False,
                                            ranges_trusted=_fast)
+        if not meta:
+            _problems.append('cache meta is not a JSON object')
         if meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget':
             _problems.append('cache does not attest the frozen train-prefix tokenizer fit')
         if meta.get('tokenizer_fit_docs_in_train_prefix') is not True:
@@ -6712,13 +6716,18 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         if _problems:
             _cache_warning('WikiText train/validation split', _problems)
         else:
-            if 'val_fp' not in meta:
-                print('[data] NOTE: this cache has no validation fingerprint; its file bytes are range/shape-checked but its split membership cannot be independently re-derived.')
-            audit_corpus_split(train_ids, val_batch, int(meta['vocab']),
-                               dataset='wikitext', meta=meta)
-            _out = (train_ids, val_batch, int(meta['vocab']), None, val_bnd)
-            _memo_put(_WT103_MEMO, _mkey, _out, _WT103_MEMO_CAP)
-            return _out
+            _vocab = _as_seed_int(meta.get('vocab'))
+            if _vocab is None or _vocab <= 0:
+                _cache_warning('WikiText train/validation split',
+                               [f"cache vocab {meta.get('vocab')!r} is not a positive exact integer"])
+            else:
+                if 'val_fp' not in meta:
+                    print('[data] NOTE: this cache has no validation fingerprint; its file bytes are range/shape-checked but its split membership cannot be independently re-derived.')
+                audit_corpus_split(train_ids, val_batch, _vocab,
+                                   dataset='wikitext', meta=meta)
+                _out = (train_ids, val_batch, _vocab, None, val_bnd)
+                _memo_put(_WT103_MEMO, _mkey, _out, _WT103_MEMO_CAP)
+                return _out
     ds = local_wikitext_if_available(cache_dir)
     if ds is None:
         last_err = None
@@ -7090,6 +7099,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         test_ids = np.load(te_path)
         with open(me_path, encoding='utf-8') as _jf:
             meta = json.load(_jf)
+        if not isinstance(meta, dict):
+            meta = {}
         test_bnd = np.load(tb_path)
         test_doc_ids = None
         if os.path.exists(td_path):
@@ -7102,6 +7113,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         else:
             _problems_td = None
         _problems = []
+        if not meta:
+            _problems.append('test cache meta is not a JSON object')
         if _problems_td:
             _problems.append(_problems_td)
         _sigs = _cache_file_sigs(_sig_paths)
@@ -8274,6 +8287,8 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         print('[data] loading cached fineweb token ids ...')
         with open(me_path, encoding='utf-8') as _jf:
             meta = json.load(_jf)
+        if not isinstance(meta, dict):
+            meta = {}
         train_ids = _npy_serve_int32(tr_path)
         _sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path,
                                   'train_doc_ids': trd_path, 'val_doc_ids': vad_path})
@@ -8289,6 +8304,8 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                                                meta.get('vocab'), seq_len=seq_len,
                                                fingerprints_trusted=False,
                                                ranges_trusted=_fast)
+            if not meta:
+                _problems.append('cache meta is not a JSON object')
             try:
                 _trd = np.load(trd_path)
                 _vad = np.load(vad_path)
@@ -8339,13 +8356,18 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             if _problems:
                 _cache_warning('FineWeb train/validation split', _problems)
             else:
-                if 'val_fp' not in meta:
-                    print('[data] NOTE: this FineWeb cache has no validation fingerprint; shape/range checks passed but split membership cannot be independently re-derived.')
-                audit_corpus_split(train_ids, val_batch, int(meta['vocab']),
-                                   dataset='fineweb', meta=meta)
-                _out = (train_ids, val_batch, int(meta['vocab']), None, val_bnd)
-                _memo_put(_FWEB_MEMO, _mkey, _out, _FWEB_MEMO_CAP)
-                return _out
+                _vocab = _as_seed_int(meta.get('vocab'))
+                if _vocab is None or _vocab <= 0:
+                    _cache_warning('FineWeb train/validation split',
+                                   [f"cache vocab {meta.get('vocab')!r} is not a positive exact integer"])
+                else:
+                    if 'val_fp' not in meta:
+                        print('[data] NOTE: this FineWeb cache has no validation fingerprint; shape/range checks passed but split membership cannot be independently re-derived.')
+                    audit_corpus_split(train_ids, val_batch, _vocab,
+                                       dataset='fineweb', meta=meta)
+                    _out = (train_ids, val_batch, _vocab, None, val_bnd)
+                    _memo_put(_FWEB_MEMO, _mkey, _out, _FWEB_MEMO_CAP)
+                    return _out
     rows = _fineweb_docs(source)
     _dedup = _DocDeduplicator()
     _skipped = {'fit': {'exact': 0, 'near': 0},
