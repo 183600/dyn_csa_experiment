@@ -12023,7 +12023,7 @@ def main():
     _check('N48 split audit rejects a flat validation batch', t_split_audit_rejects_flat_validation)
     _check('N49 seed recovery keeps seed-averaged fields consistent', t_seed_recovery_keeps_seed_averaged_fields_consistent)
     _check('N50 error-analysis provenance + archive required-file symlinks', t_error_compare_and_archive_fail_closed)
-    _check('N51 report keeps key-only legacy variant records', t_report_keeps_key_only_variant)
+    _check('N51 report keeps key-only variant records', t_report_keeps_key_only_variant)
     _check('N52 fail-closed edges: corpus/TimeGuard/seed metadata/audits/merge/kernel', t_fail_closed_edge_cases)
     _check('N53 composite temporal identity + exact checkpoint geometry', t_composite_identity_and_checkpoint_geometry)
     _check('N54 ngram public entry points reject float token ids', t_ngram_public_entry_points_reject_float_ids)
