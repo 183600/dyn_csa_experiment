@@ -21692,14 +21692,8 @@ class TimeGuard:
             else:
                 bookings = self.state.setdefault('bookings', {})
                 if 'booked_untracked' not in self.state:
-                    # First tokenised booking coexisting with a pre-bookings
-                    # state (e.g. the parent's data-load record_run, or any
-                    # serial phase that ran before this parallel one): every
-                    # second booked so far has no per-token representation,
-                    # so it ALL becomes the untracked remainder.  Defaulting
-                    # it to 0 would erase those seconds from the
-                    # booked total on the next refund's recompute — the cap
-                    # would then never fill in parallel mode.
+                    # With no prior booked_untracked field, all earlier booked
+                    # seconds are the untracked remainder.
                     self.state['booked_untracked'] = max(0.0, float(self.state.get('booked_seconds', 0.0)) - sum(float(b.get('seconds', 0.0)) for b in bookings.values()))
                 if seconds > 0:
                     # A second reservation under the same token accumulates
@@ -21774,14 +21768,7 @@ class TimeGuard:
                 b = bookings[tok]
                 est_s = float(b.get('seconds', 0.0))
                 dead = not self._pid_alive(b.get('pid', -1))
-                # A live child can hold a booking for at most its dispatcher
-                # watchdog horizon (par.py SIGKILLs run/warm/lenphase cells at
-                # max(3*est, est+1h); every other kind is capped at 12 h).  A
-                # booking older than that CANNOT have a live owner: the pid
-                # reading is a reuse artifact (an instance reboot recycles
-                # pids — this driver's own auto-shutdown makes that the common
-                # case), and without an age fallback the phantom reservation
-                # would starve every later cell behind the cap forever.
+                # A booking older than the dispatcher horizon has no live owner.
                 horizon = max(4.0 * est_s, 13.0 * 3600.0)
                 too_old = b.get('ts') is not None and (now - float(b['ts'])) > horizon
                 if dead or too_old:

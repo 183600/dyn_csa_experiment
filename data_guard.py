@@ -3269,9 +3269,7 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
     if not ref:
         # With no reference vocabulary every holdout category is unseen: the
         # two sides are disjoint distributions, i.e. the supremum JS (ln 2)
-        # and TV=1, exactly as for any non-empty disjoint comparison.  Letting
-        # the zero-mass reference histogram fall through would report only
-        # half that divergence (JS=ln2/2, TV=0.5) despite unseen_rate=1.0.
+        # and TV=1, exactly as for any non-empty disjoint comparison.
         return {'js_divergence': math.log(2.0), 'js_divergence_normalized': 1.0,
                 'total_variation': 1.0,
                 'n_reference': 0, 'n_holdout': len(hold),

@@ -1732,9 +1732,6 @@ def audit_attribution(outdirs=None):
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no results_*/summary.json on this machine — the attribution readout needs the experiment artifacts; the collection hooks are already wired (enable_block_stats / attn._stats per design_notes §14)'
     if _block_count_mismatch and out['status'] == 'ok':
-        # A fixed-vs-dynamic contrast whose block counts differ is confounded:
-        # it cannot attribute the effect to blocking alone, so it must not be
-        # presented as a clean ("ok") attribution audit.
         out['status'] = 'warn'
         _note = out.get('note') or ''
         out['note'] = (_note + ' ' if _note else '') + (
@@ -3147,11 +3144,7 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         if _bad_seed:
             out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed rows lack usable mass_covered/random_baseline: {_bad_seed[:5]}')
         _n_valid = len(_d)
-        # The claim is directional (mass/recall above baseline), but the seed
-        # test is two-sided: a uniformly reversed per-seed effect (every seed
-        # showing mass well BELOW its baseline) still yields a tiny two-sided
-        # p.  Require the seed-level deltas to point the same way as the
-        # cell-level aggregates so a contradictory panel cannot be claimed.
+        # Seed-level deltas must point the same way as the cell aggregates.
         _seed_dir_ok = bool(_d and float(np.mean(_d)) > 0.0)
         if _n_valid >= 2:
             try:

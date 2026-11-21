@@ -131,9 +131,7 @@ TEST_OUTDIR = 'results_lm_test'
 FREEZE_MANIFEST = 'confirmation_frozen.json'
 PHASES = [('P5C', 'lenphase', P5C_CFG, None), ('P5MP', 'probe', P5MP_CFG, None), ('P5S2', 'run', P5S2_CFG, None), ('P5S3', 'run', P5S3_CFG, None), ('P5H', 'health', None, None), ('P5T', 'finaltest', None, None)]
 _PLAN_DONE = False
-# Keyed by the manifest that was actually preflighted: a successful check of
-# manifest A says nothing about manifest B, so a global boolean would let a
-# different (possibly rejecting) plan skip its own zero-GPU preflight.
+# Preflight completion is tracked per manifest.
 _PLAN_DONE_FOR = set()
 
 def run_training_health(cfg=None):
@@ -2907,11 +2905,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     if unified_fp is not None:
         _lock_dir = os.path.dirname(os.path.abspath(bylen_path))
         _lp = _freeze_lock_path(_lock_dir)
-        # A bare lock file is not enough: a pre-access attestation (which by
-        # definition does NOT prove a read, see _lock_proves_test_access) can
-        # be left behind by an aborted power gate.  Accepting it here would
-        # let a copied bylen.json launder itself into a "first access" by
-        # merely upgrading that pre-access lock to stage='accessed'.
+        # A pre-access attestation does not prove a test-split read.
         if not (_lock_proves_test_access(_lp)
                 or _lock_proves_test_access(_freeze_lock_mirror_path())):
             raise SystemExit(f'[v12] REFUSE: {bylen_path} has admissible confirmation records but no freeze lock in {_lock_dir} that proves the first test-split access (a pre-access attestation is not an access) — refuse to analyse a copied result that cannot be tied to the first test-split access')
@@ -3086,10 +3080,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             res['params_unverifiable_seeds'] = [
                 int(s) for s, pa, pb in zip(usable, _params_a, _params_b)
                 if pa is None or pa <= 0 or pb is None or pb <= 0]
-        # Every usable PAIR must carry a digest for both arms.  A union over
-        # the non-null values would let one missing digest disappear while the
-        # remaining 23 records still attest the same init, confirming a
-        # comparison whose initialization was not actually verified per seed.
+        # Every usable PAIR must carry a digest for both arms.
         _iv = []
         _init_complete = bool(usable)
         for _s in usable:

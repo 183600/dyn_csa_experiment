@@ -869,10 +869,7 @@ def _parse_seeds(s):
 
 
 def _analysis_dir_for(outdir):
-    # Each panel owns a distinct results_*/ directory, so it must also own a
-    # distinct analysis directory: sharing one would let a later `aux` /
-    # `extended` / `report` run silently overwrite an earlier panel's
-    # stats.json and OPEN_BLOCK_REPORT.md.
+    # Each panel owns a distinct analysis directory.
     name = os.path.basename(str(outdir).rstrip('/'))
     if name.startswith('results_'):
         name = name[len('results_'):]

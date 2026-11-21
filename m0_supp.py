@@ -492,11 +492,7 @@ def run_kernel():
     if not tost_measured:
         reasons.append('training-level TOST not measured')
     print('[kernel] G0 certificate NOT written/overwritten: ' + '; '.join(reasons))
-    # A *measured* gate failure must downgrade any earlier passing certificate:
-    # require_g0 only inspects the file on disk, so leaving a stale "pass" there
-    # would admit an unverified panel.  Gates that were merely not measured on
-    # this machine (no CUDA/triton) do not invalidate a certificate produced on
-    # a capable machine.
+    # A measured gate failure downgrades any earlier passing certificate.
     if fail or benchmark_failed or tost_failed:
         _write_g0_certificate(ck, numeric_pass=not fail, benchmark_pass=benchmark_pass,
                               best_tflops=best, training_tost=_tost)

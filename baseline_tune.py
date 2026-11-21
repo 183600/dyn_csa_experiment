@@ -616,10 +616,7 @@ def _run_final(base, outdir, protocol, selected):
     # would make the remaining tests look better than the study design allows.
     _named = []
     for name, st in comparison['contrasts'].items():
-        # Pass the raw measurement: holm_adjust's `_finite_scalar` contract
-        # refuses booleans/numeric strings/non-finite values and keeps an
-        # invalid declared slot in the family as p=1.  Coercing with float()
-        # here would manufacture a valid p from a stringified artifact.
+        # Pass the raw measurement to holm_adjust without coercion.
         _named.append((name, st.get('p_exact_signflip')))
     _holm = L.holm_adjust(_named, alpha=0.05) if _named else {}
     _m = len(plan)
