@@ -319,7 +319,7 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     # would silently change the health verdict, and int(4.9)=4 would diagnose
     # a different tail.  Reject malformed values instead of coercing them.
     _tail_k = _as_seed_int(tail_k)
-    if _tail_k is None or _tail_k < 1:
+    if _tail_k is None or _tail_k < 1 or abs(_tail_k) > 2 ** 53:
         raise ValueError(
             f'classify_training_health: tail_k must be a positive exact '
             f'integer, got {tail_k!r}')
@@ -564,7 +564,11 @@ def _valid_alpha01(alpha):
 def _valid_min_n(min_n):
     """Positive exact integer seed-count floor, or None."""
     n = _as_seed_int(min_n)
-    return n if n is not None and n > 0 else None
+    if n is None or n < 1:
+        return None
+    if abs(n) > 2 ** 53:
+        return None
+    return n
 
 
 # Bootstrap draws are materialised as float arrays, so exact counts above the
