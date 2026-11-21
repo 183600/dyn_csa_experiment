@@ -46,6 +46,9 @@ def make_guard():
                 try:
                     with open(src, encoding='utf-8') as _jf:
                         st = json.load(_jf)
+                    if not isinstance(st, dict):
+                        print(f'[v10] WARNING: {src} is not a JSON object — this run starts UNCALIBRATED')
+                        continue
                     sbc = st.get('sps_by_class') or {}
                     norm = st.get('norm_sps')
                     if not sbc and norm is None:
@@ -1674,6 +1677,9 @@ def _equal_token_slices():
             try:
                 with open(_sp, encoding='utf-8') as _f:
                     _raw = json.load(_f)
+                if not isinstance(_raw, dict):
+                    print(f'[stats] WARNING: {_sp} is not a JSON object ({type(_raw).__name__}) — ignoring')
+                    _raw = None
             except Exception:
                 _raw = None
         ha = _hist_by_seed(spec['outdir'], 'csa_fixed', raw=_raw)
@@ -2363,18 +2369,18 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             if not rows:
                 continue
 
-            def _at(Ln, rows=rows):
+            def _at(Ln, rows=rows, _v=v):
                 cells = L.by_len_cells(rows, Ln)
                 ok = [c for c in cells if isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated'))]
                 if (ok if ok else cells) and len(ok if ok else cells) < len(rows):
-                    print(f'[v10 report] {v} L{Ln}: the column mean covers {len(ok if ok else cells)}/{len(rows)} seeds — the rest hold no usable cell at this length (error/truncated cell), so the column is a sub-seed mean')
+                    print(f'[v10 report] {_v} L{Ln}: the column mean covers {len(ok if ok else cells)}/{len(rows)} seeds — the rest hold no usable cell at this length (error/truncated cell), so the column is a sub-seed mean')
                 if ok:
                     # A mean over a strict subset is not a complete column:
                     # mark it partial so the rendered cell carries `~` too.
                     return (float(np.mean([c['ppl'] for c in ok])), len(ok) != len(rows))
                 return (float(np.mean([c['ppl'] for c in cells])), True) if cells else (float('nan'), False)
 
-            def _paired_ratio(rows=rows):
+            def _paired_ratio(rows=rows, _v=v):
                 m512, m4096 = ({}, {})
                 for r in rows:
                     bl = r.get('by_len')
@@ -2393,7 +2399,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                             mp[r.get('seed')] = float(c['ppl'])
                 both = sorted(set(m512) & set(m4096))
                 if both and len(both) < len(rows):
-                    print(f'[v10 report] {v} ratio@4096: computed over {len(both)}/{len(rows)} seeds — the rest lack a usable cell at 512 or 4096')
+                    print(f'[v10 report] {_v} ratio@4096: computed over {len(both)}/{len(rows)} seeds — the rest lack a usable cell at 512 or 4096')
                 if not both:
                     return None
                 return float(np.mean([m4096[s] / m512[s] for s in both]))

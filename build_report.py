@@ -43,13 +43,20 @@ def _as_finite(v):
 def load(path, default=None):
     try:
         with open(path, encoding='utf-8') as f:
-            return json.load(f)
+            data = json.load(f)
     except FileNotFoundError:
         return default
     except Exception as _e:
         # 「文件存在但损坏」与「实验未跑」是两种不同的事实：前者必须阻断
         # 发布（进入 main 的 failed 列表），而不是伪装成「（无结果）」。
         raise RuntimeError(f'{path} exists but cannot be parsed ({type(_e).__name__}: {_e}); refusing to build a report over corrupt data — repair or remove the file') from _e
+    if data is None:
+        return default
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f'{path} is valid JSON but not an object ({type(data).__name__}); '
+            'refusing to build a report over corrupt data — repair or remove the file')
+    return data
 
 def _object_or_refuse(value, path, kind):
     """A valid-JSON non-object is corrupt for this role, not empty data."""

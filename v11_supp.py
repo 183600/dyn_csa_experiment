@@ -487,18 +487,18 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
             if not rows:
                 continue
 
-            def _at(Ln, rows=rows):
+            def _at(Ln, rows=rows, _v=v):
                 cells = L.by_len_cells(rows, Ln)
                 ok = [c for c in cells if isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated'))]
                 if (ok if ok else cells) and len(ok if ok else cells) < len(rows):
-                    print(f'[v11 report] {v} L{Ln}: the column mean covers {len(ok if ok else cells)}/{len(rows)} seeds — the rest hold no usable cell at this length (error/truncated cell), so the column is a sub-seed mean')
+                    print(f'[v11 report] {_v} L{Ln}: the column mean covers {len(ok if ok else cells)}/{len(rows)} seeds — the rest hold no usable cell at this length (error/truncated cell), so the column is a sub-seed mean')
                 if ok:
                     # A mean over a strict subset is not a complete column:
                     # mark it partial so the rendered cell carries `~` too.
                     return (float(np.mean([c['ppl'] for c in ok])), len(ok) != len(rows))
                 return (float(np.mean([c['ppl'] for c in cells])), True) if cells else (float('nan'), False)
 
-            def _paired_ratio(rows=rows):
+            def _paired_ratio(rows=rows, _v=v):
                 m512, m4096 = ({}, {})
                 for r in rows:
                     bl = r.get('by_len')
@@ -517,7 +517,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
                             mp[r.get('seed')] = float(c['ppl'])
                 both = sorted(set(m512) & set(m4096))
                 if both and len(both) < len(rows):
-                    print(f'[v11 report] {v} ratio@4096: computed over {len(both)}/{len(rows)} seeds — the rest lack a usable cell at 512 or 4096')
+                    print(f'[v11 report] {_v} ratio@4096: computed over {len(both)}/{len(rows)} seeds — the rest lack a usable cell at 512 or 4096')
                 if not both:
                     return None
                 return float(np.mean([m4096[s] / m512[s] for s in both]))

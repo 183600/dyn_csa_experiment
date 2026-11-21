@@ -742,9 +742,10 @@ def load_g0_certificate(path=None):
         return None
     try:
         with open(p, encoding='utf-8') as f:
-            return json.load(f)
+            cert = json.load(f)
     except Exception:
         return None
+    return cert if isinstance(cert, dict) else None
 
 def require_g0(context='scale panel', path=None):
     """Fail closed unless a valid G0 certificate exists for this tree.

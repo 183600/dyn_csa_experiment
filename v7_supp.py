@@ -2226,10 +2226,10 @@ def run_niah_phase(payload, guard=None, label=''):
                 _niah_rng_fp = L.rng_fingerprint()
                 _niah_losses = []
                 _niah_buf = []
-                def _niah_flush():
-                    if _niah_buf:
-                        _niah_losses.extend(torch.stack(_niah_buf).tolist())
-                        _niah_buf.clear()
+                def _niah_flush(_buf=_niah_buf, _losses=_niah_losses):
+                    if _buf:
+                        _losses.extend(torch.stack(_buf).tolist())
+                        _buf.clear()
                 model = L.SmallGPT(vocab, 256, 6, 8, 32, 512, cfgs, mlp_ratio=mr).to(DEVICE)
                 opt = torch.optim.AdamW(model.parameters(), lr=0.0003, betas=L.OPT_ADAMW_BETAS, eps=L.OPT_ADAMW_EPS, weight_decay=0.0, foreach=True)
                 model.train()

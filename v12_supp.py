@@ -1844,6 +1844,8 @@ def run_power_check(cfg=None):
                 summary = json.load(_jf)
         except Exception as _e:
             raise SystemExit(f'[v12 power] REFUSE: {summary_path} exists but cannot be parsed ({type(_e).__name__}: {_e})')
+        if not isinstance(summary, dict):
+            raise SystemExit(f'[v12 power] REFUSE: {summary_path} is valid JSON but not an object ({type(summary).__name__})')
     else:
         print(f'[v12 power] NOTE: {summary_path} not found — no validation panel yet; the artifact records a data gap (run P3MT/P4MT/P5C first for a real power read)')
     comps = {}
@@ -3014,8 +3016,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         # complete pair and report the dropped seeds.  Whether n<12 may still
         # confirm is a PRE-REGISTERED choice (statistics.min_seeds_for_confirmation,
         # manifest v3: 8, the mathematical minimum for Holm/4 with alpha=0.05).
-        def _cell_ppl(rec):
-            c = _by_len_cell(rec, Ln)
+        def _cell_ppl(rec, _Ln=Ln):
+            c = _by_len_cell(rec, _Ln)
             return float(c['ppl']) if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated')) else None
         dl = []
         usable = []
