@@ -222,6 +222,19 @@ def _compare_reason(meta_a, meta_b, seq_len, max_seq_a=None, max_seq_b=None):
                 return _name, meta.get(_name)
         return None, None
 
+    def _eval_slice_conflict(meta):
+        # A checkpoint may persist its evaluation-slice fingerprint under
+        # either spelling, but a single checkpoint carrying BOTH with
+        # different values is internally inconsistent: taking the first one
+        # would let a mismatched slice pass as token-aligned.
+        _ea, _eb = meta.get('eval_fp'), meta.get('val_fp')
+        return (_ea is not None and _eb is not None
+                and str(_ea) != str(_eb))
+
+    if _eval_slice_conflict(meta_a) or _eval_slice_conflict(meta_b):
+        return ('unverifiable evaluation-slice fingerprint (a checkpoint '
+                'records conflicting eval_fp/val_fp values)')
+
     _ka, _va = _eval_slice_fp(meta_a)
     _kb, _vb = _eval_slice_fp(meta_b)
     if (isinstance(_va, (bool, np.bool_)) or L._is_nonmeasurement_scalar(_va)

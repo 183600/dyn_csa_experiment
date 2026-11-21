@@ -2098,6 +2098,9 @@ def _canonical_object_cell(v):
 
 def _matrix_fingerprint(X):
     arr = np.asarray(X)
+    if arr.ndim == 0:
+        raise ValueError(
+            'matrix fingerprinting needs a 1-D or 2-D table, got a scalar')
     h = hashlib.sha256()
     h.update(str(arr.shape).encode('ascii'))
     # Convert and hash one row block at a time; the block size follows the

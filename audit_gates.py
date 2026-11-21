@@ -1610,6 +1610,7 @@ def audit_attribution(outdirs=None):
     L = _import_exp_lib()
     import numpy as np
     _missing_panels = []
+    _block_count_mismatch = []
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
         _sp = os.path.join(_repo_path(d), 'summary.json')
@@ -1708,6 +1709,8 @@ def audit_attribution(outdirs=None):
                         _r = max(_ba, _bb) / min(_ba, _bb)
                         rec['block_count_ratio'] = float(_r)
                         rec['block_count_matched'] = bool(_r <= 1.10)
+                        if not rec['block_count_matched']:
+                            _block_count_mismatch.append(f'{a} vs {b} (ratio {_r:.2f})')
                     else:
                         rec['block_count_matched'] = None
                     if _pos_num(_la) and _pos_num(_lb):
@@ -1728,6 +1731,14 @@ def audit_attribution(outdirs=None):
     if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no results_*/summary.json on this machine — the attribution readout needs the experiment artifacts; the collection hooks are already wired (enable_block_stats / attn._stats per design_notes §14)'
+    if _block_count_mismatch and out['status'] == 'ok':
+        # A fixed-vs-dynamic contrast whose block counts differ is confounded:
+        # it cannot attribute the effect to blocking alone, so it must not be
+        # presented as a clean ("ok") attribution audit.
+        out['status'] = 'warn'
+        _note = out.get('note') or ''
+        out['note'] = (_note + ' ' if _note else '') + (
+            'block-count-matched pairs differ: ' + '; '.join(_block_count_mismatch))
     print(json.dumps(out, ensure_ascii=False, indent=2)[:4000])
     return out
 
@@ -3136,6 +3147,12 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         if _bad_seed:
             out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed rows lack usable mass_covered/random_baseline: {_bad_seed[:5]}')
         _n_valid = len(_d)
+        # The claim is directional (mass/recall above baseline), but the seed
+        # test is two-sided: a uniformly reversed per-seed effect (every seed
+        # showing mass well BELOW its baseline) still yields a tiny two-sided
+        # p.  Require the seed-level deltas to point the same way as the
+        # cell-level aggregates so a contradictory panel cannot be claimed.
+        _seed_dir_ok = bool(_d and float(np.mean(_d)) > 0.0)
         if _n_valid >= 2:
             try:
                 L = _import_exp_lib()
@@ -3147,11 +3164,13 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
                              'recall_at_k': rec, 'mass_covered': mass, 'random_baseline': base,
                              'mass_excess': mass - base, 'recall_excess': rec - base,
                              'n_queries': nq, 'n_seeds': _n_seeds, 'n_seeds_valid': _n_valid,
+                             'seed_dir_ok': _seed_dir_ok,
                              'seed_test': _st,
                              'claim_allowed': bool(_range_ok and _geom_ok and _el_ok and _nq_ok
                                                    and not _bad_seed
                                                    and _n_valid == _n_seeds
                                                    and mass > base and rec > base
+                                                   and _seed_dir_ok
                                                    and _st is not None
                                                    and _st.get('p_exact_signflip', 1.0) < 0.05
                                                    and int(_st.get('n', 0)) >= 6)})
