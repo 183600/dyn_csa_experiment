@@ -13503,8 +13503,9 @@ def _hash_seed_str(v):
     makes every spawned worker (par.py dispatch, the subprocess reproducibility
     probe) die before running a single line of the job.  Fold exactly the way
     ``set_seed`` folds the NumPy stream; an in-range seed is byte-identical to
-    the old spelling (``str(n) == str(n % 2**32)`` for ``0 <= n < 2**32``), so
-    recorded/repro hash seeds do not change for the normal panel.
+    its direct decimal spelling (``str(n) == str(n % 2**32)`` for
+    ``0 <= n < 2**32``), so recorded/repro hash seeds keep the same value for
+    the normal panel.
     """
     n = _as_seed_int(v)
     if n is None:
@@ -18081,11 +18082,9 @@ class _PrefixStats:
         self.n_seq = 0
         self.age_sum = 0.0
         self.age_max = 0
-        # Exact integer-age histogram instead of one tensor per forward: the
-        # old list grew as O(forwards * layers * T) and forced a full cat+sort
-        # of ~100M elements at summary time.  A histogram is O(distinct ages),
-        # bounded by the position capacity, and yields the same quantiles up
-        # to float precision (the histogram form is in fact more precise).
+        # Exact integer-age histogram: O(distinct ages), bounded by the
+        # position capacity, yielding quantiles from the weighted order
+        # statistics.
         self.age_p95 = {}
         self.outside_len_sum = 0.0
         self.outside_nonzero = 0

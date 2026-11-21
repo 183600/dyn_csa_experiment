@@ -3351,15 +3351,14 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         A('')
         _conf = ft.get('confirmed')
         if _conf is None:
-            # Legacy stats files without a `confirmed` key: re-derive the
+            # Stats files without a `confirmed` key: re-derive the
             # pre-registered decision rule EXACTLY as `finaltest_stats` does
             # (manifest v3): strict p_holm < alpha (not holm_adjust's `<=`
             # reject flag), direction_ok is True, `param_matched is not false`
             # (None = unverifiable does not block), and n >= the declared
             # min_seeds_for_confirmation floor.  `coverage_ok` is reported,
-            # NOT required — v3 explicitly removed the all-12-seeds veto —
-            # and the init-core digests are instrumentation, not decision
-            # inputs.
+            # NOT required (the rule applies no all-12-seeds veto), and the
+            # init-core digests are instrumentation, not decision inputs.
             # Use the manifest's declared confirmation floor so the report and
             # the stats artifact apply the same gate.
             _floor = None

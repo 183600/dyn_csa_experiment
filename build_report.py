@@ -2079,7 +2079,7 @@ def _note_comparison(label, p, family=None, p_holm=None, n=None, mean=None):
 def global_multiplicity_adjust(named_pvals, alpha=0.05):
     """Local twin of exp_lib.global_multiplicity_audit (this builder
     intentionally does not import torch/exp_lib; test_review_fixes cross-checks
-    the two implementations against each other so they cannot drift).
+    the two implementations against each other so they cannot differ).
 
     Benjamini-Hochberg step-up q-values + Bonferroni over ALL displayed
     comparisons.  Invalid/missing p keeps a p=1 slot (fail-closed family size,

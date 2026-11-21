@@ -214,9 +214,9 @@ def _compare_reason(meta_a, meta_b, seq_len, max_seq_a=None, max_seq_b=None):
             return f'the checkpoints were measured on different {_k} slices'
 
     def _eval_slice_fp(meta):
-        # Older checkpoints persist the same evaluation-slice fingerprint as
-        # `val_fp`; current ones call it `eval_fp`.  Treat the two spellings as
-        # one identity so a one-sided/mismatched slice cannot slip through.
+        # A checkpoint may persist its evaluation-slice fingerprint under
+        # either `eval_fp` or `val_fp`.  Treat the two spellings as one
+        # identity so a one-sided/mismatched slice cannot slip through.
         for _name in ('eval_fp', 'val_fp'):
             if meta.get(_name) is not None:
                 return _name, meta.get(_name)
