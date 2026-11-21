@@ -1780,10 +1780,9 @@ def sec_p1l():
 _AGG_ENTRY_CACHE = {}
 
 def _agg_entry(d, v):
-    # The resolution below scans the whole dict; agg dicts are already
-    # memoized in _LOADED, so cache the per-variant resolution on the dict's
-    # identity (keeping a strong ref to `d` so the id cannot be recycled
-    # while the entry is alive).  Results are identical to the uncached scan.
+    # Cache the per-variant resolution on the dict's identity (keeping a
+    # strong ref to `d` so the id cannot be recycled while the entry is
+    # alive).  Results are identical to the uncached scan.
     _ck = id(d)
     _ent = _AGG_ENTRY_CACHE.get(_ck)
     if _ent is None or _ent[0] is not d:

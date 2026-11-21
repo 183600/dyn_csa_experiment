@@ -852,7 +852,7 @@ def run_topup():
     if target < 1:
         raise SystemExit('ABL_SEED_TARGET must be >= 1')
     # Validate ALL environment overrides before any GPU work starts: a
-    # malformed CORE_SEED_TARGET must fail before the hours-long P-ABL phase,
+    # malformed CORE_SEED_TARGET must fail before the long P-ABL phase,
     # not after it.
     _core_raw = os.environ.get('CORE_SEED_TARGET')
     _core_target = None

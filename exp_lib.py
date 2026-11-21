@@ -709,7 +709,7 @@ def _g0_pass_flag(value):
     A JSON string ("false"), a non-zero number or any other truthy object is
     not evidence that the corresponding check passed.  Accept both Python and
     NumPy booleans (the writer stores Python bools; a caller may round-trip a
-    legacy object through NumPy)."""
+    NumPy boolean through an object container)."""
     return isinstance(value, (bool, np.bool_)) and bool(value)
 
 def _g0_mismatch(cert):
@@ -930,8 +930,7 @@ def cosine_similarity_consecutive(H, eps=1e-08):
 _SEGMENT_CACHE = collections.OrderedDict()
 _SEGMENT_CACHE_CAP = 4096
 # Per-length host position table arange(n + 1) reused across segmenter calls
-# (read-only).  Pure cache — the same integers `np.arange(n + 1)` returns
-# every call.
+# (read-only); the values equal `np.arange(n + 1)`.
 _SEG_POS_CACHE = {}
 _SEG_POS_CACHE_CAP = 16
 
@@ -2461,9 +2460,8 @@ def pool_variable_blocks(Xa, Xb, Za, Zb, block_ids, B_pos_a, B_pos_b, overlap, n
 _POOL_PARTS_HOST = True
 _POOL_PARTS_BUCKET = 256
 _POOL_GEOM_BUCKET = 1024
-# Content-keyed host-geometry cache: dynamic block-ids objects are rebuilt
-# every forward, so the per-object cache cannot hit; identical cut tables
-# (e.g. repeated eval passes) can reuse the same read-only flats.
+# Content-keyed host-geometry cache: identical cut tables (e.g. repeated
+# eval passes) reuse the same read-only flats.
 _POOL_GEOM_CONTENT = {}
 _POOL_GEOM_CONTENT_BYTES = 64 << 20
 _POOL_GEOM_CONTENT_MAX_ENTRIES = 8192
@@ -2581,11 +2579,9 @@ def _pool_parts_flat(counts_l, B, ov, n, pad_to=1):
         counts_np = np.asarray(counts_l, dtype=np.int32)
         if counts_np.shape != (B,):
             return None
-        # The content cache exists for repeated eval passes over an identical
-        # cut table.  A very wide counts row makes each key several KiB while
-        # a training panel never repeats it, so above the small-table bound the
-        # per-object caches are the only useful layer (the values are the same
-        # either way).
+        # The content cache serves repeated eval passes over an identical cut
+        # table.  Above the small-table bound the per-object caches are the
+        # only layer used (the values are the same either way).
         _ck = ('p', counts_np.tobytes(), B, -1 if ov is None else int(ov), n, int(pad_to)) if B <= 1024 else None
         _hit = _pool_geom_content_get(_ck)
         if _hit is not None:
@@ -3678,9 +3674,8 @@ def _rank_blocks(masked, B, ties, k=None):
     rank.masked_fill_(~sel, kk)
     # Scatter the selected source columns into [n, kk] (column order); the
     # sentinel column kk absorbs the non-selected lanes and is sliced away.
-    # The base arange is a read-only constant of (B, device) — the same exact
-    # integers a fresh torch.arange returns every call — so it uses the
-    # shared index-table cache.
+    # The base arange is a read-only constant of (B, device), equal to a fresh
+    # torch.arange, so it uses the shared index-table cache.
     cols = _i32_range_cache(B, src.device)[None, :].expand(n, B)
     buf = torch.empty(n, kk + 1, dtype=torch.int32, device=src.device)
     buf.scatter_(1, rank, cols)
@@ -4222,9 +4217,8 @@ def _attn_full_width_ok(n, k, w, need_dedup):
     return elems <= _FO_FULL_CAP_BYTES
 
 def _finfo_min(dtype):
-    # torch.finfo(dtype).min is a pure function of the dtype — the same
-    # constant on every call, so it is memoised per dtype (host-side, no
-    # tensor values involved).
+    # torch.finfo(dtype).min is a pure function of the dtype, memoised per
+    # dtype (host-side, no tensor values involved).
     v = _FO_MINL.get(dtype)
     if v is None:
         v = torch.finfo(dtype).min
@@ -19582,9 +19576,9 @@ def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
         dec = []
         for t in range(max(1, int(ids.shape[1]) - n_dec), int(ids.shape[1]) + 1):
             # One untimed call per prefix LENGTH: the first forward at a new
-            # shape can include one-time kernel selection / allocator growth,
-            # which would otherwise bias the timing measurement.  The sweep helper
-            # warms every (batch, length) cell for the same reason.
+            # shape can include one-time setup that would otherwise bias the
+            # timing measurement.  The sweep helper warms every (batch, length)
+            # cell for the same reason.
             model(ids[:, :t])
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)

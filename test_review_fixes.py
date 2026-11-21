@@ -2705,11 +2705,7 @@ def t_segment_uniform_stride_only_when_all_cuts():
 def t_shipped_manifest_consistency():
     with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
         v2 = json.load(f)
-    # v4 (2026-11-14) removed ee/es from the machine-checkable signature:
-    # they are diagnostic-eval monitoring knobs, not training-recipe identity.
-    # v5 (2026-11-14) is a documentation-only revision: the manifest and the
-    # implementation state the same registered decision_rule, so no normative
-    # field changed.
+    # ee/es are diagnostic-eval monitoring knobs, not training-recipe identity.
     assert v2['manifest_version'] == 5
     assert 'ee' not in v2['binding']['training_recipe_signature']
     assert 'es' not in v2['binding']['training_recipe_signature']
@@ -12039,7 +12035,7 @@ def main():
     _check('N60 variant_mlp_ratio bool-flag handling incl. NumPy bools', t_variant_mlp_ratio_bool_flag)
     _check('N61 baseline_tuning_audit compares a NumPy boolean stability flag', t_baseline_tuning_audit_np_bool_stability)
     _check('N62 kernel ref masks A-path gradients through invalid lanes', t_kernel_ref_masked_lane_gradient_with_inf_logit)
-    _check('N63 budget audit refuses a declared/recorded step conflict', t_audit_budget_declared_steps_conflict)
+    _check('N63 allocation audit refuses a declared/recorded step conflict', t_audit_budget_declared_steps_conflict)
     _check('N64 data_guard canonicalises extended NaN spellings', t_data_guard_extended_missing_identities)
     _check('N65 confirmatory architecture gate honours recipe aliases', t_v12_finaltest_arch_alias_gate)
     _check('N66 baseline final keeps records without a variant field', t_baseline_final_without_variant_field)
