@@ -1578,7 +1578,16 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
                 f'training_recipe_signature {_want_arch} — a differently shaped model cannot '
                 'enter the confirmation panel even when its recipe string matches (the p1l '
                 'recipe is decoded from injected constants, not from the weights).')
-    _want_mr = ((_bind.get('per_arm_recipe_signature') or {}).get(v) or {}).get('mr')
+    _bind = manifest.get('binding') if isinstance(manifest, dict) else None
+    if not isinstance(_bind, dict):
+        _bind = {}
+    _per_arm_sig = _bind.get('per_arm_recipe_signature')
+    if not isinstance(_per_arm_sig, dict):
+        _per_arm_sig = {}
+    _per_arm_entry = _per_arm_sig.get(v)
+    if not isinstance(_per_arm_entry, dict):
+        _per_arm_entry = {}
+    _want_mr = _per_arm_entry.get('mr')
     if _want_mr is not None:
         try:
             _want_mr = float(_want_mr)
