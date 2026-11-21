@@ -5859,6 +5859,12 @@ def t_report_aggregate_status_fails_closed():
         {'a': {'status': 'warnings'}, 'b': {'status': 'fail'}}) == 'fail'
     assert A._aggregate_audit_status(
         {'a': {'status': 'ok'}, 'b': {'status': 'not_verifiable_locally'}}) == 'not_verifiable_locally'
+    assert A._aggregate_audit_status(
+        {'a': {'status': 'ok'}, 'b': {'status': 'error'}}) == 'error'
+    assert A._aggregate_audit_status(
+        {'a': {'status': 'fail'}, 'b': {'status': 'error'}}) == 'fail'
+    assert A._run_audit(lambda: 1 / 0)['status'] == 'error'
+    assert A._aggregate_audit_status({'a': A._run_audit(lambda: 1 / 0)}) == 'error'
     assert A._aggregate_audit_status({'a': None, 'b': {}}) == 'ok'
 
 
@@ -7268,6 +7274,20 @@ def t_selection_attribution_contract():
             json.dump({'cells': [frac_cell]}, f)
         r7 = A.audit_selection()
         assert r7['status'] == 'fail' and any('non-integral geometry' in x for x in r7['problems']), r7
+        str_cell = dict(cell, recall_at_k='0.6', mass_covered='0.8',
+                        random_baseline='0.03')
+        with open(os.path.join(td, 'analysis_mechanism', 'selection_attribution.json'), 'w', encoding='utf-8') as f:
+            json.dump({'cells': [str_cell]}, f)
+        r8 = A.audit_selection()
+        assert r8['status'] == 'fail' and any('non-numeric fields' in x for x in r8['problems']), r8
+        seed_str_cell = dict(cell, per_seed={
+            str(i): {'mass_covered': '0.8', 'random_baseline': '0.03'}
+            for i in range(6)})
+        with open(os.path.join(td, 'analysis_mechanism', 'selection_attribution.json'), 'w', encoding='utf-8') as f:
+            json.dump({'cells': [seed_str_cell]}, f)
+        r9 = A.audit_selection()
+        assert r9['cells'][0]['n_seeds_valid'] == 0, r9
+        assert r9['cells'][0]['claim_allowed'] is False and r9['status'] == 'fail', r9
     finally:
         A.REPO = old_repo
         shutil.rmtree(td, ignore_errors=True)
@@ -11467,6 +11487,202 @@ def t_baseline_tuning_audit_np_bool_stability():
     assert any('recorded selection_stability=False' in p for p in _problems), _problems
 
 
+def t_kernel_ref_masked_lane_gradient_with_inf_logit():
+    import csa_kernels as CK
+    torch.manual_seed(0)
+    R, T, nh, hd, w, nb = 1, 4, 2, 4, 2, 3
+    q0 = torch.randn(R, T, nh, hd, dtype=torch.float64)
+    kb0 = torch.randn(R, nb, nh, hd, dtype=torch.float64)
+    vb0 = torch.randn(R, nb, nh, hd, dtype=torch.float64)
+    ks0 = torch.randn(R, T, nh, hd, dtype=torch.float64)
+    vs0 = torch.randn(R, T, nh, hd, dtype=torch.float64)
+    ks0[0, 0, 0, 0] = 1e308
+    idx = torch.tensor([[[0, 1, 2], [1, 2, 0], [0, 2, 1], [0, 1, 2]]])
+    last = torch.tensor([[0, 1, 2]])
+    valid = torch.ones(R, T, nb, dtype=torch.bool)
+
+    eager = [x[0].clone().requires_grad_() for x in (q0, kb0, vb0, ks0, vs0)]
+    ref = [x.clone().requires_grad_() for x in (q0, kb0, vb0, ks0, vs0)]
+    oe = L.gathered_attention(eager[0], eager[1], eager[2], idx[0], last[0],
+                              eager[3], eager[4], w, 0.7, sel_valid=valid[0],
+                              topk_distinct=True, q_chunk=2, mem_budget_bytes=1 << 20)
+    ok = CK.gathered_attention_kernel(ref[0], ref[1], ref[2], idx, last,
+                                      ref[3], ref[4], w, 0.7, sel_valid=valid,
+                                      impl='ref')
+    assert torch.allclose(oe, ok[0], rtol=0, atol=0), (oe, ok[0])
+    ge = torch.autograd.grad(oe[0, 0, 0], eager)
+    gk = torch.autograd.grad(ok[0, 0, 0, 0], ref)
+    for name, a, b in zip(('q', 'k_blk', 'v_blk', 'k_sw', 'v_sw'), ge, gk):
+        assert torch.allclose(a.reshape_as(b), b, rtol=1e-12, atol=1e-12), (name, a, b)
+
+
+def t_audit_budget_declared_steps_conflict():
+    with tempfile.TemporaryDirectory() as d:
+        sp = os.path.join(d, 'summary.json')
+        rec = {'variant': 'v', 'params': 1000, 'steps': 4000,
+               'batch_size': 2, 'seq_len': 8}
+
+        def _run(declared, records):
+            with open(sp, 'w', encoding='utf-8') as f:
+                json.dump({f'v::s{i}': r for i, r in enumerate(records)}, f)
+            with contextlib.redirect_stdout(io.StringIO()):
+                return A.audit_budget(state_files=(), panels=((d, 'v', declared),))
+
+        out = _run(4000, [rec])
+        assert out['status'] == 'ok' and out['panels'][d]['tokens'] == 64000, out
+        out = _run(8000, [rec])
+        assert out['status'] == 'fail' and out['panels'][d]['estimate'] is None, out
+        assert any('disagrees with recorded steps' in p for p in out['problems']), out
+        out = _run(4000, [rec, dict(rec, steps=5000)])
+        assert out['status'] == 'fail' and out['panels'][d]['estimate'] is None, out
+        out = _run(True, [rec])
+        assert out['status'] == 'fail' and out['panels'][d]['estimate'] is None, out
+
+
+def t_data_guard_extended_missing_identities():
+    import data_guard as DG
+    from decimal import Decimal
+    groups = np.array([complex(float('nan'), 0.0) for _ in range(3)], dtype=object)
+    try:
+        DG.assert_no_split_leakage([0], [1], [2], groups=groups)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('complex NaN group ids must be one missing group')
+
+    X = np.array([[Decimal('NaN')], [Decimal('NaN')], ['a']], dtype=object)
+    enc = DG.LeakageSafeCategoricalEncoder(handle_unknown='error').fit(X)
+    assert enc.feature_stats_[0]['categories'] == ['a'], enc.feature_stats_
+    assert enc.transform(X).ravel().tolist() == [2.0, 2.0, 0.0]
+    assert enc.transform(np.array([[Decimal('NaN')]], dtype=object)).ravel().tolist() == [2.0]
+    missing_fps = {
+        DG._categorical_fingerprint(np.array([[v]], dtype=object))
+        for v in (None, np.nan, np.datetime64('NaT'), Decimal('NaN'),
+                  complex(float('nan'), 0.0))
+    }
+    assert len(missing_fps) == 1, missing_fps
+
+    ref = [[1, 2], [3, 4]]
+    hold = np.empty(2, dtype=object)
+    hold[:] = [np.array([1, 2], dtype=object), np.array([3, 4], dtype=object)]
+    r = DG.categorical_shift_report(ref, hold)
+    assert r['unseen_rate'] == 0.0 and r['total_variation'] == 0.0, r
+
+
+def t_v12_finaltest_arch_alias_gate():
+    recipe = ('steps3000_sl512_bs12_nt8000000_lr0.0003_wd0.1_d256_L6_H8_Dh32_'
+              'v8192_wu50_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee250_es128_'
+              'detcpu-eager_dfdeadbeef_cscURRENT')
+    manifests = [
+        {'binding': {'training_recipe': {'d': 256, 'L': 6, 'H': 8, 'Dh': 32}}},
+        {'binding': {'training_recipe_signature': {'steps': 3000},
+                     'per_arm_recipe_signature': {'full_rope': {
+                         'd': 256, 'L': 6, 'H': 8, 'Dh': 32}}}},
+    ]
+    for manifest in manifests:
+        with tempfile.TemporaryDirectory() as d:
+            ckpt_dir = os.path.join(d, 'ck')
+            os.makedirs(ckpt_dir)
+            ck = os.path.join(ckpt_dir, L.direct_ckpt_name('full_rope', 0))
+            torch.save({'code': V10.V.CKPT_CODE, 'recipe': recipe, 'd': 128,
+                        'n_layers': 6, 'n_heads': 8, 'd_head': 32}, ck)
+            mech = os.path.join(d, 'mech.json')
+            with open(mech, 'w', encoding='utf-8') as f:
+                json.dump({'full_rope::seed0': {'_code': V10.V.CKPT_CODE,
+                                                'by_len': {}}}, f)
+            cfg = {'outdir': d, 'bylen_summary': os.path.join(d, 'bylen.json'),
+                   'ckpt_dir': ckpt_dir, 'mech_summary': mech,
+                   'eval_lens': [512], 'smoke': True}
+            try:
+                V12._finaltest_bylen_cell(cfg, manifest, 'full_rope', 0,
+                                          torch.zeros(2, dtype=torch.long))
+            except SystemExit as e:
+                assert 'architecture' in str(e).lower(), e
+            else:
+                raise AssertionError('wrong-shaped checkpoint was not refused')
+
+
+def t_baseline_final_without_variant_field():
+    protocol = {'search_seeds': [0], 'final_seeds': [1, 2], 'method_arm': 'm'}
+    picked = {'lr': 1e-3, 'weight_decay': 0.0, 'warmup': 0}
+    selected = {a: {'selected': dict(picked), 'trials': [{}, {}]}
+                for a in ('m', 'b')}
+    original_run = BT.L.run
+
+    def _run(cfg, seeds=None, guard=None, label=None):
+        arm = cfg['variants'][0]
+        adir = cfg['outdir']
+        os.makedirs(adir, exist_ok=True)
+        recs = {}
+        for s in seeds:
+            recs[f'{arm}::seed{s}'] = {
+                'seed': s, 'ppl': (100.0 if arm == 'm' else 90.0) + s,
+                'params': 1000, 'provenance': 'p', 'data_version': 'd',
+                'data_fp': 'x', 'val_fp': 'v', 'eval_fp': 'e',
+                'init_core_fp': 'i', 'train_knobs': {'opt': 'adam'},
+                'steps': 10, 'tokens_seen': 160,
+            }
+        with open(os.path.join(adir, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump(recs, f)
+
+    BT.L.run = _run
+    try:
+        with tempfile.TemporaryDirectory() as outdir:
+            with open(os.path.join(outdir, 'baseline_tuning.json'), 'w',
+                      encoding='utf-8') as f:
+                json.dump({}, f)
+            with contextlib.redirect_stdout(io.StringIO()):
+                BT._run_final({}, outdir, protocol, selected)
+            with open(os.path.join(outdir, 'final', 'tuned_comparison.json'),
+                      encoding='utf-8') as f:
+                comp = json.load(f)
+    finally:
+        BT.L.run = original_run
+    assert {a: (v['n_seeds'], v['seeds'])
+            for a, v in comp['arm_summary'].items()} == {
+                'm': (2, [1, 2]), 'b': (2, [1, 2])}, comp['arm_summary']
+    st = comp['contrasts']['m - b']
+    assert st['n_shared'] == 2 and st['n'] == 2 and st['seeds'] == [1, 2], st
+
+
+def t_report_duplicate_rows_are_not_arbitrary():
+    _repo, _loaded = BR.REPO, dict(BR._LOADED)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            BR.REPO = d
+            BR._LOADED.clear()
+            rec = {'variant': 'csa_fixed', 'seed': 0, 'warm_steps': 0,
+                   'ppl': 100.0, '_code': BR._CUR_CS, 'run_cfg': 'x'}
+            BR._LOADED[('summary', 'results_lm_v7_warmup')] = {
+                'a::seed0': rec, 'b::seed0': dict(rec, ppl=10.0)}
+            txt = BR.sec_p0w()
+            assert not any('| `csa_fixed` | 0 |' in line
+                           for line in txt.splitlines()), txt
+            BR._LOADED.pop(('summary', 'results_lm_v7_warmup'), None)
+
+            os.makedirs(os.path.join(d, 'analysis_v7'))
+            rows = [
+                {'seq_len': 512, 'sel_ratio': 0.1, 'csa_over_dense': 0.9,
+                 'hybrid_over_dense': 0.9, 'csa_kv_over_dense': 0.9},
+                {'seq_len': 512, 'sel_ratio': 0.1, 'csa_over_dense': 1.5,
+                 'hybrid_over_dense': 1.5, 'csa_kv_over_dense': 1.5},
+                {'seq_len': 2048, 'sel_ratio': 0.05, 'csa_over_dense': 0.8,
+                 'hybrid_over_dense': 0.8, 'csa_kv_over_dense': 0.8},
+            ]
+            with open(os.path.join(d, 'analysis_v7', 'flops_analytic.json'),
+                      'w', encoding='utf-8') as f:
+                json.dump({'config': {}, 'rows': rows,
+                           'crossover_seq_len_csa_beats_dense': 2048}, f)
+            flops = BR.sec_flops()
+            table = [line for line in flops.splitlines()
+                     if line.startswith('| 512 ')]
+            assert len(table) == 1 and '0.900' in table[0], (table, flops)
+    finally:
+        BR.REPO = _repo
+        BR._LOADED.clear()
+        BR._LOADED.update(_loaded)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -11822,6 +12038,12 @@ def main():
     _check('N59 temporal/complex scalars refused in PPL/effect/report paths', t_nonmeasurement_scalars_in_measurement_paths)
     _check('N60 variant_mlp_ratio bool-flag handling incl. NumPy bools', t_variant_mlp_ratio_bool_flag)
     _check('N61 baseline_tuning_audit compares a NumPy boolean stability flag', t_baseline_tuning_audit_np_bool_stability)
+    _check('N62 kernel ref masks A-path gradients through invalid lanes', t_kernel_ref_masked_lane_gradient_with_inf_logit)
+    _check('N63 budget audit refuses a declared/recorded step conflict', t_audit_budget_declared_steps_conflict)
+    _check('N64 data_guard canonicalises extended NaN spellings', t_data_guard_extended_missing_identities)
+    _check('N65 confirmatory architecture gate honours recipe aliases', t_v12_finaltest_arch_alias_gate)
+    _check('N66 baseline final keeps records without a variant field', t_baseline_final_without_variant_field)
+    _check('N67 report excludes ambiguous/duplicate measurement rows', t_report_duplicate_rows_are_not_arbitrary)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

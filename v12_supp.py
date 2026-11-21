@@ -1553,8 +1553,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     # p1l path, so a matching recipe alone cannot prove the checkpoint's real
     # shape; the probe path already hard-refuses architecture mismatches —
     # mirror that check for the confirmatory by-length cells.
-    _bind = manifest.get('binding') or {}
-    _arch_sig = _bind.get('training_recipe_signature') or {}
+    _arch_sig = _recipe_signature(manifest, v) or {}
     _present = [_k for _k in ('d', 'L', 'H', 'Dh') if _k in _arch_sig]
     if _present:
         # A mangled frozen binding must not silently disable the shape check

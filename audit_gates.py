@@ -2537,7 +2537,13 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
                 'positive steps/batch/seq allocation')
         if len(_param_vals) > 1:
             _conflict.append(f'params {_param_vals}')
-        if steps is None and len(_step_vals) > 1:
+        if steps is not None:
+            _decl_i = _exact_int_scalar(steps)
+            if _decl_i is None or _decl_i <= 0:
+                _conflict.append(f'declared steps {steps!r} is not a positive integer')
+            elif _step_vals and _step_vals != [_decl_i]:
+                _conflict.append(f'declared steps {_decl_i} disagrees with recorded steps {_step_vals}')
+        elif len(_step_vals) > 1:
             _conflict.append(f'steps {_step_vals}')
         if len(_tok_vals) > 1:
             _conflict.append(f'tokens {_tok_vals}')
@@ -3039,11 +3045,25 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
             out['problems'].append(
                 f'cell {i} ({c.get("arm")}): non-integral geometry fields {_bad_int}')
             continue
-        try:
-            rec, mass, base = (float(c['recall_at_k']), float(c['mass_covered']), float(c['random_baseline']))
-        except (TypeError, ValueError, OverflowError):
+        def _measurement(v):
+            if (v is None or isinstance(v, (bool, np.bool_, complex,
+                                            np.complexfloating, str, bytes,
+                                            np.datetime64, np.timedelta64))
+                    or not isinstance(v, numbers.Real)):
+                return None
+            try:
+                f = float(v)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return f if math.isfinite(f) else None
+
+        _meas = {name: _measurement(c[name])
+                 for name in ('recall_at_k', 'mass_covered', 'random_baseline')}
+        if any(v is None for v in _meas.values()):
             out['problems'].append(f'cell {i}: non-numeric fields')
             continue
+        rec, mass, base = (_meas['recall_at_k'], _meas['mass_covered'],
+                           _meas['random_baseline'])
         k, B = _ints['k'], _ints['n_blocks']
         nq = _ints['n_queries']
         _range_ok = bool(0.0 <= rec <= 1.0 and 0.0 <= mass <= 1.0 and 0.0 <= base <= 1.0)
@@ -3103,15 +3123,13 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
             if isinstance(v.get('mass_covered'), (bool, np.bool_)) or isinstance(v.get('random_baseline'), (bool, np.bool_)):
                 _bad_seed.append(str(_sk))
                 continue
-            try:
-                _mv = float(v.get('mass_covered'))
-                _bv = float(v.get('random_baseline'))
-            except (TypeError, ValueError, OverflowError):
+            _mv = _measurement(v.get('mass_covered'))
+            _bv = _measurement(v.get('random_baseline'))
+            if _mv is None or _bv is None:
                 _bad_seed.append(str(_sk))
                 continue
             # Per-seed fractions must be finite probabilities in [0,1].
-            if (not (math.isfinite(_mv) and math.isfinite(_bv))
-                    or not (0.0 <= _mv <= 1.0 and 0.0 <= _bv <= 1.0)):
+            if not (0.0 <= _mv <= 1.0 and 0.0 <= _bv <= 1.0):
                 _bad_seed.append(str(_sk))
                 continue
             _d.append(_mv - _bv)
@@ -3149,6 +3167,8 @@ def _aggregate_audit_status(results):
     statuses = [r.get('status') for r in results.values() if isinstance(r, dict)]
     if 'fail' in statuses:
         return 'fail'
+    if 'error' in statuses:
+        return 'error'
     if any(s in ('warnings', 'warn') for s in statuses):
         return 'warnings'
     if 'not_verifiable_locally' in statuses:

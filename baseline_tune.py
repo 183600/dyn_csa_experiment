@@ -561,8 +561,9 @@ def _run_final(base, outdir, protocol, selected):
     # these two means.
     arm_summary = {}
     for arm, entry in selected.items():
-        _recs = {int(r['seed']): float(r['ppl']) for r in merged.values()
-                 if isinstance(r, dict) and r.get('variant') == arm
+        _recs = {int(r['seed']): float(r['ppl'])
+                 for key, r in merged.items()
+                 if isinstance(r, dict) and key.split('::', 1)[0] == arm
                  and r.get('seed') is not None and L.ppl_is_usable(r.get('ppl'))}
         _vals = [_recs[s] for s in sorted(_recs)]
         arm_summary[arm] = {
@@ -583,8 +584,10 @@ def _run_final(base, outdir, protocol, selected):
                   'contrasts': {}}
     for method, baseline in plan:
         deltas, seeds, skipped = [], [], []
-        _common = sorted({int(r['seed']) for r in merged.values() if r.get('variant') == method} &
-                         {int(r['seed']) for r in merged.values() if r.get('variant') == baseline})
+        _common = sorted({int(r['seed']) for key, r in merged.items()
+                          if key.split('::', 1)[0] == method} &
+                         {int(r['seed']) for key, r in merged.items()
+                          if key.split('::', 1)[0] == baseline})
         for seed in _common:
             ra = merged.get(f'{method}::seed{seed}')
             rb = merged.get(f'{baseline}::seed{seed}')

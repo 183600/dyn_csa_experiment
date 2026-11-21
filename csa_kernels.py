@@ -1456,6 +1456,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                         if GS is not None:
                             acc = acc + (-(P_sinkS * GS)).sum(dim=(0, 1))
                         dsink[h] += acc.to(dtype)
+                dzA = dzA * lane_ok
                 if dzS is not None:
                     dzS = dzS * s_live
                 dz = dzA if dzS is None else dzA + dzS
@@ -2054,7 +2055,7 @@ def _attach_attn_kernels(ns):
             m = tl.zeros((BT,), tl.float32) + sk
             l = tl.full((BT,), 1.0, tl.float32)
         else:
-            m = tl.full((BT,), -1e30, tl.float32)
+            m = tl.full((BT,), float('-inf'), tl.float32)
             l = tl.zeros((BT,), tl.float32)
         acc = tl.zeros((BT, HD), tl.float32)
         p_lo = tl.maximum(t0 - (W - 1), 0)
@@ -2067,6 +2068,7 @@ def _attach_attn_kernels(ns):
             ok = pm[None, :] & (p[None, :] <= ti[:, None]) & (p[None, :] > ti[:, None] - W)
             z = tl.where(ok, z, float('-inf'))
             mn = tl.maximum(m, tl.max(z, 1))
+            mn = tl.where(mn == float('-inf'), -1e30, mn)
             alpha = tl.exp(m - mn)
             pa = tl.exp(z - mn[:, None])
             l = l * alpha + tl.sum(pa, 1)
@@ -2089,6 +2091,7 @@ def _attach_attn_kernels(ns):
             zj = tl.sum(qt * kj, 1) * SCALE
             zj = tl.where(ok, zj, float('-inf'))
             mn = tl.maximum(m, zj)
+            mn = tl.where(mn == float('-inf'), -1e30, mn)
             alpha = tl.exp(m - mn)
             pj = tl.exp(zj - mn)
             l = l * alpha + pj
@@ -2100,6 +2103,8 @@ def _attach_attn_kernels(ns):
         else:
             lsafe = tl.where(l == 0.0, 1.0, l)
             out = acc / lsafe[:, None]
+        _bad = (l != l) | (l == float('inf'))
+        out = tl.where(_bad[:, None], 0.0, out)
         tl.store(out_ptr + ((r * T + ti[:, None]) * NH + h) * HD + d[None, :], out.to(out_ptr.dtype.element_ty), mask=tm[:, None])
 
     ns.attn_fwd = attn_fwd
@@ -2132,9 +2137,9 @@ def _attach_attn_kernels(ns):
             mS = tl.zeros((BT,), tl.float32) + sk
             ZS = tl.full((BT,), 1.0, tl.float32)
         else:
-            mA = tl.full((BT,), -1e30, tl.float32)
+            mA = tl.full((BT,), float('-inf'), tl.float32)
             ZA = tl.zeros((BT,), tl.float32)
-            mS = tl.full((BT,), -1e30, tl.float32)
+            mS = tl.full((BT,), float('-inf'), tl.float32)
             ZS = tl.zeros((BT,), tl.float32)
         GAr = tl.zeros((BT,), tl.float32)
         GSr = tl.zeros((BT,), tl.float32)
@@ -2150,12 +2155,14 @@ def _attach_attn_kernels(ns):
             z = tl.where(ok, z, float('-inf'))
             g = tl.dot(dOt, tl.trans(vt), input_precision=DOT)
             mnA = tl.maximum(mA, tl.max(z, 1))
+            mnA = tl.where(mnA == float('-inf'), -1e30, mnA)
             aA = tl.exp(mA - mnA)
             ZA = ZA * aA + tl.sum(tl.exp(z - mnA[:, None]), 1)
             GAr = GAr * aA + tl.sum(tl.exp(z - mnA[:, None]) * g, 1)
             mA = mnA
             if HAS_SOFT:
                 mnS = tl.maximum(mS, tl.max(z, 1))
+                mnS = tl.where(mnS == float('-inf'), -1e30, mnS)
                 aS = tl.exp(mS - mnS)
                 ZS = ZS * aS + tl.sum(tl.exp(z - mnS[:, None]), 1)
                 GSr = GSr * aS + tl.sum(tl.exp(z - mnS[:, None]) * g, 1)
@@ -2178,6 +2185,7 @@ def _attach_attn_kernels(ns):
             zj = tl.where(ok, zj, float('-inf'))
             g = tl.sum(dOt * vjv, 1)
             mnA = tl.maximum(mA, zj)
+            mnA = tl.where(mnA == float('-inf'), -1e30, mnA)
             aA = tl.exp(mA - mnA)
             eA = tl.exp(zj - mnA)
             ZA = ZA * aA + eA
@@ -2189,11 +2197,20 @@ def _attach_attn_kernels(ns):
                 zS = tl.maximum(zj + lam, -3.402823466e38)
                 zS = tl.where(ok, zS, float('-inf'))
                 mnS = tl.maximum(mS, zS)
+                mnS = tl.where(mnS == float('-inf'), -1e30, mnS)
                 aS = tl.exp(mS - mnS)
                 eS = tl.exp(zS - mnS)
                 ZS = ZS * aS + eS
                 GSr = GSr * aS + eS * g
                 mS = mnS
+        _badA = (ZA != ZA) | (ZA == float('inf'))
+        _badS = (ZS != ZS) | (ZS == float('inf'))
+        mA = tl.where(_badA, 0.0, mA)
+        ZA = tl.where(_badA, 1.0, ZA)
+        GAr = tl.where(_badA, 0.0, GAr)
+        mS = tl.where(_badS, 0.0, mS)
+        ZS = tl.where(_badS, 1.0, ZS)
+        GSr = tl.where(_badS, 0.0, GSr)
         ZAs = tl.where(ZA == 0.0, 1.0, ZA)
         ZSs = tl.where(ZS == 0.0, 1.0, ZS)
         base = (r * T + ti) * NH + h
@@ -2244,6 +2261,7 @@ def _attach_attn_kernels(ns):
             GS = 0.0
             ZSs = 1.0
         dqacc = tl.zeros((BT, HD), tl.float32)
+        dq_bad = tl.zeros((BT,), tl.float32)
         p_lo = tl.maximum(t0 - (W - 1), 0)
         p_hi = tl.minimum(t0 + BT, T)
         for p0 in range(p_lo, p_hi, BW):
@@ -2254,6 +2272,7 @@ def _attach_attn_kernels(ns):
             z = tl.dot(qt, tl.trans(kt), input_precision=DOT) * SCALE
             ok = pm[None, :] & (p[None, :] <= ti[:, None]) & (p[None, :] > ti[:, None] - W)
             z = tl.where(ok, z, float('-inf'))
+            dq_bad = tl.maximum(dq_bad, tl.max(tl.where((z == float('inf')) | (z != z), 1.0, 0.0), 1))
             eA = tl.exp(z - mA[:, None])
             g = tl.dot(dOt, tl.trans(vt), input_precision=DOT)
             dz = eA / ZAs[:, None] * (g - GA[:, None])
@@ -2277,6 +2296,7 @@ def _attach_attn_kernels(ns):
             vjv = tl.load(vb_ptr + ((r * Bm + src[:, None]) * NH + h) * HD + d[None, :], mask=ok[:, None], other=0.0).to(tl.float32)
             zj = tl.sum(qt * kj, 1) * SCALE
             zj = tl.where(ok, zj, float('-inf'))
+            dq_bad = tl.maximum(dq_bad, tl.where((zj == float('inf')) | (zj != zj), 1.0, 0.0))
             eA = tl.exp(zj - mA)
             g = tl.sum(dOt * vjv, 1)
             dz = eA / ZAs * (g - GA)
@@ -2288,6 +2308,7 @@ def _attach_attn_kernels(ns):
                 eS = tl.exp(zS - mS)
                 dz += eS / ZSs * (g - GS)
             dqacc += dz[:, None] * kj * SCALE
+        dqacc = tl.where(dq_bad[:, None] != 0.0, 0.0, dqacc)
         tl.store(dq_ptr + ((r * T + ti[:, None]) * NH + h) * HD + d[None, :], dqacc.to(dq_ptr.dtype.element_ty), mask=tm[:, None])
 
     ns.attn_bwd_dq = attn_bwd_dq
@@ -2341,6 +2362,8 @@ def _attach_attn_kernels(ns):
                 q_v = tl.load(q_ptr + ((r * T + tt) * NH + h) * HD + d).to(tl.float32)
                 dO_v = tl.load(dO_ptr + ((r * T + tt) * NH + h) * HD + d).to(tl.float32)
                 z = tl.sum(q_v * kb_v) * SCALE
+                _bad = (z != z) | (z == float('inf'))
+                z = tl.where(_bad, 0.0, z)
                 st = (r * T + tt) * NH + h
                 mA = tl.load(mA_ptr + st)
                 ZA = tl.load(ZA_ptr + st)
@@ -2360,6 +2383,8 @@ def _attach_attn_kernels(ns):
                     PS = tl.exp(zS - mS) / ZSs
                     dzS = PS * (g - GS)
                     dz += dzS
+                dz = tl.where(_bad, 0.0, dz)
+                PA = tl.where(_bad, 0.0, PA)
                 if NEED_DK:
                     dk_acc += dz * q_v * SCALE
                 if NEED_DV:
@@ -2419,11 +2444,14 @@ def _attach_attn_kernels(ns):
                 GS = tl.load(GS_ptr + st, mask=tm, other=0.0)
                 ZSs = tl.where(ZS == 0.0, 1.0, ZS)
                 z = tl.sum(q_v * k_v, 1) * SCALE
+                _bad = (z != z) | (z == float('inf'))
+                z = tl.where(_bad, 0.0, z)
                 zS = tl.maximum(z + lam, -3.402823466e38)
                 zS = tl.where(ok, zS, float('-inf'))
                 PS = tl.exp(zS - mS) / ZSs
                 g = tl.sum(dO_v * v_v, 1)
                 dzS = PS * (g - GS)
+                dzS = tl.where(_bad, 0.0, dzS)
                 ds_h = tl.where(sf > 1e-12, dzS / tl.maximum(sf, 1e-12), 0.0)
                 acc += ds_h.to(dsoft_ptr.dtype.element_ty).to(tl.float32)
             tl.store(dsoft_ptr + ((r * T + ti) * NB + j), acc.to(dsoft_ptr.dtype.element_ty), mask=tm)
@@ -2461,6 +2489,8 @@ def _attach_attn_kernels(ns):
             q_t = tl.load(q_ptr + ((r * T + tt64[:, None]) * NH + h) * HD + d[None, :], mask=tm2[:, None], other=0.0).to(tl.float32)
             dO_t = tl.load(dO_ptr + ((r * T + tt64[:, None]) * NH + h) * HD + d[None, :], mask=tm2[:, None], other=0.0).to(tl.float32)
             z_t = tl.sum(q_t * k_v[None, :], 1) * SCALE
+            _bad_t = (z_t != z_t) | (z_t == float('inf'))
+            z_t = tl.where(_bad_t, 0.0, z_t)
             st = (r * T + tt64) * NH + h
             mA_t = tl.load(mA_ptr + st, mask=tm2, other=0.0)
             ZA_t = tl.load(ZA_ptr + st, mask=tm2, other=1.0)
@@ -2476,6 +2506,8 @@ def _attach_attn_kernels(ns):
                 ZSs_t = tl.where(ZS_t == 0.0, 1.0, ZS_t)
                 PS_t = tl.exp(z_t - mS_t) / ZSs_t
                 dz_t += PS_t * (g_t - GS_t)
+            dz_t = tl.where(_bad_t, 0.0, dz_t)
+            PA_t = tl.where(_bad_t, 0.0, PA_t)
             if NEED_DK:
                 dk_acc += tl.sum(dz_t[:, None] * q_t * SCALE, 0)
             if NEED_DV:

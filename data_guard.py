@@ -1036,6 +1036,8 @@ def _contains_missing_marker(value):
             return False
     if isinstance(value, (tuple, list, set, frozenset)):
         return any(_contains_missing_marker(x) for x in value)
+    if isinstance(value, np.ndarray):
+        return any(_contains_missing_marker(x) for x in value.reshape(-1).tolist())
     if isinstance(value, dict):
         return any(_contains_missing_marker(k) or _contains_missing_marker(v)
                    for k, v in value.items())
@@ -1075,6 +1077,8 @@ def _group_key(value):
         return value.normalize()
     if isinstance(value, (np.datetime64, np.timedelta64)) and np.isnat(value):
         return _MISSING_GROUP_NAT
+    if isinstance(value, (complex, np.complexfloating)) and _contains_missing_marker(value):
+        return _MISSING_GROUP_NAN
     try:
         hash(value)
     except TypeError:
@@ -1463,11 +1467,7 @@ def _as_categorical_2d(X, *, name='X'):
 def _category_is_missing(value):
     if value is None:
         return True
-    if isinstance(value, (float, np.floating)):
-        return bool(math.isnan(float(value)))
-    if isinstance(value, (np.datetime64, np.timedelta64)):
-        return bool(np.isnat(value))
-    return False
+    return _contains_missing_marker(value)
 
 
 def _sorted_categories(values):
@@ -3160,11 +3160,17 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
         # list of tuple labels must stay two categories, not be expanded into
         # four scalars by reshape(-1).  Rows of a genuine 2-D array are one
         # composite category each.
+        def _label_tuple(v):
+            if isinstance(v, np.ndarray):
+                if v.ndim == 0:
+                    return v.item()
+                return tuple(_label_tuple(x) for x in v.tolist())
+            if isinstance(v, list):
+                return tuple(_label_tuple(x) for x in v)
+            return v
+
         def _item(v):
-            # A list is the unhashable spelling of the same composite
-            # category; normalise it so a row from a 2-D array and a tuple
-            # supplied by the caller compare equal.
-            return tuple(v) if isinstance(v, list) else v
+            return _label_tuple(v)
 
         if isinstance(values, np.ndarray):
             if values.ndim == 0:

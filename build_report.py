@@ -966,6 +966,7 @@ def sec_p0w():
     rows = _prefer_one_cfg(rows, lambda row: ((row[0], row[1]), (s.get(row[-1]) or {}).get('run_cfg')), who='sec_p0w')
     _kept_keys = {row[-1] for row in rows}
     rec_by_s = collections.defaultdict(dict)
+    _ambiguous = set()
     for _k, _r in sorted(s.items()):
         if _k not in _kept_keys:
             continue
@@ -982,8 +983,10 @@ def sec_p0w():
         if _rv is None:
             continue
         _slot = rec_by_s[_rv, _w]
-        if _sd in _slot:
-            print(f"[report] sec_p0w: ambiguous (variant, warm_steps, seed) = ({_rv!r}, {_w}, {_sd}): two measurable records found; keeping the FIRST (key {_k!r} ignored)")
+        if _sd in _slot or (_rv, _w, _sd) in _ambiguous:
+            print(f"[report] sec_p0w: ambiguous (variant, warm_steps, seed) = ({_rv!r}, {_w}, {_sd}): multiple measurable records found; the whole slot is EXCLUDED rather than choosing an order-dependent winner (key {_k!r})")
+            _slot.pop(_sd, None)
+            _ambiguous.add((_rv, _w, _sd))
             continue
         _slot[_sd] = _r
     grp = collections.defaultdict(list)
@@ -1907,17 +1910,6 @@ def sec_flops():
             or not math.isfinite(float(_xo))):
         _xo = None
     _xo_txt = f'**seq = {_xo:g}**' if _xo is not None else '**不存在**（所测长度内 CSA 均不低于 dense）'
-    lines = ['## 解析 FLOPs / KV-cache 与交叉点', '', f'**配置**：{cfg}。**方法**：论文只给相对百分比、无闭式，故采用与硬件无关的解析 FLOPs / KV-cache 进行对比。**这些是结构性估算**；任何「效率优势」主张必须用 `audit_gates.measure_prefill_decode` 在真实 checkpoint 上测量后另行报告。', '', f'**交叉点**：CSA 的每 token 注意力 FLOPs 在 {_xo_txt} 处开始低于 dense。', '', '| seq | 选择率 | CSA/dense FLOPs | hybrid/dense | CSA KV/dense |', '|---|---|---|---|---|']
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        try:
-            _sv = float(r.get('seq_len'))
-            if not math.isfinite(_sv) or _sv not in pick:
-                continue
-            lines.append(f'| {r['seq_len']} | {r['sel_ratio']:.2%} | {r['csa_over_dense']:.3f} | {r['hybrid_over_dense']:.3f} | {r['csa_kv_over_dense']:.3f} |')
-        except (KeyError, TypeError, ValueError, OverflowError) as _e:
-            print(f'[report] sec_flops: a malformed row was skipped ({type(_e).__name__}: {_e})')
     _need = ('seq_len', 'sel_ratio', 'csa_over_dense', 'hybrid_over_dense',
              'csa_kv_over_dense')
     _clean = []
@@ -1941,6 +1933,11 @@ def sec_flops():
         # Normalise the key so an integral float (512.0) and an int (512) are
         # one sequence length instead of two mixed-type sort keys.
         _rows.setdefault(int(_sv) if _sv.is_integer() else _sv, r)
+    lines = ['## 解析 FLOPs / KV-cache 与交叉点', '', f'**配置**：{cfg}。**方法**：论文只给相对百分比、无闭式，故采用与硬件无关的解析 FLOPs / KV-cache 进行对比。**这些是结构性估算**；任何「效率优势」主张必须用 `audit_gates.measure_prefill_decode` 在真实 checkpoint 上测量后另行报告。', '', f'**交叉点**：CSA 的每 token 注意力 FLOPs 在 {_xo_txt} 处开始低于 dense。', '', '| seq | 选择率 | CSA/dense FLOPs | hybrid/dense | CSA KV/dense |', '|---|---|---|---|---|']
+    for _sv, r in sorted(_rows.items()):
+        if _sv not in pick:
+            continue
+        lines.append(f'| {_sv} | {float(r['sel_ratio']):.2%} | {float(r['csa_over_dense']):.3f} | {float(r['hybrid_over_dense']):.3f} | {float(r['csa_kv_over_dense']):.3f} |')
     _x = _xo
     _r512 = _rows.get(512)
     if _r512 is not None and _x is not None:
