@@ -945,7 +945,7 @@ def run_full():
         print(f'\n[m0] INCOMPLETE — panel {panel}: {len(_missing)} planned cell(s) missing/unusable after the run:')
         for _k in _missing:
             print(f'    {_k}')
-        print('[m0] NOT reporting success — re-run to resume (checkpoints keep the re-run cheap); cells skipped by the cap leave no partial measurement.')
+        print('[m0] NOT reporting success — re-run to resume (checkpoints allow resume); cells skipped by the cap leave no partial measurement.')
         schedule_shutdown(2400)
         sys.exit(1)
     print('\n[m0] DONE.')

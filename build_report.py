@@ -2302,7 +2302,7 @@ def sec_efficiency():
             rows.append((name, key, rec, eff))
     if not rows:
         return ''
-    lines = ['## Measured efficiency (not analytic FLOPs)', '',
+    lines = ['## Measured efficiency', '',
              '> Measured on the actual checkpoint/architecture with warmup + repeated runs. `prefix_prefill` is **not** incremental decode: the model has no KV cache, so each step re-runs the whole prefix.', '',
              '| panel | cell | params (M) | prefill p50/p95 ms | tokens/s | prefix-prefill p50 ms | peak alloc MB | peak reserved MB |', '|---|---|---|---|---|---|---|---|']
     for name, key, rec, eff in rows:

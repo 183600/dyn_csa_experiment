@@ -2648,7 +2648,7 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
 
 
 # ---------------------------------------------------------------------------
-# 9) 测量工具：prefill/decode 与容量读数（含 CPU 微型自检）
+# 9) 测量工具：prefill/decode 读数（含 CPU 微型自检）
 # ---------------------------------------------------------------------------
 
 def measure_prefill_decode(model, ids, device, warmup=1, iters=3):
@@ -2656,7 +2656,7 @@ def measure_prefill_decode(model, ids, device, warmup=1, iters=3):
 
     prefill = 整段前向一次的墙钟；所谓 decode 当前每次从 token 0 重跑完整
     前缀，因此它是 prefix-prefill 均摊，不是有 KV cache 的增量 decode。
-    实现在 exp_lib.measure_efficiency（p50/p95、tokens/s 等读数）。"""
+    实现在 exp_lib.measure_efficiency。"""
     try:
         L = _import_exp_lib()
         return L.measure_efficiency(model, ids, device, warmup=warmup, iters=iters)

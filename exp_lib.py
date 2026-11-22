@@ -9273,8 +9273,8 @@ def stamped_analysis(kind, payload, *, outdir=None, name=None, event=True):
     """Return `payload` merged with the standard traceability stamp — and
     optionally persist it plus an experiments.jsonl entry.
 
-    A derived number (statistic, audit verdict, analytic FLOPs table, kernel
-    validation report, parameter count) is quotable in a report only if the
+    A derived number (statistic, audit verdict, kernel validation report,
+    parameter count) is quotable in a report only if the
     artifact records WHICH code produced it, when, and under which
     environment/git state — the same provenance spine a training record
     carries.  Without this, re-deriving an analysis after a code change is
@@ -9808,8 +9808,7 @@ def kv_cache_elements_per_token(m):
     Full attention keeps K and V of width n_heads*d_head; CSA/HCA keep the
     compressed [c_kv | c_kv] lanes (plus the indexer's query projection is
     weights, not cache).  This is the structural quantity behind any
-    "KV-cache ratio" claim; storage bytes additionally need dtype/allocator
-    overhead and are measured by the harness, not inferred here.
+    "KV-cache ratio" claim.
     """
     total = 0
     per_layer = []
@@ -9823,7 +9822,7 @@ def kv_cache_elements_per_token(m):
         per_layer.append(int(n))
         total += int(n)
     return {'elements_per_token_total': int(total), 'per_layer': per_layer,
-            'note': 'elements, not bytes; multiply by dtype size and add allocator/block overhead for the measured footprint'}
+            'note': 'elements, not bytes'}
 
 def open_block_config(m):
     """Machine-readable descriptor of every layer's read rule.
@@ -15668,22 +15667,16 @@ def _param_control_detail(recs, a, b):
     return out
 
 def _compute_control_detail(recs, a, b, *, tolerance=0.25):
-    """Measured compute allocation of a pair, not just its step count.
+    """Compare the measured compute allocation of a pair.
 
-    Equal `steps`/`tokens_seen` is enforced by `pair_reason`, but that is not
-    equal compute: the parameter-matched dense arm widens its MLP (+69%) and
-    reads every token, while a sparse arm reads a fraction of the blocks.  The
-    mismatch must be *shown*, and its DIRECTION matters: if the arm with more
-    measured compute also wins, the
-    comparison is confounded in favour of the claim; if it loses, the claim is
-    conservative.
+    Equal `steps`/`tokens_seen` does not imply equal compute.  The mismatch
+    must be shown, and its direction matters: more compute on the winning arm
+    confounds the comparison in favour of the claim.
 
-    Sources, in order of preference:
-      * measured wall-clock per token (`train_time_s / tokens_seen`), median
-        over the arm's seeds;
-      * the 6ND proxy (`params * tokens_seen`) when no timing is recorded.
-    Returns `{}`-shaped fields with None when neither record can support the
-    comparison; never guesses.
+    Prefer a measured per-token timing ratio (`train_time_s / tokens_seen`,
+    median over the arm's seeds); otherwise use the 6ND proxy
+    (`params * tokens_seen`).  Return None-shaped fields when neither record
+    supports the comparison; never guess.
     """
     def _series(arm):
         tpt, prox, par = [], [], []
@@ -16586,7 +16579,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 # The floor must be compared on the SAME denominator as the
                 # panel: the neural panel scores R x (L-1) positions, so use
                 # the matched-denominator floor (excludes row-first tokens)
-                # whenever the artifact provides it.  An earlier artifact without
+                # whenever the artifact provides it.  An artifact without
                 # the field falls back to the fallback scale, which is
                 # slightly INFLATED (row-first tokens have no context) — the
                 # fallback makes "beats the floor" easier, so it is labelled.
@@ -18399,8 +18392,8 @@ class _BlockStats:
             return None
         mean = self.s / self.total
         # Match the concatenated form's sample standard deviation
-        # (torch.std's default Bessel correction); with a single observation
-        # the original reports 0.0.
+        # (torch.std's default Bessel correction); a single observation
+        # reports 0.0.
         if self.total > 1:
             var = max((self.ss - self.s * self.s / self.total) / (self.total - 1), 0.0)
         else:

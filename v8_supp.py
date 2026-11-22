@@ -272,7 +272,7 @@ def run_full():
     if all_ok:
         print('\n[v8] ALL PHASES DONE.')
     else:
-        print('\n[v8] INCOMPLETE — not every planned phase ran cleanly; re-run to resume (checkpoints make the re-run cheap).')
+        print('\n[v8] INCOMPLETE — not every planned phase ran cleanly; re-run to resume (checkpoints allow resume).')
     schedule_shutdown(120 if all_ok else 2400)
     if not all_ok:
         sys.exit(1)
