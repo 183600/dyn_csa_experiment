@@ -41,7 +41,7 @@ def git_push(msg):
             # A network stall must not hang the driver forever with nothing
             # pushed and no shutdown scheduled.
             return subprocess.CompletedProcess(a, -9, '', 'git command timed out after 600s')
-    ra = run('git', 'add', '-A')
+    ra = run('git', 'add', '-u')
     if ra.returncode != 0:
         print(f'[git] add FAILED: {(ra.stdout + ra.stderr)[-300:]} — NOT pushing (a commit could miss unstaged work); leaving the tree for inspection')
         return False
@@ -605,7 +605,7 @@ def merge_long_aggregate(adir, snapshot_agg):
     print(f'[v6-merge] aggregate.json: {n_folded} measured entr(ies) folded into the snapshot — per-seed PPL means/stds and the paired deltas cover every measured seed; pooled/secondary fields are replaced only when the fresh aggregate re-measured the full old seed set (overlapping partial merges are marked instead of publishing a double-counted blend)')
 
 def schedule_shutdown(delay_s=90):
-    if os.environ.get('V6_NO_SHUTDOWN'):
+    if os.environ.get('V6_NO_SHUTDOWN', '').strip().lower() in ('1', 'true', 'yes', 'on'):
         print('[v6] shutdown suppressed (V6_NO_SHUTDOWN)')
         return
     marker = 'v6autoshutdown'

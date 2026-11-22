@@ -353,7 +353,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
         # corpus identity).
         out['checks']['fit_fp_provenance'] = (
             'not_verified (train and/or test fit_fp is missing or not a string)')
-        out['status'] = 'warnings'
+        out['status'] = 'fail'
         out['note'] = ('tokenizer fit-corpus provenance (fit_fp) is missing or malformed on '
                        'at least one side; tokenizer/split provenance cannot be independently verified')
     elif _train_fit_fp != _test_fit_fp:

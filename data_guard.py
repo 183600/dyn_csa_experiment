@@ -128,75 +128,91 @@ class _UnhashableKey:
         return f'_UnhashableKey({self.type_name!r}, {self.text!r})'
 
 
-def _unhashable_identity(value):
+_UID_DEPTH = 64
+
+def _unhashable_identity(value, _seen=None, _depth=0):
     """Canonical identity for a composite (unhashable) group/label value.
 
     Mirrors ``_group_key``'s scalar contract recursively: bool stays distinct
     from int, ``-0.0`` folds to ``0.0``, every NaN is one missing value, and
     mapping insertion order cannot change the identity.
+
+    Adds cycle detection and depth limiting to prevent infinite recursion on
+    deeply nested or self-referential structures (guards against stack overflow).
     """
-    if isinstance(value, (bool, np.bool_)):
-        return ('bool', bool(value))
-    if isinstance(value, (np.datetime64, np.timedelta64)):
-        # Use the same unit-independent temporal identity as the scalar
-        # `_group_key`/row-key contract: the same instant stored as ns/us/ms
-        # is one group, and every NaT (either unit) is the one missing group.
-        if np.isnat(value):
-            return ('nat',)
-        return _temporal_identity(value)
-    if isinstance(value, (int, np.integer)):
-        # Python's scalar group contract treats 1 and 1.0 as the same group
-        # (their hashes/equality agree).  Use one numeric tag for both and
-        # canonicalise every integral float to its exact integer spelling, so
-        # a list/dict group id cannot split [1] from [1.0].  A float above
-        # 2**53 already denotes a specific integer; int(f) is that exact
-        # value, while 2**53 + 1 stays distinct from float(2**53 + 1).
-        return ('num', int(value))
-    if isinstance(value, (float, np.floating)):
-        if isinstance(value, np.longdouble):
-            return _longdouble_identity(value)
-        f = float(value)
-        if math.isnan(f):
-            return ('nan',)
-        if math.isinf(f):
-            return ('inf', 1 if f > 0 else -1)
-        if f.is_integer():
-            return ('num', int(f))
-        return ('num', f)
-    if isinstance(value, decimal.Decimal):
-        if value.is_nan():
-            return ('nan',)
-        if value.is_infinite():
-            return ('inf', 1 if value > 0 else -1)
-        return _decimal_identity(value)
-    if isinstance(value, (complex, np.complexfloating)):
-        # Canonicalise signed zero and missing/overflowed components exactly
-        # like the row-key/fingerprint paths, so a composite group id does not
-        # depend on the NaN payload or a -0.0 spelling.
-        return _canonical_complex_cell(value)
-    if isinstance(value, (bytes, bytearray, np.bytes_)):
-        return ('bytes', bytes(value))
-    if isinstance(value, (str, np.str_)):
-        return ('str', str(value))
-    if isinstance(value, tuple):
-        return ('tuple', tuple(_unhashable_identity(x) for x in value))
-    if isinstance(value, list):
-        return ('list', tuple(_unhashable_identity(x) for x in value))
-    if isinstance(value, dict):
-        _items = sorted(
-            ((_unhashable_identity(k), _unhashable_identity(v))
-             for k, v in value.items()), key=lambda kv: repr(kv[0]))
-        return ('dict', tuple(_items))
-    if isinstance(value, (set, frozenset)):
-        return ('set', tuple(sorted((_unhashable_identity(x) for x in value),
-                                    key=repr)))
-    if isinstance(value, numbers.Real):
-        return _real_identity(value)
+    if _depth > _UID_DEPTH:
+        return ('deep', type(value).__name__, _depth)
+    if _seen is None:
+        _seen = set()
+    val_id = id(value)
+    if val_id in _seen:
+        return ('cycle', type(value).__name__, val_id)
+    _seen.add(val_id)
     try:
-        hash(value)
-    except TypeError:
-        return ('unhashable', type(value).__name__, repr(value))
-    return ('obj', type(value).__name__, value)
+        if isinstance(value, (bool, np.bool_)):
+            return ('bool', bool(value))
+        if isinstance(value, (np.datetime64, np.timedelta64)):
+            # Use the same unit-independent temporal identity as the scalar
+            # `_group_key`/row-key contract: the same instant stored as ns/us/ms
+            # is one group, and every NaT (either unit) is the one missing group.
+            if np.isnat(value):
+                return ('nat',)
+            return _temporal_identity(value)
+        if isinstance(value, (int, np.integer)):
+            # Python's scalar group contract treats 1 and 1.0 as the same group
+            # (their hashes/equality agree).  Use one numeric tag for both and
+            # canonicalise every integral float to its exact integer spelling, so
+            # a list/dict group id cannot split [1] from [1.0].  A float above
+            # 2**53 already denotes a specific integer; int(f) is that exact
+            # value, while 2**53 + 1 stays distinct from float(2**53 + 1).
+            return ('num', int(value))
+        if isinstance(value, (float, np.floating)):
+            if isinstance(value, np.longdouble):
+                return _longdouble_identity(value)
+            f = float(value)
+            if math.isnan(f):
+                return ('nan',)
+            if math.isinf(f):
+                return ('inf', 1 if f > 0 else -1)
+            if f.is_integer():
+                return ('num', int(f))
+            return ('num', f)
+        if isinstance(value, decimal.Decimal):
+            if value.is_nan():
+                return ('nan',)
+            if value.is_infinite():
+                return ('inf', 1 if value > 0 else -1)
+            return _decimal_identity(value)
+        if isinstance(value, (complex, np.complexfloating)):
+            # Canonicalise signed zero and missing/overflowed components exactly
+            # like the row-key/fingerprint paths, so a composite group id does not
+            # depend on the NaN payload or a -0.0 spelling.
+            return _canonical_complex_cell(value)
+        if isinstance(value, (bytes, bytearray, np.bytes_)):
+            return ('bytes', bytes(value))
+        if isinstance(value, (str, np.str_)):
+            return ('str', str(value))
+        if isinstance(value, tuple):
+            return ('tuple', tuple(_unhashable_identity(x, _seen, _depth + 1) for x in value))
+        if isinstance(value, list):
+            return ('list', tuple(_unhashable_identity(x, _seen, _depth + 1) for x in value))
+        if isinstance(value, dict):
+            _items = sorted(
+                ((_unhashable_identity(k, _seen, _depth + 1), _unhashable_identity(v, _seen, _depth + 1))
+                 for k, v in value.items()), key=lambda kv: repr(kv[0]))
+            return ('dict', tuple(_items))
+        if isinstance(value, (set, frozenset)):
+            return ('set', tuple(sorted((_unhashable_identity(x, _seen, _depth + 1) for x in value),
+                                        key=repr)))
+        if isinstance(value, numbers.Real):
+            return _real_identity(value)
+        try:
+            hash(value)
+        except TypeError:
+            return ('unhashable', type(value).__name__, repr(value))
+        return ('obj', type(value).__name__, value)
+    finally:
+        _seen.discard(val_id)
 
 
 # ---------------------------------------------------------------------------

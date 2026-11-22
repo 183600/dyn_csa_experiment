@@ -10,7 +10,9 @@ if os.environ.get('CSA_HF_MIRROR', '').strip().lower() in ('1', 'true', 'yes'):
 # set/dict iteration order, but pinning it closes the last Python-level
 # nondeterminism source on repeat runs of the same machine.
 os.environ.setdefault('PYTHONHASHSEED', '0')
-_cpu_thr = os.environ.get('CSA_CPU_THREADS', '').strip() or '1'
+_cpu_thr = os.environ.get('CSA_CPU_THREADS', '').strip()
+if not _cpu_thr or _cpu_thr == '0':
+    _cpu_thr = '1'
 os.environ.setdefault('OMP_NUM_THREADS', _cpu_thr)
 os.environ.setdefault('MKL_NUM_THREADS', _cpu_thr)
 os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
@@ -159,7 +161,8 @@ def _uses_batched_eager(cfgs, device=None, batch_size=None, forced=None):
     if not _active:
         return False
     return any(
-        getattr(c, 'kind', None) in ('csa', 'hca')
+        _pos_cap_eq_129(c)
+        and getattr(c, 'kind', None) in ('csa', 'hca')
         # RoPE CSA/HCA layers ALWAYS take the per-row
         # `HybridAttentionRoPE._single_rope` loop (v7_supp.py forward), and the
         # batched twin in csa_kernels has no RoPE/qk-norm implementation.  A
@@ -169,9 +172,23 @@ def _uses_batched_eager(cfgs, device=None, batch_size=None, forced=None):
         and getattr(c, 'indexer_mode', 'learned')
         and getattr(c, 'open_block_mode', 'closed') == 'closed'
         and int(getattr(c, 'max_block', 128) or 0) == 128
-        and int(getattr(c, 'position_capacity', lambda: 129)()) == 129
         for c in cfgs
     )
+
+
+def _pos_cap_eq_129(c):
+    """Whether ``c.position_capacity`` equals 129.
+
+    Handles missing attribute (defaults to 129), numeric values, and callable
+    methods — replacing the original lambda-default pattern which was atypical
+    and could mask missing configuration.
+    """
+    _pc = getattr(c, 'position_capacity', None)
+    if _pc is None:
+        return True  # default 129 matches 129
+    if callable(_pc):
+        return _pc() == 129
+    return int(_pc) == 129
 
 def code_stamp():
     """当前代码+内核模式写进每条记录的 `_code` 戳（eager = CODE_SEMANTICS
