@@ -13462,18 +13462,16 @@ def _as_seed_int(v):
     if v is None or isinstance(v, (bool, np.bool_)) or _is_nonmeasurement_scalar(v):
         return None
     if isinstance(v, numbers.Integral):
-        # Python int (and numpy integer types that subclass Integral) must
-        # also respect the 2**53 exact-representability limit, because the
-        # downstream reductions are binary64.  Values above 2**53 would silently
-        # round when converted to float, corrupting denominators.
-        # 2**53 itself is exactly representable as a float, so we use strict >.
-        if abs(v) > 2 ** 53:
-            return None
+        # Exact integer identities are preserved unbounded: panel seeds, token
+        # counts and cache signatures may legitimately exceed binary64 and the
+        # callers that need a float guard (normalize_seed_list, set_seed, ...)
+        # do so explicitly.  Rejecting them here would silently drop valid
+        # records and shrink identity keys.
         return int(v)
     if isinstance(v, numbers.Real):
         # np.float32/np.float64 are Real but not all are Python ``float``;
         # int() would silently truncate 1.5 to 1, turning an invalid seed
-        # into a different valid one.  Above 2**53 a float cannot
+        # into a different valid one.  At or above 2**53 a float cannot
         # represent every integer, so accepting it would let a requested
         # seed collapse to a different one (the same rule as
         # normalize_seed_list).
@@ -13483,7 +13481,7 @@ def _as_seed_int(v):
             return None
         if not (math.isfinite(f) and f.is_integer()):
             return None
-        if abs(f) > 2 ** 53:
+        if abs(f) >= 2 ** 53:
             return None
         return int(f)
     # Strings are a deliberate JSON/normalisation spelling: int('4') and
