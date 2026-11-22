@@ -6628,7 +6628,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             _problems.append('cache meta is not a JSON object')
         if meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget':
             _problems.append('cache does not attest the frozen train-prefix tokenizer fit')
-        if meta.get('tokenizer_fit_docs_in_train_prefix') is not True:
+        if (not (meta.get('tokenizer_fit_docs_in_train_prefix') is True or (isinstance(meta.get('tokenizer_fit_docs_in_train_prefix'), np.bool_) and bool(meta.get('tokenizer_fit_docs_in_train_prefix')) == True))):
             _problems.append(
                 'cache does not attest that the tokenizer fit docs are inside '
                 'the training prefix')
@@ -6697,7 +6697,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                     _problems.append(
                         'cache has document-id sidecars but no document-disjointness '
                         'attestation in its metadata')
-                if _mdoc and (_mdoc.get('disjoint') is not True
+                if _mdoc and ((not (_mdoc.get('disjoint') is True or (isinstance(_mdoc.get('disjoint'), np.bool_) and bool(_mdoc.get('disjoint')) == True)))
                               or _as_seed_int(_mdoc.get('overlap', 0)) != 0):
                     _problems.append(
                         'cache metadata does not attest document-disjoint train/validation splits')
@@ -7184,7 +7184,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                 elif _mdoc['test_fp'] != _ids_fp(test_doc_ids):
                     _problems.append(
                         'test document-id sidecar does not match the fingerprint in the cache metadata')
-                if (_mdoc.get('disjoint') is not True
+                if ((not (_mdoc.get('disjoint') is True or (isinstance(_mdoc.get('disjoint'), np.bool_) and bool(_mdoc.get('disjoint')) == True)))
                         or _as_seed_int(_mdoc.get('train_overlap', 0)) != 0
                         or _as_seed_int(_mdoc.get('validation_overlap', 0)) != 0):
                     _problems.append(
@@ -8327,7 +8327,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 if _shared_docs:
                     _problems.append(f'{_shared_docs} document ids occur in both train and validation')
                 _mdoc = meta.get('doc_ids') if isinstance(meta.get('doc_ids'), dict) else {}
-                if _mdoc.get('disjoint') is not True:
+                if (not (_mdoc.get('disjoint') is True or (isinstance(_mdoc.get('disjoint'), np.bool_) and bool(_mdoc.get('disjoint')) == True))):
                     _problems.append('cache metadata does not attest document-level disjointness')
                 # A missing fingerprint is not a pass: it cannot bind the
                 # sidecar to this cache.  WikiText already fails closed here;
@@ -8354,7 +8354,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
             if (_vreg or {}).get('policy') != 'per_cap_closed_no_cross_cap_reuse':
                 _problems.append('cache does not declare a closed per-cap validation region')
             if (meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget'
-                    or meta.get('tokenizer_fit_docs_in_train_prefix') is not True):
+                    or (not (meta.get('tokenizer_fit_docs_in_train_prefix') is True or (isinstance(meta.get('tokenizer_fit_docs_in_train_prefix'), np.bool_) and bool(meta.get('tokenizer_fit_docs_in_train_prefix')) == True)))):
                 _problems.append('cache does not attest a tokenizer fit inside the training prefix')
             if not meta.get('val_fp'):
                 _problems.append(
@@ -8858,7 +8858,7 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
         report['documents'] = {k: _docs.get(k) for k in
                                ('train_count', 'validation_count', 'overlap',
                                 'disjoint', 'policy')}
-        if (_docs.get('disjoint') is not True
+        if ((not (_docs.get('disjoint') is True or (isinstance(_docs.get('disjoint'), np.bool_) and bool(_docs.get('disjoint')) == True)))
                 or _as_seed_int(_docs.get('overlap', 0)) != 0):
             report['hard_failures'].append('cache does not attest document-disjoint train/validation splits')
     elif dataset == 'fineweb':
@@ -13002,7 +13002,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None, alpha=0.05):
                     tpp_ratio = None
             budget_matched = (bool(tpp_ratio <= 1.0 + tol)
                               if tpp_ratio is not None else None)
-            if budget_matched is False:
+            if (budget_matched is False or (isinstance(budget_matched, np.bool_) and bool(budget_matched) == False)):
                 warnings.append(
                     'tokens-per-parameter is not matched across the ladder '
                     f'(max/min={tpp_ratio:.2f} > {1.0 + tol:.2f}); a cross-scale '
@@ -15054,7 +15054,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         if len(_st) > 1 or len(_tk) > 1:
             problems.append(f'trial {sig[:48]} uses different steps/tokens across arms (steps={sorted(_st)}, tokens={sorted(_tk)})')
             break
-    if selected.get('search_complete') is False:
+    if (selected.get('search_complete') is False or (isinstance(selected.get('search_complete'), np.bool_) and bool(selected.get('search_complete')) == False)):
         warnings.append('the search grid was truncated (search_complete=False); it is equal across arms, but describe it as a bounded search, not the full declared grid')
     final_records = selected.get('final_records') or {}
     if not isinstance(final_records, dict):
@@ -15414,7 +15414,7 @@ def _apply_within_arm_missing(ctl, missing, totals):
                  if 0 < missing.get(a, 0) < totals.get(a, 0))
     if bad:
         ctl['within_arm_missing'] = bad
-        if ctl['equal'] is True:
+        if (ctl['equal'] is True or (isinstance(ctl['equal'], np.bool_) and bool(ctl['equal']) == True)):
             ctl['equal'] = None
     return ctl
 
@@ -15465,7 +15465,7 @@ def controlled_variables_report(recs, arms):
             _setting_missing_records(recs, arms, _get), _totals)
     hp_checked = [k for k, v in hyper.items()
                   if any(v['values'].get(a) for a in arms)]
-    hp_diffs = [k for k in hp_checked if hyper[k]['equal'] is False]
+    hp_diffs = [k for k in hp_checked if (hyper[k]['equal'] is False or (isinstance(hyper[k]['equal'], np.bool_) and bool(hyper[k]['equal']) == False))]
     hp_unknown = [k for k in hp_checked if hyper[k]['equal'] is None]
     if not hp_checked:
         hp_equal = None
@@ -15483,7 +15483,7 @@ def controlled_variables_report(recs, arms):
         | {a for k in hp_checked for a in hyper[k].get('within_arm_missing', [])})
     diff_values = {}
     for key, ctl in (('run_cfg', run_cfg), ('train_knobs', train_knobs)):
-        if ctl['equal'] is False:
+        if (ctl['equal'] is False or (isinstance(ctl['equal'], np.bool_) and bool(ctl['equal']) == False)):
             diff_values[key] = ctl['values']
     for key in hp_diffs:
         diff_values['hyperparams.' + key] = hyper[key]['values']
@@ -15510,9 +15510,9 @@ def controlled_variables_report(recs, arms):
         seed_coverage_equal = bool(len(set(_nonempty)) == 1)
     controlled = None
     flags = [run_cfg['equal'], train_knobs['equal'], hp_equal]
-    if any(f is False for f in flags):
+    if any((f is False or (isinstance(f, np.bool_) and bool(f) == False)) for f in flags):
         controlled = False
-    elif all(f is True for f in flags):
+    elif all((f is True or (isinstance(f, np.bool_) and bool(f) == True)) for f in flags):
         controlled = True
     return {
         'arms': arms,
@@ -15788,7 +15788,7 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
                           seed noise (|mean| <= std);
     unverified          — no controlled contrast (missing arm / config mismatch).
     """
-    usable = [e for e in entries if e.get('controlled') and (not require_param_match or e.get('param_controlled') is True)]
+    usable = [e for e in entries if e.get('controlled') and (not require_param_match or (e.get('param_controlled') is True or (isinstance(e.get('param_controlled'), np.bool_) and bool(e.get('param_controlled')) == True)))]
     if not usable:
         return 'unverified'
     def _entry_n(entry):
@@ -15804,7 +15804,7 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
         return 'underpowered'
     sig = [e for e in powered if e.get('significant_global')]
     if sig:
-        if any(e.get('direction_consistent') is False for e in sig):
+        if any((e.get('direction_consistent') is False or (isinstance(e.get('direction_consistent'), np.bool_) and bool(e.get('direction_consistent')) == False)) for e in sig):
             return 'direction_conflict'
         if any(e.get('predicted_sign') == 0 for e in sig):
             return 'direction_unspecified'
@@ -15812,7 +15812,7 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
         # claimed winner is a system-level difference.  `verified` is reserved
         # for contrasts that pass `mechanism_claim_allowed`, so the flag the
         # audit already computes finally has a consumer.
-        if all(e.get('mechanism_claim_allowed') is False for e in sig):
+        if all((e.get('mechanism_claim_allowed') is False or (isinstance(e.get('mechanism_claim_allowed'), np.bool_) and bool(e.get('mechanism_claim_allowed')) == False)) for e in sig):
             return 'system_level_only'
         return 'verified'
     noise_free = [e for e in powered if not e.get('within_seed_noise')]
@@ -16128,7 +16128,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     _cc = _compute_control_detail(recs, a, b)
                     st['compute_control'] = _cc
                     st['compute_matched'] = _cc.get('compute_matched')
-                    if _cc.get('compute_matched') is False and isinstance(st.get('mean'), (int, float)) and math.isfinite(float(st['mean'])):
+                    if (_cc.get('compute_matched') is False or (isinstance(_cc.get('compute_matched'), np.bool_) and bool(_cc.get('compute_matched')) == False)) and isinstance(st.get('mean'), (int, float)) and math.isfinite(float(st['mean'])):
                         _mean_sign = _sign_of(st['mean'])
                         if _mean_sign == 0:
                             st['compute_confound_direction'] = 'no_observed_winner'
@@ -16183,7 +16183,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                                'run_cfg_equal': _cfg_a is not None and _cfg_a == _cfg_b,
                                'run_cfg_knobs': run_cfg_knobs(_cfg_a) or None,
                                'param_rel_diff': _rel, 'param_controlled': _param_ok,
-                               'capacity_confounded': (_param_ok is False),
+                               'capacity_confounded': ((_param_ok is False or (isinstance(_param_ok, np.bool_) and bool(_param_ok) == False))),
                                'with_mean': _a_mean, 'with_std': _a_std,
                                'without_mean': _b_mean, 'without_std': _b_std,
                                'relative_effect_pct': _rel_effect,
@@ -16226,11 +16226,11 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     report['warnings'].append('%s: incomplete %s `%s` vs `%s` — missing `%s`' % (comp, kind, a, b, a if not a_present else b))
                 else:
                     report['warnings'].append('%s: neither `%s` nor `%s` measured — no %s for this %s yet' % (comp, a, b, 'leave-one-out' if kind == 'component' else 'baseline contrast', kind))
-                if kind == 'baseline' and _param_ok is False:
+                if kind == 'baseline' and (_param_ok is False or (isinstance(_param_ok, np.bool_) and bool(_param_ok) == False)):
                     report['warnings'].append('%s: `%s` vs `%s` differ in parameter count by %.2f%% — NOT parameter-controlled, so this baseline claim is not counted as verified' % (comp, a, b, 100.0 * (_rel or 0.0)))
                 elif kind == 'baseline' and _param_ok is None and a_present and b_present:
                     report['warnings'].append('%s: `%s` vs `%s` carry no usable `params` — parameter control is UNVERIFIABLE, so this baseline claim is not counted as verified' % (comp, a, b))
-                elif kind == 'component' and _param_ok is False:
+                elif kind == 'component' and (_param_ok is False or (isinstance(_param_ok, np.bool_) and bool(_param_ok) == False)):
                     report['warnings'].append('%s: `%s` vs `%s` differ in parameter count by %.2f%% — part of this module effect may be a capacity (parameter-count) effect rather than the mechanism; report the parameter delta or add a parameter-matched control before claiming the mechanism is useful' % (comp, a, b, 100.0 * (_rel or 0.0)))
             out[comp] = entries
             meta[comp] = {'arms': arms}
@@ -16368,8 +16368,8 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             _cv = controlled_variables_report(recs, _arms)
             _cv.update({
                 'arms_present': sorted(a for a in _arms if a in present),
-                'param_matched': all(e.get('param_controlled') is True for e in entries) if entries else None,
-                'objective_matched': (all(e.get('objective_matched') is True for e in entries) if entries else None),
+                'param_matched': all((e.get('param_controlled') is True or (isinstance(e.get('param_controlled'), np.bool_) and bool(e.get('param_controlled')) == True)) for e in entries) if entries else None,
+                'objective_matched': (all((e.get('objective_matched') is True or (isinstance(e.get('objective_matched'), np.bool_) and bool(e.get('objective_matched')) == True)) for e in entries) if entries else None),
                 'objective_differences': sorted({x for e in entries for x in (e.get('objective_differences') or []) if 'differs' in str(x)}),
             })
             if _cv.get('objective_differences'):
@@ -16381,7 +16381,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             if _cv.get('hyperparam_differences'):
                 report['warnings'].append('%s: structured hyperparameters differ across arms (%s) even where run_cfg matches — the comparison is not fully controlled'
                                           % (comp, ', '.join(_cv['hyperparam_differences'])))
-            if _cv.get('seed_coverage_equal') is False:
+            if (_cv.get('seed_coverage_equal') is False or (isinstance(_cv.get('seed_coverage_equal'), np.bool_) and bool(_cv.get('seed_coverage_equal')) == False)):
                 _cov = '; '.join(
                     '%s={%s}' % (a, ','.join('%s:%s' % (t or 'base', s)
                                              for t, s in _cv['seed_coverage'].get(a) or []))
@@ -16571,7 +16571,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 _comparable = None
                 if _sb_val_fp and _panel_val_fps:
                     _comparable = _sb_val_fp in _panel_val_fps
-                if _comparable is True and _sb_eval_fp and _panel_eval_fps:
+                if (_comparable is True or (isinstance(_comparable, np.bool_) and bool(_comparable) == True)) and _sb_eval_fp and _panel_eval_fps:
                     if _sb_eval_fp not in _panel_eval_fps:
                         _comparable = False
                         report['warnings'].append(
@@ -16599,16 +16599,16 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     'simple_floor_ppl': _floor_ppl,
                     'simple_floor_scale': _floor_scale,
                     'panel_beats_simple_floor': (bool(_ref_ppl(_ref) < _floor_ppl)
-                                                 if _comparable is True and _floor_ppl is not None
+                                                 if (_comparable is True or (isinstance(_comparable, np.bool_) and bool(_comparable) == True)) and _floor_ppl is not None
                                                  else None),
                 })
-                if _comparable is False:
+                if (_comparable is False or (isinstance(_comparable, np.bool_) and bool(_comparable) == False)):
                     report['warnings'].append(
                         'simple-baseline artifact and this panel do not share a validation fingerprint — the floor comparison is NOT comparable and must not be quoted')
                 elif _comparable is None:
                     report['warnings'].append(
                         'the floor comparison is UNVERIFIABLE: panel records and/or the simple-baseline artifact lack a shared validation fingerprint; do not quote a beats-floor claim')
-                elif report['simple_baseline'].get('panel_beats_simple_floor') is False:
+                elif (report['simple_baseline'].get('panel_beats_simple_floor') is False or (isinstance(report['simple_baseline'].get('panel_beats_simple_floor'), np.bool_) and bool(report['simple_baseline'].get('panel_beats_simple_floor')) == False)):
                     report['warnings'].append(
                         'the panel\'s best declared-arm PPL (%.4f, %s) does not beat the tuned count-model floor (%.4f, %s, %s) — the mechanism claim lacks the most basic baseline'
                         % (float(_ref.get('ppl_primary', _ref['ppl_mean'])), _ref_key, float(_floor_ppl),
@@ -16717,7 +16717,7 @@ def _print_methodology_audit(report):
                 _p = ('%.4f' % e['p_exact_signflip']) if math.isfinite(e['p_exact_signflip']) else 'n/a'
                 _ph = e.get('p_holm_global')
                 _phs = ('%.4f' % _ph) if isinstance(_ph, (int, float)) and math.isfinite(_ph) else 'n/a'
-                print('    %-22s − %-22s  n=%-2d  Δ=%+.3f ± %.3f  d_z=%+.2f  p=%s  p_Holm=%s  params=%s' % (e['with'], e['without'], e['n'], e['mean'], e['std'], e['cohens_dz'], _p, _phs, ('yes' if e.get('param_controlled') else ('no' if e.get('param_controlled') is False else 'n/a'))))
+                print('    %-22s − %-22s  n=%-2d  Δ=%+.3f ± %.3f  d_z=%+.2f  p=%s  p_Holm=%s  params=%s' % (e['with'], e['without'], e['n'], e['mean'], e['std'], e['cohens_dz'], _p, _phs, ('yes' if e.get('param_controlled') else ('no' if (e.get('param_controlled') is False or (isinstance(e.get('param_controlled'), np.bool_) and bool(e.get('param_controlled')) == False)) else 'n/a'))))
                 print('        %s | %s' % ('controlled (same run_cfg)' if e['controlled'] else ('UNCONTROLLED: ' + '; '.join(e['skipped_reasons'])), e['effect_vs_noise']))
         _mt = report.get('metric_audit') or {}
         print('  metric policy: %s (warnings: %d)' % (_mt.get('status') or 'n/a', len(_mt.get('warnings') or [])))
@@ -17142,7 +17142,7 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
             # Only a stream that provably changed counts as passing.  A
             # probed-but-unverifiable stream (e.g. a tensorflow draw that
             # errored) must not wave the contract through.
-            checks['different_seed_changes_streams'] = bool(changed) and all(v is True for v in changed.values())
+            checks['different_seed_changes_streams'] = bool(changed) and all((v is True or (isinstance(v, np.bool_) and bool(v) == True)) for v in changed.values())
         except Exception as e:
             errors['rng_draws'] = f'{type(e).__name__}: {e}'
             a = b = c = {}
@@ -17179,7 +17179,7 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
             except Exception as e:
                 errors['subprocess_seed'] = f'{type(e).__name__}: {e}'
                 checks['subprocess_seed_reproducible'] = False
-    failed = [k for k, ok in checks.items() if ok is False]
+    failed = [k for k, ok in checks.items() if (ok is False or (isinstance(ok, np.bool_) and bool(ok) == False))]
     passed = not failed and not errors
     report = {
         'kind': 'rng_seed_contract',
@@ -17558,7 +17558,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
             return None
         _rc = doc.get('run_cfg')
         if _rc is None:
-            if doc.get('legacy') is True:
+            if (doc.get('legacy') is True or (isinstance(doc.get('legacy'), np.bool_) and bool(doc.get('legacy')) == True)):
                 print(f'[track] WARNING: {what} evidence ({path}) has no run_cfg and is explicitly marked as imported — embedding it as unverified evidence')
                 return doc
             print(f'[track] WARNING: {what} evidence ({path}) has NO run_cfg — refusing to embed it (it cannot be tied to this panel; mark legacy=True only for a deliberately imported record)')
@@ -20942,7 +20942,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         and final_acc >= float(target_acc) and grad_finite and params_changed
         and math.isfinite(best_loss) and best_loss <= float(target_loss)
         and loss_decreased and _loss_curve_all_finite and _nonfinite_step is None
-        and _batch_contract is not False
+        and (not (_batch_contract is False or (isinstance(_batch_contract, np.bool_) and bool(_batch_contract) == False)))
         and (not _label_shift_required or bool(_label_shift_ok))
         and (not _initial_chance_required or _initial_near_chance))
     passed = _passed
@@ -21003,7 +21003,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
             'best_loss_below_target': bool(math.isfinite(best_loss) and best_loss <= float(target_loss)),
             'loss_decreased': bool(loss_decreased),
             'loss_curve_all_finite': bool(_loss_curve_all_finite and _nonfinite_step is None),
-            'batch_contract_not_failed': bool(_batch_contract is not False),
+            'batch_contract_not_failed': bool((not (_batch_contract is False or (isinstance(_batch_contract, np.bool_) and bool(_batch_contract) == False)))),
             'labels_are_next_token_shift': (bool(_label_shift_ok) if _label_shift_required else None),
             'initial_loss_near_log_vocab': (bool(_initial_near_chance) if _initial_chance_required else None),
         },
@@ -21019,7 +21019,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         },
     }
     report['passed'] = passed
-    report['failed_criteria'] = [k for k, ok in report['pass_criteria'].items() if ok is False]
+    report['failed_criteria'] = [k for k, ok in report['pass_criteria'].items() if (ok is False or (isinstance(ok, np.bool_) and bool(ok) == False))]
     if passed:
         report['diagnosis'] = 'ok'
     elif not (grad_finite and params_changed):
@@ -21030,7 +21030,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
         report['diagnosis'] = 'labels are not the next-token shift of the inputs (label construction/order error)'
     elif _initial_chance_required and not _initial_near_chance:
         report['diagnosis'] = 'initial loss is far from log(vocab) (wrong label map, vocabulary mismatch or invalid initialisation)'
-    elif _batch_contract is False:
+    elif (_batch_contract is False or (isinstance(_batch_contract, np.bool_) and bool(_batch_contract) == False)):
         report['diagnosis'] = 'the explicit batch violates the shape/label contract'
     elif not (_loss_curve_all_finite and _nonfinite_step is None):
         report['diagnosis'] = 'the loss/gradient curve became non-finite before the target was reached'
@@ -21250,14 +21250,14 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
         # retried (or re-raised) on the next call: treating any present key as
         # "already checked" would let a caller that caught the first failure
         # bypass the hard stop on a later phase in the same process.
-        if _OVERFIT_GUARD.get(_key(v)) is True:
+        if (_OVERFIT_GUARD.get(_key(v)) is True or (isinstance(_OVERFIT_GUARD.get(_key(v)), np.bool_) and bool(_OVERFIT_GUARD.get(_key(v))) == True)):
             return True
         if src == 'synthetic':
             # A passed data/batch probe of the same model/probe geometry
             # subsumes the synthetic plumbing check.
             for _k in list(_OVERFIT_GUARD):
                 if (_k[0] == v and _k[1] in ('data', 'batch')
-                        and _OVERFIT_GUARD.get(_k) is True
+                        and (_OVERFIT_GUARD.get(_k) is True or (isinstance(_OVERFIT_GUARD.get(_k), np.bool_) and bool(_OVERFIT_GUARD.get(_k)) == True))
                         and (_OVERFIT_REPORTS.get(_k) or {}).get('guard_probe_semantics') == _semantics[v]):
                     return True
         return False
@@ -21505,7 +21505,7 @@ def reproducibility_guard(variants, *, seed=0, steps=3, tol=1e-06, force=False, 
 
     # As in overfit_guard, a cached FAILURE is not a certificate: retry it so a
     # later phase cannot silently inherit the failed status as "already done".
-    todo = [(v, sd) for v in variants for sd in _seed_list if force or _REPRO_GUARD.get((v, _base_for(v, sd))) is not True]
+    todo = [(v, sd) for v in variants for sd in _seed_list if force or (not (_REPRO_GUARD.get((v, _base_for(v, sd))) is True or (isinstance(_REPRO_GUARD.get((v, _base_for(v, sd))), np.bool_) and bool(_REPRO_GUARD.get((v, _base_for(v, sd)))) == True)))]
     reports = []
     for v, sd in todo:
         r = reproducibility_check(v, seed=sd, steps=steps, tol=tol, arch=_arch, train_ids=train_ids, vocab=vocab, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), seq_len=seq_len, batch_size=batch_size)
@@ -22668,7 +22668,7 @@ def aggregate(summary, *, outdir=None):
                     dyn_lens.append(lm)
                     if 'bnd_f1' in lv:
                         _f1 = _cell(lv, 'bnd_f1')
-                        _ex = _cell(lv, 'bnd_excess') if lv.get('bnd_rand_exact') is not False else None
+                        _ex = _cell(lv, 'bnd_excess') if (not (lv.get('bnd_rand_exact') is False or (isinstance(lv.get('bnd_rand_exact'), np.bool_) and bool(lv.get('bnd_rand_exact')) == False))) else None
                         if _f1 is not None:
                             r_f1.append(_f1)
                         if _ex is not None:
@@ -23667,7 +23667,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
                 print('[seed-plan] this panel declares %d controlled contrasts; with n=%d seeds the family-corrected exact-test floor is above alpha, so results are DESCRIPTIVE ONLY. '
                       'A family-corrected rejection needs n>=%d (raise the seed list or narrow the pre-registered family before claiming significance).'
                       % (_sp['declared_contrasts'], _sp['n_seeds'], _sp['min_seeds_for_family_significance']))
-            if _sp.get('ablation_complete') is False:
+            if (_sp.get('ablation_complete') is False or (isinstance(_sp.get('ablation_complete'), np.bool_) and bool(_sp.get('ablation_complete')) == False)):
                 _abl = _sp.get('ablation_completeness') or {}
                 print('[seed-plan] ABLATION INCOMPLETE for this panel: missing %s. '
                       'A component with only a partial combination cannot support the claim that each module is useful; add the named full-minus-X arm (or run the full factorial).'

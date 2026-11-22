@@ -1175,7 +1175,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: {_shared_docs} document ids occur in '
                               'both train and validation (group leakage)')
-                    if _mdoc and _mdoc.get('disjoint') is not True:
+                    if _mdoc and (not (_mdoc.get('disjoint') is True or (isinstance(_mdoc.get('disjoint'), np.bool_) and bool(_mdoc.get('disjoint')) == True))):
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: cache metadata does not attest '
                               'document-disjoint splits')
@@ -2156,11 +2156,11 @@ def audit_fairness(summary_path=os.path.join(REPO, 'results_v10_mech/summary.jso
         if recs_map and len(_cv_arms) >= 1:
             cv = L.controlled_variables_report(recs_map, _cv_arms)
             out['controlled_variables'] = cv
-            if cv.get('run_cfg_equal') is False:
+            if (cv.get('run_cfg_equal') is False or (isinstance(cv.get('run_cfg_equal'), np.bool_) and bool(cv.get('run_cfg_equal')) == False)):
                 problems.append('run_cfg differs across arms — the training length / data / architecture knobs are not controlled; pair_reason would refuse every pairing')
-            if cv.get('train_knobs_equal') is False:
+            if (cv.get('train_knobs_equal') is False or (isinstance(cv.get('train_knobs_equal'), np.bool_) and bool(cv.get('train_knobs_equal')) == False)):
                 problems.append('train_knobs differ across arms (optimizer / betas / eps / lr-schedule / grad-clip / augmentation) — a gain from a different optimizer is not a gain from the method')
-            if cv.get('hyperparams_equal') is False:
+            if (cv.get('hyperparams_equal') is False or (isinstance(cv.get('hyperparams_equal'), np.bool_) and bool(cv.get('hyperparams_equal')) == False)):
                 problems.append('structured hyperparameters differ across arms: ' + ', '.join(cv.get('hyperparam_differences') or []) + ' — the comparison is not fully controlled')
             for _arm in cv.get('within_arm_mixed') or []:
                 problems.append(f'{_arm}: seeds mix DIFFERENT run_cfg/train_knobs/hyperparameter values inside one arm')
@@ -2880,7 +2880,7 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
                 rec['reason'] = 'missing or non-positive measured prefill time'
             elif _na != _nb or len(_na) != 1 or len(_nb) != 1:
                 rec['reason'] = f'different or ambiguous measured token counts ({_na} vs {_nb}); a timing ratio across shapes is not a paired comparison'
-            elif _same_batch is False:
+            elif (_same_batch is False or (isinstance(_same_batch, np.bool_) and bool(_same_batch) == False)):
                 rec['reason'] = (f'different or ambiguous batch sizes ({sorted(_ba) if _ba is not None else None} '
                                  f'vs {sorted(_bb) if _bb is not None else None}); timing depends on the batch shape')
             elif not same_env:

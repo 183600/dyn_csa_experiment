@@ -200,7 +200,7 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None):
     _pc = L.paired_param_control([panel[a][s] for s in res['seeds']],
                                  [panel[b][s] for s in res['seeds']])
     res.update(_pc)
-    if _pc.get('param_controlled') is False:
+    if (_pc.get('param_controlled') is False or (isinstance(_pc.get('param_controlled'), np.bool_) and bool(_pc.get('param_controlled')) == False)):
         print(f'[stats] {who}{name}: arms differ in total parameters by {100.0 * _pc["param_rel_diff"]:.1f}% '
               f'({_pc["params_a"]:,} vs {_pc["params_b"]:,}) — capacity-confounded: system-level difference only, '
               'not an isolated mechanism claim')
@@ -232,8 +232,8 @@ def v9_analysis(out='analysis_v9/stats.json'):
         if 'omitted' in v:
             print(f'  {k:38s} omitted — {v['omitted']}')
             continue
-        _ptxt = ('' if v.get('param_controlled') is True else
-                 (f'  params {100.0 * v['param_rel_diff']:+.1f}% [capacity-confounded: system-level]' if v.get('param_controlled') is False else '  params unverifiable [system-level]'))
+        _ptxt = ('' if (v.get('param_controlled') is True or (isinstance(v.get('param_controlled'), np.bool_) and bool(v.get('param_controlled')) == True)) else
+                 (f'  params {100.0 * v['param_rel_diff']:+.1f}% [capacity-confounded: system-level]' if (v.get('param_controlled') is False or (isinstance(v.get('param_controlled'), np.bool_) and bool(v.get('param_controlled')) == False)) else '  params unverifiable [system-level]'))
         print(f'  {k:38s} Δ={v['mean']:+7.2f} ± {v.get('std', 0):5.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  n={v['n']}{_ptxt}')
     return out_d
 

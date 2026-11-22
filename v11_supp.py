@@ -237,7 +237,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
         _fit_entries[_lab] = {'label': _lab, 'd': _v.get('d'),
                               'crossover_tokens': _v.get('mean_crossover_tokens'),
                               'train_tokens': _v.get('train_tokens'),
-                              'censored': bool(_v.get('censored') or _v.get('mean_crossed') is False),
+                              'censored': bool(_v.get('censored') or (_v.get('mean_crossed') is False or (isinstance(_v.get('mean_crossed'), np.bool_) and bool(_v.get('mean_crossed')) == False))),
                               'reconstructed': bool(_is_recon_v11(_v))}
     # Same refusal rules as v10: one point per width,
     # uncensored, comparable training volume, >=4 widths, slope with CI.

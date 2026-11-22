@@ -1293,7 +1293,7 @@ def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
     ``allow_unhealthy_override=True`` (plus the health status), so the
     override is auditable from the artifacts alone.
     """
-    if L._as_bool_flag(cfg.get('smoke')) is True:
+    if (L._as_bool_flag(cfg.get('smoke')) is True or (isinstance(L._as_bool_flag(cfg.get('smoke')), np.bool_) and bool(L._as_bool_flag(cfg.get('smoke'))) == True)):
         return None
     health = (ckpt_meta or {}).get('curve_health') or (train_rec or {}).get('curve_health')
     allow = os.environ.get('V12_ALLOW_UNHEALTHY', '').strip().lower() in ('1', 'true', 'yes', 'on')
@@ -1877,7 +1877,7 @@ def run_power_check(cfg=None):
                 continue
             # A truncated cell did not evaluate the frozen endpoint length;
             # its PPL cannot certify power at that length.
-            if ca.get('truncated') is not False or cb.get('truncated') is not False:
+            if (not (ca.get('truncated') is False or (isinstance(ca.get('truncated'), np.bool_) and bool(ca.get('truncated')) == False))) or (not (cb.get('truncated') is False or (isinstance(cb.get('truncated'), np.bool_) and bool(cb.get('truncated')) == False))):
                 continue
             pa, pb = ca.get('ppl'), cb.get('ppl')
             if L.ppl_is_usable(pa) and L.ppl_is_usable(pb):
@@ -2020,7 +2020,7 @@ def run_finaltest(cfg=None, guard=None):
     # `finaltest` CLI mode must run it before any test access so a plan that
     # plan_check would reject cannot consume the one-shot test.  Smoke runs use injected
     # data and are not the frozen confirmation, so they skip it.
-    _smoke = L._as_bool_flag(cfg.get('smoke')) is True
+    _smoke = (L._as_bool_flag(cfg.get('smoke')) is True or (isinstance(L._as_bool_flag(cfg.get('smoke')), np.bool_) and bool(L._as_bool_flag(cfg.get('smoke'))) == True))
     _manifest_path = cfg.get('manifest') or FREEZE_MANIFEST
     if os.path.abspath(_manifest_path) not in _PLAN_DONE_FOR and not _smoke:
         plan_check(_manifest_path)

@@ -832,6 +832,9 @@ def _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed, 
             couple_pos.update((kp, vp))
         if condition == 'distract':
             k = int(round(rho * n_far))
+            if rho > 0.0:
+                k = max(1, k)
+            k = min(k, n_far)
             if k > 0:
                 crng = np.random.default_rng((eval_len * 1000003 + i * 10007) * 1048576 + int(round(rho * 1048576)))
                 pos = crng.choice(n_far, size=k, replace=False)
@@ -2211,7 +2214,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
         fit_entries[_lab] = {'label': _lab, 'd': _v.get('d'),
                              'crossover_tokens': _v.get('mean_crossover_tokens'),
                              'train_tokens': _v.get('train_tokens'),
-                             'censored': bool(_v.get('censored') or _v.get('mean_crossed') is False),
+                             'censored': bool(_v.get('censored') or (_v.get('mean_crossed') is False or (isinstance(_v.get('mean_crossed'), np.bool_) and bool(_v.get('mean_crossed')) == False))),
                              'reconstructed': bool(_is_recon(_v))}
     # One point per width, no censored subset, comparable
     # training volume, at least 4 widths, and a slope WITH CI.  The helper
@@ -2238,8 +2241,8 @@ def v10_analysis(out='analysis_v10/stats.json'):
         if 'omitted' in v:
             print(f'  {k:38s} omitted — {v['omitted']}')
             continue
-        _ptxt = ('' if v.get('param_controlled') is True else
-                 (f'  params {100.0 * v['param_rel_diff']:+.1f}% [capacity-confounded: system-level]' if v.get('param_controlled') is False else '  params unverifiable [system-level]'))
+        _ptxt = ('' if (v.get('param_controlled') is True or (isinstance(v.get('param_controlled'), np.bool_) and bool(v.get('param_controlled')) == True)) else
+                 (f'  params {100.0 * v['param_rel_diff']:+.1f}% [capacity-confounded: system-level]' if (v.get('param_controlled') is False or (isinstance(v.get('param_controlled'), np.bool_) and bool(v.get('param_controlled')) == False)) else '  params unverifiable [system-level]'))
         print(f'  {k:38s} Δ={v['mean']:+7.2f} ± {v.get('std', 0):5.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  n={v['n']}{_ptxt}')
     for label, v in xo.items():
         if v.get('status') == 'ok':

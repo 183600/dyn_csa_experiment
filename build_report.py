@@ -899,7 +899,7 @@ def sec_p0r():
         # Only a *known* mismatch is flagged: when params are missing
         # (`is_param_matched` returns None) keep the "params 未知" tag but do
         # not assert the structural-mismatch block.
-        rope_is_defect = is_param_matched(_cf_r, _fu_r) is False
+        rope_is_defect = (is_param_matched(_cf_r, _fu_r) is False or (isinstance(is_param_matched(_cf_r, _fu_r), np.bool_) and bool(is_param_matched(_cf_r, _fu_r)) == False))
         _w_abs = ('未知' if not math.isfinite(g_abs) else '领先' if g_abs < 0 else '落后' if g_abs > 0 else '持平')
         _w_absm = ('未知' if not math.isfinite(g_abs_m) else '领先' if g_abs_m < 0 else '落后' if g_abs_m > 0 else '持平')
         _w_rope = ('未知' if not math.isfinite(g_rope) else '领先' if g_rope < 0 else '落后' if g_rope > 0 else '持平')
@@ -1820,7 +1820,7 @@ def _agg_entry_scan(d, v):
         rc = e.get('run_cfg')
         return isinstance(rc, str) and bool(_CUR_CS) and rc.endswith(f'_cs{_CUR_CS}')
     if any((_is_cur(e) for _k, e in cands)):
-        cands.sort(key=lambda kv: (not _is_cur(kv[1]), -(_int_or(kv[1].get('n_seeds'), 0))))
+        cands.sort(key=lambda kv: (not _is_cur(kv[1]), -(_int_or(kv[1].get('n_seeds'), 0)), str(kv[0])))
         _why = 'the one stamped with the current code semantics'
     else:
         # Fail closed: with several incompatible config groups and no current
@@ -1907,9 +1907,9 @@ def sec_p2s():
             if _mt:
                 _pm_ok = is_param_matched(_agg_entry(_agg, 'csa_fixed'),
                                           _agg_entry(_agg, 'full_matched'))
-                if _pm_ok is True:
+                if (_pm_ok is True or (isinstance(_pm_ok, np.bool_) and bool(_pm_ok) == True)):
                     _which = '`csa_fixed − full_matched`（参数对齐）'
-                elif _pm_ok is False:
+                elif (_pm_ok is False or (isinstance(_pm_ok, np.bool_) and bool(_pm_ok) == False)):
                     _which = '`csa_fixed − full_matched`（参数不匹配，见下表）'
                 else:
                     _which = '`csa_fixed − full_matched`（参数未验证，见下表）'

@@ -126,10 +126,10 @@ def resolve_ctx(par=None, label=""):
         return par or None
     if par is None:
         par = os.environ.get("CSA_PAR")
-    if par is None or par is False:
+    if par is None or (par is False or (isinstance(par, np.bool_) and bool(par) == False)):
         return None
 
-    value = "auto" if par is True else str(par).strip().lower()
+    value = "auto" if (par is True or (isinstance(par, np.bool_) and bool(par) == True)) else str(par).strip().lower()
     if value in _OFF:
         return None
 

@@ -354,7 +354,7 @@ def _training_tost_check(ck, *, seeds=(0, 1, 2, 3, 4, 5), steps=40,
             st['ref_ppl'] = ref
             st['triton_ppl'] = tri
             st['deltas'] = deltas
-            st['passed'] = bool(st.get('equivalent') is True)
+            st['passed'] = bool((st.get('equivalent') is True or (isinstance(st.get('equivalent'), np.bool_) and bool(st.get('equivalent')) == True)))
         except Exception as e:
             st = {'passed': False, 'error': f'{type(e).__name__}: {e}'}
         out['variants'][variant] = st
