@@ -17302,7 +17302,7 @@ def _jsonable(v):
             return float(v)
         item = v.item()
         return _jsonable(item) if not isinstance(item, np.generic) else str(item)
-    if isinstance(v, (str, int, float, bool)) or v is None:
+    if isinstance(v, (str, int, float, bool, np.bool_)) or v is None:
         return v
     return str(v)
 
@@ -17620,7 +17620,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                     continue
                 _curves = _cell_curve_data(outdir, rec)
                 _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else (_curves.get('losses') if isinstance(_curves.get('losses'), list) else [])
-                _loss_nums = [float(x) for x in _losses if isinstance(x, (int, float)) and not isinstance(x, bool)]
+                _loss_nums = [float(x) for x in _losses if isinstance(x, (int, float)) and not isinstance(x, (bool, np.bool_))]
                 _ph = rec.get('ppl_history') if isinstance(rec.get('ppl_history'), list) else (_curves.get('ppl_history') if isinstance(_curves.get('ppl_history'), list) else [])
                 if not _losses and rec.get('curve_n_points') is not None:
                     _loss_nums = []

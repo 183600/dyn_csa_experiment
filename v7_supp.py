@@ -1211,7 +1211,7 @@ def _phase_cell_record(v, seed, rec, *, run_cfg, metric='ppl', key=None):
     """Normalised manifest cell for a custom phase (warmup/NIAH/lenphase)."""
     _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
     _loss_nums = [float(x) for x in _losses
-                  if isinstance(x, (int, float)) and not isinstance(x, bool)
+                  if isinstance(x, (int, float)) and not isinstance(x, (bool, np.bool_))
                   and math.isfinite(float(x))]
     _curve = {
         'n_points': len(_loss_nums),

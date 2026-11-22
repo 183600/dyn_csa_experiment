@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json, math, os, shutil, statistics, subprocess, sys, time, traceback
 import copy
+import numpy as np
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -498,8 +499,8 @@ def merge_long_aggregate(adir, snapshot_agg):
             _overlap_warn = bool(_overlap) and not _fresh_covers
             for _f in _secondary:
                 _vo, _vn = (sentry.get(_f), fentry.get(_f))
-                _vn_ok = isinstance(_vn, (int, float)) and (not isinstance(_vn, bool)) and math.isfinite(_vn)
-                _vo_ok = isinstance(_vo, (int, float)) and (not isinstance(_vo, bool)) and math.isfinite(_vo)
+                _vn_ok = isinstance(_vn, (int, float)) and (not isinstance(_vn, (bool, np.bool_))) and math.isfinite(_vn)
+                _vo_ok = isinstance(_vo, (int, float)) and (not isinstance(_vo, (bool, np.bool_))) and math.isfinite(_vo)
                 if _fresh_covers:
                     # The fresh entry covers the whole union, so a field it
                     # does not report is unavailable (not the snapshot's

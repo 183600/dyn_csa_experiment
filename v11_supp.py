@@ -398,7 +398,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
                 continue
             _bl = _v.get('by_len')
             _acc = _v.get('acc')
-            _meas = L.ppl_is_usable(_v.get('ppl')) or (isinstance(_bl, dict) and any((isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) for c in _bl.values()))) or (isinstance(_acc, (int, float)) and (not isinstance(_acc, bool)) and (0.0 <= float(_acc) <= 1.0))
+            _meas = L.ppl_is_usable(_v.get('ppl')) or (isinstance(_bl, dict) and any((isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) for c in _bl.values()))) or (isinstance(_acc, (int, float)) and (not isinstance(_acc, (bool, np.bool_))) and (0.0 <= float(_acc) <= 1.0))
             if not _meas:
                 continue
             _me += 1

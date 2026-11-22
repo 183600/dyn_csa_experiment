@@ -1488,7 +1488,7 @@ def _tokens_per_step(outdir, fallback=None, raw=None):
         if not isinstance(r, dict) or r.get('synthesized'):
             continue
         _ts, _st = (r.get('tokens_seen'), r.get('steps'))
-        if isinstance(_ts, bool) or isinstance(_st, bool):
+        if isinstance(_ts, (bool, np.bool_)) or isinstance(_st, (bool, np.bool_)):
             n_bad += 1
             continue
         if not (isinstance(_ts, (int, float)) and isinstance(_st, (int, float))):

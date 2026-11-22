@@ -38,6 +38,7 @@
 import json
 import math
 import numbers
+import numpy as np
 import os
 import re
 import sys
@@ -771,7 +772,7 @@ def _sample_tokens(arr, cap=1000000, seed=0):
         return a
     n = int(a.size)
     _seed = seed
-    if isinstance(_seed, (bool,)):
+    if isinstance(_seed, (bool, np.bool_)):
         raise ValueError('seed must be an integer, not a bool')
     # Exact-integer contract (same as exp_lib._as_seed_int): int(1.9) == 1
     # would silently fold fractional seeds onto the same deterministic sample.
@@ -2624,7 +2625,7 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
             _runs = st.get('runs')
             if isinstance(_runs, (list, tuple, dict, set)):
                 _run_count = len(_runs)
-            elif isinstance(_runs, (int, float)) and not isinstance(_runs, bool):
+            elif isinstance(_runs, (int, float)) and not isinstance(_runs, (bool, np.bool_)):
                 # A run counter is an exact integer; int(3.9) would silently
                 # report a different number of completed runs.  A malformed
                 # counter falls back to an alternative field instead.
@@ -3231,7 +3232,7 @@ def _json_fallback_clean(obj):
             return _json_fallback_clean(obj.item())
     except Exception:
         pass
-    if isinstance(obj, bool) or obj is None:
+    if isinstance(obj, (bool, np.bool_)) or obj is None:
         return obj
     if isinstance(obj, int):
         return obj

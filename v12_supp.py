@@ -632,7 +632,7 @@ def _load_manifest(path):
     if math.isfinite(_min_holm) and _min_holm >= _alpha and not _stat.get('descriptive_only'):
         _kmin = L.signflip_min_consistency(_n, _m_family, _alpha)
         raise SystemExit(f'[v12] REFUSE: the frozen plan cannot confirm ANYTHING by construction — with n={_n} seeds, a two-sided exact sign-flip and a Holm family of m={_m_family}, the smallest attainable Holm p is {_min_holm:.4g} > alpha={_alpha} (all {_n} seeds one-sided still gives {_kmin is None and "insufficient" or f"k_min={_kmin} needed"}). This is a resolution ceiling, NOT a conservative design. Revise the plan BEFORE any test-split evaluation (add seeds / shrink the family / change the test) and record the revision in the manifest history. ({_stat.get("descriptive_only")!r})')
-    if not isinstance(m.get('seeds'), list) or not all(isinstance(s, int) and (not isinstance(s, bool)) for s in m['seeds']) or len(set(m['seeds'])) != len(m['seeds']):
+    if not isinstance(m.get('seeds'), list) or not all(isinstance(s, int) and (not isinstance(s, (bool, np.bool_))) for s in m['seeds']) or len(set(m['seeds'])) != len(m['seeds']):
         raise SystemExit(f'[v12] REFUSE: seeds must be a list of unique integers ({m.get("seeds")!r}) — seed identity is the pairing unit of the whole protocol')
     # The declared n-floor is part of the decision rule.  Refuse a
     # floor that is below 2, above the frozen seed count, or mathematically
@@ -1527,7 +1527,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         # Exact-integer contract for architecture knobs: bools are not
         # dimensions, floats must be finite and integral (int(256.9) silently
         # truncates otherwise), and temporals/complex/strings are refused.
-        if isinstance(x, bool):
+        if isinstance(x, (bool, np.bool_)):
             return None
         if isinstance(x, numbers.Integral):
             i = int(x)

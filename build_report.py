@@ -1426,7 +1426,7 @@ def sec_p1t():
     if failed:
         lines += ['', '**未完成的扫描点（如实记录）**：', '']
         for v in sorted(failed):
-            seeds = ','.join((str(x) for x in sorted(failed[v], key=lambda x: (x is None, 0 if isinstance(x, (int, float)) and (not isinstance(x, bool)) else 1, x if isinstance(x, (int, float)) and (not isinstance(x, bool)) else str(x)))))
+            seeds = ','.join((str(x) for x in sorted(failed[v], key=lambda x: (x is None, 0 if isinstance(x, (int, float)) and (not isinstance(x, (bool, np.bool_))) else 1, x if isinstance(x, (int, float)) and (not isinstance(x, (bool, np.bool_))) else str(x)))))
             lines.append(f'- `{v}`（seed {seeds}）：该扫描点在本配置与运行时长约束下未完成（记录为 error），扫描被截断。')
         lines.append('')
     if missing:
@@ -1960,7 +1960,7 @@ def sec_flops():
             if not math.isfinite(_sv):
                 continue
             if any(not isinstance(r.get(k), (int, float))
-                   or isinstance(r.get(k), bool)
+                   or isinstance(r.get(k), (bool, np.bool_))
                    or not math.isfinite(float(r[k])) for k in _need[1:]):
                 continue
         except (TypeError, ValueError, OverflowError):

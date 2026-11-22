@@ -244,7 +244,7 @@ def _norm(obj):
         # result file unwritable; use the same null spelling as exp_lib's
         # JSON cleaner.
         return obj if math.isfinite(obj) else None
-    if isinstance(obj, (str, int, bool)) or obj is None:
+    if isinstance(obj, (str, int, bool, np.bool_)) or obj is None:
         return obj
     return str(obj)
 
