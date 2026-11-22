@@ -7840,9 +7840,7 @@ def _disk_ids_chunk(buf, disk_dt, vocab):
 def _i32_sidecar_path(path):
     """Identity-bound int32 sidecar path for a wide on-disk token cache.
 
-    The ``v2`` marker invalidates sidecars written before the narrowing path
-    stopped trusting a stale ``max_id`` metadata field: such a sidecar could
-    contain silently wrapped ids and must never be served again."""
+    The ``v2`` marker keeps sidecars bound to a validated token-id range."""
     st = os.stat(path)
     return (f'{path}.i32v2-{int(st.st_size)}-'
             f'{int(getattr(st, "st_mtime_ns", 0))}-'
@@ -8097,11 +8095,7 @@ class _DocDeduplicator:
     def snapshot(self):
         """Structural copy of the CURRENT index (same documents, fresh counters).
 
-        Used to attribute duplicates to their true source: a query against the
-        live object also INDEXES the queried document, so after a few queries
-        the live index can no longer tell "duplicate of a train document" from
-        "duplicate of an earlier queried document".  A snapshot taken before
-        the queries stays frozen and answers that question read-only.
+        A frozen copy for read-only duplicate attribution.
         """
         clone = _DocDeduplicator(near_threshold=self.near_threshold, bands=self.bands)
         clone.exact = set(self.exact)
@@ -19585,8 +19579,7 @@ def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
 
     There is no KV cache in the model, so the decode number is explicitly a
     PREFIX-PREFILL measurement (it re-runs the whole prefix), not incremental
-    decode.  Results are reported as p50/p95 wall-clock plus tokens/s and
-    allocator peaks."""
+    decode."""
     was = model.training
     model.eval()
     ids = torch.as_tensor(ids)

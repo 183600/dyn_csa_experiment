@@ -11,7 +11,7 @@
            span/doc/topical 腐坏 + NIAH-natural + 从头训练
            对照臂）；
   P5S2  —— 等训练 token 的大模型规模臂（P3SL_TOK）；
-  P5S3  —— 6ND 参数量代理规模的大模型规模臂（P3SL_FLOP，参数量比例缩步）；
+   P5S3  —— 按参数量比例缩步的大模型规模臂（P3SL_FLOP）；
   P5T   —— **冻结后的独立最终测试**：按仓库根的冻结清单
            `confirmation_frozen.json`（预注册主比较、终点、种子数、检验与
            校正规则），在 WikiText-103 的 held-out test split（wiki.test.raw，
@@ -19,9 +19,7 @@
 
 加载/运行/统计三层的硬门槛：
   1. 功效门槛（意见一）：加载清单即校验「该方案是否数学上可能确认」
-     （min attainable Holm p = m·2/2^n < α）。6 种子 × 双侧 × Holm/4 的
-     原设计在该门槛下会被拒绝——清单 v2 已在**未读任何 test 数据**的
-     前提下把种子修订为 12（见清单 revision 块）。
+     （min attainable Holm p = m·2/2^n < α），种子数取自冻结清单。
   2. 严格准入（意见二）：`finaltest_stats` 只接纳同时通过「冻结种子白名
      表、唯一记录、非空 data_fp、单一冻结 test 切片、_code 与 recipe 的
      机器校验、manifest 哈希绑定」的记录；歧义重复与混切片直接拒绝。

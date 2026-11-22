@@ -1233,26 +1233,21 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP', par=None):
 
 P3SS_CFG = dict(L.RUN, outdir='results_lm_v10_scale_s', d=128, n_layers=4, n_heads=4, d_head=32, seq_len=512, batch_size=12, n_train_tokens=40000000, steps=8000, warmup=100, eval_every=250, eval_subset=64, variants=['csa_fixed', 'full'])
 P3SL_CFG = dict(L.RUN, outdir='results_lm_v10_scale_l', d=512, n_layers=10, n_heads=16, d_head=32, seq_len=512, batch_size=12, n_train_tokens=40000000, steps=4000, warmup=100, eval_every=250, eval_subset=64, variants=['csa_fixed', 'full'])
-# ---- 规模对照臂：等训练 token 与参数量代理规模的大模型臂 ----
-# P3SL_TOK 与 P3SS 对齐累计 token；P3SL_FLOP 按参数量比例缩放步数
-# （steps 运行期由 _flop_matched_steps 确定性计算，避免在 import 期
-# 构建模型——§7 导入零副作用）。
+# ---- 规模对照臂：大模型配置与运行期步数推导 ----
+# steps 运行期由 _flop_matched_steps 确定性计算，避免在 import 期
+# 构建模型——§7 导入零副作用。
 P3SL_TOK_CFG = dict(P3SL_CFG, outdir='results_lm_v10_scale_l8k', steps=8000)
 P3SL_FLOP_CFG = dict(P3SL_CFG, outdir='results_lm_v10_scale_lflop', steps=None)
 
 def _flop_matched_steps(small_cfg, large_cfg, min_steps=250):
-    """Deterministic equal-total-compute PROXY step count for the large arm.
+    """Deterministic parameter-count-proportional step count for the large arm.
 
-    这里的「等计算」是 6·N·D 参数量代理（N=参数量，D=token 数），不是实测
-    等 FLOPs——稀疏选择、池化、注意力与激活重算的计算量不与参数量成比例；
-    若触发步数下限，也会偏离原目标规模。面板报告必须把它称为「6ND 参数
-    量代理规模臂」，并分别陈述等 token 与等计算量。步数推导：先在 CPU 上
-    按面板配置构建两个面板的模型（不碰 DEVICE、无 RNG 副作用），取两臂
-    （csa/full）参数量的平均值，large_steps = small_steps ·
-    N_small / N_large。结果打印完整推导以供审计；确定性：同一代码下重复
-    调用逐位相同（count_params 是形状的纯函数）。步数下限 250（warmup=100
-    时余下学习率调度仍有意义）——触发下限时必须如实报告「代理值被下限
-    偏离」，不得写成严格匹配。"""
+    Build both panel configs on CPU (no DEVICE touch, no RNG side effects),
+    take the mean parameter count over the arms, and scale steps by
+    N_small / N_large.  The full derivation is printed; repeated calls with
+    the same code are bitwise identical.  Steps are floored at 250 so the LR
+    schedule still has room after warmup=100.
+    """
     counts = {}
     deriv = []
     for _tag, _cfg in (('small', small_cfg), ('large', large_cfg)):
