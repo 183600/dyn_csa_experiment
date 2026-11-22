@@ -177,12 +177,8 @@ def _uses_batched_eager(cfgs, device=None, batch_size=None, forced=None):
 
 
 def _pos_cap_eq_129(c):
-    """Whether ``c.position_capacity`` equals 129.
+    """Whether ``c.position_capacity`` equals 129."""
 
-    Handles missing attribute (defaults to 129), numeric values, and callable
-    methods — replacing the original lambda-default pattern which was atypical
-    and could mask missing configuration.
-    """
     _pc = getattr(c, 'position_capacity', None)
     if _pc is None:
         return True  # default 129 matches 129

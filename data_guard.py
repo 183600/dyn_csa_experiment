@@ -137,8 +137,6 @@ def _unhashable_identity(value, _seen=None, _depth=0):
     from int, ``-0.0`` folds to ``0.0``, every NaN is one missing value, and
     mapping insertion order cannot change the identity.
 
-    Adds cycle detection and depth limiting to prevent infinite recursion on
-    deeply nested or self-referential structures (guards against stack overflow).
     """
     if _depth > _UID_DEPTH:
         return ('deep', type(value).__name__, _depth)
