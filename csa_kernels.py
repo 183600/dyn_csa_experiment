@@ -913,9 +913,6 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk, need_soft=True):
     # int64 升型循环外一次），布尔值与全幅形式逐格相同，[R, T, Bm] 全幅
     # 掩码不物化。
     lt64 = last_tok.to(torch.int64)
-    # 工作精度 = max(dtype, fp32)（fp32/bf16/fp16 输入取 fp32；fp64 输入
-    # 全 fp64，前向/反向同一精度合同）。升型整体只做一次（逐片 cast 的值
-    # 与整张 cast 后取片逐位一致）。
     acc = torch.promote_types(dtype, torch.float32)
     qIf = qI if qI.dtype == acc else qI.to(acc)
     kIf = kI if kI.dtype == acc else kI.to(acc)
