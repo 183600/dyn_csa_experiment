@@ -397,6 +397,10 @@ def _job_watchdog_seconds(job, ctx):
     """
     v = job.get("watchdog_seconds") or ctx.get("watchdog_seconds")
     if v:
+        # A boolean flag is not a wall-clock duration: float(True) == 1.0
+        # would install a one-second watchdog and kill every healthy child.
+        if isinstance(v, (bool, np.bool_)):
+            return 12.0 * 3600.0
         try:
             wd = float(v)
         except (TypeError, ValueError, OverflowError):
@@ -411,10 +415,15 @@ def _job_watchdog_seconds(job, ctx):
         kind = job.get("kind")
         if kind in ("run", "warm"):
             cfg = job.get("cfg") or {}
+            # Use the SAME defaulting as _note_watchdog_kill below: a job may
+            # legally omit optional geometry keys, and required indexing here
+            # would raise KeyError -> silently fall back to the 12 h net while
+            # the later kill note still books with the defaults (different
+            # class -> mismatched TimeGuard calibration).
             est = guard.estimate_seconds(
-                cfg["steps"], d=cfg.get("d", 256),
-                n_layers=cfg.get("n_layers", 6), seq_len=cfg["seq_len"],
-                batch_size=cfg["batch_size"], variant=job.get("v"),
+                cfg.get("steps"), d=cfg.get("d", 256),
+                n_layers=cfg.get("n_layers", 6), seq_len=cfg.get("seq_len", 512),
+                batch_size=cfg.get("batch_size", 12), variant=job.get("v"),
             )
         elif kind == "lenphase":
             p = job.get("payload") or {}
