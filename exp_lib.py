@@ -4527,7 +4527,20 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             soft_log_g.masked_fill_(soft_g <= 0, _finfo_min(soft_log_g.dtype))
             soft_logits = logits.clone()
             soft_logits[:, :, :_nb].add_(soft_log_g[:, None, :]).clamp_min_(_MINL)
-            soft_logits.masked_fill_(nvalid, _MINL)
+            # A block lane with a zero prior is not part of the S-path
+            # distribution.  Merely assigning log(0)=-inf/MIN and relying on
+            # softmax is insufficient: when every usable block prior is zero,
+            # all logits can become the same finite sentinel MINL.  Softmax
+            # then assigns a uniform probability to those lanes, and the
+            # straight-through S path leaks gradients into q/K despite there
+            # being no live prior lane.  Match the custom reference/Triton
+            # backward: mask zero-prior block lanes before softmax; leave
+            # sliding-window lanes untouched because the prior does not apply
+            # to them.
+            soft_zero = torch.zeros_like(nvalid)
+            if _nb:
+                soft_zero[:, :, :_nb] = (soft_g <= 0)[:, None, :]
+            soft_logits.masked_fill_(nvalid | soft_zero, _MINL)
             soft_attn, _sink_unused = _sink_split_softmax(soft_logits, sink_logits, want_sink=False)
             # soft_logits is dead once soft_attn is built.
             del soft_logits, soft_log_g
@@ -4658,9 +4671,20 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
         if _soft_live:
             soft_g = soft[s:e]
             s_log = torch.log(soft_g.clamp_min(1e-12))
-            s_log.masked_fill_(~valid, _finfo_min(s_log.dtype))
+            # Zero-probability candidates are absent from the S-path support,
+            # not merely candidates with a very small prior.  Without this
+            # mask, log(clamp_min(1e-12)) leaves a finite lane in the softmax;
+            # an all-zero candidate row can then create a spurious uniform
+            # S-path distribution and leak gradients into q/K.
+            s_log.masked_fill_(~valid | (soft_g <= 0), _finfo_min(s_log.dtype))
             logits_soft = logits.clone()
             logits_soft[:, :, :K].add_(s_log[:, None, :])
+            # Mask after the addition as well: adding the finite MIN sentinel
+            # to a finite logit can round back to MIN while retaining an
+            # identity gradient through the add.  The post-add mask makes
+            # zero-prior candidate lanes true constants in the S path.
+            logits_soft[:, :, :K].masked_fill_(
+                (~valid | (soft_g <= 0))[:, None, :], _MINL)
             logits_soft.masked_fill_(~valid_all[:, None, :], _MINL)
             attn_soft, _ = _sink_split_softmax(logits_soft, sink_logits, want_sink=False)
             del logits_soft, s_log

@@ -10201,6 +10201,172 @@ def t_kernel_soft_invalid_lane_gradients():
     assert not bool(g_k[3][0, 1, 1]), 'non-causal block received a soft gradient'
 
 
+def t_kernel_zero_soft_prior_preserves_window_s_path():
+    # A zero prior removes only compressed-block lanes from the S path.  The
+    # unmodified sliding-window lanes remain live and must retain the same
+    # straight-through gradients in eager and kernel-reference implementations.
+    import csa_kernels as CK
+    torch.manual_seed(7)
+    R, T, nh, hd, w, nb = 1, 2, 1, 2, 2, 1
+    q = torch.randn(R, T, nh, hd, dtype=torch.float64)
+    kb = torch.randn(R, nb, nh, hd, dtype=torch.float64)
+    vb = torch.randn_like(kb)
+    ks = torch.randn(R, T, nh, hd, dtype=torch.float64)
+    vs = torch.randn_like(ks)
+    idx = torch.zeros(R, T, nb, dtype=torch.long)
+    last = torch.tensor([[1]])  # the compressed block is not yet readable
+    valid = torch.ones_like(idx, dtype=torch.bool)
+    soft = torch.zeros(R, T, nb, dtype=torch.float64)
+
+    def _run(kernel):
+        qg = (q if kernel else q[0]).clone().requires_grad_(True)
+        kbg = (kb if kernel else kb[0]).clone().requires_grad_(True)
+        vbg = (vb if kernel else vb[0]).clone().requires_grad_(True)
+        ksg = (ks if kernel else ks[0]).clone().requires_grad_(True)
+        vsg = (vs if kernel else vs[0]).clone().requires_grad_(True)
+        sg = (soft if kernel else soft[0]).clone().requires_grad_(True)
+        if kernel:
+            out = CK.gathered_attention_kernel(
+                qg, kbg, vbg, idx, last, ksg, vsg, w, 0.5,
+                soft=sg, sel_valid=valid, impl='ref')
+        else:
+            out = L.gathered_attention(
+                qg, kbg, vbg, idx[0], last[0], ksg, vsg, w, 0.5,
+                soft=sg, sel_valid=valid[0], q_chunk=1)
+        weight = torch.arange(1, out.numel() + 1, dtype=out.dtype).view_as(out)
+        grads = torch.autograd.grad((out * weight).sum(), (qg, kbg, vbg, ksg, vsg, sg))
+        return out.detach(), grads
+
+    out_e, grad_e = _run(False)
+    out_k, grad_k = _run(True)
+    assert torch.equal(out_e, out_k[0]), 'zero-prior window forward changed'
+    for name, a, b in zip(('q', 'k_block', 'v_block', 'k_window', 'v_window', 'soft'),
+                          grad_e, grad_k):
+        assert torch.allclose(a.reshape_as(b), b, atol=1e-12, rtol=0.0), (
+            f'zero block prior changed the {name} window-path gradient')
+
+
+def t_kernel_zero_soft_prior_all_block_lanes_is_no_prior():
+    # The closed-path leak appears when EVERY usable lane is a zero-prior
+    # block lane: the S-path logits then all sit at the same sentinel and a
+    # uniform softmax leaks q/K gradients.  A prior narrower than the logits
+    # (here float32 prior, float64 logits) is the case that reproduces it,
+    # because a same-dtype MIN sentinel saturates the add and clamp_min_
+    # already cuts the gradient.  With the mask, the zero prior must be
+    # gradient-identical to no prior in BOTH implementations.
+    import csa_kernels as CK
+    torch.manual_seed(11)
+    R, T, nh, hd, w, nb = 1, 2, 1, 2, 0, 2
+    q = torch.randn(R, T, nh, hd, dtype=torch.float64)
+    kb = torch.randn(R, nb, nh, hd, dtype=torch.float64)
+    vb = torch.randn_like(kb)
+    ks = torch.empty(R, T, nh, hd, dtype=torch.float64)
+    vs = torch.empty_like(ks)
+    idx = torch.tensor([[[0, 1], [0, 1]]])
+    last = torch.tensor([[0, 0]])  # both blocks readable at the second query
+    valid = torch.ones_like(idx, dtype=torch.bool)
+    soft = torch.zeros(R, T, nb, dtype=torch.float32)
+
+    def _run(kernel, use_soft):
+        qg = (q if kernel else q[0]).clone().requires_grad_(True)
+        kbg = (kb if kernel else kb[0]).clone().requires_grad_(True)
+        vbg = (vb if kernel else vb[0]).clone().requires_grad_(True)
+        sg = ((soft if kernel else soft[0]).clone().requires_grad_(True)
+              if use_soft else None)
+        if kernel:
+            out = CK.gathered_attention_kernel(
+                qg, kbg, vbg, idx, last, ks, vs, w, 0.5,
+                soft=sg, sel_valid=valid, impl='ref')
+        else:
+            out = L.gathered_attention(
+                qg, kbg, vbg, idx[0], last[0], ks[0], vs[0], w, 0.5,
+                soft=sg, sel_valid=valid[0], q_chunk=1)
+        weight = torch.arange(1, out.numel() + 1, dtype=out.dtype).view_as(out)
+        inputs = (qg, kbg, vbg) if sg is None else (qg, kbg, vbg, sg)
+        grads = torch.autograd.grad((out * weight).sum(), inputs)
+        return out.detach(), grads
+
+    # Inside each implementation the zero prior must change neither values
+    # nor any gradient (bit-exact, not merely close).
+    for kernel, impl in ((False, 'eager'), (True, 'kernel')):
+        out0, grad0 = _run(kernel, False)
+        out1, grad1 = _run(kernel, True)
+        assert torch.equal(out0, out1), f'{impl}: zero prior changed the forward'
+        for name, a, b in zip(('q', 'k_block', 'v_block'), grad0, grad1):
+            assert torch.equal(a.reshape_as(b), b), (
+                f'{impl}: zero block prior changed the {name} gradient')
+        assert not bool(grad1[3].any()), f'{impl}: zero prior received a gradient'
+
+    # And the two implementations must still agree with each other.
+    out_e, grad_e = _run(False, True)
+    out_k, grad_k = _run(True, True)
+    assert torch.equal(out_e, out_k[0]), 'zero-prior all-block forward changed'
+    for name, a, b in zip(('q', 'k_block', 'v_block', 'soft'), grad_e, grad_k):
+        assert torch.allclose(a.reshape_as(b), b, atol=1e-12, rtol=0.0), (
+            f'zero block prior: eager and kernel {name} gradients disagree')
+
+
+def t_open_zero_soft_prior_removes_candidate_lanes_from_s_path():
+    # Open-block attention has its own eager soft-prior path.  With no local
+    # window, an all-zero candidate prior must make the S path contribute no
+    # gradients; the hard A path must match the no-prior call exactly.
+    torch.manual_seed(9)
+    T, nh, hd, B, K = 2, 1, 2, 2, 2
+    q0 = torch.randn(T, nh, hd, dtype=torch.float64)
+    kb0 = torch.randn(B, nh, hd, dtype=torch.float64)
+    vb0 = torch.randn_like(kb0)
+    ks0 = torch.randn(T, nh, hd, dtype=torch.float64)
+    vs0 = torch.randn_like(ks0)
+    idx = torch.tensor([[0, 1], [0, 1]])
+    valid = torch.ones(T, K, dtype=torch.bool)
+    prefix_k = torch.zeros(T, nh, hd, dtype=torch.float64)
+    prefix_v = torch.zeros_like(prefix_k)
+
+    def _run(with_soft):
+        q = q0.clone().requires_grad_(True)
+        kb = kb0.clone().requires_grad_(True)
+        vb = vb0.clone().requires_grad_(True)
+        soft = (torch.zeros(T, K, dtype=torch.float64).requires_grad_(True)
+                if with_soft else None)
+        out, _ = L.gathered_attention_open(
+            q, kb, vb, idx, valid, torch.tensor([0, 0]), ks0, vs0, 0, 0.5,
+            prefix_geo={}, prefix_kind='summary', prefix_k=prefix_k,
+            prefix_v=prefix_v, soft=soft, q_chunk=1)
+        weight = torch.arange(1, out.numel() + 1, dtype=out.dtype).view_as(out)
+        inputs = (q, kb, vb) if soft is None else (q, kb, vb, soft)
+        grads = torch.autograd.grad((out * weight).sum(), inputs)
+        return out.detach(), grads
+
+    out_plain, grad_plain = _run(False)
+    out_zero, grad_zero = _run(True)
+    assert torch.equal(out_plain, out_zero), 'zero-prior open attention changed forward'
+    for name, a, b in zip(('q', 'k_block', 'v_block'), grad_plain, grad_zero):
+        assert torch.allclose(a, b, atol=1e-12, rtol=0.0), (
+            f'zero open-block prior leaked an S-path gradient into {name}')
+    assert not bool(grad_zero[3].any()), 'zero open-block prior received a gradient'
+
+
+def t_rope_reinforce_saturated_policy_keeps_gradient():
+    # The RoPE fallback must score sampled actions with pre-sigmoid logits;
+    # logit(sigmoid(z).clamp(...)) has zero derivative once sigmoid saturates.
+    import v7_supp as V7
+    torch.manual_seed(1)
+    cfg = V7.AttnCfgRope(
+        kind='csa', dynamic=True, chunking='cosine_learnable',
+        target_block_tokens=4, overlap=1, index_topk=4,
+        temperature=0.1, rope=True, rope_dim=2, qk_norm=False,
+        boundary_policy='reinforce', min_block=2, max_block=4)
+    attn = V7.HybridAttentionRoPE(8, 2, 4, cfg).double()
+    with torch.no_grad():
+        attn.delta_logit.fill_(2.0)
+    x = torch.randn(8, 8, dtype=torch.float64, requires_grad=True)
+    _out, _reg = attn._single_rope(x)
+    assert attn.last_boundary_logp is not None
+    grad, = torch.autograd.grad(attn.last_boundary_logp, attn.delta_logit)
+    assert torch.isfinite(grad).all() and bool(grad.abs().sum() > 0), (
+        'saturated RoPE boundary policy lost its REINFORCE gradient')
+
+
 def t_paired_log_ratio_no_cancellation():
     a = 1e300 * (1.0 + 1e-14)
     r = L.paired_log_ratio([a], [1e300])
@@ -12040,6 +12206,10 @@ def main():
     _check('N65 confirmatory architecture gate honours recipe aliases', t_v12_finaltest_arch_alias_gate)
     _check('N66 baseline final keeps records without a variant field', t_baseline_final_without_variant_field)
     _check('N67 report excludes ambiguous/duplicate measurement rows', t_report_duplicate_rows_are_not_arbitrary)
+    _check('N68 closed zero block prior masks its S-path lanes (mixed dtype)', t_kernel_zero_soft_prior_all_block_lanes_is_no_prior)
+    _check('N69 zero block prior keeps the sliding-window S path', t_kernel_zero_soft_prior_preserves_window_s_path)
+    _check('N70 open zero prior removes candidate lanes from the S path', t_open_zero_soft_prior_removes_candidate_lanes_from_s_path)
+    _check('N71 saturated RoPE REINFORCE keeps its policy gradient', t_rope_reinforce_saturated_policy_keeps_gradient)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

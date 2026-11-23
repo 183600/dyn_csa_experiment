@@ -47,6 +47,8 @@ release archive produced by `archive_release.py`.
 | review 6 (2026-11-14, independent) | fresh full-repo methodological audit (statistics, kernels, data pipeline, drivers, report layer). Fixed: zero-width soft prior doubling every attention gradient (eager + kernel twin; latent — no scheduled arm uses index_topk=0); v12 CONFIRMED gate had drifted stricter than the pre-registered manifest v3 rule (param_matched is True + init-digest gates + a report fallback that re-required coverage_ok) — restored to the frozen text via one shared helper (the review-5 loop pass had instead kept the stricter implementation with a `decision_rule_applied` disclosure; this pass reverts the implementation to the registered rule — the manifest wording was never revised — and re-points that disclosure at the restored semantics); `_classify_group_status` never returned `measured` (powered non-noise contrasts were mislabeled `noise_level`); the v6 long-panel merge pooled/paired records across different run_cfg stamps; v8/v9(/v10/v11) driver-level `csa_fixed - full` contrasts published exact p-values without the parameter-control disclosure (arms differ ~24% in parameters); `pair_reason` accepted boolean fingerprints on both sides; report length table dropped JSON integral-float spellings; v12 smoke cache isolation was overridable; `load_wikitext` required the Hub client even on cache-hit/local-dump paths. | code/methodology hardening; frozen manifest NOT modified; no test-split access |
 | review 7 (2026-11-14, independent) | six-track independent audit (statistics / data-leakage / v12 frozen-plan faithfulness / training+aggregation / attention algorithms / drivers+reports, ~25k randomized numeric cross-checks). Algorithm core verified CLEAN (causality read-gate, pooling, indexer, gathered attention, RoPE, dynamic segmenter prefix-invariance, kernel twins — no defects). Fixed: (1) `scaling_trend` heterogeneity Q was NOT variance-normalised (raw `sum(n*resid^2)` in effect units) — its chi2 "p", I2, tau2 and the `heterogeneous_trend` verdict flipped under a pure change of the effect unit (log10 vs ln vs percent); now a lack-of-fit F test normalised by the pooled within-scale pure-error variance (exact via the incomplete-beta F sf; fail-closed "unavailable" when no within-scale replication); unit-invariance regression test added; (2) manifest **v5**: the v4 revision note still claimed a strictly TIGHTER implemented decision rule, but review-6 had restored the implementation to the registered v3 text — v5 corrects the historical record (no normative field changed; precondition: still zero test-split access); (3) `load_wikitext` cache-hit path did not re-validate `tokenizer_fit_token_cap` against the current `min(TOKENIZER_FIT_TOKENS, n_train_tokens)` (stale-fit cache served under the same tag if the constant ever changes) — now a fail-closed rebuild check; (4) `par.py` watchdog could overwrite a child's valid `result.json` (written in its finally block before teardown) with `watchdog_timeout` AND double-book the cell's already-refunded TimeGuard seconds — now adopts the valid result and skips re-booking (verified by an integration simulation both ways); (5) `aggregate()` silently shrank `n_seeds` when planned seeds carried no usable measurement — entries now disclose `n_dropped_error_no_ppl` / `n_dropped_nonfinite_ppl` / `dropped_seeds` / `n_dropped_synthesized` plus a NOTE line; (6) `chi2_sf` exact branch truncated at 1000 series terms (rel err 8e-6 at df=1e5) and the Wilson-Hilferty branch (df>1e5) had up to 2.7% tail error — adaptive iteration cap (20*sqrt(a)+100) and the approximation now reserved for df>1e8 (verified <1e-7 vs scipy through df=1e8); (7) `_doc_bootstrap_ppl_ci` did not drop zero-token rows (comment claimed it did; `_combined_seed_doc_ci` did) — now aligned; (8) `measure_efficiency` prefix-prefill loop timed the first call at each new length (one-time kernel selection inside the p50/p95) — one untimed warmup per length added; (9) docs: `_DocDeduplicator` docstring overstated near-dup sensitivity (measured: 1-word edit of a <=30-word line exceeds Hamming-3) — reworded to the measured net; freeze-lock mirror `.gitignore` whitelist made explicit; README/README_zh stale "CI is disabled" claim replaced with the documented requirement + a "verify the actual state" instruction; `final_minus_best` mixed-basis disclosure field added; (10) dead code removed (`fuse_analysis.signflip`, `audit_gates` unused `ra, rb`, `par._KILL` write-only flag) and `error_analysis._compare_reason` now checks checkpoint A's position-table capacity symmetrically. `CODE_SEMANTICS` stays `v11.128`: every change is an analysis-layer bug fix, a guard, a disclosure field or documentation — no measurement semantics on any valid training/eval path changed, so no existing record is invalidated. | frozen plan v5 (documentation-only revision) + statistics fix + guard hardening; no test-split access |
 
+| review 8 (2026-11-23, patch merged onto the loop HEAD) | three review fixes rebased onto the current main: (1) the closed CSA straight-through S path masks zero-probability compressed-block lanes before softmax, so a lower-precision all-zero prior can no longer leave every usable block logit at one finite sentinel and leak a uniform-softmax gradient into q/K (sliding-window lanes untouched); (2) `gathered_attention_open` masks zero-prior candidate lanes before AND after the log-prior add (a finite MIN sentinel can keep the add's identity gradient while rounding to the sentinel); (3) the RoPE boundary fallback scores sampled Bernoulli actions with the original pre-sigmoid policy logits instead of `logit(clamp(sigmoid(z)))`, whose derivative is zero once the gate saturates. Tests N68-N71 are registered in `test_review_fixes.py`; the closed-path regression uses a float32 prior on float64 logits because a same-dtype MIN sentinel saturates the add and `clamp_min_` already cuts the gradient (the original window-only case passes either way). No new runs, frozen manifest untouched, no test-split access. | code hardening; exploratory panels unchanged |
+
 ## What the v12 freeze does and does not cover
 
 Covered: fixed-chunk CSA vs parameter-matched dense, trained random-indexer and
@@ -256,3 +258,60 @@ spellings, param disclosure, frozen-rule helper) plus the rewritten
 `t_audit_resolution_classification` and
 `t_finaltest_decision_rule_matches_frozen_manifest`; full suite green
 (253 + 15 checks).
+
+## 2026-11-23 — review-8 zero-prior S-path and RoPE REINFORCE fixes (no new runs; frozen plan untouched)
+
+Three implementation defects reported by executable CPU tests were fixed on top
+of the current loop HEAD. No experiment was re-run, no numeric artifact was
+regenerated, `confirmation_frozen.json` was NOT modified and no test-split
+access occurred. Forward values on every valid path are unchanged; only the
+straight-through gradient of zero-prior lanes and the saturated boundary-policy
+gradient change.
+
+1. **Closed CSA zero-prior lanes** (`exp_lib.gathered_attention`). A block lane
+   whose prior is exactly zero is absent from the S-path support. With a
+   lower-precision prior (e.g. float32 prior on float64 logits) the sentinel
+   stays finite, the `add_` + `clamp_min_` pair keeps an identity gradient, and
+   a row whose every usable lane is a zero-prior block lane turns into a
+   uniform sentinel softmax — a spurious S-path gradient into q/K that the
+   reference kernel twin already refuses. Zero-prior block lanes are now
+   masked before softmax; sliding-window lanes are never masked because the
+   prior does not apply to them. (With a same-dtype MIN sentinel the add
+   saturates and the old code is already gradient-free, so the regression test
+   uses the mixed dtype that exposes the defect.)
+2. **Open-block zero-prior lanes** (`exp_lib.gathered_attention_open`). The
+   open path adds the log prior without the closed path's `clamp_min_`, so a
+   finite MIN sentinel can survive the add while keeping the add's identity
+   gradient. Zero-prior candidate lanes are now masked both before and after
+   the add; the post-add mask makes them constants in the S path. The hard A
+   path is untouched.
+3. **RoPE REINFORCE policy gradient**
+   (`v7_supp.HybridAttentionRoPE._single_rope`). The fallback reconstructed the
+   policy logits with `logit(clamp(sigmoid(z)))`, whose derivative is zero
+   whenever the gate saturates at either clamp edge. The sampled Bernoulli
+   action is now scored with the original pre-sigmoid affine logits, matching
+   `exp_lib._single`.
+
+Merge notes (the patch was written against an older main): the paper-trail
+file `docs/code_review_fixes.md` is folded into this entry instead of adding a
+new `docs/` file — the current `.gitignore` whitelists `docs/design_notes.md`
+only, and `DECISION_LOG.md` is the tracked place for review rationale. The new
+test functions were not registered in `main()` in the patch; N68-N71 now run in
+CI. The closed-path test was strengthened: its original window-only case passes
+both before and after the fix, so N68 adds the all-block-lane mixed-dtype case
+that actually fails on the unfixed tree.
+
+Deliberately not changed: the dynamic-boundary score formula, block/window
+overlap semantics and the frozen experiment design. Those are method choices
+that need an explicit scientific decision (and, where applicable, a
+pre-registration amendment), not an implementation-only fix. Equal-FLOPs
+controls, broader document sampling and full GPU/Triton validation remain
+experimental follow-up work.
+
+Regression coverage: `test_review_fixes.py` N68-N71 (closed mixed-dtype
+all-block-lane zero prior, sliding-window S-path preservation, open all-zero
+candidate prior, saturated RoPE REINFORCE). Local run on the rebased tree:
+357/363 checks passed; the 5 errors are missing optional `matplotlib` /
+`tokenizers` imports on this box and the single skip is a sandbox
+POSIX-semaphore restriction — the CI job installs those dependencies. The
+zero-GPU preflight (`python v12_supp.py plan`) still admits 48/48 records.
