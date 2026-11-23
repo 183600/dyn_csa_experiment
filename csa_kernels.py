@@ -879,7 +879,8 @@ def _stable_topk_desc(x, k):
     rank.masked_fill_(~sel, kk)
     cols = torch.arange(B, device=dev, dtype=torch.int32)[None, :].expand(m, B)
     buf = torch.empty(m, kk + 1, dtype=torch.int32, device=dev)
-    buf.scatter_(1, rank, cols)
+    # torch < 2.14 requires int64 scatter index; index dtype only, src/self stay int32.
+    buf.scatter_(1, rank.long(), cols)
     cand = buf[:, :kk].long()
     order = torch.argsort(flat.gather(1, cand), dim=1, stable=True, descending=True)
     cand = cand.gather(1, order)
@@ -1983,7 +1984,8 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
                     order = order.to(torch.int32)
                 flat_l = flat.to(_idt)
                 cnt = torch.zeros((R, Bm), device=dev, dtype=_idt)
-                cnt.scatter_add_(1, flat_l, torch.ones_like(flat_l))
+                # torch < 2.14 requires int64 scatter_add_ index; index dtype only.
+                cnt.scatter_add_(1, flat_l.long(), torch.ones_like(flat_l))
                 del flat_l
                 offs = torch.zeros((R, Bm + 1), device=dev, dtype=_idt)
                 offs[:, 1:] = cnt.cumsum(dim=1)

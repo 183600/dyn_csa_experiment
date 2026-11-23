@@ -144,6 +144,19 @@ def _seed_identity_scalar(value):
     return None
 
 
+class _CorruptJSON:
+    def __init__(self, path, error):
+        self.path = path
+        self.error = error
+
+    def __repr__(self):
+        return f'<CorruptJSON {self.path}: {self.error}>'
+
+
+def _is_corrupt(obj):
+    return isinstance(obj, _CorruptJSON)
+
+
 def _load(path):
     if not os.path.exists(path):
         return None
@@ -151,8 +164,9 @@ def _load(path):
         with open(path, encoding='utf-8') as _jf:
             return json.load(_jf)
     except Exception as e:
-        print(f'[audit] WARNING: {path} exists but cannot be parsed ({type(e).__name__}: {e})')
-        return None
+        msg = f'{path} exists but cannot be parsed ({type(e).__name__}: {e})'
+        print(f'[audit] WARNING: {msg}')
+        return _CorruptJSON(path, msg)
 
 
 def _repo_path(p):
@@ -240,21 +254,14 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
         _tmeta = _load(_tp)
         if not isinstance(_tmeta, dict):
             if os.path.exists(_tp):
-                # A valid-JSON non-object is corrupt metadata, not an absent
-                # cache: it must fail the provenance gate, not downgrade it
-                # to "not verifiable".
-                _parse_failures.append(
-                    os.path.basename(_tp) if _tmeta is None else
-                    f'{os.path.basename(_tp)} (not an object)')
+                _parse_failures.append(_tmeta.error if _is_corrupt(_tmeta) else f'{os.path.basename(_tp)} (not an object)')
             continue
         _ttag = os.path.basename(_tp)[len('test_meta_'):-len('.json')]
         for _mp in _vm:
             _mmeta = _load(_mp)
             if not isinstance(_mmeta, dict):
                 if os.path.exists(_mp):
-                    _parse_failures.append(
-                        os.path.basename(_mp) if _mmeta is None else
-                        f'{os.path.basename(_mp)} (not an object)')
+                    _parse_failures.append(_mmeta.error if _is_corrupt(_mmeta) else f'{os.path.basename(_mp)} (not an object)')
                 continue
             _tv, _mv = _as_int(_tmeta.get('vocab')), _as_int(_mmeta.get('vocab'))
             _diff = []
@@ -1033,13 +1040,10 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             tag = os.path.basename(mp)[len('meta_'):-len('.json')]
             meta = _load(mp)
             if not isinstance(meta, dict):
-                # An existing but unreadable/non-object meta is a corrupt
-                # cache, not "no cache": skipping it silently would leave the
-                # split contract unverified while the audit reports ok.
-                cache['corpora'][tag] = {'status': 'fail', 'meta': os.path.basename(mp),
-                                         'error': 'metadata exists but is not a JSON object'}
+                _err = meta.error if _is_corrupt(meta) else 'metadata exists but is not a JSON object'
+                cache['corpora'][tag] = {'status': 'fail', 'meta': os.path.basename(mp), 'error': _err}
                 cache['status'] = 'fail'
-                _fail(f'{cd}/{tag}: cache metadata is unreadable or not a JSON object — split contract cannot be verified')
+                _fail(f'{cd}/{tag}: {_err} — split contract cannot be verified')
                 continue
             trp = os.path.join(cd, f'train_ids_{tag}.npy')
             vap = os.path.join(cd, f'val_batch_{tag}.npy')
@@ -1229,7 +1233,8 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 _tm = _load(_tmp)
                 if not isinstance(_tm, dict):
                     rec['status'] = 'fail'
-                    _fail(f'{cd}/{_ttag}: test cache metadata is unreadable or not a JSON object — test split contract cannot be verified')
+                    _err = _tm.error if _is_corrupt(_tm) else 'test cache metadata is not a JSON object'
+                    _fail(f'{cd}/{_ttag}: {_err} — test split contract cannot be verified')
                     continue
                 _tfp = os.path.join(cd, f'test_ids_{_ttag}.npy')
                 if not os.path.exists(_tfp):
@@ -1628,11 +1633,12 @@ def audit_attribution(outdirs=None):
     for d in dirs:
         _sp = os.path.join(_repo_path(d), 'summary.json')
         summ = _load(_sp)
+        if _is_corrupt(summ):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: {summ.error} — the block attribution cannot be audited')
+            continue
         if summ is None:
-            if os.path.exists(_sp):
-                out['status'] = 'fail'
-                out.setdefault('problems', []).append(
-                    f'{d}: summary.json exists but cannot be parsed — the block attribution cannot be audited')
             continue
         if not isinstance(summ, dict):
             out['status'] = 'fail'
@@ -1771,11 +1777,11 @@ def audit_boundary(outdirs=None):
     for d in dirs:
         _sp = os.path.join(_repo_path(d), 'summary.json')
         summ = _load(_sp)
+        if _is_corrupt(summ):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(f'{d}: {summ.error} — boundary alignment cannot be audited')
+            continue
         if summ is None:
-            if os.path.exists(_sp):
-                out['status'] = 'fail'
-                out.setdefault('problems', []).append(
-                    f'{d}: summary.json exists but cannot be parsed — boundary alignment cannot be audited')
             continue
         if not isinstance(summ, dict):
             out['status'] = 'fail'
@@ -1872,11 +1878,11 @@ def audit_length(bylen_path=os.path.join(REPO, 'results_lm_test/bylen.json')):
     n_seq × (L−1)，即同一组前缀目标 token 被评分）；truncated 必须为假；
     逐文档行数 n_seq 跨臂一致。若某臂对不同目标集评分，跨臂比较无效。"""
     raw = _load(bylen_path)
+    if _is_corrupt(raw):
+        out = {'status': 'fail', 'problems': [f'{raw.error} — the length cells cannot be audited']}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
     if raw is None:
-        if os.path.exists(bylen_path):
-            out = {'status': 'fail', 'problems': [f'{bylen_path} exists but cannot be parsed — the length cells cannot be audited']}
-            print(json.dumps(out, ensure_ascii=False, indent=2))
-            return out
         out = {'status': 'not_verifiable_locally', 'note': f'{bylen_path} absent — P5T has not run; the same checks apply to results_v10_mech/summary.json by_len panels'}
         print(json.dumps(out, ensure_ascii=False))
         return out
@@ -2088,14 +2094,14 @@ def audit_fairness(summary_path=os.path.join(REPO, 'results_v10_mech/summary.jso
     一致；mlp_ratio 只在「参数量匹配」臂上有差异且被显式记录。任何臂间
     单独调参会在此被点名，而不是混进「方法效果」里。"""
     summ = _load(summary_path)
+    if _is_corrupt(summ):
+        out = {'status': 'fail', 'arms': {}, 'controlled_variables': None,
+               'seed_coverage': {},
+               'problems': [f'{summ.error} — the frozen-arm records cannot be audited'],
+               'warnings': [], 'tuning': {}}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
     if summ is None:
-        if os.path.exists(summary_path):
-            out = {'status': 'fail', 'arms': {}, 'controlled_variables': None,
-                   'seed_coverage': {},
-                   'problems': [f'{summary_path} exists but cannot be parsed — the frozen-arm records cannot be audited'],
-                   'warnings': [], 'tuning': {}}
-            print(json.dumps(out, ensure_ascii=False, indent=2))
-            return out
         out = {'status': 'not_verifiable_locally', 'note': f'{summary_path} absent — needs the training records of the frozen arms'}
         print(json.dumps(out, ensure_ascii=False))
         return out
@@ -2239,11 +2245,11 @@ def audit_failures(outdirs=None):
     for d in dirs:
         _sp = os.path.join(_repo_path(d), 'summary.json')
         summ = _load(_sp)
+        if _is_corrupt(summ):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(f'{d}: {summ.error} — failures cannot be audited')
+            continue
         if summ is None:
-            if os.path.exists(_sp):
-                out['status'] = 'fail'
-                out.setdefault('problems', []).append(
-                    f'{d}: summary.json exists but cannot be parsed — failures cannot be audited')
             continue
         if not isinstance(summ, dict):
             out['status'] = 'fail'
@@ -2290,14 +2296,11 @@ def audit_metrics(outdirs=None):
     for d in dirs:
         sp = os.path.join(_repo_path(d), 'summary.json')
         summ = _load(sp)
+        if _is_corrupt(summ):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(f'{d}: {summ.error} — metric policy cannot be audited')
+            continue
         if summ is None:
-            if os.path.exists(sp):
-                # Exists but is unreadable: this is a failed panel, not an
-                # absent one.  Silently skipping it would leave status "ok"
-                # with the record-level checks never run.
-                out['status'] = 'fail'
-                out.setdefault('problems', []).append(
-                    f'{d}: summary.json exists but cannot be parsed — metric policy cannot be audited')
             continue
         if not isinstance(summ, dict):
             out['status'] = 'fail'
@@ -2404,11 +2407,11 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
         _dir = d if os.path.isabs(d) else os.path.join(REPO, d)
         _sp = os.path.join(_dir, 'summary.json')
         summ = _load(_sp)
+        if _is_corrupt(summ):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(f'{d}: {summ.error} — methodology cannot be audited')
+            continue
         if summ is None:
-            if os.path.exists(_sp):
-                out['status'] = 'fail'
-                out.setdefault('problems', []).append(
-                    f'{d}: summary.json exists but cannot be parsed — methodology cannot be audited')
             continue
         if not isinstance(summ, dict):
             out['status'] = 'fail'
@@ -2484,11 +2487,12 @@ def audit_allocation(state_files=('run_time_state_v10.json', 'run_time_state_v12
     for d, v, steps in panels:
         _sp = os.path.join(_repo_path(d), 'summary.json')
         summ = _load(_sp)
+        if _is_corrupt(summ):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(f'{d}: {summ.error} — the allocation cannot be reconciled')
+            out['panels'][d] = 'corrupt'
+            continue
         if summ is None:
-            if os.path.exists(_sp):
-                out['status'] = 'fail'
-                out.setdefault('problems', []).append(
-                    f'{d}: summary.json exists but cannot be parsed — the allocation cannot be reconciled')
             out['panels'][d] = 'not present locally'
             continue
         if not isinstance(summ, dict):
@@ -2621,10 +2625,9 @@ def audit_allocation(state_files=('run_time_state_v10.json', 'run_time_state_v12
     for sf in state_files:
         _sf_path = _repo_path(sf)
         st = _load(_sf_path)
-        if st is None and os.path.exists(_sf_path):
+        if _is_corrupt(st):
             out['status'] = 'fail'
-            out.setdefault('problems', []).append(
-                f'{sf}: TimeGuard state exists but cannot be parsed — the run ledger cannot be reconciled')
+            out.setdefault('problems', []).append(f'{sf}: {st.error} — the run ledger cannot be reconciled')
             continue
         if st is not None:
             if not isinstance(st, dict):
@@ -2785,11 +2788,11 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
     for d in dirs:
         _sp = os.path.join(_repo_path(d), 'summary.json')
         summ = _load(_sp)
+        if _is_corrupt(summ):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(f'{d}: {summ.error} — efficiency pairs cannot be audited')
+            continue
         if summ is None:
-            if os.path.exists(_sp):
-                out['status'] = 'fail'
-                out.setdefault('problems', []).append(
-                    f'{d}: summary.json exists but cannot be parsed — efficiency pairs cannot be audited')
             continue
         if not isinstance(summ, dict):
             out['status'] = 'fail'
@@ -3023,6 +3026,9 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         print(json.dumps({k: v for k, v in out.items() if k != 'cells'}, ensure_ascii=False, indent=2))
         return out
     raw = _load(p)
+    if _is_corrupt(raw):
+        out.update({'status': 'fail', 'problems': [raw.error]})
+        return out
     cells = raw.get('cells') if isinstance(raw, dict) else None
     if not isinstance(cells, list) or not cells:
         out.update({'status': 'fail', 'problems': ['artifact has no cells list']})

@@ -3697,7 +3697,8 @@ def _rank_blocks(masked, B, ties, k=None):
     # torch.arange, so it uses the shared index-table cache.
     cols = _i32_range_cache(B, src.device)[None, :].expand(n, B)
     buf = torch.empty(n, kk + 1, dtype=torch.int32, device=src.device)
-    buf.scatter_(1, rank, cols)
+    # torch < 2.14 requires int64 scatter index; index dtype only, src/self stay int32.
+    buf.scatter_(1, rank.long(), cols)
     del rank, sel, cols
     cand = buf[:, :kk].long()
     del buf, kth
@@ -3751,7 +3752,8 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     # form (host-side integer equivalence, design notes §6.2).
     tgt = torch.where(keep, dest, _w_keep)
     kept = torch.full((n, _w_keep + 1), -1, dtype=torch.int32, device=scores.device)
-    kept.scatter_(1, tgt, order_k)
+    # torch < 2.14 requires int64 scatter index; index dtype only, src/self stay int32.
+    kept.scatter_(1, tgt.long(), order_k)
     kept = kept[:, :_w_keep]
     # last_tok from either pooling path is non-decreasing (a cumsum of
     # non-negative counts followed by the monotone (ends-1).clamp(0, n-1)),
@@ -14096,6 +14098,9 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             except Exception as e:
                 return {'status': 'fail', 'baseline_verified': False,
                         'problems': [f'cannot parse {path}: {type(e).__name__}: {e}']}
+            if not isinstance(artifact, dict):
+                return {'status': 'fail', 'baseline_verified': False,
+                        'problems': [f'{path} is valid JSON but not an object ({type(artifact).__name__})']}
         else:
             return {'status': 'not_verifiable_locally', 'baseline_verified': False,
                     'problems': [f'{path} absent — run baseline_tune.py simple before claiming the trivial floor was tuned']}
@@ -14850,6 +14855,9 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                     selected = json.load(_jf)
             except Exception as e:
                 return {'status': 'fail', 'tuning_verified': False, 'problems': [f'cannot parse {path}: {type(e).__name__}: {e}']}
+            if not isinstance(selected, dict):
+                return {'status': 'fail', 'tuning_verified': False,
+                        'problems': [f'{path} is valid JSON but not an object ({type(selected).__name__})']}
         else:
             return {'status': 'not_verifiable_locally', 'tuning_verified': False,
                     'problems': [f'{path} absent — run baseline_tune.py before claiming a baseline win']}

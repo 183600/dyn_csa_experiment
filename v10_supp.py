@@ -1520,8 +1520,16 @@ def _scale_crossovers():
             try:
                 with open(_sp, encoding='utf-8') as _f:
                     _raw = json.load(_f)
-            except Exception:
-                _raw = None
+            except Exception as _e:
+                print(f'[stats] WARNING: {label}: { _sp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — treating as missing/unreadable, not empty')
+                out[label] = {'status': 'unreadable', **p,
+                              'error': f'{type(_e).__name__}: {_e}'}
+                continue
+            if not isinstance(_raw, dict):
+                print(f'[stats] WARNING: {label}: {_sp} is {type(_raw).__name__}, not an object — treating as unreadable')
+                out[label] = {'status': 'unreadable', **p,
+                              'error': f'not an object: {type(_raw).__name__}'}
+                continue
         ha = _hist_by_seed(p['outdir'], 'csa_fixed', raw=_raw)
         hb = _hist_by_seed(p['outdir'], 'full', raw=_raw)
         _stale_seeds = sorted(getattr(ha, 'stale_cfg_seeds', set()) | getattr(hb, 'stale_cfg_seeds', set()))
@@ -1679,7 +1687,8 @@ def _equal_token_slices():
                 if not isinstance(_raw, dict):
                     print(f'[stats] WARNING: {_sp} is not a JSON object ({type(_raw).__name__}) — ignoring')
                     _raw = None
-            except Exception:
+            except Exception as _e:
+                print(f'[stats] WARNING: {_sp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — ignoring')
                 _raw = None
         ha = _hist_by_seed(spec['outdir'], 'csa_fixed', raw=_raw)
         hb = _hist_by_seed(spec['outdir'], 'full', raw=_raw)
