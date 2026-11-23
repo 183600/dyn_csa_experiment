@@ -20637,13 +20637,13 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
         for k, v in buckets.items():
             out_buckets[k] = {'n': int(v['n']),
                               'mean_ce': (v['ce_sum'] / v['n']) if v['n'] else None,
-                              'perplexity': (math.exp(min(v['ce_sum'] / v['n'], 700.0)) if v['n'] else None)}
+                              'perplexity': (_safe_exp_ppl(v['ce_sum'] / v['n']) if v['n'] else None)}
         ent_vals = [t[5] for t in tok_heap if math.isfinite(t[5])]
         _pooled_ce = (sum(x[2] for x in seq_rows) / n_targets) if n_targets else None
         return {'kind': 'token_error_analysis', 'rows': n_rows, 'seq_len': seq,
                 'n_targets': int(n_targets), 'n_nonfinite_tokens': int(n_nonfinite),
                 'mean_ce': _pooled_ce,
-                'pooled_ppl': (math.exp(min(_pooled_ce, 700.0)) if _pooled_ce is not None else None),
+                'pooled_ppl': (_safe_exp_ppl(_pooled_ce) if _pooled_ce is not None else None),
                 'buckets': out_buckets,
                 'worst_sequences': worst_seqs,
                 'worst_tokens': worst_tokens,
