@@ -180,8 +180,12 @@ def sample_std(vals):
         return 0.0
     _, e = math.frexp(amax)
     scaled = np.ldexp(a, -e) if e else a
-    mu = float(scaled.mean())
-    ss = float(((scaled - mu) ** 2).sum())
+    # Center BEFORE taking the mean: values that differ by only a few ULPs
+    # round to their common magnitude when averaged, which collapses the
+    # deviation sum to a single point and overstates the spread by ~70%.
+    shifted = scaled - scaled[0]
+    mu = float(shifted.mean())
+    ss = float(((shifted - mu) ** 2).sum())
     std = math.sqrt(ss / (n - 1))
     if not e:
         return std

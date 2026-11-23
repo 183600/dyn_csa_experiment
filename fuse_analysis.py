@@ -183,17 +183,22 @@ def _finite_mean_std(a):
         return 0.0, 0.0
     _, e = math.frexp(amax)
     scaled = np.ldexp(a, -e) if e else a
-    mu = float(scaled.mean())
+    # Center before averaging (as build_report.sample_std does): averaging
+    # values that differ by only a few ULPs rounds to an endpoint and inflates
+    # the residual sum of squares.
+    shifted = scaled - scaled[0]
+    mu = float(shifted.mean())
+    mean_s = float(scaled[0]) + mu
     if not e:
-        mean = mu
+        mean = mean_s
     else:
         try:
-            mean = math.ldexp(mu, e)
+            mean = math.ldexp(mean_s, e)
         except OverflowError:
-            mean = math.copysign(float('inf'), mu)
+            mean = math.copysign(float('inf'), mean_s)
     if a.size <= 1:
         return mean, 0.0
-    ss = float(((scaled - mu) ** 2).sum())
+    ss = float(((shifted - mu) ** 2).sum())
     std = math.sqrt(ss / (a.size - 1))
     if not e:
         return mean, std
@@ -683,7 +688,7 @@ def main(argv=None):
         _c1 = f'1. **同面板配对下 fuse 显著改变了边界 F1**：hybrid 栈按 seed 配对（n={_n_p}），ΔF1 = **{_pv('d_f1')}**（±{_psd('sd_f1')}），p(exact) = **{_pv('p_f1', '{:.3f}')}** < 0.05——「F1 差不稳固」的读法在本轮产物上不成立。\n'
     else:
         _f1_floor = L.signflip_p_floor(_n_p_eff) if isinstance(_n_p_eff, int) and _n_p_eff > 0 else float('nan')
-        _f1_floor_txt = f'p 值打在 n={_n_p} 的分辨率下限上，不能排除是噪声' if _f1_p is not None and math.isfinite(_f1_floor) and (abs(_f1_p - _f1_floor) < 1e-12) else f'p={_pv('p_f1', '{:.3f}')}，高于 n={_n_p or '?'} 的分辨率下限 {_f1_floor:.3f}，不能排除是噪声'
+        _f1_floor_txt = f'p 值打在 n={_n_p_eff} 的分辨率下限上，不能排除是噪声' if _f1_p is not None and math.isfinite(_f1_floor) and (abs(_f1_p - _f1_floor) < 1e-12) else f'p={_pv('p_f1', '{:.3f}')}，高于 n={_n_p_eff or '?'} 的分辨率下限 {_f1_floor:.3f}，不能排除是噪声'
         _x_f1 = probe.get('x_d_f1')
         if _x_f1 is None or not np.isfinite(_x_f1):
             _x_f1_txt = '跨面板的纯 CSA 对比未测量'
@@ -696,7 +701,7 @@ def main(argv=None):
         _c3 = f'3. **PPL 存在可分辨的差异**：同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')} < 0.05），「PPL 不变」的读法在本轮产物上不成立。\n'
     else:
         _ppl_floor = L.signflip_p_floor(_n_pp_eff) if isinstance(_n_pp_eff, int) and _n_pp_eff > 0 else float('nan')
-        _ppl_floor_txt = f'配对符号翻转 p 值打在 n={_n_pp} 的分辨率下限上，任何差异不能排除是种子噪声' if _ppl_p is not None and math.isfinite(_ppl_floor) and (abs(_ppl_p - _ppl_floor) < 1e-12) else f'配对符号翻转 p={_pv('p_ppl', '{:.3f}')}，高于 n={_n_pp or '?'} 的分辨率下限 {_ppl_floor:.3f}，任何差异不能排除是种子噪声'
+        _ppl_floor_txt = f'配对符号翻转 p 值打在 n={_n_pp_eff} 的分辨率下限上，任何差异不能排除是种子噪声' if _ppl_p is not None and math.isfinite(_ppl_floor) and (abs(_ppl_p - _ppl_floor) < 1e-12) else f'配对符号翻转 p={_pv('p_ppl', '{:.3f}')}，高于 n={_n_pp_eff or '?'} 的分辨率下限 {_ppl_floor:.3f}，任何差异不能排除是种子噪声'
         _x_ppl = probe.get('x_d_ppl_csa')
         _x_ppl_txt = f'，跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL' if _x_ppl is not None and np.isfinite(_x_ppl) else '，跨面板纯 CSA 对比未测量'
         _c3 = f'3. **PPL 同样不变**：两条验证 PPL 轨迹全程重叠（见 `fuse_ppl_traj.png`），同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')}）{_x_ppl_txt}——{_ppl_floor_txt}。\n'

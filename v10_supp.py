@@ -450,9 +450,10 @@ def _cell_ppl(nll_sum, n_tok):
         # An exact token total beyond the binary64 range underflows the
         # per-token NLL to zero (PPL 1.0).
         return 1.0
-    if ce > 709.0:
-        return float('inf')
-    return math.exp(ce)
+    # Use the shared exp-for-PPL helper: the binary64 exp boundary is
+    # ~709.7827, so a hard 709.0 cutoff would turn finite PPLs into inf.
+    _ppl = L._safe_exp_ppl(ce)
+    return float('inf') if _ppl is None else _ppl
 
 def _probe_span_len(cfg):
     """Exact positive span geometry for the `span` corruption mode.
@@ -1110,7 +1111,8 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             key = _cell_key(Ln, rho, mode)
             nll_sum, n_tok = _distractor_ppls(model, val_ids, Ln, rho, _pcfg['n_seq'], _pcfg, row_cache=_row_cache, chunk_mem=_chunk_mem, mode=mode)
             cell_ppl = _cell_ppl(nll_sum, n_tok)
-            per_seq = [float('inf') if s / t > 709.0 else math.exp(s / t) for s, t in zip(nll_sum, n_tok)]
+            per_seq = [(_ppl if _ppl is not None else float('inf'))
+                       for _ppl in (L._safe_exp_ppl(s / t) for s, t in zip(nll_sum, n_tok))]
             _fp_base = _probe_fp_for_mode(_fp, _pcfg, mode)
             _fp_rec = dict(_fp_base, mode=mode) if mode != 'uniform' else _fp_base
             _pending[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], 'val_fp': _val_fp, '_code': V.CKPT_CODE, 'probe_params': _fp_rec, 'recipe': _ck_recipe, 'train_knobs': _tr.get('train_knobs'), 'train_objective': _tr.get('train_objective'), 'param_breakdown': _tr.get('param_breakdown'), 'rng_fp': _tr.get('rng_fp'), 'train_fp': _tr.get('data_fp'), 'manifest_sha256': cfg.get('manifest_sha256')}
@@ -2484,7 +2486,12 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                        for _k, v in vs)
         dn, ab, ri = (_rng('dense'), _rng('allblocks'), _rng('randidx'))
         ri_sig = _all_sig('randidx')
-        _n_by_c = [(k, v.get('n', 0)) for k, v in _legacy.items() if 'omitted' not in v]
+        def _floor_n(v):
+            n = L._as_seed_int(v.get('n'))
+            nn = L._as_seed_int(v.get('n_nonzero'))
+            return (nn if nn is not None and (n is None or 0 <= nn <= n)
+                    else (n or 0))
+        _n_by_c = [(k, _floor_n(v)) for k, v in _legacy.items() if 'omitted' not in v]
         n_min = min((n for _k, n in _n_by_c), default=0)
         _bind = [k for k, n in _n_by_c if n == n_min]
         n_min_ri = min((n for k, n in _n_by_c if 'randidx' in k), default=0)

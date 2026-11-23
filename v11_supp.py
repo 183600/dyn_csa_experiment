@@ -25,6 +25,19 @@ DEVICE = L.DEVICE
 RUN_CAP_V11 = dict(L.RUN_CAP)
 
 
+def _floor_n(v):
+    """Nonzero paired count that sets the exact sign-flip p floor.
+
+    Zero deltas multiply the null space without moving the statistic, so the
+    attainable floor is 2/2**n_nonzero (same rule as attach_holm), not 2/2**n.
+    """
+    n = L._as_seed_int(v.get('n'))
+    nn = L._as_seed_int(v.get('n_nonzero'))
+    if nn is not None and (n is None or 0 <= nn <= n):
+        return nn
+    return n or 0
+
+
 def _cap_hours(_name, _default):
     try:
         _v = float(os.environ.get(_name, _default))
@@ -218,12 +231,12 @@ def v11_analysis(out='analysis_v11/stats.json'):
                  'holm_exploratory': L.attach_holm(
                      _slots, family='v11 distractor probe contrasts')}
         _n_cell_max = max((c['n'] for c in probe_cells), default=0)
-        _n_pair_max = max((v['n'] for v in contrasts.values()), default=0)
-        _n_pair_min = min((v['n'] for v in contrasts.values()), default=0)
+        _n_pair_max = max((_floor_n(v) for v in contrasts.values()), default=0)
+        _n_pair_min = min((_floor_n(v) for v in contrasts.values()), default=0)
         _n_pair_cells = bool(contrasts)
         probe['n_seeds'] = {'cell_max': _n_cell_max, 'contrast_paired_max': _n_pair_max, 'contrast_paired_min': _n_pair_min}
         if _n_pair_cells and _n_pair_min < _n_cell_max:
-            lowered = sorted((k for k, v in contrasts.items() if v['n'] < _n_cell_max))
+            lowered = sorted((k for k, v in contrasts.items() if _floor_n(v) < _n_cell_max))
             # `2.0 / 2**n` overflows int->float conversion at n >= 1024; the
             # canonical floor helper evaluates 2/2**n via ldexp instead.
             _fp_pair_min = L.signflip_p_floor(_n_pair_min)
@@ -348,10 +361,10 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
             mech_sum = {}
     probe_cells_ = probe.get('cells', [])
     contr_ = probe.get('contrasts', {})
-    n_contr_max = max((v['n'] for v in contr_.values()), default=0)
+    n_contr_max = max((_floor_n(v) for v in contr_.values()), default=0)
     _n_seeds = probe.get('n_seeds') or {}
     n_cells_max = max(_n_seeds.get('cell_max', 0), max((c['n'] for c in probe_cells_), default=0))
-    _n_pair = sorted({v['n'] for v in contr_.values()})
+    _n_pair = sorted({_floor_n(v) for v in contr_.values()})
     n_pair_min = _n_pair[0] if _n_pair else n_contr_max
     _pair_ragged = bool(contr_) and n_pair_min < n_contr_max
     _xo_ok = {k: len(v['seeds']) for k, v in xo.items() if v.get('status') == 'ok'}
@@ -572,10 +585,10 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
             _tag_n = f'{v['n']}' if v['n'] >= n_cells_max else f'{v['n']}（未配满，cell n={n_cells_max}）'
             A(f'| {k} | {_tag_n} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} | {v.get('p_holm') if v.get('p_holm') is not None else '—'} |')
         A('')
-        n6 = [v for v in contr.values() if v['n'] >= 6]
+        n6 = [v for v in contr.values() if _floor_n(v) >= 6]
         if n6:
             sig = [v for v in n6 if v.get('p_holm') is not None and v.get('p_holm') < 0.05]
-            _weakest = min((v['n'] for v in n6))
+            _weakest = min((_floor_n(v) for v in n6))
             floor_p_weakest = L.signflip_p_floor(_weakest)
             if floor_p_tree >= 0.05:
                 _tree_txt = f'本面板最弱的对比仍有 n={n_tree_min}，其下限为 {floor_p_tree:.3f}，跨不过 0.05——因此本报告的一切显著性主张只对上面的 n>={_weakest} 行成立，凡引用最弱对比（n={n_tree_min}）的段落一律按效应量 + 方向同向性表述。'

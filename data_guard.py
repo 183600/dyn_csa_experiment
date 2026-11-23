@@ -643,12 +643,17 @@ def _assert_order_finite(order, *, name='order'):
                     continue
                 # Only real numeric scalars can be missing.  Calling float()
                 # on every object turned the legitimate string key "nan" (or
-                # "inf") into a spurious NaN timestamp.
-                if not isinstance(value, numbers.Real) or isinstance(value, (bool, np.bool_)):
+                # "inf") into a spurious NaN timestamp.  Decimal is a Number
+                # but NOT a Real, and Decimal('NaN') would otherwise survive
+                # this check and raise InvalidOperation during the split's
+                # max/min comparison instead of a clean, documented ValueError.
+                if (not isinstance(value, numbers.Number)
+                        or isinstance(value, (bool, np.bool_, complex,
+                                              np.complexfloating))):
                     continue
                 try:
                     f = float(value)
-                except (TypeError, ValueError, OverflowError):
+                except (TypeError, ValueError, OverflowError, decimal.InvalidOperation):
                     continue
                 if not math.isfinite(f):
                     raise ValueError(
@@ -1235,7 +1240,7 @@ def assert_no_split_leakage(train_idx, val_idx, test_idx, *, groups=None,
                 earlier_max = _order_extreme(time[ia], maximum=True)
                 later_min = _order_extreme(time[ib], maximum=False)
                 leaked = bool(earlier_max >= later_min)
-            except (TypeError, ValueError, OverflowError):
+            except (TypeError, ValueError, OverflowError, decimal.InvalidOperation):
                 # Mixed/unorderable object timestamps cannot prove a monotone
                 # partition; fail closed rather than letting a TypeError
                 # escape from what is supposed to be a verification helper.
@@ -2860,7 +2865,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                 earlier_max = _order_extreme(time[ia], maximum=True)
                 later_min = _order_extreme(time[ib], maximum=False)
                 leaked = bool(earlier_max >= later_min)
-            except (TypeError, ValueError, OverflowError):
+            except (TypeError, ValueError, OverflowError, decimal.InvalidOperation):
                 hard_leak = True
                 temporal[f'{a}__{b}'] = {'checked': False,
                                          'error': 'time values are not mutually orderable'}
@@ -3132,9 +3137,30 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                 smd.append(None)
                 missing_reference.append(j)
                 continue
-            sd = float(np.std(tv, ddof=0))
-            if sd <= _EPS:
-                delta = abs(float(np.mean(hv)) - float(np.mean(tv)))
+            # Standardize on a common power-of-two scale first: np.std and
+            # np.mean square/sum in binary64 and overflow to inf for large but
+            # perfectly finite features, which would make the SMD a spurious
+            # zero and let a real covariate shift pass the gate.  SMD is
+            # invariant to a common positive rescaling, so the ratio below is
+            # the same value; the original-unit checks are restored with ldexp.
+            amax_t, amax_h = float(np.max(np.abs(tv))), float(np.max(np.abs(hv)))
+            et = math.frexp(amax_t)[1] if amax_t > 0.0 and math.isfinite(amax_t) else 0
+            eh = math.frexp(amax_h)[1] if amax_h > 0.0 and math.isfinite(amax_h) else 0
+            tvs = np.ldexp(tv, -et) if et else tv
+            hvs = np.ldexp(hv, -eh) if eh else hv
+            sd = float(np.std(tvs, ddof=0))
+            mt, mh = float(np.mean(tvs)), float(np.mean(hvs))
+            try:
+                sd_orig = math.ldexp(sd, et)
+            except OverflowError:
+                sd_orig = float('inf')
+            if sd_orig <= _EPS:
+                # Original-unit mean difference (the constant-feature rule is
+                # absolute, not scale-relative).
+                try:
+                    delta = abs(math.ldexp(mh, eh) - math.ldexp(mt, et))
+                except OverflowError:
+                    delta = float('inf')
                 if delta <= _EPS:
                     smd.append(0.0)
                 else:
@@ -3145,7 +3171,14 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                     smd.append(None)
                     non_estimable.append(j)
             else:
-                smd.append(float((np.mean(hv) - np.mean(tv)) / sd))
+                # SMD = (mean_h - mean_t)/sd_t is invariant to rescaling each
+                # side by its own power of two: combine the two exponents in
+                # log space instead of forming overflowing original means.
+                try:
+                    val = math.ldexp(mh / sd, eh - et) - mt / sd
+                except OverflowError:
+                    val = math.copysign(1e300, mh)
+                smd.append(val)
         miss_train = 1.0 - np.mean(np.isfinite(Xt), axis=0)
         miss_hold = 1.0 - np.mean(np.isfinite(Xh), axis=0)
         finite_smd = [abs(v) for v in smd if v is not None]

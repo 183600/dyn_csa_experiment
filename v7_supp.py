@@ -1770,7 +1770,7 @@ def exact_sign_permutation(deltas):
             return math.copysign(float('inf'), float(v))
     _mu = _unscale(_ds.mean())
     _sd = _unscale(_ds.std(ddof=1)) if n > 1 else 0.0
-    return _extras({'n': n, 'mean': _mu, 'std': _sd,
+    return _extras({'n': n, 'n_nonzero': _m_nonzero, 'mean': _mu, 'std': _sd,
                     'p_exact_signflip': float(_r['p']),
                     'n_flips': (int(1 << n) if _r.get('method', '').startswith('exact') else 0),
                     'method': _r.get('method'),

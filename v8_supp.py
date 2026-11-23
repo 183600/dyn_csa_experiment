@@ -178,14 +178,21 @@ def _panel_block(panel):
             # ordered by insertion (JSON key) order, otherwise the table's
             # seed group can differ from the paired-delta group purely because
             # of how the summary file happened to be serialized.
-            _ranked = sorted(by_cfg.items(), key=lambda kv: (not (isinstance(raw_cfg.get(kv[0]), str) and raw_cfg[kv[0]].endswith(_cur_sfx)), -len(kv[1]), str(kv[0])))
+            # Rank by USABLE measurements, not raw record count: an error stub
+            # with ppl=None contributes no evidence, and keeping three stubs
+            # over two real PPLs would publish an empty panel and drop the
+            # measurements that were actually made.
+            def _usable_count(group):
+                return sum(1 for r in group.values()
+                           if L.ppl_is_usable(r.get('ppl') if isinstance(r, dict) else r))
+            _ranked = sorted(by_cfg.items(), key=lambda kv: (not (isinstance(raw_cfg.get(kv[0]), str) and raw_cfg[kv[0]].endswith(_cur_sfx)), -_usable_count(kv[1]), str(kv[0])))
             _kept_cfg = raw_cfg.get(_ranked[0][0])
             if len(by_cfg) > 1:
                 keep = _ranked[0][1]
-                _ties = [g for _k, g in _ranked[1:] if len(g) == len(keep)]
-                print(f'[stats] _panel_block: variant `{v}` spans {len(by_cfg)} distinct run_cfg groups — pooling across configurations is not allowed, so the table keeps only one group ({len(keep)}/{len(recs)} seeds, preferring the one stamped with the current code semantics) and drops the rest')
+                _ties = [g for _k, g in _ranked[1:] if _usable_count(g) == _usable_count(keep)]
+                print(f'[stats] _panel_block: variant `{v}` spans {len(by_cfg)} distinct run_cfg groups — pooling across configurations is not allowed, so the table keeps only one group ({_usable_count(keep)} usable PPL / {len(keep)} records out of {len(recs)}, preferring the one stamped with the current code semantics) and drops the rest')
                 if _ties:
-                    print(f'[stats] _panel_block: variant `{v}` run_cfg groups TIE at {len(keep)} seed(s) each — the kept group is {sorted(keep)}; the tied alternatives are dropped, so this panel contributes fewer seeds than were measured')
+                    print(f'[stats] _panel_block: variant `{v}` run_cfg groups TIE at {_usable_count(keep)} usable PPL each — the kept group is {sorted(keep)}; the tied alternatives are dropped, so this panel contributes fewer measurements than were made')
                 recs = keep
             _stale_cfg = not (isinstance(_kept_cfg, str) and _kept_cfg.endswith(_cur_sfx))
             if _stale_cfg:

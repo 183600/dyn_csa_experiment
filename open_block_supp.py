@@ -746,14 +746,23 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
         e = _cell_efficiency(cell['record'])
         if e is not None:
             efficiency[f'{v}::seed{s}'] = e
-    _prim_n = [L._as_seed_int(results[n].get('n')) for n in prim_names
-               if L._as_seed_int(results[n].get('n')) is not None]
-    _prim_n = [n for n in _prim_n if n > 0]
+    def _floor_n(rec):
+        # Exact sign-flip drops zero deltas, so the attainable floor is set by
+        # n_nonzero, not the declared seed count (same rule as attach_holm).
+        n = L._as_seed_int(rec.get('n'))
+        nn = L._as_seed_int(rec.get('n_nonzero'))
+        if nn is not None and (n is None or 0 <= nn <= n):
+            return nn
+        return n
+    _prim_n = [v for n in prim_names if (v := _floor_n(results[n])) is not None]
     # The family's finest attainable p is set by the best-resolved (largest-n)
     # comparison, not the smallest one.
     _prim_n_max = max(_prim_n) if _prim_n else 0
-    _holm_floor = (L.holm_min_attainable_p(_prim_n_max, len(prim_names), 0.05)
-                   if _prim_n_max and prim_names else None)
+    if _prim_n and _prim_n_max == 0:
+        _holm_floor = 1.0  # no nonzero pair in any contrast: nothing can reject
+    else:
+        _holm_floor = (L.holm_min_attainable_p(_prim_n_max, len(prim_names), 0.05)
+                       if _prim_n_max and prim_names else None)
     _holm_min_n = (L.signflip_min_n_for_holm(len(prim_names), 0.05)
                    if prim_names else None)
     os.makedirs(analysis_dir, exist_ok=True)

@@ -2843,6 +2843,23 @@ def _frozen_rule_confirms(holm_entry, comp, alpha, n_seeds_fallback=8):
     return _n >= _floor
 
 
+def _exact_mean(xs):
+    """Mean of exact integer counts without converting them to float first.
+
+    A valid but huge parameter count overflows float() and np.mean; an exact
+    int/int ratio stays representable whenever the result is, and the rare
+    non-integral case beyond binary64 falls back to the exact floor.
+    """
+    total, n = sum(xs), len(xs)
+    q, r = divmod(total, n)
+    if r == 0:
+        return q
+    try:
+        return total / n
+    except OverflowError:
+        return q
+
+
 def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analysis_v12/test_stats.json'):
     """Zero-GPU: paired confirmation statistics under the frozen plan.
 
@@ -3068,8 +3085,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         _param_complete = bool(usable) and all(
             p is not None and p > 0 for p in _params_a + _params_b)
         if _param_complete:
-            _am, _bm = float(np.mean(_params_a)), float(np.mean(_params_b))
-            _rel = abs(_am - _bm) / max(_am, _bm, 1.0)
+            _am, _bm = _exact_mean(_params_a), _exact_mean(_params_b)
+            _rel = abs(_am - _bm) / max(_am, _bm, 1)
             res['param_matched'] = bool(_rel <= 0.01)
             res['param_rel_diff'] = float(_rel)
             res['params_a'] = _am
@@ -3102,7 +3119,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                     _act_i = L._as_seed_int(_pbd.get('active'))
                     if _act_i is not None and _act_i > 0:
                         _act.append(_act_i)
-        res['active_params_mean'] = (float(np.mean(_act)) if _act else None)
+        res['active_params_mean'] = (_exact_mean(_act) if _act else None)
         res['data_fp'] = unified_fp
         res['manifest_sha256'] = manifest.get('manifest_sha256')
         res['delta_definition'] = f'{a} - {b} (paired per seed, test split)'

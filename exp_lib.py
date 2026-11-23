@@ -15672,6 +15672,24 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
     (`params * tokens_seen`).  Return None-shaped fields when neither record
     supports the comparison; never guess.
     """
+    def _median_exact(xs):
+        if not xs:
+            return None
+        ys = sorted(xs)
+        n = len(ys)
+        mid = n // 2
+        if n % 2:
+            return ys[mid]
+        lo, hi = ys[mid - 1], ys[mid]
+        if isinstance(lo, int) and isinstance(hi, int):
+            try:
+                return lo + (hi - lo) / 2
+            except OverflowError:
+                # Huge exact counts: keep the midpoint exact rather than
+                # converting either endpoint to a float (which overflows).
+                return (lo + hi) // 2
+        return float(lo) + (float(hi) - float(lo)) / 2
+
     def _series(arm):
         tpt, prox, par = [], [], []
         for (v, _t, _s), r in recs.items():
@@ -15681,14 +15699,15 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
             if tt is not None and tok is not None and tt > 0 and tok > 0:
                 tpt.append(float(tt) / float(tok))
             # Parameter and token counts are exact integers; bool/fractional
-            # values must not silently become a compute ratio.
+            # values must not silently become a compute ratio.  Keep them as
+            # ints: float(10**400) raises, while an exact int/int ratio stays
+            # representable even for a count beyond the binary64 range.
             p = _as_seed_int(r.get('params'))
             if p is not None and p > 0:
-                par.append(float(p))
+                par.append(p)
                 if tok is not None and tok > 0:
-                    prox.append(float(p) * float(tok))
-        med = (lambda xs: float(np.median(xs)) if xs else None)
-        return med(tpt), med(par), med(prox)
+                    prox.append(p * tok)
+        return _median_exact(tpt), _median_exact(par), _median_exact(prox)
 
     ta, pa, xa = _series(a)
     tb, pb, xb = _series(b)
@@ -22567,7 +22586,9 @@ def aggregate(summary, *, outdir=None):
     def _rel_param_diff(_a, _b):
         if _a is None or _b is None:
             return None
-        return abs(_a - _b) / float(max(_a, _b))
+        # Exact int/int division (as in `_param_control`): a valid but huge
+        # parameter count must not raise OverflowError converting to float.
+        return abs(_a - _b) / max(_a, _b, 1)
 
     for (v, tag), recs in per_variant.items():
         if _steps_ok(recs):
@@ -22586,6 +22607,7 @@ def aggregate(summary, *, outdir=None):
             _split_groups.append(((v, tag, _i), _rs))
             _group_records[v, tag, _i] = _rs
             _group_cfg_fp[v, tag, _i] = _fp
+    _unattributed_drop_seen = set()
     for (_v, _tag, _fp_idx), recs in _split_groups:
         v, tag = (_v, _tag)
         key = _agg_key(v, tag, _fp_idx)
@@ -22625,8 +22647,19 @@ def aggregate(summary, *, outdir=None):
             _cfg = _group_cfg_fp.get((_v, _tag, _fp_idx))
             _cfg_dr = {'synthesized': 0, 'nonfinite_ppl': 0, 'error_no_ppl': 0, 'seeds': []}
             for _rr in _dr.get('records', ()):
-                if _cfg_fp(_rr) != _cfg:
+                _cfg_known = any(_rr.get(k) is not None
+                                 for k in ('run_cfg', 'params', *PAIR_STEP_KEYS))
+                if _cfg_known:
+                    if _cfg_fp(_rr) != _cfg:
+                        continue
+                elif (_v, _tag) in _unattributed_drop_seen:
+                    # A config-less error record (it died before `run_cfg` was
+                    # stamped) cannot be matched by fingerprint.  Book it once,
+                    # to the first group of this (variant, protocol), instead
+                    # of dropping it from every group or counting it twice.
                     continue
+                else:
+                    _unattributed_drop_seen.add((_v, _tag))
                 _rb = ('synthesized' if _rr.get('synthesized')
                        else ('nonfinite_ppl' if 'ppl' in _rr else 'error_no_ppl'))
                 _cfg_dr[_rb] += 1
@@ -22935,6 +22968,18 @@ def aggregate(summary, *, outdir=None):
     return agg
 _TW = {'variant': 18, 'ppl': 16, 'd': 15, 'd2': 15, 'params': 10, 'seeds': 6, 'blklen': 7, 'bnd': 13}
 
+def _params_millions(p):
+    if p is None:
+        return None
+    try:
+        return float(p) / 1000000.0
+    except OverflowError:
+        # An exact count outside binary64 has no finite millions display;
+        # mark it out of range rather than aborting a report whose
+        # aggregate.json has already been published.
+        return float('inf')
+
+
 def _fmt_cell(value, width, fmt, absent='—'):
     s = absent if value is None else f'{value:{fmt}}'
     return s if len(s) >= width else f'{s:>{width}s}'
@@ -22968,7 +23013,7 @@ def _print_table(agg):
         bl = e.get('avg_dyn_block_len', e.get('avg_block_len'))
         bls = _fmt_cell(bl, _TW['blklen'], '.1f')
         _pm = e.get('params')
-        pms = _fmt_cell(_pm / 1000000.0 if _pm is not None else None, _TW['params'], '.2f')
+        pms = _fmt_cell(_params_millions(_pm), _TW['params'], '.2f')
         bf = e.get('boundary_f1_dyn')
         bfs = _fmt_pair(bf, e.get('boundary_f1_dyn_std', 0.0), _TW['bnd'], '6.3f', '5.3f', never_wider='.3f')
         try:
@@ -23063,7 +23108,7 @@ def _plot(summary, agg, outdir):
     _unknown = [v for v in vs if agg[v].get('params') is None]
     if _unknown:
         print(f'[plot] {len(_unknown)} variant(s) report no `params` ({', '.join(_unknown)}) — their size bar is left at 0 and the size panel cannot be read for them')
-    params_m = [(agg[v]['params'] or 0) / 1000000.0 for v in vs]
+    params_m = [(_params_millions(agg[v]['params']) or 0) for v in vs]
     ax[1].bar(range(len(vs)), params_m, color='orange')
     ax[1].set_xticks(range(len(vs)))
     ax[1].set_xticklabels(vs, rotation=30, ha='right')

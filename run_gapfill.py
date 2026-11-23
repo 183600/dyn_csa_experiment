@@ -101,6 +101,13 @@ def _panel_missing(outdir, variants, seeds):
             rec = summary.get(key)
             if not isinstance(rec, dict) or not L.ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
                 _missing.append(key)
+                continue
+            # A usable PPL filed under the right key is not enough: a record
+            # mislabeled with a different variant/seed would make a planned
+            # cell look complete while the intended run never happened.
+            if (rec.get('variant') is not None and str(rec.get('variant')) != str(v)) or (
+                    rec.get('seed') is not None and L._as_seed_int(rec.get('seed')) != int(seed)):
+                _missing.append(key)
     return _missing, None
 
 

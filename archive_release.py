@@ -139,6 +139,10 @@ def _collect(dirs, include_ckpt=False):
             continue
         base = os.path.join(REPO, d)
         for root, _dirs, names in os.walk(base):
+            # `--dirs .` must not turn the evidence release into a source
+            # mirror: .git holds mutable local refs/objects, not archived
+            # evidence, and packing it would leak unpublished history.
+            _dirs[:] = [dn for dn in _dirs if dn != '.git']
             for n in names:
                 p = os.path.join(root, n)
                 if os.path.islink(p) or not os.path.isfile(p):
@@ -510,8 +514,16 @@ def cmd_verify(tar_path):
         man_name = f'{_base}.MANIFEST.sha256'
         _hits = [n for n in names if n == man_name]
         if len(_hits) != 1:
-            print(f'[archive] REFUSE: expected exactly one {man_name!r} inside the archive, found {len(_hits)}')
-            return 1
+            # A released tar can be renamed (mirror upload, download alias)
+            # without changing its contents.  The manifest is self-describing,
+            # so accept the unique in-archive manifest in that case; still
+            # refuse when several candidates could hijack the verification.
+            _candidates = [n for n in names if n.endswith('.MANIFEST.sha256')]
+            if len(_candidates) == 1:
+                man_name = _candidates[0]
+            else:
+                print(f'[archive] REFUSE: expected exactly one {man_name!r} inside the archive, found {len(_hits)}; manifest candidates: {_candidates[:5]}')
+                return 1
         try:
             with tf.extractfile(man_name) as _man_f:
                 man = json.load(_man_f)

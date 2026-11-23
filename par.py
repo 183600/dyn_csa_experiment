@@ -155,7 +155,19 @@ def resolve_ctx(par=None, label=""):
             )
         slots = slots[:workers]
     else:
-        workers = 1 if wanted is None else wanted
+        # A CPU-only box has no device table to cap against: an unbounded
+        # CSA_PAR=N would try to allocate a slot list of N entries (a typo can
+        # raise OverflowError or exhaust memory before any job is dispatched).
+        # Cap at the visible logical CPU count, like the GPU path caps at the
+        # device slot table.
+        cpu_cap = max(1, os.cpu_count() or 1)
+        workers = 1 if wanted is None else min(wanted, cpu_cap)
+        if wanted is not None and wanted > cpu_cap:
+            print(
+                f"[par] Requested {wanted} CPU workers; "
+                f"capping at {cpu_cap} CPU slot(s).",
+                flush=True,
+            )
         slots = [""] * workers
         print(
             f"[par] No visible CUDA device: using {workers} CPU worker(s).",
