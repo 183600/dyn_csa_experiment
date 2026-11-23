@@ -279,6 +279,10 @@ def _curve_slope_stats(points, key, k=4):
     the sign of that noise.  Callers that need a scale-free criterion compare
     the slope with a multiple of this SE.
     """
+    _k = _as_seed_int(k)
+    if _k is None:
+        raise ValueError(f'_curve_slope_stats: k must be an exact integer, got {k!r}')
+    k = max(2, _k)
     pts = []
     for p in (points if points is not None else []):
         if not isinstance(p, dict):
@@ -287,7 +291,7 @@ def _curve_slope_stats(points, key, k=4):
         y = _finite_scalar(p.get(key))
         if x is not None and y is not None:
             pts.append((x, y))
-    pts = pts[-max(2, int(k)):]
+    pts = pts[-k:]
     if len(pts) < 2:
         return None, None
     n = len(pts)
