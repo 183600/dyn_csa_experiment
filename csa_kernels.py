@@ -861,9 +861,6 @@ def _stable_topk_desc(x, k):
     # Same candidate construction as exp_lib._rank_blocks: strictly greater
     # entries plus the earliest equal-to-kth entries.  Prefix ranks use int32
     # (B < 2^31), the same exact integers; the sentinel is filled in place.
-    # torch < 2.14 requires an int64 scatter index, so only the index is
-    # widened below; `cols` stays int32 to match the destination dtype
-    # (scatter_ also requires src and self to share a dtype).
     gt = flat > kth
     eq = flat == kth
     need = (kk - gt.sum(dim=1)).clamp_min(0).to(torch.int32)
@@ -882,7 +879,7 @@ def _stable_topk_desc(x, k):
     rank.masked_fill_(~sel, kk)
     cols = torch.arange(B, device=dev, dtype=torch.int32)[None, :].expand(m, B)
     buf = torch.empty(m, kk + 1, dtype=torch.int32, device=dev)
-    buf.scatter_(1, rank.long(), cols)
+    buf.scatter_(1, rank, cols)
     cand = buf[:, :kk].long()
     order = torch.argsort(flat.gather(1, cand), dim=1, stable=True, descending=True)
     cand = cand.gather(1, order)
@@ -1980,15 +1977,13 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
                 # 计数是整数（块 id 非负且 < Bm），scatter_add_ 与逐行 bincount
                 # 给出同一组精确整数。lane 值域 [0, T·NB) 只在确实越过 int32
                 # 时才用 int64；常规规模下 order/计数/偏移表全部用 int32。
-                # 但 torch < 2.14 的 scatter_add_ 同样要求 int64 索引，故调用处
-                # 只把索引加宽为 int64（计数与值不变，仅 dtype 兼容性转换）。
                 _narrow = int(T) * int(nb) < (1 << 31)
                 _idt = torch.int32 if _narrow else torch.int64
                 if _narrow:
                     order = order.to(torch.int32)
                 flat_l = flat.to(_idt)
                 cnt = torch.zeros((R, Bm), device=dev, dtype=_idt)
-                cnt.scatter_add_(1, flat_l.long(), torch.ones_like(flat_l))
+                cnt.scatter_add_(1, flat_l, torch.ones_like(flat_l))
                 del flat_l
                 offs = torch.zeros((R, Bm + 1), device=dev, dtype=_idt)
                 offs[:, 1:] = cnt.cumsum(dim=1)

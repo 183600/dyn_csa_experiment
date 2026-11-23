@@ -2278,9 +2278,6 @@ def _row_keys(X):
             f'duplicate detection needs a 1-D or 2-D table, got shape {src.shape}')
     if src.ndim == 1:
         src = src.reshape(-1, 1)
-    if src.shape[1] == 0:
-        # Zero-column rows are vacuously distinct.
-        return [f'Z{i}'.encode() for i in range(src.shape[0])]
     if src.dtype == object:
         # An all-integer object table has an exact fixed-width twin.  Route it
         # through the same uint64/int64 canonicalisation as a typed table so

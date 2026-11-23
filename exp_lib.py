@@ -3697,10 +3697,7 @@ def _rank_blocks(masked, B, ties, k=None):
     # torch.arange, so it uses the shared index-table cache.
     cols = _i32_range_cache(B, src.device)[None, :].expand(n, B)
     buf = torch.empty(n, kk + 1, dtype=torch.int32, device=src.device)
-    # torch < 2.14 requires an int64 scatter index; `.long()` widens only the
-    # index dtype and preserves every integer value.  `cols` stays int32
-    # because scatter_ also requires src to match the destination dtype.
-    buf.scatter_(1, rank.long(), cols)
+    buf.scatter_(1, rank, cols)
     del rank, sel, cols
     cand = buf[:, :kk].long()
     del buf, kth
@@ -3739,9 +3736,7 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     order_w = order[:, :_w_keep]
     keep = cf.gather(1, order_w)
     # Integer prefix ranks fit in int32 (k <= B < 2**31): the same exact
-    # integers as the default int64 cumsum.  The scatter target is nevertheless
-    # cast to int64 below: torch < 2.14 requires an int64 index for scatter_,
-    # and `.long()` preserves every integer value.
+    # integers as the default int64 cumsum.
     dest = keep.cumsum(dim=1, dtype=torch.int32)
     dest -= 1
     # int64 -> int32 narrowing, on the kept slice only — same integers
@@ -3756,7 +3751,7 @@ def _indexer_selection(scores, causal, k, ties='earliest', out_valid=None):
     # form (host-side integer equivalence, design notes §6.2).
     tgt = torch.where(keep, dest, _w_keep)
     kept = torch.full((n, _w_keep + 1), -1, dtype=torch.int32, device=scores.device)
-    kept.scatter_(1, tgt.long(), order_k)
+    kept.scatter_(1, tgt, order_k)
     kept = kept[:, :_w_keep]
     # last_tok from either pooling path is non-decreasing (a cumsum of
     # non-negative counts followed by the monotone (ends-1).clamp(0, n-1)),
