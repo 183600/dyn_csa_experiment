@@ -263,14 +263,14 @@ class HybridAttentionRoPE(L.HybridAttention):
                 else:
                     prefix_mean = torch.cumsum(sim, 0) / L._range_cache(1, sim.numel() + 1, x.device)
                     tau = prefix_mean + self.delta_logit
-                    # Keep the affine policy logits before sigmoid.  Rebuilding
-                    # them with logit(clamp(gate)) kills the score-function
-                    # gradient whenever sigmoid saturates at either clamp edge.
+                    # Score the sampled Bernoulli action with the pre-sigmoid
+                    # affine policy logits so the score-function gradient stays
+                    # finite when sigmoid saturates.
                     _logits = (tau - sim) / max(cfg.temperature, 0.001)
                     gate = torch.sigmoid(_logits)
                     if getattr(cfg, 'boundary_policy', 'threshold') == 'reinforce' and torch.is_grad_enabled():
-                        # Match exp_lib._single: the sampled Bernoulli action
-                        # is scored with the original, unclamped policy logits.
+                        # The policy log-probability uses the same pre-sigmoid
+                        # logits as the gate.
                         hard_b = torch.bernoulli(gate).bool()
                         self.last_boundary_logp = -F.binary_cross_entropy_with_logits(
                             _logits, hard_b.to(gate.dtype), reduction='sum')

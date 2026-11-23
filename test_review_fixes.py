@@ -10247,13 +10247,10 @@ def t_kernel_zero_soft_prior_preserves_window_s_path():
 
 
 def t_kernel_zero_soft_prior_all_block_lanes_is_no_prior():
-    # The closed-path leak appears when EVERY usable lane is a zero-prior
-    # block lane: the S-path logits then all sit at the same sentinel and a
-    # uniform softmax leaks q/K gradients.  A prior narrower than the logits
-    # (here float32 prior, float64 logits) is the case that reproduces it,
-    # because a same-dtype MIN sentinel saturates the add and clamp_min_
-    # already cuts the gradient.  With the mask, the zero prior must be
-    # gradient-identical to no prior in BOTH implementations.
+    # Every usable lane is a zero-prior block lane.  The zero prior must be
+    # gradient-identical to no prior in BOTH implementations.  A prior
+    # narrower than the logits (here float32 prior, float64 logits) covers
+    # the mixed-dtype sentinel path.
     import csa_kernels as CK
     torch.manual_seed(11)
     R, T, nh, hd, w, nb = 1, 2, 1, 2, 0, 2
@@ -10308,8 +10305,8 @@ def t_kernel_zero_soft_prior_all_block_lanes_is_no_prior():
 
 def t_open_zero_soft_prior_removes_candidate_lanes_from_s_path():
     # Open-block attention has its own eager soft-prior path.  With no local
-    # window, an all-zero candidate prior must make the S path contribute no
-    # gradients; the hard A path must match the no-prior call exactly.
+    # window, an all-zero candidate prior makes the S path contribute no
+    # gradients; the hard A path matches the no-prior call exactly.
     torch.manual_seed(9)
     T, nh, hd, B, K = 2, 1, 2, 2, 2
     q0 = torch.randn(T, nh, hd, dtype=torch.float64)
@@ -10347,8 +10344,8 @@ def t_open_zero_soft_prior_removes_candidate_lanes_from_s_path():
 
 
 def t_rope_reinforce_saturated_policy_keeps_gradient():
-    # The RoPE fallback must score sampled actions with pre-sigmoid logits;
-    # logit(sigmoid(z).clamp(...)) has zero derivative once sigmoid saturates.
+    # The RoPE fallback scores sampled actions with pre-sigmoid logits, so
+    # the score-function gradient stays finite when sigmoid saturates.
     import v7_supp as V7
     torch.manual_seed(1)
     cfg = V7.AttnCfgRope(
