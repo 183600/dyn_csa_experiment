@@ -2279,10 +2279,7 @@ def _row_keys(X):
     if src.ndim == 1:
         src = src.reshape(-1, 1)
     if src.shape[1] == 0:
-        # A zero-column table is a valid (if uninformative) input.  Its rows
-        # are vacuously distinct feature vectors; hashing an empty byte view
-        # would collapse every row to one key and manufacture duplicate
-        # leakage (and a false hard failure) across splits.
+        # Zero-column rows are vacuously distinct.
         return [f'Z{i}'.encode() for i in range(src.shape[0])]
     if src.dtype == object:
         # An all-integer object table has an exact fixed-width twin.  Route it
@@ -3149,12 +3146,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             hvs = np.ldexp(hv, -eh) if eh else hv
             sd = float(np.std(tvs, ddof=0))
             mt, mh = float(np.mean(tvs)), float(np.mean(hvs))
-            # Constancy is a scale-free property: `tvs` was rescaled so its
-            # magnitude is O(1), so a genuinely varying feature has sd >> 0
-            # regardless of the units its values were originally expressed
-            # in.  Testing the original-unit std here would classify every
-            # small-magnitude feature as constant and silently zero its SMD,
-            # letting an arbitrarily large relative shift pass the gate.
+            # Constancy is scale-free; compare the rescaled standard deviation.
             if sd <= _EPS:
                 # Original-unit mean difference (the constant-feature rule is
                 # absolute, not scale-relative).

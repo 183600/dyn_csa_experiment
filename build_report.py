@@ -167,11 +167,7 @@ def _hist_points(r):
 def sample_std(vals):
     a = np.asarray(vals, dtype=float)
     if not np.isfinite(a).all():
-        # Non-finite entries are not samples: dropping them (and using the
-        # same scale-free path as the finite case) keeps this helper
-        # consistent with fuse_analysis.sample_std.  The previous branch
-        # shifted by a[0] but never removed NaN/Inf, so the mean and the sum
-        # of squares turned into NaN/Inf and the helper returned nan.
+        # Non-finite entries are not samples.
         a = a[np.isfinite(a)]
     n = a.size
     if n < 2:
@@ -1094,10 +1090,8 @@ def sec_p0w():
         for v, w, _dd, _st in _contrasts:
             _st['p_holm'] = _p0w_holm.get(f'P0W csa_fixed warm={w} vs warm=0')
             _d = _st['mean']
-            # The exact test drops non-finite and zero deltas, so the floor and
-            # the direction check must follow the SAME filtered pairs it used,
-            # not the raw list (a NaN/Inf delta would otherwise inflate the
-            # nonzero count and make the printed floor too small).
+            # The floor and direction check follow the same filtered pairs
+            # as the exact test.
             _finite_dd = [f for f in (_as_finite(x) for x in _dd)
                           if f is not None and f != 0.0]
             _floor = signflip_p_floor(len(_finite_dd))

@@ -549,9 +549,6 @@ def _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
     dtype = Xa.dtype
     L, W = geom.max_len, geom.W_b
     has_b = Xb is not None and W > 0
-    # Same contract as the Triton launch wrapper: a one-sided (Xb, Zb) pair is
-    # malformed and must fail closed with a clear diagnostic instead of being
-    # dereferenced as None deeper in the reference loop.
     if (Xb is None) != (Zb is None):
         raise ValueError(
             'pool_variable_blocks: Xb and Zb must both be tensors or both '

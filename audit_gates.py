@@ -3201,9 +3201,6 @@ def _aggregate_audit_status(results):
     # Fail closed for any other non-ok verdict (no_release, incomplete,
     # skipped_no_torch, ...).  Treating an unknown status as clean would let a
     # sub-audit's explicit refusal disappear from the aggregate exit code.
-    # Some sub-audits report a successful verdict as 'pass' rather than 'ok'
-    # (e.g. audit_causality); it is a clean success synonym, not an unknown
-    # refusal, and must not downgrade a passing aggregate to unverifiable.
     if any(s not in (None, 'ok', 'pass') for s in statuses):
         return 'not_verifiable_locally'
     return 'ok'
