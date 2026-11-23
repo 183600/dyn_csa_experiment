@@ -2167,7 +2167,7 @@ def causal_window_mask_f(T, window, device, dtype):
 
 _ATTN_TRANSIENT_CAP_BYTES = 512 << 20
 
-def _attn_transient_budget(device):
+def _attn_transient_limit(device):
     key = (_dev_str(device), _ATB_EPOCH)
     if key in _ATB_CACHE:
         return _ATB_CACHE[key]
@@ -2195,11 +2195,11 @@ def _full_attn_row_chunk(device, B, nh, T, elem_size, max_rows=1024):
     # [B, nh, rows, T], so bounding `rows` bounds the table.  Chunking is a
     # pure row partition, so no value changes.
     row_chunk = max(1, min(int(T), int(max_rows)))
-    budget = _attn_transient_budget(device)
-    if budget is None:
-        budget = _FULL_ATTN_TRANSIENT_BYTES
+    limit_bytes = _attn_transient_limit(device)
+    if limit_bytes is None:
+        limit_bytes = _FULL_ATTN_TRANSIENT_BYTES
     per_row = max(1, 3 * int(B) * int(nh) * int(T)) * int(elem_size)
-    return max(1, min(row_chunk, int(budget) // per_row))
+    return max(1, min(row_chunk, int(limit_bytes) // per_row))
 
 _WINDOW_MASK_CACHE = {}
 _WINDOW_MASK_BUDGET_BYTES = 64 << 20
@@ -2239,11 +2239,11 @@ def _window_attn_row_chunk(device, B, nh, T, window, elem_size, max_rows=1024):
     # sequence width.  Sizing the row block from (window + rows) keeps launch
     # counts small even when T is very long.
     rows = max(1, min(int(T), int(max_rows)))
-    budget = _attn_transient_budget(device)
-    if budget is None:
-        budget = _FULL_ATTN_TRANSIENT_BYTES
+    limit_bytes = _attn_transient_limit(device)
+    if limit_bytes is None:
+        limit_bytes = _FULL_ATTN_TRANSIENT_BYTES
     per_row = max(1, 3 * int(B) * int(nh) * (int(window) + rows)) * int(elem_size)
-    return max(1, min(rows, int(budget) // per_row))
+    return max(1, min(rows, int(limit_bytes) // per_row))
 
 
 def _window_attn_local_impl(q, k, v, window, scale):
@@ -4239,7 +4239,7 @@ def _finfo_min(dtype):
         _FO_MINL[dtype] = v
     return v
 
-def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None, topk_distinct=False, soft_form=False, v_stacked=None, k_stacked=None):
+def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_limit_bytes=None, sel_valid=None, topk_distinct=False, soft_form=False, v_stacked=None, k_stacked=None):
     n = q.shape[0]
     dev = q.device
     # A zero-width soft prior (index_topk == 0 / no selectable blocks) carries
@@ -4257,17 +4257,17 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         raise ValueError(
             'gathered_attention: w>0 requires the window tensors k_sw/v_sw; '
             'pass w=0 when there is no local window')
-    if mem_budget_bytes is None:
-        mem_budget_bytes = _attn_transient_budget(dev)
-    if mem_budget_bytes is None:
-        mem_budget_bytes = 256 << 20
+    if mem_limit_bytes is None:
+        mem_limit_bytes = _attn_transient_limit(dev)
+    if mem_limit_bytes is None:
+        mem_limit_bytes = 256 << 20
     _heads = q.shape[1] if q.dim() == 3 else 1
     _M = max(1, int(topk_idx.shape[1]) + int(w))
     _per_row = 4 * _M * _heads * int(q.shape[-1]) + 2 * _M * _heads
     _bytes_per_chunk_row = _per_row * q.element_size()
-    _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
+    _bindable = mem_limit_bytes is not None and math.isfinite(float(mem_limit_bytes))
     if _bindable and _bytes_per_chunk_row > 0:
-        _max_rows = max(1, int(mem_budget_bytes) // _bytes_per_chunk_row)
+        _max_rows = max(1, int(mem_limit_bytes) // _bytes_per_chunk_row)
         q_chunk = min(q_chunk, _max_rows)
     q_chunk = max(1, min(int(q_chunk), n))
     out = torch.empty_like(q)
@@ -4545,7 +4545,7 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
                             k_sw, v_sw, w, scale, *, prefix_geo,
                             prefix_kind='summary', prefix_k=None, prefix_v=None,
                             soft=None, sink_logits=None, q_chunk=128,
-                            mem_budget_bytes=None, return_prefix_mass=False):
+                            mem_limit_bytes=None, return_prefix_mass=False):
     """Gathered attention with per-query prefix candidates.
 
     `topk_idx` holds combined candidate ids (closed blocks `0..B-1`, prefix
@@ -4579,13 +4579,13 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
         raise ValueError(
             'gathered_attention_open requires the window tensors k_sw/v_sw '
             '(use w=0 only with an actual empty window table)')
-    if mem_budget_bytes is None:
-        mem_budget_bytes = _attn_transient_budget(dev)
-    if mem_budget_bytes is None:
-        mem_budget_bytes = 256 << 20
+    if mem_limit_bytes is None:
+        mem_limit_bytes = _attn_transient_limit(dev)
+    if mem_limit_bytes is None:
+        mem_limit_bytes = 256 << 20
     M = max(1, K + int(w))
     per_row = 4 * M * nh * hd + 2 * M * nh
-    q_chunk = max(1, min(int(q_chunk), max(1, int(mem_budget_bytes) // max(1, per_row * q.element_size()))))
+    q_chunk = max(1, min(int(q_chunk), max(1, int(mem_limit_bytes) // max(1, per_row * q.element_size()))))
     q_chunk = max(1, min(q_chunk, n))
     win_idx, win_valid_all = _window_geometry(n, int(w), dev)
     # Same promoted-logit dtype rule as `gathered_attention`.  The prefix

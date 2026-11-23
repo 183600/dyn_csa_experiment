@@ -41,7 +41,7 @@ run_time_state_m2.json（内核模式 .k 后缀，两面板互不混账）；超
 `require_g0` 校验 `results_m0_g0/g0_certificate.json`（内核数值、训练级
 TOST 等检查都由 `kernel` 子命令写出并绑定代码/内核戳/git 树）；
 没有有效证书时拒绝启动，只能用 CSA_ALLOW_UNVERIFIED_EAGER=1 做显式调试。
-`full` 还会在真实面板几何上做短校准，使解析外推的单元开销与真实运行一致，
+`full` 还会在真实面板几何上做短校准，使解析外推的单元估计与真实运行一致，
 避免因估计偏差而使单元被 cap 跳过。
 """
 import gc, json, math, os, shutil, subprocess, sys, time, traceback

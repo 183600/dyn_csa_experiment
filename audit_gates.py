@@ -2467,7 +2467,7 @@ def train_flops_estimate(params, tokens, attn_overhead=0.35):
     return {'flops_6nd': base, 'flops_with_attn_proxy': with_attn, 'attn_overhead_assumed': overhead, 'note': 'analytic PROXY, not a measurement; report alongside the TimeGuard accounting'}
 
 
-def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.json'), panels=(('results_lm_v10_scale_s', 'csa_fixed', 8000), ('results_lm_v10_scale_l8k', 'csa_fixed', 8000), ('results_lm_v10_scale_lflop', 'csa_fixed', None))):
+def audit_allocation(state_files=('run_time_state_v10.json', 'run_time_state_v12.json'), panels=(('results_lm_v10_scale_s', 'csa_fixed', 8000), ('results_lm_v10_scale_l8k', 'csa_fixed', 8000), ('results_lm_v10_scale_lflop', 'csa_fixed', None))):
     out = {'status': 'ok', 'panels': {}}
     for d, v, steps in panels:
         _sp = os.path.join(_repo_path(d), 'summary.json')
@@ -3257,7 +3257,7 @@ def run_report(out='audit_report.json'):
            'hypotheses': _run_audit(audit_hypotheses),
            'methodology': _run_audit(audit_methodology),
            'failures': _run_audit(audit_failures),
-           'budget': _run_audit(audit_budget),
+           'allocation': _run_audit(audit_allocation),
            'efficiency_pairs': _run_audit(audit_efficiency_pairs),
            'release': _run_audit(audit_release_readiness),
            'selection': _run_audit(audit_selection)}
@@ -3282,7 +3282,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'selection': audit_selection, 'release': audit_release_readiness, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'failures': audit_failures, 'allocation': audit_allocation, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'selection': audit_selection, 'release': audit_release_readiness, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

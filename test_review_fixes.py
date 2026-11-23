@@ -3814,7 +3814,7 @@ def t_attention_zero_blocks_keeps_window():
     q, k, v = (torch.randn(n, h, d) for _ in range(3))
     topk = torch.empty(n, 0, dtype=torch.int32)
     last = torch.empty(0, dtype=torch.long)
-    got = L.gathered_attention(q, torch.empty(0, h, d), torch.empty(0, h, d), topk, last, k, v, w, 0.5, q_chunk=2, mem_budget_bytes=1 << 20)
+    got = L.gathered_attention(q, torch.empty(0, h, d), torch.empty(0, h, d), topk, last, k, v, w, 0.5, q_chunk=2, mem_limit_bytes=1 << 20)
     ref = torch.empty_like(q)
     for i in range(n):
         lo = max(0, i - w + 1)
@@ -5410,29 +5410,29 @@ def t_sample_tokens_uniform_rejection():
         A._CHOICE_PERM_MAX_ELEMS = old
 
 
-def t_audit_budget_integer_runs():
+def t_audit_allocation_integer_runs():
     with tempfile.TemporaryDirectory() as d:
         state = os.path.join(d, 'run_time_state.json')
         with open(state, 'w', encoding='utf-8') as f:
             json.dump({'booked_seconds': 12.5, 'runs': 3}, f)
-        out = A.audit_budget(state_files=(state,), panels=())
+        out = A.audit_allocation(state_files=(state,), panels=())
         assert out['measured'][state]['run_count'] == 3, out
         with open(state, 'w', encoding='utf-8') as f:
             json.dump({'booked_seconds': 1.0, 'runs': [1, 2]}, f)
-        out = A.audit_budget(state_files=(state,), panels=())
+        out = A.audit_allocation(state_files=(state,), panels=())
         assert out['measured'][state]['run_count'] == 2, out
         # A fractional run counter is not a count; never truncate it to one.
         with open(state, 'w', encoding='utf-8') as f:
             json.dump({'booked_seconds': 1.0, 'runs': 3.9}, f)
-        out = A.audit_budget(state_files=(state,), panels=())
+        out = A.audit_allocation(state_files=(state,), panels=())
         assert out['measured'][state]['run_count'] is None, out
         with open(state, 'w', encoding='utf-8') as f:
             json.dump({'booked_seconds': 1.0, 'runs': 3.9, 'run_count': 7}, f)
-        out = A.audit_budget(state_files=(state,), panels=())
+        out = A.audit_allocation(state_files=(state,), panels=())
         assert out['measured'][state]['run_count'] == 7, out
     # Panel bookkeeping must use exact positive counts: a boolean/fractional
     # parameter or token count would otherwise produce a plausible FLOP number.
-    td = tempfile.mkdtemp(prefix='budget_', dir=REPO)
+    td = tempfile.mkdtemp(prefix='alloc_', dir=REPO)
     try:
         sp = os.path.join(td, 'summary.json')
         for bad in ({'params': True, 'steps': 3, 'batch_size': 2, 'seq_len': 8},
@@ -5442,7 +5442,7 @@ def t_audit_budget_integer_runs():
                     {'params': 1000, 'steps': 3, 'batch_size': 2.5, 'seq_len': 8}):
             with open(sp, 'w', encoding='utf-8') as f:
                 json.dump({'v::s0': dict(bad, variant='v')}, f)
-            r = A.audit_budget(state_files=(), panels=((td, 'v', None),))
+            r = A.audit_allocation(state_files=(), panels=((td, 'v', None),))
             assert r['status'] == 'fail' and r.get('problems'), (bad, r)
             _panel = r['panels'][td]
             assert not isinstance(_panel, dict) or _panel.get('estimate') is None, (bad, r)
@@ -5453,13 +5453,13 @@ def t_audit_budget_integer_runs():
                                  'batch_size': 2, 'seq_len': 8},
                        'v::s1': {'variant': 'v', 'params': 2000, 'steps': 3,
                                  'batch_size': 2, 'seq_len': 8}}, f)
-        r = A.audit_budget(state_files=(), panels=((td, 'v', None),))
+        r = A.audit_allocation(state_files=(), panels=((td, 'v', None),))
         assert r['status'] == 'fail' and r.get('problems'), r
         assert r['panels'][td]['estimate'] is None, r
         with open(sp, 'w', encoding='utf-8') as f:
             json.dump({'v::s0': {'variant': 'v', 'params': 1000, 'steps': 3,
                                  'batch_size': 2, 'seq_len': 8}}, f)
-        r = A.audit_budget(state_files=(), panels=((td, 'v', None),))
+        r = A.audit_allocation(state_files=(), panels=((td, 'v', None),))
         assert r['status'] == 'ok', r
         assert r['panels'][td]['tokens'] == 48, r
         assert r['panels'][td]['estimate']['flops_6nd'] == 6.0 * 1000 * 48, r
@@ -6124,7 +6124,7 @@ def t_valid_json_non_object_summaries_are_refused():
         assert out['status'] == 'fail', out
         out = A.audit_fairness(os.path.join(d, 'summary.json'))
         assert out['status'] == 'fail', out
-        out = A.audit_budget(state_files=(), panels=((d, 'arm', 10),))
+        out = A.audit_allocation(state_files=(), panels=((d, 'arm', 10),))
         assert out['status'] == 'fail', out
         # The report builder must refuse a non-object summary/aggregate too.
         try:
@@ -8591,7 +8591,7 @@ def t_identity_fingerprint_and_pairing_regressions():
             json.dump({'v::s0': {'variant': 'v', 'params': 1000, 'steps': 3,
                                  'batch_size': 2, 'seq_len': 8},
                        'v::s1': {'variant': 'v', 'params': 1000, 'tokens_seen': 100}}, _f)
-        _bud = A.audit_budget(state_files=(), panels=((_td, 'v', None),))
+        _bud = A.audit_allocation(state_files=(), panels=((_td, 'v', None),))
         assert _bud['status'] == 'fail' and _bud['panels'][_td]['estimate'] is None, _bud
     # A recorded validation fingerprint must be checked against the val rows.
     with tempfile.TemporaryDirectory() as _td:
@@ -9780,11 +9780,11 @@ def t_gathered_attention_zero_block_rows():
     zero = torch.empty(n, 0, dtype=torch.int32)
     ref = L.gathered_attention(q, torch.empty(0, h, d), torch.empty(0, h, d),
                                zero, last, k, v, w, 0.5, q_chunk=2,
-                               mem_budget_bytes=1 << 20)
+                               mem_limit_bytes=1 << 20)
     got = L.gathered_attention(q, torch.empty(0, h, d), torch.empty(0, h, d),
                                torch.zeros(n, 2, dtype=torch.int32), last,
                                k, v, w, 0.5, q_chunk=2,
-                               mem_budget_bytes=1 << 20)
+                               mem_limit_bytes=1 << 20)
     assert torch.equal(got, ref), 'impossible block lanes changed the window-only result'
     # A non-empty soft prior over impossible lanes is still "no prior": it
     # must not add a zero-width straight-through S path (which would double
@@ -9794,11 +9794,11 @@ def t_gathered_attention_zero_block_rows():
     got_g = L.gathered_attention(qg, torch.empty(0, h, d), torch.empty(0, h, d),
                                  torch.zeros(n, 2, dtype=torch.int32), last,
                                  kg, vg, w, 0.5, soft=soft, q_chunk=2,
-                                 mem_budget_bytes=1 << 20)
+                                 mem_limit_bytes=1 << 20)
     q0, k0, v0 = (t.detach().clone().requires_grad_(True) for t in (q, k, v))
     ref_g = L.gathered_attention(q0, torch.empty(0, h, d), torch.empty(0, h, d),
                                  zero, last, k0, v0, w, 0.5, q_chunk=2,
-                                 mem_budget_bytes=1 << 20)
+                                 mem_limit_bytes=1 << 20)
     gout = torch.autograd.grad(got_g.sum(), (qg, kg, vg))
     rout = torch.autograd.grad(ref_g.sum(), (q0, k0, v0))
     for a, b in zip(gout, rout):
@@ -10375,7 +10375,7 @@ def t_attention_mask_uses_logit_dtype():
     out = L.gathered_attention(
         q, k_blk, v_blk, torch.zeros((1, 1), dtype=torch.int32),
         torch.zeros(1, dtype=torch.int64), k_sw, v_sw, 1, 1.0,
-        q_chunk=1, mem_budget_bytes=1 << 20)
+        q_chunk=1, mem_limit_bytes=1 << 20)
     assert torch.allclose(out, torch.full((1, 1, 1), 3.0, dtype=out.dtype)), out
 
 
@@ -10392,10 +10392,10 @@ def t_soft_prior_dtype_mismatch_is_safe():
     soft = torch.rand(n, nb, dtype=torch.float32)
     ref = L.gathered_attention(q, kb, vb, topk, last, ksw, vsw, w, 0.5,
                                sel_valid=valid, q_chunk=2,
-                               mem_budget_bytes=1 << 20)
+                               mem_limit_bytes=1 << 20)
     got = L.gathered_attention(q, kb, vb, topk, last, ksw, vsw, w, 0.5,
                                soft=soft, sel_valid=valid, q_chunk=2,
-                               mem_budget_bytes=1 << 20)
+                               mem_limit_bytes=1 << 20)
     assert torch.equal(ref, got), 'a lower-precision prior changed the forward value'
 
 
@@ -10964,7 +10964,7 @@ def t_fail_closed_edge_cases():
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
             json.dump({'a::s0': {'variant': 'csa_fixed', 'params': 100}}, f)
-        out = A.audit_budget(state_files=(), panels=((d, 'csa_fixed', None),))
+        out = A.audit_allocation(state_files=(), panels=((d, 'csa_fixed', None),))
         assert out['status'] == 'fail', out
 
     # Equal list/dict object cells (signed zero, dict order) are duplicates.
@@ -11501,7 +11501,7 @@ def t_kernel_ref_masked_lane_gradient_with_inf_logit():
     ref = [x.clone().requires_grad_() for x in (q0, kb0, vb0, ks0, vs0)]
     oe = L.gathered_attention(eager[0], eager[1], eager[2], idx[0], last[0],
                               eager[3], eager[4], w, 0.7, sel_valid=valid[0],
-                              topk_distinct=True, q_chunk=2, mem_budget_bytes=1 << 20)
+                              topk_distinct=True, q_chunk=2, mem_limit_bytes=1 << 20)
     ok = CK.gathered_attention_kernel(ref[0], ref[1], ref[2], idx, last,
                                       ref[3], ref[4], w, 0.7, sel_valid=valid,
                                       impl='ref')
@@ -11522,7 +11522,7 @@ def t_audit_budget_declared_steps_conflict():
             with open(sp, 'w', encoding='utf-8') as f:
                 json.dump({f'v::s{i}': r for i, r in enumerate(records)}, f)
             with contextlib.redirect_stdout(io.StringIO()):
-                return A.audit_budget(state_files=(), panels=((d, 'v', declared),))
+                return A.audit_allocation(state_files=(), panels=((d, 'v', declared),))
 
         out = _run(4000, [rec])
         assert out['status'] == 'ok' and out['panels'][d]['tokens'] == 64000, out
@@ -11847,7 +11847,7 @@ def main():
     _check('I7 split audit finds sequence-level row overlap', t_audit_split_sequence_overlap)
     _check('I8 public exports resolve (star-import safe)', t_public_exports_resolve)
     _check('I9 rejection-sampled token audit stays uniform', t_sample_tokens_uniform_rejection)
-    _check('I10 allocation audit accepts TimeGuard integer run counters', t_audit_budget_integer_runs)
+    _check('I10 allocation audit accepts TimeGuard integer run counters', t_audit_allocation_integer_runs)
     _check('I11 failure audit does not count NaN PPL as a success', t_audit_failures_ignores_unmeasured_ppl)
     _check('I12 object-time NaN + zero-feature data guards', t_object_time_and_zero_feature_guards)
     _check('I13 split audit marks per-cache warnings', t_audit_split_warning_status)

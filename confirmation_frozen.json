@@ -14,7 +14,20 @@
     "csa_fixed_rope_randidx",
     "csa_fixed_rope_allblocks"
   ],
-  "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11
+  ],
   "training_recipe": "P3MT/P4MT/P5C: 3000 steps, seq 512, batch 12 (18.4M tokens consumed per run over the 8M-token train cache; identical data order per seed), all four arms under one config; csa_fixed_rope & full_rope via P3MT/P4MT (seeds 0-5) + P5C (seeds 6-11), controls via P3MTC/P5C (seeds 0-11, same recipe and outdir).",
   "binding": {
     "training_recipe_signature": {
@@ -76,12 +89,25 @@
   "eval": {
     "data": "wiki.test.raw via exp_lib.load_wikitest (held out; the ONLY phase allowed to read it)",
     "n_seqs_clean": 16,
-    "by_length_ppl": [512, 1024, 2048, 4096],
+    "by_length_ppl": [
+      512,
+      1024,
+      2048,
+      4096
+    ],
     "per_document": "bylen records additionally store ppl_per_seq (per-row PPL) so document-sampling uncertainty can be stratified; n_seqs=16 does NOT cover the language-population distribution and population-level claims are out of scope (design_notes section 20)",
     "distractor_probe": {
       "mode": "uniform",
-      "rhos": [0.0, 0.125, 0.25, 0.5],
-      "eval_lens": [2048, 4096],
+      "rhos": [
+        0.0,
+        0.125,
+        0.25,
+        0.5
+      ],
+      "eval_lens": [
+        2048,
+        4096
+      ],
       "target": 512,
       "n_seq": 16
     }
@@ -114,7 +140,7 @@
       "b": "csa_fixed_rope",
       "endpoint": "by_len.ppl@4096",
       "expected_sign": "positive",
-      "hypothesis_direction": "positive delta would confirm that learned selection beats a TRAINED random selector at equal budget (the test-time intervention cannot answer this)",
+      "hypothesis_direction": "positive delta would confirm that learned selection beats a TRAINED random selector at equal reading scope (the test-time intervention cannot answer this)",
       "interpretation_caveat": "'random' is a FIXED deterministic hash pattern ((row*12.9898 + col*78.233)), identical for every seed, layer and step — not a fresh random draw. The claim is about learned selection vs this fixed pseudo-random read pattern, at matched parameters (but with 201,216 dead W_DQ/W_DK/W_w parameters in the randidx arm, so its effective parameter count is ~1.8% lower)."
     },
     {
@@ -123,8 +149,8 @@
       "b": "csa_fixed_rope",
       "endpoint": "by_len.ppl@4096",
       "expected_sign": "positive",
-      "hypothesis_direction": "positive delta would confirm that learned top-32 selection beats TRAINED all-block reading (allblocks reads strictly more information; this is a selection-vs-full-read contrast, NOT an equal-budget contrast)",
-      "interpretation_caveat": "The arms are parameter-matched but NOT computation/reading-budget matched. index_topk=1000000, and lightning_indexer internally caps k=min(topk, B): allblocks reads 128 blocks at train L512 and 1024 blocks at eval L4096, versus 32 for learned (about 32x more at L4096). It is therefore an information-rich 'read everything' control, which is scientifically valid but must not be described as equal budget. The indexer's STE soft prior also differs (log(1/32) vs log(1/1024) on the selected set), so the learned sink strength differs by about 30x at L4096; 'only index_topk changed' is not accurate."
+      "hypothesis_direction": "positive delta would confirm that learned top-32 selection beats TRAINED all-block reading (allblocks reads strictly more information; this is a selection-vs-full-read contrast, NOT an equal reading-scope contrast)",
+      "interpretation_caveat": "The arms are parameter-matched but NOT computation/reading-scope matched. index_topk=1000000, and lightning_indexer internally caps k=min(topk, B): allblocks reads 128 blocks at train L512 and 1024 blocks at eval L4096, versus 32 for learned (about 32x more at L4096). It is therefore an information-rich 'read everything' control, which is scientifically valid but must not be described as equal reading scope. The indexer's STE soft prior also differs (log(1/32) vs log(1/1024) on the selected set), so the learned sink strength differs by about 30x at L4096; 'only index_topk changed' is not accurate."
     },
     {
       "name": "aligned-dense: full_rope - csa_fixed_rope_allblocks @ L4096 (test)",

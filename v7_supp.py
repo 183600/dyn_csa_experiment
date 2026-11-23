@@ -371,17 +371,17 @@ class HybridAttentionRoPE(L.HybridAttention):
                 preserve_rng_state=False, **kwargs)
         return self._rope_attn(*args, **kwargs)
 
-    def _rope_attn(self, q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, sink, rope_dim, q_chunk=128, soft=None, rope_base=10000.0, mem_budget_bytes=None, sel_valid=None, topk_distinct=False):
+    def _rope_attn(self, q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, sink, rope_dim, q_chunk=128, soft=None, rope_base=10000.0, mem_limit_bytes=None, sel_valid=None, topk_distinct=False):
         T, nh, hd = q.shape
         dev = q.device
-        if mem_budget_bytes is None:
-            mem_budget_bytes = L._attn_transient_budget(dev)
+        if mem_limit_bytes is None:
+            mem_limit_bytes = L._attn_transient_limit(dev)
         _es = q.element_size()
         _m = max(1, int(topk_idx.shape[1]) + int(w))
         _bytes_per_chunk_row = 2 * _m * nh * hd * _es + 4 * _m * nh * _es
-        _bindable = mem_budget_bytes is not None and math.isfinite(float(mem_budget_bytes))
+        _bindable = mem_limit_bytes is not None and math.isfinite(float(mem_limit_bytes))
         if _bindable and _bytes_per_chunk_row > 0:
-            _max_rows = max(1, int(mem_budget_bytes) // _bytes_per_chunk_row)
+            _max_rows = max(1, int(mem_limit_bytes) // _bytes_per_chunk_row)
             q_chunk = min(q_chunk, _max_rows)
         cos, sin = rope_cos_sin(hd, rope_dim, L._arange_cache(T, dev), dev, rope_base)
         # RoPE is applied to the query chunk inside the loop: every rotated
