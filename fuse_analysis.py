@@ -183,9 +183,7 @@ def _finite_mean_std(a):
         return 0.0, 0.0
     _, e = math.frexp(amax)
     scaled = np.ldexp(a, -e) if e else a
-    # Center before averaging (as build_report.sample_std does): averaging
-    # values that differ by only a few ULPs rounds to an endpoint and inflates
-    # the residual sum of squares.
+    # Center before averaging so the deviation sum stays representative.
     shifted = scaled - scaled[0]
     mu = float(shifted.mean())
     mean_s = float(scaled[0]) + mu

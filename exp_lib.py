@@ -15685,8 +15685,7 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
             try:
                 return lo + (hi - lo) / 2
             except OverflowError:
-                # Huge exact counts: keep the midpoint exact rather than
-                # converting either endpoint to a float (which overflows).
+                # Keep the midpoint exact for large integer counts.
                 return (lo + hi) // 2
         return float(lo) + (float(hi) - float(lo)) / 2
 
@@ -15698,10 +15697,8 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
             tt, tok = _finite_scalar(r.get('train_time_s')), _as_seed_int(r.get('tokens_seen'))
             if tt is not None and tok is not None and tt > 0 and tok > 0:
                 tpt.append(float(tt) / float(tok))
-            # Parameter and token counts are exact integers; bool/fractional
-            # values must not silently become a compute ratio.  Keep them as
-            # ints: float(10**400) raises, while an exact int/int ratio stays
-            # representable even for a count beyond the binary64 range.
+            # Parameter and token counts are exact integers; keep them as
+            # ints so the compute ratio stays exact.
             p = _as_seed_int(r.get('params'))
             if p is not None and p > 0:
                 par.append(p)
@@ -22586,8 +22583,7 @@ def aggregate(summary, *, outdir=None):
     def _rel_param_diff(_a, _b):
         if _a is None or _b is None:
             return None
-        # Exact int/int division (as in `_param_control`): a valid but huge
-        # parameter count must not raise OverflowError converting to float.
+        # Exact int/int division keeps the ratio representable for huge counts.
         return abs(_a - _b) / max(_a, _b, 1)
 
     for (v, tag), recs in per_variant.items():
@@ -22653,10 +22649,9 @@ def aggregate(summary, *, outdir=None):
                     if _cfg_fp(_rr) != _cfg:
                         continue
                 elif (_v, _tag) in _unattributed_drop_seen:
-                    # A config-less error record (it died before `run_cfg` was
-                    # stamped) cannot be matched by fingerprint.  Book it once,
-                    # to the first group of this (variant, protocol), instead
-                    # of dropping it from every group or counting it twice.
+                    # A config-less error record cannot be matched by
+                    # fingerprint; book it once to the first group of this
+                    # (variant, protocol).
                     continue
                 else:
                     _unattributed_drop_seen.add((_v, _tag))
@@ -22974,9 +22969,7 @@ def _params_millions(p):
     try:
         return float(p) / 1000000.0
     except OverflowError:
-        # An exact count outside binary64 has no finite millions display;
-        # mark it out of range rather than aborting a report whose
-        # aggregate.json has already been published.
+        # Mark counts outside the display range as infinite.
         return float('inf')
 
 

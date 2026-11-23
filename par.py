@@ -155,11 +155,8 @@ def resolve_ctx(par=None, label=""):
             )
         slots = slots[:workers]
     else:
-        # A CPU-only box has no device table to cap against: an unbounded
-        # CSA_PAR=N would try to allocate a slot list of N entries (a typo can
-        # raise OverflowError or exhaust memory before any job is dispatched).
-        # Cap at the visible logical CPU count, like the GPU path caps at the
-        # device slot table.
+        # Cap CPU workers at the visible logical CPU count, like the GPU
+        # path caps at the device slot table.
         cpu_cap = max(1, os.cpu_count() or 1)
         workers = 1 if wanted is None else min(wanted, cpu_cap)
         if wanted is not None and wanted > cpu_cap:
@@ -409,8 +406,7 @@ def _job_watchdog_seconds(job, ctx):
     """
     v = job.get("watchdog_seconds") or ctx.get("watchdog_seconds")
     if v:
-        # A boolean flag is not a wall-clock duration: float(True) == 1.0
-        # would install a one-second watchdog and kill every healthy child.
+        # A boolean flag is not a wall-clock duration.
         if isinstance(v, (bool, np.bool_)):
             return 12.0 * 3600.0
         try:
@@ -427,11 +423,8 @@ def _job_watchdog_seconds(job, ctx):
         kind = job.get("kind")
         if kind in ("run", "warm"):
             cfg = job.get("cfg") or {}
-            # Use the SAME defaulting as _note_watchdog_kill below: a job may
-            # legally omit optional geometry keys, and required indexing here
-            # would raise KeyError -> silently fall back to the 12 h net while
-            # the later kill note still books with the defaults (different
-            # class -> mismatched TimeGuard calibration).
+            # Optional geometry keys may be omitted; use the same defaults
+            # as _note_watchdog_kill below for consistent TimeGuard booking.
             est = guard.estimate_seconds(
                 cfg.get("steps"), d=cfg.get("d", 256),
                 n_layers=cfg.get("n_layers", 6), seq_len=cfg.get("seq_len", 512),

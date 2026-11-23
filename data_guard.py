@@ -641,12 +641,9 @@ def _assert_order_finite(order, *, name='order'):
                             f'{name} contains NaT; a temporal split needs a '
                             'well-defined order')
                     continue
-                # Only real numeric scalars can be missing.  Calling float()
-                # on every object turned the legitimate string key "nan" (or
-                # "inf") into a spurious NaN timestamp.  Decimal is a Number
-                # but NOT a Real, and Decimal('NaN') would otherwise survive
-                # this check and raise InvalidOperation during the split's
-                # max/min comparison instead of a clean, documented ValueError.
+                # Only real numeric scalars can be missing.  String keys and
+                # non-real numbers (Decimal, complex) are skipped so they
+                # cannot be coerced into misleading timestamps.
                 if (not isinstance(value, numbers.Number)
                         or isinstance(value, (bool, np.bool_, complex,
                                               np.complexfloating))):
@@ -3137,12 +3134,8 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                 smd.append(None)
                 missing_reference.append(j)
                 continue
-            # Standardize on a common power-of-two scale first: np.std and
-            # np.mean square/sum in binary64 and overflow to inf for large but
-            # perfectly finite features, which would make the SMD a spurious
-            # zero and let a real covariate shift pass the gate.  SMD is
-            # invariant to a common positive rescaling, so the ratio below is
-            # the same value; the original-unit checks are restored with ldexp.
+            # Standardize on a common power-of-two scale: SMD is invariant to
+            # rescaling, and original units are restored with ldexp.
             amax_t, amax_h = float(np.max(np.abs(tv))), float(np.max(np.abs(hv)))
             et = math.frexp(amax_t)[1] if amax_t > 0.0 and math.isfinite(amax_t) else 0
             eh = math.frexp(amax_h)[1] if amax_h > 0.0 and math.isfinite(amax_h) else 0
@@ -3171,9 +3164,8 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                     smd.append(None)
                     non_estimable.append(j)
             else:
-                # SMD = (mean_h - mean_t)/sd_t is invariant to rescaling each
-                # side by its own power of two: combine the two exponents in
-                # log space instead of forming overflowing original means.
+                # SMD is invariant to rescaling each side by its own power
+                # of two: combine the two exponents in log space.
                 try:
                     val = math.ldexp(mh / sd, eh - et) - mt / sd
                 except OverflowError:

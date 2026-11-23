@@ -237,8 +237,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
         probe['n_seeds'] = {'cell_max': _n_cell_max, 'contrast_paired_max': _n_pair_max, 'contrast_paired_min': _n_pair_min}
         if _n_pair_cells and _n_pair_min < _n_cell_max:
             lowered = sorted((k for k, v in contrasts.items() if _floor_n(v) < _n_cell_max))
-            # `2.0 / 2**n` overflows int->float conversion at n >= 1024; the
-            # canonical floor helper evaluates 2/2**n via ldexp instead.
+            # The canonical floor helper evaluates 2/2**n via ldexp.
             _fp_pair_min = L.signflip_p_floor(_n_pair_min)
             _fp_cell_max = L.signflip_p_floor(_n_cell_max)
             print(f'[v11 stats] NOTE: the fullest probe cell reaches n={_n_cell_max} but the WEAKEST contrast pairs only {_n_pair_min} seeds — the arms are not seed-complete with each other, so every p value below is computed at its own PAIRED count, i.e. the worst floor for this panel is {_fp_pair_min:.3f}, not {_fp_cell_max:.3f}. {len(lowered)}/{len(contrasts)} contrast(s) are limited by this: {lowered[:3]}')

@@ -2844,12 +2844,7 @@ def _frozen_rule_confirms(holm_entry, comp, alpha, n_seeds_fallback=8):
 
 
 def _exact_mean(xs):
-    """Mean of exact integer counts without converting them to float first.
-
-    A valid but huge parameter count overflows float() and np.mean; an exact
-    int/int ratio stays representable whenever the result is, and the rare
-    non-integral case beyond binary64 falls back to the exact floor.
-    """
+    """Mean of exact integer counts without converting them to float first."""
     total, n = sum(xs), len(xs)
     q, r = divmod(total, n)
     if r == 0:

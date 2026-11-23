@@ -178,10 +178,7 @@ def _panel_block(panel):
             # ordered by insertion (JSON key) order, otherwise the table's
             # seed group can differ from the paired-delta group purely because
             # of how the summary file happened to be serialized.
-            # Rank by USABLE measurements, not raw record count: an error stub
-            # with ppl=None contributes no evidence, and keeping three stubs
-            # over two real PPLs would publish an empty panel and drop the
-            # measurements that were actually made.
+            # Rank by usable measurements rather than raw record count.
             def _usable_count(group):
                 return sum(1 for r in group.values()
                            if L.ppl_is_usable(r.get('ppl') if isinstance(r, dict) else r))

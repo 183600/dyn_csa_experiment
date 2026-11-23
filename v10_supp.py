@@ -450,8 +450,7 @@ def _cell_ppl(nll_sum, n_tok):
         # An exact token total beyond the binary64 range underflows the
         # per-token NLL to zero (PPL 1.0).
         return 1.0
-    # Use the shared exp-for-PPL helper: the binary64 exp boundary is
-    # ~709.7827, so a hard 709.0 cutoff would turn finite PPLs into inf.
+    # Use the shared exp-for-PPL helper for the binary64 exp boundary.
     _ppl = L._safe_exp_ppl(ce)
     return float('inf') if _ppl is None else _ppl
 

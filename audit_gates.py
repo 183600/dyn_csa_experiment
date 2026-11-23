@@ -903,10 +903,7 @@ def _row_overlap_count(train, rows, chunk_tokens=1 << 20):
     train = np.asarray(train)
     rows = np.asarray(rows)
     if train.ndim not in (1, 2) or rows.ndim not in (1, 2):
-        # Returning 0 for an unrecognised rank silently cleared the row-overlap
-        # gate: a 3-D token cache could duplicate whole validation rows and
-        # still be reported as isolated.  Callers turn ValueError into a
-        # fail-closed "overlap cannot be verified" verdict.
+        # Unrecognised ranks are rejected so the overlap gate stays fail-closed.
         raise ValueError(
             f'_row_overlap_count: token tables must be 1-D or 2-D, '
             f'got shapes {train.shape} / {rows.shape}')
@@ -1276,9 +1273,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 _mfit_bad = _mfit is not None and not _fit_ok(_mfit)
                 _tfit_bad = _tfit is not None and not _fit_ok(_tfit)
                 if _mfit_bad or _tfit_bad:
-                    # True/12345 are not corpus identities: float(True)==1.0
-                    # would let two malformed fingerprints compare "equal",
-                    # so provenance must be called out as unverified.
+                    # Malformed fingerprints must be reported as unverified.
                     _warn(f'{cd}/{tag}: train/test tokenizer fit-corpus fingerprint (fit_fp) is malformed (not a non-empty string) — fit provenance is not independently verified')
                 if _fit_ok(_mfit) and _fit_ok(_tfit) and _mfit != _tfit:
                     _mismatch_seen.append((_ttag, 'fit_fp', _tfit, _mfit))
