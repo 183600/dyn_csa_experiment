@@ -793,7 +793,11 @@ def _render_markdown(stats):
     lines = ['# Open-block panel: maximum block length × current-block reading', '']
     lines.append(f'Code: `{stats["code"]}`  |  cells: {len(stats["cells_available"])}  |  seeds: {stats["seeds_requested"]}')
     if stats.get('primary_holm_floor') is not None:
-        lines.append(f'Primary family Holm floor: `{_fmt(stats.get("primary_holm_floor"))}` at n={stats.get("primary_holm_floor_n") or stats.get("seeds_requested")}; minimum seeds for a confirmatory claim: `{stats.get("primary_holm_min_seeds")}`.')
+        _floor_n = stats.get("primary_holm_floor_n")
+        if not isinstance(_floor_n, (int, float)) or not math.isfinite(float(_floor_n)) or int(_floor_n) <= 0:
+            _req = stats.get("seeds_requested") or []
+            _floor_n = len(_req) if isinstance(_req, (list, tuple, set)) else _req
+        lines.append(f'Primary family Holm floor: `{_fmt(stats.get("primary_holm_floor"))}` at n={int(_floor_n) if isinstance(_floor_n, (int, float)) and math.isfinite(float(_floor_n)) else _floor_n}; minimum seeds for a confirmatory claim: `{stats.get("primary_holm_min_seeds")}`.')
     lines += ['', 'Delta convention: `a - b` on token NLL; negative means `a` is better.', '']
     lines.append('| comparison | family | n | mean ΔNLL | SD | dz | exact p | Holm p | p floor | CI95 | controlled |')
     lines.append('|---|---|---|---|---|---|---|---|---|---|---|')
