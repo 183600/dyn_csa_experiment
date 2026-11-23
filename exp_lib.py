@@ -19617,7 +19617,7 @@ def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
             pre.append((time.perf_counter() - t0) * 1000.0)
         n_dec = min(max(1, int(decode_tokens)), max(1, int(ids.shape[1]) - 1))
         dec = []
-        for t in range(max(1, int(ids.shape[1]) - n_dec), int(ids.shape[1]) + 1):
+        for t in range(max(1, int(ids.shape[1]) - n_dec + 1), int(ids.shape[1]) + 1):
             # One untimed call per prefix LENGTH: the first forward at a new
             # shape can include one-time setup that would otherwise bias the
             # timing measurement.  The sweep helper warms every (batch, length)

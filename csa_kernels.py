@@ -549,6 +549,13 @@ def _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
     dtype = Xa.dtype
     L, W = geom.max_len, geom.W_b
     has_b = Xb is not None and W > 0
+    # Same contract as the Triton launch wrapper: a one-sided (Xb, Zb) pair is
+    # malformed and must fail closed with a clear diagnostic instead of being
+    # dereferenced as None deeper in the reference loop.
+    if (Xb is None) != (Zb is None):
+        raise ValueError(
+            'pool_variable_blocks: Xb and Zb must both be tensors or both '
+            'be None (the previous-block overlap lane needs both)')
     if Za.shape[-1] != c:
         raise ValueError(
             f'pool semantics require X and Z to share width (kv_dim): Xa.shape[-1]={c}, Za.shape[-1]={Za.shape[-1]}')
@@ -627,6 +634,10 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     acc = torch.promote_types(dtype, torch.float32)
     L, W = geom.max_len, geom.W_b
     has_b = Xb is not None and W > 0
+    if (Xb is None) != (Zb is None):
+        raise ValueError(
+            'pool_variable_blocks: Xb and Zb must both be tensors or both '
+            'be None (the previous-block overlap lane needs both)')
     gXa = torch.zeros_like(Xa) if need_xa else None
     gZa = torch.zeros_like(Za) if need_za else None
     # W_b == 0（overlap=0 / 单块行）时 B 泳道为空：eager 的 autograd 图里

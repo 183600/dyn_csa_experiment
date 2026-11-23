@@ -165,16 +165,17 @@ def _hist_points(r):
         yield (_step, _pv)
 
 def sample_std(vals):
-    n = len(vals)
+    a = np.asarray(vals, dtype=float)
+    if not np.isfinite(a).all():
+        # Non-finite entries are not samples: dropping them (and using the
+        # same scale-free path as the finite case) keeps this helper
+        # consistent with fuse_analysis.sample_std.  The previous branch
+        # shifted by a[0] but never removed NaN/Inf, so the mean and the sum
+        # of squares turned into NaN/Inf and the helper returned nan.
+        a = a[np.isfinite(a)]
+    n = a.size
     if n < 2:
         return float('nan')
-    a = np.asarray(vals, dtype=float)
-    if not np.all(np.isfinite(a)):
-        ref = float(a[0])
-        shifted = a - ref
-        mu = float(shifted.mean())
-        ss = float(((shifted - mu) ** 2).sum())
-        return math.sqrt(ss / (n - 1))
     amax = float(np.max(np.abs(a)))
     if amax == 0.0:
         return 0.0
@@ -1093,10 +1094,14 @@ def sec_p0w():
         for v, w, _dd, _st in _contrasts:
             _st['p_holm'] = _p0w_holm.get(f'P0W csa_fixed warm={w} vs warm=0')
             _d = _st['mean']
-            # The exact test drops zero deltas, so the resolution floor follows
-            # the NONZERO pair count.
-            _floor = signflip_p_floor(sum(1 for x in _dd if x != 0))
-            _same_dir = all((x != 0 and (x > 0) == (_d > 0) for x in _dd))
+            # The exact test drops non-finite and zero deltas, so the floor and
+            # the direction check must follow the SAME filtered pairs it used,
+            # not the raw list (a NaN/Inf delta would otherwise inflate the
+            # nonzero count and make the printed floor too small).
+            _finite_dd = [f for f in (_as_finite(x) for x in _dd)
+                          if f is not None and f != 0.0]
+            _floor = signflip_p_floor(len(_finite_dd))
+            _same_dir = all((x > 0) == (_d > 0) for x in _finite_dd)
             _gate_ok = _sig_gate(_st, label=f'P0W csa_fixed warm={w} vs warm=0', family='P0W')
             if not _gate_ok:
                 _verdict = f'n={_st['n']} 时 p={_st['p_exact_signflip']:.4f}（检验下限 {_floor:.3f}），**不构成显著/未过族校正**，' + ('各 seed 方向一致，仅作方向性读数' if _same_dir else '方向不一致')
