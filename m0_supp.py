@@ -829,17 +829,26 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
         entry = {'per_scale': raw, 'meta': meta}
         # Paired S1->S2 interaction on the seeds present in BOTH panels.
         low_lbl, high_lbl = sorted(raw)[0], sorted(raw)[-1]
-        lo = dict(zip(raw[low_lbl]['seeds'], raw[low_lbl]['effects']))
-        hi = dict(zip(raw[high_lbl]['seeds'], raw[high_lbl]['effects']))
-        common = sorted(set(lo) & set(hi))
-        if len(common) >= 2:
-            entry['interaction'] = L.scale_interaction(
-                [lo[s] for s in common], [hi[s] for s in common],
-                low_label=low_lbl, high_label=high_lbl, seeds=common, min_n=3)
+        _ls = raw[low_lbl].get('seeds') or []
+        _le = raw[low_lbl].get('effects') or []
+        _hs = raw[high_lbl].get('seeds') or []
+        _he = raw[high_lbl].get('effects') or []
+        if len(_ls) == len(_le) and len(_hs) == len(_he):
+            lo = dict(zip(_ls, _le))
+            hi = dict(zip(_hs, _he))
+            common = sorted(set(lo) & set(hi))
+            if len(common) >= 2:
+                entry['interaction'] = L.scale_interaction(
+                    [lo[s] for s in common], [hi[s] for s in common],
+                    low_label=low_lbl, high_label=high_lbl, seeds=common, min_n=3)
+            else:
+                entry['interaction'] = {'status': 'insufficient_common_seeds',
+                                        'low': low_lbl, 'high': high_lbl,
+                                        'n_common': len(common)}
         else:
-            entry['interaction'] = {'status': 'insufficient_common_seeds',
+            entry['interaction'] = {'status': 'refused_seeds_effects_mismatch',
                                     'low': low_lbl, 'high': high_lbl,
-                                    'n_common': len(common)}
+                                    'n_common': 0}
         report['cross_scale'][name] = entry
         print(f'[m0-analysis] cross-scale {name}: {meta.get("status")} '
               f'(poolable={meta.get("poolable")}, points={meta.get("n_points")})')

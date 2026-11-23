@@ -12546,7 +12546,11 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     # paired per-seed slopes: complete cases only (same seed at every scale)
     by_seed = {}
     for p in pts:
-        for s, e in zip(p['seeds'], p['effects']):
+        _ps = p.get('seeds') or []
+        _pe = p.get('effects') or []
+        if len(_ps) != len(_pe):
+            continue
+        for s, e in zip(_ps, _pe):
             by_seed.setdefault(s, {})[p['label']] = float(e)
     complete = sorted([s for s, m in by_seed.items() if all(lb in m for lb in labels)], key=str)
     paired = {'n_complete_seeds': len(complete), 'seeds': complete, 'labels': labels}
@@ -12583,12 +12587,19 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     paired_primary = len(complete) >= 2
     # extreme-scale interaction (smallest vs largest) on shared seeds
     lo, hi = pts[0], pts[-1]
-    lo_map = dict(zip(lo['seeds'], lo['effects']))
-    hi_map = dict(zip(hi['seeds'], hi['effects']))
-    shared = sorted(set(lo_map) & set(hi_map), key=str)
-    inter = scale_interaction([lo_map[s] for s in shared], [hi_map[s] for s in shared],
-                              low_label=lo['label'], high_label=hi['label'], seeds=shared,
-                              alpha=alpha, min_n=min_seeds) if len(shared) >= 2 else {'n': len(shared), 'note': 'fewer than 2 shared seeds'}
+    _ls = lo.get('seeds') or []
+    _le = lo.get('effects') or []
+    _hs = hi.get('seeds') or []
+    _he = hi.get('effects') or []
+    if len(_ls) == len(_le) and len(_hs) == len(_he):
+        lo_map = dict(zip(_ls, _le))
+        hi_map = dict(zip(_hs, _he))
+        shared = sorted(set(lo_map) & set(hi_map), key=str)
+        inter = scale_interaction([lo_map[s] for s in shared], [hi_map[s] for s in shared],
+                                  low_label=lo['label'], high_label=hi['label'], seeds=shared,
+                                  alpha=alpha, min_n=min_seeds) if len(shared) >= 2 else {'n': len(shared), 'note': 'fewer than 2 shared seeds'}
+    else:
+        inter = {'n': 0, 'note': 'seeds/effects length mismatch on a scale point — interaction refused'}
     out['interaction_extremes'] = inter
     # Heterogeneity is the LACK OF FIT around the fitted slope, not the spread
     # of the point means around their grand mean: a clean monotone ladder has
