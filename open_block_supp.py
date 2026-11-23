@@ -418,6 +418,8 @@ def _cell_diagnostics(rec):
         if not isinstance(d, dict):
             continue
         for k in keys_mean:
+            if k == 'len_max':
+                continue
             v = _finite_float(d.get(k))
             if v is not None:
                 out[k].append(v)
