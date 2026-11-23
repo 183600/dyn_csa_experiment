@@ -214,7 +214,9 @@ def sample_std(deltas, axis=None):
         # bitwise-identical.
         if not np.isfinite(d).all():
             d = d[np.isfinite(d)]
-        return _finite_mean_std(d)[1] if d.size else 0.0
+        if d.size < 2:
+            return float('nan')
+        return _finite_mean_std(d)[1]
     if isinstance(axis, (bool, np.bool_)) or not isinstance(axis, (int, np.integer)):
         # A boolean flag is not an axis: int(True) == 1 would silently reduce
         # over the second dimension instead of refusing the malformed request.
@@ -226,12 +228,12 @@ def sample_std(deltas, axis=None):
         raise ValueError(f'axis {axis} is out of bounds for an array with {d.ndim} dimension(s)')
     out_shape = d.shape[:axis] + d.shape[axis + 1:]
     if d.shape[axis] < 2:
-        return np.zeros(out_shape)
+        return np.full(out_shape, np.nan, dtype=float)
     srt = np.moveaxis(d, axis, 0).reshape(d.shape[axis], -1)
-    out = np.zeros(srt.shape[1])
+    out = np.full(srt.shape[1], np.nan)
     for j in range(srt.shape[1]):
         col = srt[:, j][np.isfinite(srt[:, j])]
-        out[j] = _finite_mean_std(col)[1] if col.size else 0.0
+        out[j] = _finite_mean_std(col)[1] if col.size >= 2 else np.nan
     return out.reshape(out_shape)
 
 def _row_nanmean(M):

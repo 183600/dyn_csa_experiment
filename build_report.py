@@ -1247,7 +1247,8 @@ def sec_p0e():
             g_last = ys[-1]
             n_ = len(xs)
             mx, my = (sum(xs) / n_, sum(ys) / n_)
-            slope = sum(((x - mx) * (y - my) for x, y in zip(xs, ys))) / sum(((x - mx) ** 2 for x in xs)) if n_ > 1 else 0.0
+            _den = sum(((x - mx) ** 2 for x in xs))
+            slope = sum(((x - mx) * (y - my) for x, y in zip(xs, ys))) / _den if n_ > 1 and _den > 0.0 else 0.0
 
             def rate(var):
                 if _paired:
@@ -1255,7 +1256,8 @@ def sec_p0e():
                 else:
                     yv = [sum(trajs[var][st].values()) / len(trajs[var][st]) for st in tail]
                 my2 = sum(yv) / n_
-                return sum(((x - mx) * (y - my2) for x, y in zip(xs, yv))) / sum(((x - mx) ** 2 for x in xs)) if n_ > 1 else 0.0
+                _den2 = sum(((x - mx) ** 2 for x in xs))
+                return sum(((x - mx) * (y - my2) for x, y in zip(xs, yv))) / _den2 if n_ > 1 and _den2 > 0.0 else 0.0
             r_csa, r_full = (rate('csa_fixed'), rate('full'))
 
             def _gap_at(step):
