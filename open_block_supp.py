@@ -431,6 +431,11 @@ def _cell_diagnostics(rec):
         lm = _finite_float(d.get('len_max'))
         if lm is not None:
             out['len_max'].append(lm)
+        ob = d.get('open_block')
+        if isinstance(ob, dict):
+            lm2 = _finite_float(ob.get('len_max'))
+            if lm2 is not None:
+                out['len_max'].append(lm2)
     agg = {}
     for k, vals in out.items():
         if not vals:

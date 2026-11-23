@@ -373,7 +373,7 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
                 if (_st2.st_mtime_ns, _st2.st_size, _st2.st_ctime_ns, _st2.st_ino) != (_st.st_mtime_ns, _st.st_size, _st.st_ctime_ns, _st.st_ino):
                     raise RuntimeError(f'{rel} changed while the archive was being written — refusing to publish a torn release; re-run')
                 man['files'][rel] = {'sha256': _fp, 'bytes': int(_st.st_size)}
-            man_bytes = json.dumps(man, ensure_ascii=False, indent=2).encode('utf-8')
+            man_bytes = json.dumps(man, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8')
             import io
             ti = tarfile.TarInfo(man_path_rel)
             ti.size = len(man_bytes)
@@ -385,7 +385,7 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
         with open(tmp_sha, 'w', encoding='utf-8') as f:
             f.write(f'{tar_sha}  {os.path.basename(tar_path)}\n')
         with open(tmp_rec, 'w', encoding='utf-8') as f:
-            json.dump({'release': base_name, 'tag': tag, 'created_at': man['created_at'], 'tar_sha256': tar_sha, 'n_files': len(man['files']), 'n_ckpt_hashes': len(man['checkpoint_hashes']), 'git_head': (man['git'].get('git_head') if isinstance(man.get('git'), dict) else None)}, f, ensure_ascii=False, indent=2)
+            json.dump({'release': base_name, 'tag': tag, 'created_at': man['created_at'], 'tar_sha256': tar_sha, 'n_files': len(man['files']), 'n_ckpt_hashes': len(man['checkpoint_hashes']), 'git_head': (man['git'].get('git_head') if isinstance(man.get('git'), dict) else None)}, f, ensure_ascii=False, indent=2, allow_nan=False)
         for _tmp, _final in ((tmp_tar, tar_path), (tmp_man, man_ext),
                              (tmp_sha, sha_path), (tmp_rec, rec_path)):
             os.replace(_tmp, _final)
