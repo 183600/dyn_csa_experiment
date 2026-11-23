@@ -4390,7 +4390,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
     # 它。训练/checkpoint 重算都在 grad 开启下运行，条件与首次前向一致。
     _soft_live = soft is not None and torch.is_grad_enabled() and any(
         _t is not None and getattr(_t, 'requires_grad', False)
-        for _t in (soft, q, k_blk, v_blk, k_sw, v_sw, sink_logits))
+        for _t in (soft, q, k_blk, v_blk, k_sw, v_sw, k_stacked, sink_logits))
     _tk2 = _take_2d
     _einsum = torch.einsum
     if _has_all:
@@ -4649,7 +4649,7 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
         # (forward values are identical either way).
         _soft_live = (soft is not None and torch.is_grad_enabled() and any(
             _t is not None and getattr(_t, 'requires_grad', False)
-            for _t in (soft, q, k_blk, v_blk, k_sw, v_sw, sink_logits)))
+            for _t in (soft, q, k_blk, v_blk, k_sw, v_sw, prefix_k, sink_logits)))
         attn_soft = None
         if _soft_live:
             soft_g = soft[s:e]
@@ -22428,6 +22428,7 @@ def aggregate(summary, *, outdir=None):
                                          {'synthesized': 0, 'nonfinite_ppl': 0,
                                           'error_no_ppl': 0, 'seeds': []})
                 _d[_bucket] = _d.get(_bucket, 0) + 1
+                _d.setdefault('records', []).append(rec)
                 _s = _as_seed_int(rec.get('seed'))
                 if _s is not None and _bucket != 'synthesized':
                     _d['seeds'].append(_s)
@@ -22550,6 +22551,7 @@ def aggregate(summary, *, outdir=None):
     agg = {}
     _split_groups = []
     _group_records = {}
+    _group_cfg_fp = {}
 
     def _agg_key(v, tag, fp_idx=None):
         key = v if not tag else f'{v}#{tag}'
@@ -22583,6 +22585,7 @@ def aggregate(summary, *, outdir=None):
             _i = hashlib.sha1(_fp.encode('utf-8')).hexdigest()[:8]
             _split_groups.append(((v, tag, _i), _rs))
             _group_records[v, tag, _i] = _rs
+            _group_cfg_fp[v, tag, _i] = _fp
     for (_v, _tag, _fp_idx), recs in _split_groups:
         v, tag = (_v, _tag)
         key = _agg_key(v, tag, _fp_idx)
@@ -22618,6 +22621,19 @@ def aggregate(summary, *, outdir=None):
         # survivors, and a shrunken panel must never read as "fewer seeds
         # were planned".
         _dr = _dropped.get((_v, _tag))
+        if _dr is not None and _fp_idx is not None:
+            _cfg = _group_cfg_fp.get((_v, _tag, _fp_idx))
+            _cfg_dr = {'synthesized': 0, 'nonfinite_ppl': 0, 'error_no_ppl': 0, 'seeds': []}
+            for _rr in _dr.get('records', ()):
+                if _cfg_fp(_rr) != _cfg:
+                    continue
+                _rb = ('synthesized' if _rr.get('synthesized')
+                       else ('nonfinite_ppl' if 'ppl' in _rr else 'error_no_ppl'))
+                _cfg_dr[_rb] += 1
+                _rs = _as_seed_int(_rr.get('seed'))
+                if _rs is not None and _rb != 'synthesized':
+                    _cfg_dr['seeds'].append(_rs)
+            _dr = _cfg_dr
         if _dr is not None:
             entry['n_dropped_error_no_ppl'] = int(_dr['error_no_ppl'])
             entry['n_dropped_nonfinite_ppl'] = int(_dr['nonfinite_ppl'])

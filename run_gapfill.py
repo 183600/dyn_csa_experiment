@@ -42,7 +42,7 @@ def git_push(msg):
             # A network stall must not hang the driver forever with nothing
             # pushed and no shutdown scheduled.
             return subprocess.CompletedProcess(a, -9, '', 'git command timed out after 600s')
-    ra = run('git', 'add', '-u')
+    ra = run('git', 'add', '-A')
     if ra.returncode != 0:
         print(f'[git] add FAILED: {(ra.stdout + ra.stderr)[-300:]} — NOT pushing (a commit could miss unstaged work); leaving the tree for inspection')
         return False

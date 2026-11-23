@@ -1269,7 +1269,7 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
         # V12_REFREEZE after a directory rename/delete: keep the superseded
         # identity from the mirror so the exploratory history survives.
         prev = {_k: _mirror_prev.get(_k) for _k in ('manifest_sha256', 'test_ids_fp', 'train_fp', 'locked_at', 'frozen_at')}
-        lock['superseded'] = [_mirror_prev.get('superseded'), prev] if _mirror_prev.get('superseded') else [prev]
+        lock['superseded'] = list(_mirror_prev.get('superseded') or []) + [prev]
         lock['history'] = lock['history'] + [{'stage': 'refreeze-mirror', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
                                               'note': 'local lock was absent but the git-tracked mirror proved an earlier access; that round is downgraded to exploratory',
                                               'superseded': prev}]
