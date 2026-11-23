@@ -377,6 +377,11 @@ class HybridAttentionRoPE(L.HybridAttention):
     def _rope_attn(self, q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, sink, rope_dim, q_chunk=128, soft=None, rope_base=10000.0, mem_limit_bytes=None, sel_valid=None, topk_distinct=False):
         T, nh, hd = q.shape
         dev = q.device
+        # A zero-width soft prior has no lane to bias; keeping its S path would
+        # only duplicate the hard A path's gradient.  Same invariant as
+        # exp_lib.gathered_attention.
+        if soft is not None and int(getattr(soft, 'shape', ())[-1]) == 0:
+            soft = None
         if mem_limit_bytes is None:
             mem_limit_bytes = L._attn_transient_limit(dev)
         _es = q.element_size()
@@ -401,10 +406,25 @@ class HybridAttentionRoPE(L.HybridAttention):
         _wi_all, _wvalid_all = L._window_geometry(T, w, dev)
         pos_all = L._arange_cache(T, dev)
         q_chunk = max(1, min(int(q_chunk), T))
-        _MINL = L._finfo_min(k_blk.dtype)
+        # The logits are the promoted q/K pair; using k_blk's dtype alone would
+        # install too weak a mask when q (or the window table) is wider.
+        _mask_dtype = torch.promote_types(q.dtype, k_blk.dtype)
+        if k_sw is not None:
+            _mask_dtype = torch.promote_types(_mask_dtype, k_sw.dtype)
+        _MINL = L._finfo_min(_mask_dtype)
         # same int32 index transport as exp_lib.gathered_attention (§6.1):
         # identical integers, identical gathered values.
         topk_l = topk_idx if topk_idx.dtype in (torch.int32, torch.int64) else topk_idx.long()
+        if k_blk.shape[0] == 0 and topk_l.shape[1]:
+            # No compressed rows exist, so every block lane is necessarily
+            # invalid.  Drop the impossible lanes instead of indexing an empty
+            # table; the window lanes (if any) remain bit-identical to the
+            # zero-column call.
+            topk_l = topk_l[:, :0]
+            if sel_valid is not None:
+                sel_valid = sel_valid[:, :0]
+            # A width-0 soft prior is exactly "no prior".
+            soft = None
         # Same index comparison as exp_lib.gathered_attention: with the cached
         # arange expansion every row of last_tok[topk_l] is identical, so a
         # broadcast comparison gives the same booleans.
@@ -494,14 +514,24 @@ class HybridAttentionRoPE(L.HybridAttention):
                 if _keep is not None:
                     sv = sv * _keep
                 soft_log = torch.log(sv.clamp_min(1e-12))
-                soft_log.masked_fill_(sv <= 0, _MINL)
+                # `soft_log` may be narrower than the promoted logits; fill it
+                # with its own dtype's finite minimum (a wider sentinel can
+                # overflow the narrower tensor).
+                soft_log.masked_fill_(sv <= 0, L._finfo_min(soft_log.dtype))
                 # The clone is taken before the masked_fill_ below, so it
                 # carries the unmasked logits.
                 soft_logits = raw_logits.clone()
                 soft_logits[:, :, :_nb].add_(soft_log[:, None, :]).clamp_min_(_MINL)
+                # A zero-prior block lane is outside the S-path support and is
+                # masked before softmax (matching exp_lib.gathered_attention
+                # and the kernel backward).  Window lanes are never masked:
+                # the prior does not apply to them.
+                soft_zero = torch.zeros_like(_nvalid)
+                if _nb:
+                    soft_zero[:, :, :_nb] = (sv <= 0)[:, None, :]
                 logits = raw_logits.masked_fill_(_nvalid, _MINL)
                 attn, _sink_unused = L._sink_split_softmax(logits, sink, want_sink=False)
-                soft_logits.masked_fill_(_nvalid, L._finfo_min(soft_logits.dtype))
+                soft_logits.masked_fill_(_nvalid | soft_zero, _MINL)
                 soft_attn, _sink_unused = L._sink_split_softmax(soft_logits, sink, want_sink=False)
                 attn = (soft_attn - soft_attn.detach()).add_(attn)
                 if sink is None:
