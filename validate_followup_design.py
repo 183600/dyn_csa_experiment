@@ -35,6 +35,34 @@ def validate(plan: dict, require_ready: bool = False) -> list[str]:
         if not condition:
             errors.append(message)
 
+    def section(name: str) -> dict:
+        value = plan.get(name)
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            need(False, f"{name} must be a JSON object")
+            return {}
+        return value
+
+    def object_list(name: str, owner: dict) -> list:
+        value = owner.get(name)
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            need(False, f"{name} must be a JSON array")
+            return []
+        return value
+
+    def add_unique(values: set, value: object, message: str,
+                   duplicate_message: str) -> None:
+        try:
+            duplicate = value in values
+        except TypeError:
+            need(False, message)
+            return
+        need(not duplicate, duplicate_message)
+        values.add(value)
+
     need(isinstance(plan, dict), "root must be a JSON object")
     if not isinstance(plan, dict):
         return errors
@@ -42,14 +70,14 @@ def validate(plan: dict, require_ready: bool = False) -> list[str]:
     need(plan.get("schema_version") == 1, "schema_version must equal 1")
     need(bool(plan.get("study_id")), "study_id is required")
 
-    freeze = plan.get("freeze") or {}
-    design = plan.get("design") or {}
-    compute = plan.get("compute_matching") or {}
-    evaluation = plan.get("evaluation") or {}
-    stats = plan.get("statistics") or {}
-    gates = plan.get("algorithmic_gates") or {}
+    freeze = section("freeze")
+    design = section("design")
+    compute = section("compute_matching")
+    evaluation = section("evaluation")
+    stats = section("statistics")
+    gates = section("algorithmic_gates")
 
-    arms = design.get("factorial_arms") or []
+    arms = object_list("factorial_arms", design)
     seen_ids = set()
     seen_cells = set()
     for arm in arms:
@@ -57,26 +85,42 @@ def validate(plan: dict, require_ready: bool = False) -> list[str]:
             errors.append("each factorial arm must be an object")
             continue
         aid = arm.get("id")
-        need(bool(aid) and aid not in seen_ids, f"factorial arm id missing or duplicated: {aid!r}")
-        seen_ids.add(aid)
+        need(bool(aid), f"factorial arm id missing: {aid!r}")
+        if aid is not None:
+            add_unique(seen_ids, aid,
+                       f"factorial arm id must be hashable: {aid!r}",
+                       f"factorial arm id duplicated: {aid!r}")
         cell = (arm.get("family"), arm.get("segmentation"))
-        need(cell not in seen_cells, f"duplicate factorial cell: {cell}")
-        seen_cells.add(cell)
+        add_unique(seen_cells, cell,
+                   f"factorial cell must be hashable: {cell!r}",
+                   f"duplicate factorial cell: {cell}")
         need(bool(arm.get("variant")), f"{aid}: variant is required")
     need(seen_cells == REQUIRED_FACTORIAL,
          f"factorial cells must be exactly {sorted(REQUIRED_FACTORIAL)}")
 
-    dense = design.get("dense_controls") or []
-    dense_kinds = {x.get("matching") for x in dense if isinstance(x, dict)}
+    dense = object_list("dense_controls", design)
+    dense_kinds = set()
+    for entry in dense:
+        if not isinstance(entry, dict):
+            need(False, "each dense control must be an object")
+            continue
+        kind = entry.get("matching")
+        try:
+            dense_kinds.add(kind)
+        except TypeError:
+            need(False, "dense control matching must be hashable")
     need({"parameter_count", "measured_training_flops"} <= dense_kinds,
          "separate parameter-matched and measured-FLOPs-matched Dense controls are required")
 
-    seeds = design.get("seeds") or []
+    seeds = design.get("seeds")
     need(isinstance(seeds, list) and len(seeds) >= 12,
          "at least 12 predeclared seeds are required for the default four-test family")
-    need(len(seeds) == len(set(seeds)), "seed list contains duplicates")
-    need(all(isinstance(s, int) and not isinstance(s, bool) and s >= 0 for s in seeds),
-         "seeds must be non-negative integers")
+    if isinstance(seeds, list):
+        valid_seeds = all(isinstance(s, int) and not isinstance(s, bool) and s >= 0
+                          for s in seeds)
+        need(valid_seeds, "seeds must be non-negative integers")
+        if valid_seeds:
+            need(len(seeds) == len(set(seeds)), "seed list contains duplicates")
     need(design.get("same_seed_data_order") is True, "paired arms must share per-seed data order")
     need(design.get("same_training_token_budget") is True, "paired arms must share the registered token budget")
     need(design.get("same_optimizer_schedule") is True, "paired arms must share optimizer/schedule")
@@ -97,7 +141,7 @@ def validate(plan: dict, require_ready: bool = False) -> list[str]:
     need(evaluation.get("document_ids_frozen_before_test_access") is True,
          "document IDs must be frozen before test access")
     reps = evaluation.get("document_level_bootstrap_replicates")
-    need(isinstance(reps, int) and reps >= 10000,
+    need(isinstance(reps, int) and not isinstance(reps, bool) and reps >= 10000,
          "document-level bootstrap must use at least 10,000 replicates")
     need(evaluation.get("test_data_used_for_tuning") is False,
          "test data must not be used for tuning or model selection")
@@ -105,19 +149,34 @@ def validate(plan: dict, require_ready: bool = False) -> list[str]:
          evaluation.get("document_bootstrap_unit", "document") == "document",
          "bootstrap unit must be document, not window")
 
-    hypotheses = set(stats.get("primary_hypotheses") or [])
+    raw_hypotheses = stats.get("primary_hypotheses")
+    if raw_hypotheses is None:
+        raw_hypotheses = []
+    hypotheses = set()
+    if not isinstance(raw_hypotheses, list):
+        need(False, "primary_hypotheses must be a JSON array")
+    else:
+        for item in raw_hypotheses:
+            try:
+                hypotheses.add(item)
+            except TypeError:
+                need(False, "primary hypotheses must be hashable strings")
     need(hypotheses == REQUIRED_HYPOTHESES,
          f"primary hypotheses must be exactly {sorted(REQUIRED_HYPOTHESES)}")
     need(stats.get("paired_by") == "seed", "primary comparisons must be paired by seed")
     need(stats.get("test") == "exact_two_sided_sign_flip", "exact two-sided sign-flip test required")
     need(stats.get("correction") == "Holm", "Holm correction required")
     alpha = stats.get("familywise_alpha")
-    need(isinstance(alpha, (int, float)) and 0 < alpha <= 0.05,
-         "familywise alpha must be in (0, 0.05]")
+    try:
+        alpha_ok = (isinstance(alpha, (int, float)) and not isinstance(alpha, bool)
+                    and math.isfinite(float(alpha)) and 0 < alpha <= 0.05)
+    except (TypeError, ValueError, OverflowError):
+        alpha_ok = False
+    need(alpha_ok, "familywise alpha must be in (0, 0.05]")
     n = len(seeds) if isinstance(seeds, list) else 0
     m = len(REQUIRED_HYPOTHESES)
     p_floor = 2 / (2 ** n) if n else math.inf
-    need(m * p_floor < alpha if n else False,
+    need(alpha_ok and n > 0 and m * p_floor < alpha,
          f"exact sign-flip resolution cannot clear first Holm threshold: m*2/2^n={m*p_floor:g}")
     need(stats.get("power_simulation_completed") is True,
          "simulation-based power analysis must be completed before freeze")
@@ -150,10 +209,14 @@ def validate(plan: dict, require_ready: bool = False) -> list[str]:
              freeze.get("output_dir") != "results_lm_test",
              "follow-up output_dir must be separate from v12 results")
         for arm in arms:
+            if not isinstance(arm, dict):
+                continue
             variant = str(arm.get("variant", ""))
             need(bool(variant) and not variant.startswith("TODO"),
                  f"{arm.get('id')}: replace TODO with an implemented pure variant")
         for arm in dense:
+            if not isinstance(arm, dict):
+                continue
             variant = str(arm.get("variant", ""))
             need(bool(variant) and not variant.startswith("TODO"),
                  f"{arm.get('id')}: replace TODO with an implemented Dense variant")

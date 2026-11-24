@@ -2020,6 +2020,7 @@ def run_finaltest(cfg=None, guard=None):
     # data and are not the frozen confirmation, so they skip it.
     _smoke = (L._as_bool_flag(cfg.get('smoke')) is True or (isinstance(L._as_bool_flag(cfg.get('smoke')), np.bool_) and bool(L._as_bool_flag(cfg.get('smoke'))) == True))
     _manifest_path = cfg.get('manifest') or FREEZE_MANIFEST
+    cfg['manifest'] = _manifest_path
     if os.path.abspath(_manifest_path) not in _PLAN_DONE_FOR and not _smoke:
         plan_check(_manifest_path)
     manifest = _load_manifest(cfg['manifest'])

@@ -8820,7 +8820,6 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
     # scanned fraction instead of pretending the sample is a proof.
     overlap = None
     if tr.size and va.ndim == 2 and va.shape[0] and _tr_all_finite and _va_all_finite:
-        import audit_gates as _AG
         _rows = np.unique(np.linspace(0, va.shape[0] - 1,
                                       min(int(sample_rows), va.shape[0]),
                                       dtype=np.int64))
@@ -8844,17 +8843,34 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
         # validation rows than were sampled.  Join the windows with a token id
         # that cannot occur in either side: any window spanning the separator
         # then fails to equal a validation row, while each real occurrence is
-        # still seen.
+        # still seen.  The sentinel must use a width that can represent it:
+        # hard-coding int64 overflows for uint64 token caches.
+        import audit_gates as _AG
         if len(_segments) == 1:
             _scan = _segments[0]
+            _shared = int(_AG._row_overlap_count(_scan, _sample))
         else:
-            _sentinel = max(int(np.max(tr)) if tr.size else -1,
-                            int(np.max(_sample)) if _sample.size else -1) + 1
-            _scan = np.concatenate([
-                np.concatenate([np.asarray(_seg).reshape(-1),
-                                np.asarray([_sentinel], dtype=np.int64)])
-                for _seg in _segments])
-        _shared = int(_AG._row_overlap_count(_scan, _sample))
+            _max_id = max(int(np.max(tr)) if tr.size else -1,
+                          int(np.max(_sample)) if _sample.size else -1)
+            _sentinel = _max_id + 1
+            if _sentinel < 2 ** 64:
+                _scan_dtype = np.int64 if _sentinel < 2 ** 63 else np.uint64
+                _sample_cmp = np.asarray(_sample, dtype=_scan_dtype)
+                _scan = np.concatenate([
+                    np.concatenate([np.asarray(_seg, dtype=_scan_dtype).reshape(-1),
+                                    np.asarray([_sentinel], dtype=_scan_dtype)])
+                    for _seg in _segments])
+                _shared = int(_AG._row_overlap_count(_scan, _sample_cmp))
+            else:
+                # A uint64 id of 2**64-1 leaves no larger in-range sentinel.
+                # Match each sampled row independently so disjoint windows
+                # cannot double-count the same validation row.
+                _shared = 0
+                for _i in range(_sample.shape[0]):
+                    _row = _sample[_i:_i + 1]
+                    if any(_AG._row_overlap_count(np.asarray(_seg), _row)
+                           for _seg in _segments):
+                        _shared += 1
         overlap = _shared
         report['exact_row_overlap_in_sample'] = int(_shared)
         report['sampled_val_rows'] = int(_rows.size)
@@ -9076,6 +9092,24 @@ def _prov_data_version(prov):
     return data.get('data_version')
 
 
+def strict_json_load(fp):
+    """json.load that refuses duplicate object keys instead of last-one-wins.
+
+    Summary/state artifacts are evidence: a repeated record key with two
+    different values is a corrupt artifact, not a harmless JSON spelling.
+    All readers of experimental records funnel through this helper so a
+    hand-merged file cannot silently replace a measurement.
+    """
+    def _unique_keys(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ValueError(f'duplicate JSON key {key!r}')
+            obj[key] = value
+        return obj
+    return json.load(fp, object_pairs_hook=_unique_keys)
+
+
 def atomic_write_json(path, obj, indent=2):
     text = json.dumps(_json_clean(obj), indent=indent, default=float, allow_nan=False)
     d = os.path.dirname(os.path.abspath(path))
@@ -9140,7 +9174,7 @@ def locked_json_read(path):
             return {}
         try:
             with open(path, encoding='utf-8') as f:
-                _obj = json.load(f)
+                _obj = strict_json_load(f)
         except Exception as _e:
             print(f'[resume] FATAL: {path} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to start with a silently RESET panel — move it aside to start fresh.')
             raise
@@ -9196,7 +9230,7 @@ def locked_json_update(path, mutfn, indent=2):
         if os.path.exists(path):
             try:
                 with open(path, encoding='utf-8') as f:
-                    obj = json.load(f)
+                    obj = strict_json_load(f)
             except Exception as _e:
                 print(f'[resume] FATAL: {path} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with a fresh object — move it aside to start fresh.')
                 raise
@@ -13609,7 +13643,7 @@ def read_panel(outdir):
         return {}
     try:
         with open(sp, encoding='utf-8') as _jf:
-            raw = json.load(_jf)
+            raw = strict_json_load(_jf)
     except Exception as e:
         print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — this panel is EXCLUDED')
         return {}
@@ -22906,6 +22940,12 @@ def aggregate(summary, *, outdir=None):
                 print(f'[aggregate] {key}: {n_missing} missing grid cell(s) (seed never evaluated there), {n_bad_meas} unusable recorded PPL point(s) and {n_nonfinite} non-finite recorded point(s) across {len(hists)} seed(s); recorded-but-unusable points are excluded from the seed-averaged curve ({int((n_good == 0).sum())} step(s) had no usable seed and are omitted)')
             _keep = n_good > 0
             entry['ppl_curve'] = [[int(s), float(m)] for s, m, k in zip(steps_h, mean_ppl, _keep) if k]
+            # Per-step support is required to merge seed-averaged curves from
+            # disjoint runs: seeds can miss individual step points, so the
+            # number of seeds behind each mean is not always n_seeds.
+            entry['ppl_curve_support'] = [
+                [int(s), int(n_good[i])]
+                for i, (s, k) in enumerate(zip(steps_h, _keep)) if k]
         agg[key] = entry
     for key, entry in agg.items():
         recs = _group_records.get((entry['variant'], entry['protocol'], entry.get('run_cfg_class')), [])

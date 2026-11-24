@@ -474,16 +474,17 @@ def _controlled_reason(a, b):
         # matched; only a populated record can be compared field by field.
         return 'unverifiable hyperparams (empty descriptor)'
     ha, hb = (ha or {}), (hb or {})
-    keys = ('steps', 'tokens_seen', 'n_train_tokens', 'seq_len', 'batch_size',
-            'lr', 'weight_decay', 'warmup', 'comp_lambda', 'delta_lr_mult',
-            'd', 'n_layers', 'n_heads', 'd_head', 'mlp_ratio', 'vocab_size',
-            'dataset', 'data_version', 'val_seqs', 'eval_every', 'eval_subset',
-            'code', 'amp_dtype', 'eager_batch')
+    keys = ('seed', 'data_seed', 'steps', 'tokens_seen', 'n_train_tokens',
+            'seq_len', 'batch_size', 'lr', 'weight_decay', 'warmup',
+            'comp_lambda', 'delta_lr_mult', 'd', 'n_layers', 'n_heads',
+            'd_head', 'mlp_ratio', 'vocab_size', 'dataset', 'data_version',
+            'val_seqs', 'eval_every', 'eval_subset', 'code', 'amp_dtype',
+            'eager_batch', 'rng')
     # Structural counts are exact-integer training controls.
-    count_keys = {'steps', 'tokens_seen', 'n_train_tokens', 'seq_len',
-                  'batch_size', 'warmup', 'd', 'n_layers', 'n_heads',
-                  'd_head', 'vocab_size', 'val_seqs', 'eval_every',
-                  'eval_subset'}
+    count_keys = {'seed', 'data_seed', 'steps', 'tokens_seen',
+                  'n_train_tokens', 'seq_len', 'batch_size', 'warmup', 'd',
+                  'n_layers', 'n_heads', 'd_head', 'vocab_size', 'val_seqs',
+                  'eval_every', 'eval_subset'}
     for k in keys:
         va, vb = ha.get(k), hb.get(k)
         if va is None or vb is None:
@@ -673,16 +674,25 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
         c = cells.get((variant(128, 'summary'), s))
         d = cells.get((variant(128, 'closed'), s))
         _bad = False
-        for _lbl, _x, _y in (('none summary/closed', a, b),
-                             ('128 summary/closed', c, d)):
-            if _x is None or _y is None:
-                _int_reasons.append(f'seed{s}: {_lbl} record missing')
-                _bad = True
-                continue
-            _why = _controlled_reason(_x['record'], _y['record'])
-            if _why:
-                _int_reasons.append(f'seed{s}: {_lbl}: {_why}')
-                _bad = True
+        _quad = {'none summary': a, 'none closed': b,
+                 '128 summary': c, '128 closed': d}
+        if any(_x is None for _x in _quad.values()):
+            for _lbl, _x in _quad.items():
+                if _x is None:
+                    _int_reasons.append(f'seed{s}: {_lbl} record missing')
+            _bad = True
+        else:
+            # A difference-of-differences is only controlled when EVERY arm
+            # shares the same non-factor settings, not merely the two arms
+            # inside each individual difference.
+            _labels = list(_quad)
+            for _i, _li in enumerate(_labels):
+                for _lj in _labels[_i + 1:]:
+                    _why = _controlled_reason(_quad[_li]['record'],
+                                              _quad[_lj]['record'])
+                    if _why:
+                        _int_reasons.append(f'seed{s}: {_li}/{_lj}: {_why}')
+                        _bad = True
         if _bad:
             continue
         d_int.append(float((a['nll'] - b['nll']) - (c['nll'] - d['nll'])))

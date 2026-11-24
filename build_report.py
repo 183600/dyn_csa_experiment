@@ -40,10 +40,22 @@ def _as_finite(v):
         return None
     return f if math.isfinite(f) else None
 
+def _strict_json_load(fp):
+    """json.load that refuses duplicate object keys (mirror exp_lib)."""
+    def _unique_keys(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ValueError(f'duplicate JSON key {key!r}')
+            obj[key] = value
+        return obj
+    return json.load(fp, object_pairs_hook=_unique_keys)
+
+
 def load(path, default=None):
     try:
         with open(path, encoding='utf-8') as f:
-            data = json.load(f)
+            data = _strict_json_load(f)
     except FileNotFoundError:
         return default
     except Exception as _e:
@@ -97,7 +109,7 @@ def _hydrate_curve_sidecars(outdir, obj):
             continue
         try:
             with open(_path, encoding='utf-8') as _f:
-                _data = json.load(_f)
+                _data = _strict_json_load(_f)
         except FileNotFoundError:
             # A missing optional sidecar is not corrupt evidence: the record
             # simply has no hydrated curve (the caller may still have an
@@ -2363,6 +2375,7 @@ def sec_stats():
         items = {k: v for k, v in d.items() if isinstance(v, dict) and (v.get('mean') is not None or v.get('delta') is not None
                                                                         or v.get('p_exact_signflip') is not None or v.get('p') is not None)}
     _pairs = []
+    _raw_p = {}
     for k, v in items.items():
         _pv = None
         if isinstance(v, dict) and 'omitted' not in v:
@@ -2372,15 +2385,19 @@ def sec_stats():
             # artifacts that exp_lib's twin refuses as well: both are not
             # measurements, so keep them as an invalid p=1 slot.
             _pv = _as_finite(_pv)
+        _valid = _pv is not None and math.isfinite(_pv) and 0.0 <= _pv <= 1.0
         # Omitted/invalid comparisons keep a dummy p=1 slot so a report cannot
         # shrink its own correction family by dropping a failed comparison.
-        _pairs.append((k, _pv if (_pv is not None and math.isfinite(_pv) and 0.0 <= _pv <= 1.0) else 1.0))
+        _pairs.append((k, _pv if _valid else 1.0))
+        # The slot enters Holm, but the raw value stays absent for the global
+        # audit: a failed measurement is "untestable", not a real p=1 result.
+        _raw_p[k] = _pv if _valid else None
     _holm = holm_adjust(_pairs, alpha=0.05) if _pairs else {}
     # The displayed family is itself part of the report's global selection:
     # register every displayed comparison (invalid/omitted ones included) so
     # the cross-panel audit counts them with a p=1 slot, never drops them.
     for _k, _pv in _pairs:
-        _note_comparison(f'STATS {_k}', _pv, family='v7 displayed comparisons',
+        _note_comparison(f'STATS {_k}', _raw_p[_k], family='v7 displayed comparisons',
                          p_holm=_holm.get(_k))
     for k, v in items.items():
         if not isinstance(v, dict):

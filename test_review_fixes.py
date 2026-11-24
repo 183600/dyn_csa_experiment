@@ -11928,6 +11928,275 @@ def t_narrow_sidecar_rejects_corrupt_content():
         shutil.rmtree(d)
 
 
+def t_followup_validator_failclosed_on_malformed_json():
+    import copy
+    import validate_followup_design as VF
+    with open(os.path.join(REPO, 'followup_design.template.json'), encoding='utf-8') as f:
+        base = json.load(f)
+    broken = []
+    p = copy.deepcopy(base)
+    p['design'] = ['x']
+    broken.append(p)
+    p = copy.deepcopy(base)
+    p['design']['seeds'] = [['not-an-int']] * 12
+    broken.append(p)
+    p = copy.deepcopy(base)
+    p['design']['factorial_arms'] = [{'id': []}]
+    broken.append(p)
+    p = copy.deepcopy(base)
+    p['freeze'] = [1, 2]
+    broken.append(p)
+    p = copy.deepcopy(base)
+    p['statistics']['familywise_alpha'] = 'not-a-number'
+    broken.append(p)
+    for plan in broken:
+        errors = VF.validate(plan, require_ready=True)
+        assert isinstance(errors, list) and errors, errors
+        assert all(isinstance(e, str) for e in errors), errors
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'plan.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'design': ['x']}, f)
+        old_argv = sys.argv
+        sys.argv = ['validate_followup_design.py', path, '--require-ready']
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = VF.main()
+        finally:
+            sys.argv = old_argv
+        assert rc == 1 and 'NOT READY' in out.getvalue(), out.getvalue()
+
+
+def t_audit_ledger_reports_failing_status():
+    orig_fn = A.audit_length
+    L = A._import_exp_lib()
+    orig_log = L.log_experiment_event
+    events = []
+    A.audit_length = lambda: {'status': 'fail', 'problems': ['forced failure']}
+    L.log_experiment_event = lambda outdir, event: events.append(event)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            with contextlib.redirect_stdout(io.StringIO()):
+                res = A.run_report(out=os.path.join(d, 'audit_report.json'))
+            ledger = [e for e in events if e.get('label') == 'audit_report']
+            assert res['status'] == 'fail' and ledger, res
+            assert ledger[-1]['status'] == 'fail', ledger[-1]
+    finally:
+        A.audit_length = orig_fn
+        L.log_experiment_event = orig_log
+
+
+def t_split_audit_min_shift_tokens_exact():
+    for bad in (True, 1.9, float('nan'), 0, -1):
+        try:
+            A.audit_split_discipline(cache_dirs=[], min_shift_tokens=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f'min_shift_tokens={bad!r} must fail closed')
+
+
+def t_audit_provenance_rejects_duplicate_keys():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'meta.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('{"tokenizer_fit_split":"all","tokenizer_fit_split":"train"}')
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = A._load(path)
+        assert A._is_corrupt(out), out
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('{"tokenizer_fit_split":"train"}')
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = A._load(path)
+        assert out == {'tokenizer_fit_split': 'train'}, out
+
+
+def t_corpus_overlap_sentinel_handles_uint64_ids():
+    big = 2 ** 63
+    tr = np.arange(3000, dtype=np.uint64)
+    tr[1400:1402] = [big, big + 1]
+    va = np.array([[big, big + 1]], dtype=np.uint64)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rep = L.audit_corpus_split(tr, va, big + 2, dataset='synthetic',
+                                   max_scan_tokens=2000, sample_rows=1,
+                                   strict=False)
+    assert rep['exact_row_overlap_in_sample'] == 1, rep
+
+
+def t_gapfill_curve_merge_uses_per_step_support():
+    import run_gapfill as RG
+    base = {'variant': 'a', 'run_cfg': 'SAME'}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'aggregate.json')
+        snap = {'a': dict(base, seeds=[0, 1], ppls=[4.0, 8.0], n_seeds=2,
+                          ppl_mean=6.0, ppl_curve=[[10, 4.0]],
+                          ppl_curve_support=[[10, 1]])}
+        fresh = {'a': dict(base, seeds=[2, 3], ppls=[10.0, 10.0], n_seeds=2,
+                           ppl_mean=10.0, ppl_curve=[[10, 10.0]],
+                           ppl_curve_support=[[10, 2]])}
+        L.atomic_write_json(path, fresh, indent=2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            RG.merge_long_aggregate(d, snap)
+        with open(path, encoding='utf-8') as f:
+            merged = json.load(f)['a']
+        assert merged['ppl_curve'] == [[10, 8.0]], merged
+        assert merged['ppl_curve_support'] == [[10, 3]], merged
+        # Without exact support, a union curve cannot be reconstructed.
+        legacy = {'a': dict(base, seeds=[2], ppls=[10.0], n_seeds=1,
+                            ppl_mean=10.0, ppl_curve=[[10, 10.0]])}
+        L.atomic_write_json(path, legacy, indent=2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            RG.merge_long_aggregate(d, snap)
+        with open(path, encoding='utf-8') as f:
+            merged2 = json.load(f)['a']
+        assert 'ppl_curve' not in merged2, merged2
+        assert 'ppl_curve_support' not in merged2, merged2
+
+
+def t_open_block_interaction_checks_all_four_arms():
+    import open_block_supp as OB
+    with tempfile.TemporaryDirectory() as d:
+        hp = {'steps': 10, 'tokens_seen': 100, 'seq_len': 16, 'batch_size': 2,
+              'lr': 0.001, 'weight_decay': 0.0, 'warmup': 1, 'comp_lambda': 0.0,
+              'delta_lr_mult': 10.0, 'd': 16, 'n_layers': 1, 'n_heads': 2,
+              'd_head': 8, 'mlp_ratio': 4.0, 'vocab_size': 100,
+              'dataset': 'synthetic', 'eval_every': 0, 'eval_subset': 8,
+              'code': 'C', 'amp_dtype': 'fp32', 'eager_batch': False,
+              'rng': {'python': 0}}
+        summary = {}
+        for mb in (None, 128):
+            for mode in ('summary', 'closed'):
+                variant = OB._variant(mb, mode, 'full_prefix')
+                for seed in (0, 1, 2):
+                    rec_hp = dict(hp, seed=seed, data_seed=seed,
+                                  lr=(0.002 if mb == 128 else 0.001))
+                    summary[f'{variant}::seed{seed}'] = {
+                        'variant': variant, 'seed': seed, 'ppl': 10.0 + seed,
+                        'nll_sum': (10.0 + seed) * 100, 'n_tokens': 100,
+                        'params': 1000, 'code': 'C', 'run_fingerprint': 'FP',
+                        'data_fp': 'D', 'val_fp': 'V', 'eval_fp': 'E',
+                        'eval_subset_fp': 'S', 'rng_fp': 'R',
+                        'hyperparams': rec_hp,
+                        'open_block_config': {'layers': [
+                            {'max_block_tokens': mb, 'open_block_mode': mode}]}}
+        L.atomic_write_json(os.path.join(d, 'summary.json'), summary, indent=2)
+        adir = os.path.join(d, 'analysis')
+        with contextlib.redirect_stdout(io.StringIO()):
+            OB.analyse(d, analysis_dir=adir)
+        with open(os.path.join(adir, 'stats.json'), encoding='utf-8') as f:
+            stats = json.load(f)
+        st = stats['comparisons']['interaction: summary effect (none - 128)']
+        assert st['seeds'] == [], st
+        assert any('lr differs' in r for r in st['controlled_violations']), st
+
+
+def t_experimental_readers_refuse_duplicate_json_keys():
+    import build_report as BR
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'summary.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('{"a::seed0":{"ppl":10},"a::seed0":{"ppl":999}}')
+        with open(path, encoding='utf-8') as f:
+            try:
+                L.strict_json_load(f)
+            except ValueError as e:
+                assert 'duplicate' in str(e), e
+            else:
+                raise AssertionError('duplicate JSON key was accepted')
+        try:
+            L.locked_json_read(path)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('locked_json_read accepted duplicate keys')
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert L.read_panel(d) == {}, 'a corrupt panel must be excluded'
+        try:
+            BR.load(path)
+        except RuntimeError as e:
+            assert 'duplicate' in str(e), e
+        else:
+            raise AssertionError('build_report.load accepted duplicate keys')
+        obj = {'cell': {'ppl_history_ref': 'summary.json'}}
+        try:
+            BR._hydrate_curve_sidecars(d, obj)
+        except RuntimeError as e:
+            assert 'duplicate' in str(e), e
+        else:
+            raise AssertionError('build_report hydrated a corrupt curve sidecar')
+
+
+def t_report_registers_invalid_pvalues_as_untestable():
+    import build_report as BR
+    stats = {'comparisons': {
+        'good': {'mean': 1.0, 'p': 0.01},
+        'bad': {'mean': 2.0, 'p': True},
+        'omitted': {'mean': 3.0, 'omitted': 'no data'}}}
+    orig = BR.load
+    BR.load = lambda path, default=None: stats
+    BR._reset_claim_registry()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            text = BR.sec_stats()
+        assert '| good |' in text
+        by_label = {r['label']: r['p'] for r in BR._REPORTED_COMPARISONS}
+        assert by_label['STATS good'] == 0.01
+        assert by_label['STATS bad'] is None
+        assert by_label['STATS omitted'] is None
+        named = [(r['label'], r['p'], r['family'])
+                 for r in BR._REPORTED_COMPARISONS]
+        assert BR.global_multiplicity_adjust(named)['n_untestable'] == 2
+    finally:
+        BR.load = orig
+        BR._reset_claim_registry()
+
+
+def t_archive_manifest_case_collision_is_excluded():
+    import archive_release as AR
+    root = tempfile.mkdtemp()
+    old_repo = AR.REPO
+    try:
+        repo = os.path.join(root, 'repo')
+        os.makedirs(repo)
+        for name in ('DECISION_LOG.md', 'RELEASES.md', 'confirmation_frozen.json'):
+            with open(os.path.join(repo, name), 'w', encoding='utf-8') as f:
+                f.write('x')
+        results = os.path.join(repo, 'results_x')
+        os.makedirs(results)
+        with open(os.path.join(results, 'evidence.txt'), 'w', encoding='utf-8') as f:
+            f.write('evidence')
+        with open(os.path.join(repo, 'release_v1.manifest.sha256'), 'w',
+                  encoding='utf-8') as f:
+            f.write('stray lowercase manifest')
+        AR.REPO = repo
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = AR.cmd_make('v1', ['results_x'], outdir='archive')
+            tar = os.path.join(repo, 'archive', 'release_v1.tar.gz')
+            assert rc == 0
+            verify = AR.cmd_verify(tar)
+        assert verify == 0, 'archive maker must not create a case-colliding manifest'
+    finally:
+        AR.REPO = old_repo
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_v12_finaltest_manifest_fallback():
+    import v12_supp as V12
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, 'results_smoke_fallback')
+        cfg = {'smoke': True, 'outdir': out,
+               'test_ids': np.zeros((2, 5), dtype=np.int64)}
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                V12.run_finaltest(cfg)
+            except SystemExit as exc:
+                msg = str(exc)
+            else:
+                msg = ''
+        assert 'manifest' not in cfg or cfg['manifest'] == V12.FREEZE_MANIFEST
+        assert 'shape' in msg, msg
+        assert 'KeyError' not in msg and 'TypeError' not in msg, msg
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -12297,6 +12566,17 @@ def main():
     _check('N69 zero block prior keeps the sliding-window S path', t_kernel_zero_soft_prior_preserves_window_s_path)
     _check('N70 open zero prior removes candidate lanes from the S path', t_open_zero_soft_prior_removes_candidate_lanes_from_s_path)
     _check('N71 saturated RoPE REINFORCE keeps its policy gradient', t_rope_reinforce_saturated_policy_keeps_gradient)
+    _check('N76 follow-up validator fails closed on malformed JSON', t_followup_validator_failclosed_on_malformed_json)
+    _check('N77 audit ledger reports the aggregate audit status', t_audit_ledger_reports_failing_status)
+    _check('N78 split-audit minimum shift tokens must be exact', t_split_audit_min_shift_tokens_exact)
+    _check('N79 audit provenance rejects duplicate JSON keys', t_audit_provenance_rejects_duplicate_keys)
+    _check('N80 corpus overlap sentinel supports uint64 ids', t_corpus_overlap_sentinel_handles_uint64_ids)
+    _check('N81 gap-fill curves merge with per-step seed support', t_gapfill_curve_merge_uses_per_step_support)
+    _check('N82 open-block interaction checks all four arms', t_open_block_interaction_checks_all_four_arms)
+    _check('N83 experimental readers refuse duplicate JSON keys', t_experimental_readers_refuse_duplicate_json_keys)
+    _check('N84 invalid report p-values stay untestable', t_report_registers_invalid_pvalues_as_untestable)
+    _check('N85 archive excludes case-colliding manifest names', t_archive_manifest_case_collision_is_excluded)
+    _check('N86 v12 finaltest honours the manifest fallback', t_v12_finaltest_manifest_fallback)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

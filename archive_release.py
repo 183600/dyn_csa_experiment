@@ -304,12 +304,17 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
     # collected file with the same repo-relative path (e.g. `--dirs .` plus a
     # stray root manifest) so the archive never contains two members with that
     # name and still passes its own verifier.
+    _reserved_norm = posixpath.normpath(man_path_rel).lower()
+
+    def _arc_rel(p):
+        return posixpath.normpath(os.path.relpath(p, REPO).replace('\\', '/'))
+
     _collisions = [p for p in files
-                   if os.path.relpath(p, REPO) == man_path_rel]
+                   if _arc_rel(p).lower() == _reserved_norm]
     if _collisions:
         print(f'[archive] WARNING: excluding collected file(s) whose path collides '
               f'with the reserved in-archive manifest name {man_path_rel!r}: '
-              f'{[os.path.relpath(p, REPO) for p in _collisions]}')
+              f'{[_arc_rel(p) for p in _collisions]}')
         _collset = set(_collisions)
         files = [p for p in files if p not in _collset]
     _outdir_abs = os.path.join(REPO, outdir)

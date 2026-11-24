@@ -220,7 +220,7 @@ def _fold_backup_into_aggregate(adir):
         # live-subset values must be removed instead of sitting next to the
         # headline mean.
         _live_only = set(sm_l) - set(sm_b)
-        _dependent = ('ppl_curve', 'avg_dyn_block_len', 'avg_block_len',
+        _dependent = ('ppl_curve', 'ppl_curve_support', 'avg_dyn_block_len', 'avg_block_len',
                       'boundary_f1_dyn', 'boundary_excess_dyn',
                       'delta_logit_mean')
         if _live_only:
@@ -406,6 +406,23 @@ def merge_long_aggregate(adir, snapshot_agg):
         return
     merged = copy.deepcopy(snapshot_agg)
 
+    def _support_map(entry):
+        out = {}
+        raw = entry.get('ppl_curve_support') if isinstance(entry, dict) else None
+        if not isinstance(raw, list):
+            return out
+        for pt in raw:
+            try:
+                if isinstance(pt[0], bool) or isinstance(pt[1], bool):
+                    return {}
+                s, w = int(pt[0]), int(pt[1])
+            except (TypeError, ValueError, IndexError, OverflowError):
+                return {}
+            if s < 0 or w <= 0 or s in out:
+                return {}
+            out[s] = w
+        return out
+
     def _seed_map(entry, tag=''):
         out = {}
         if not isinstance(entry, dict):
@@ -535,34 +552,63 @@ def merge_long_aggregate(adir, snapshot_agg):
                     # measured value instead of dropping it.
                     sentry[_f] = _vn
             _co, _cn = (sentry.get('ppl_curve'), fentry.get('ppl_curve'))
+            _so, _sn = _support_map(sentry), _support_map(fentry)
             if _fresh_covers:
                 if _cn:
                     sentry['ppl_curve'] = _cn
+                    if _sn:
+                        sentry['ppl_curve_support'] = [[_s, _sn[_s]] for _s in sorted(_sn)]
+                    else:
+                        sentry.pop('ppl_curve_support', None)
                 else:
                     sentry.pop('ppl_curve', None)
+                    sentry.pop('ppl_curve_support', None)
             elif _overlap_warn:
                 print(f'[v6-merge] NOTE: `{key}` has overlapping seeds and only seed-averaged secondary/curve fields in the snapshot — those fields are left at their snapshot values instead of publishing a double-counted blend; per-seed PPL fields are exact.')
             elif _co and _cn:
-                _cm = {}
-                for _pt in _co:
-                    try:
-                        _cm[int(_pt[0])] = [float(_pt[1]) * n_old_all, n_old_all]
-                    except (TypeError, ValueError, IndexError):
-                        continue
-                for _pt in _cn:
-                    try:
-                        _s, _v = (int(_pt[0]), float(_pt[1]))
-                    except (TypeError, ValueError, IndexError):
-                        continue
-                    _acc = _cm.setdefault(_s, [0.0, 0])
-                    _acc[0] += _v * n_fresh
-                    _acc[1] += n_fresh
-                sentry['ppl_curve'] = [[_s, _a / _w] for _s, (_a, _w) in sorted(_cm.items()) if _w]
+                if _so and _sn:
+                    _cm = {}
+                    for _pt in _co:
+                        try:
+                            _s, _v = (int(_pt[0]), float(_pt[1]))
+                        except (TypeError, ValueError, IndexError):
+                            continue
+                        _w = _so.get(_s, 0)
+                        if _w:
+                            _acc = _cm.setdefault(_s, [0.0, 0])
+                            _acc[0] += _v * _w
+                            _acc[1] += _w
+                    for _pt in _cn:
+                        try:
+                            _s, _v = (int(_pt[0]), float(_pt[1]))
+                        except (TypeError, ValueError, IndexError):
+                            continue
+                        _w = _sn.get(_s, 0)
+                        if _w:
+                            _acc = _cm.setdefault(_s, [0.0, 0])
+                            _acc[0] += _v * _w
+                            _acc[1] += _w
+                    sentry['ppl_curve'] = [[_s, _a / _w] for _s, (_a, _w) in sorted(_cm.items()) if _w]
+                    sentry['ppl_curve_support'] = [
+                        [_s, _w] for _s, (_unused, _w) in sorted(_cm.items()) if _w]
+                else:
+                    # Seed support is missing (older artifact or a ragged
+                    # sidecar), so the seed-averaged points cannot be blended
+                    # into a union mean.  Drop them instead of publishing a
+                    # curve weighted by the number of seeds in the whole run.
+                    sentry.pop('ppl_curve', None)
+                    sentry.pop('ppl_curve_support', None)
+                    print(f'[v6-merge] NOTE: `{key}` has disjoint seed sets but no exact per-step support for its seed-averaged curve — the curve is withheld rather than blending points with run-level seed counts.')
             elif _cn:
                 # Disjoint union but only the fresh aggregate carries a curve.
                 sentry['ppl_curve'] = _cn
+                if _sn:
+                    sentry['ppl_curve_support'] = [[_s, _sn[_s]] for _s in sorted(_sn)]
+                else:
+                    sentry.pop('ppl_curve_support', None)
             elif not _co:
                 sentry.pop('ppl_curve', None)
+                sentry.pop('ppl_curve_support', None)
     if _folded_keys:
         _base_full_entry = merged.get('full')
         _base_sw_entry = merged.get('full_sw128_matched')

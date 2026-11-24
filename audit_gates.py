@@ -160,9 +160,22 @@ def _is_corrupt(obj):
 def _load(path):
     if not os.path.exists(path):
         return None
+
+    def _unique_keys(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ValueError(f'duplicate JSON key {key!r}')
+            obj[key] = value
+        return obj
+
     try:
         with open(path, encoding='utf-8') as _jf:
-            return json.load(_jf)
+            # Duplicate keys are contradictory provenance and fail closed.
+            # Non-standard NaN/Infinity spellings stay on the permissive path:
+            # downstream numeric validators report them as corrupt values in
+            # the owning panel instead of collapsing the whole audit.
+            return json.load(_jf, object_pairs_hook=_unique_keys)
     except Exception as e:
         msg = f'{path} exists but cannot be parsed ({type(e).__name__}: {e})'
         print(f'[audit] WARNING: {msg}')
@@ -1006,6 +1019,10 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             or isinstance(js_fail, (bool, np.bool_, np.datetime64, np.timedelta64,
                                     complex, np.complexfloating))):
         raise ValueError('js_warn/js_fail must be numbers on the normalized JS scale')
+    _min_shift = _exact_int_scalar(min_shift_tokens)
+    if _min_shift is None or _min_shift <= 0:
+        raise ValueError('min_shift_tokens must be a positive integer')
+    min_shift_tokens = _min_shift
     try:
         js_warn = float(js_warn)
         js_fail = float(js_fail)
@@ -3290,7 +3307,7 @@ def run_report(out='audit_report.json'):
         # analysis_audit/; the artifact itself stays at the documented path).
         res = L.stamped_analysis('audit_report', res)
         L.atomic_write_json(os.path.join(REPO, out), res, indent=2)
-        L.log_experiment_event('analysis_audit', {'kind': 'analysis', 'tracking_schema': 2, 'artifact': out, 'created_at': res.get('created_at'), 'code': res.get('code'), 'label': 'audit_report', 'status': 'ok', 'audits': sorted(k for k in res if k not in ('kind', 'created_at', 'code', 'provenance', 'generated_at'))})
+        L.log_experiment_event('analysis_audit', {'kind': 'analysis', 'tracking_schema': 2, 'artifact': out, 'created_at': res.get('created_at'), 'code': res.get('code'), 'label': 'audit_report', 'status': res.get('status'), 'audits': sorted(k for k in res if k not in ('kind', 'created_at', 'code', 'provenance', 'generated_at'))})
         print(f'[audit] wrote {out}')
     except Exception as e:
         with open(os.path.join(REPO, out), 'w', encoding='utf-8') as f:
