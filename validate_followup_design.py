@@ -28,7 +28,85 @@ REQUIRED_HYPOTHESES = {
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
-def validate(plan: dict, require_ready: bool = False) -> list[str]:
+def _registry_errors(plan: dict, repo: Path) -> list[str]:
+    """Check that the design's variant IDs exist AND have the declared shape.
+
+    The structural validator alone cannot tell a pure-HCA arm from the hybrid
+    alternation: both are just strings.  Importing the repository's variant
+    registry (``exp_lib.make_layer_cfgs`` after ``v7_supp`` installs the RoPE
+    variants) turns the design record into a machine-checkable claim about the
+    code that would actually run.
+
+    This is a *design/code consistency* check, not evidence that the arms
+    train well or that the hypotheses are true.
+    """
+    import sys
+
+    errors: list[str] = []
+    repo = Path(repo).resolve()
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
+    try:
+        import exp_lib as L  # noqa: PLC0415 — imported lazily, tests may skip
+        import v7_supp  # noqa: F401,PLC0415 — installs the *_rope registry
+    except Exception as exc:  # pragma: no cover - environment dependent
+        return [f"cannot import the variant registry from {repo}: "
+                f"{type(exc).__name__}: {exc}"]
+
+    design = plan.get("design") if isinstance(plan.get("design"), dict) else {}
+    for arm in design.get("factorial_arms") or []:
+        if not isinstance(arm, dict):
+            continue
+        variant = arm.get("variant")
+        aid = arm.get("id")
+        if not isinstance(variant, str) or not variant or variant.startswith("TODO"):
+            errors.append(f"{aid}: variant is not an implemented registry entry: {variant!r}")
+            continue
+        try:
+            cfgs = L.make_layer_cfgs(3, variant)
+        except Exception as exc:
+            errors.append(f"{aid}: make_layer_cfgs({variant!r}) failed: "
+                          f"{type(exc).__name__}: {exc}")
+            continue
+        if not cfgs:
+            errors.append(f"{aid}: make_layer_cfgs({variant!r}) returned no layers")
+            continue
+        family = str(arm.get("family", "")).lower()
+        if family in ("csa", "hca"):
+            kinds = [str(getattr(c, "kind", "")) for c in cfgs]
+            if any(k != family for k in kinds):
+                errors.append(
+                    f"{aid}: variant {variant!r} is not a pure {family.upper()} arm "
+                    f"(layer kinds {kinds}); a hybrid arm cannot answer the "
+                    f"{family.upper()} hypothesis")
+        seg = str(arm.get("segmentation", ""))
+        dynamic = [bool(getattr(c, "dynamic", False)) for c in cfgs]
+        if seg == "dynamic" and not all(dynamic):
+            errors.append(f"{aid}: declared dynamic but not every layer is dynamic: {dynamic}")
+        if seg == "fixed" and any(dynamic):
+            errors.append(f"{aid}: declared fixed but at least one layer is dynamic: {dynamic}")
+
+    for entry in design.get("dense_controls") or []:
+        if not isinstance(entry, dict):
+            continue
+        variant = entry.get("variant")
+        eid = entry.get("id")
+        if not isinstance(variant, str) or not variant or variant.startswith("TODO"):
+            errors.append(f"{eid}: dense variant is not an implemented registry entry: {variant!r}")
+            continue
+        try:
+            cfgs = L.make_layer_cfgs(3, variant)
+        except Exception as exc:
+            errors.append(f"{eid}: make_layer_cfgs({variant!r}) failed: "
+                          f"{type(exc).__name__}: {exc}")
+            continue
+        if any(str(getattr(c, "kind", "")) != "full" for c in cfgs):
+            errors.append(f"{eid}: variant {variant!r} is not a dense/full-attention arm")
+    return errors
+
+
+def validate(plan: dict, require_ready: bool = False, *,
+             verify_registry: bool = False, repo: Path | None = None) -> list[str]:
     errors: list[str] = []
 
     def need(condition: bool, message: str) -> None:
@@ -221,6 +299,12 @@ def validate(plan: dict, require_ready: bool = False) -> list[str]:
             need(bool(variant) and not variant.startswith("TODO"),
                  f"{arm.get('id')}: replace TODO with an implemented Dense variant")
 
+    if verify_registry or require_ready:
+        if repo is None:
+            errors.append("registry verification requested without a repository path")
+        else:
+            errors.extend(_registry_errors(plan, Path(repo)))
+
     return errors
 
 
@@ -229,13 +313,20 @@ def main() -> int:
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--require-ready", action="store_true",
                         help="require a frozen, test-unaccessed preregistration")
+    parser.add_argument("--verify-registry", action="store_true",
+                        help="import the repository variant registry and check that "
+                             "every declared arm exists and is pure (implied by --require-ready)")
+    parser.add_argument("--repo", type=Path, default=None,
+                        help="repository root for --verify-registry (default: the manifest's directory)")
     args = parser.parse_args()
     try:
         plan = json.loads(args.manifest.read_text(encoding="utf-8"))
     except Exception as exc:
         print(f"INVALID: cannot read JSON: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
-    errors = validate(plan, require_ready=args.require_ready)
+    errors = validate(plan, require_ready=args.require_ready,
+                      verify_registry=args.verify_registry,
+                      repo=args.repo or args.manifest.resolve().parent)
     if errors:
         print(f"NOT READY ({len(errors)} issue(s))")
         for error in errors:

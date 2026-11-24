@@ -1584,8 +1584,14 @@ def audit_causality():
     L.set_seed(0)
     dev = torch.device('cpu')
     V, T, vocab = 6, 128, 256
-    variants = ['full_rope', 'csa_fixed_rope', 'csa_fixed_rope_randidx', 'csa_fixed_rope_allblocks']
+    # Every implemented attention family, including the DYNAMIC segmenters
+    # and the pure-HCA arms: a causality gate that only covers fixed-chunk
+    # arms cannot certify the dynamic mechanism it is meant to guard.
+    variants = ['full_rope', 'csa_fixed_rope', 'csa_dynamic_rope',
+                'csa_fixed_rope_randidx', 'csa_fixed_rope_allblocks',
+                'hca_fixed_rope', 'hca_dynamic_rope']
     ids = torch.randint(0, vocab, (V, T + 1), dtype=torch.long)
+    _sentinel = torch.randint(0, vocab, (V, T), dtype=torch.long)
     fails = []
     for v in variants:
         cfgs = L.make_layer_cfgs(4, v)
@@ -1599,6 +1605,17 @@ def audit_causality():
                 part = model(ids[:, :cut])
                 if not torch.allclose(part, full[:, :cut], atol=1e-4, rtol=1e-4):
                     fails.append(f'{v}: prefix invariance violated at T\'={cut} (future leakage or T-dependent tail-block read)')
+                    break
+                # b2) future perturbation at a FIXED length: replace every
+                # token at/after the cut (the cut token itself is the first
+                # future token for a next-token position < cut) and require
+                # the earlier outputs to be unchanged.  This separates future
+                # leakage from a T-dependent-but-causal tail-block effect.
+                pert = ids[:, :-1].clone()
+                pert[:, cut:] = _sentinel[:, cut:]
+                out_pert = model(pert)
+                if not torch.allclose(out_pert[:, :cut], full[:, :cut], atol=1e-4, rtol=1e-4):
+                    fails.append(f'{v}: future-token perturbation changed prefix outputs before token {cut} (information leak)')
                     break
             # d) incremental decode vs full forward (logits tail column)
             inc = []

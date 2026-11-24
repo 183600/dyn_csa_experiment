@@ -837,6 +837,24 @@ def make_layer_cfgs_v7(n_layers, variant):
             else:
                 out.append(AttnCfgRope(kind='hca', dynamic=False, block_size=64, rope=True, rope_dim=16, qk_norm=True))
         return out
+    # ---- pure HCA arms (follow-up factorial) --------------------------------
+    # `hybrid_fixed_rope` alternates CSA/HCA layers, so it cannot answer an
+    # HCA-vs-CSA question: the "HCA" contrast would be diluted by the CSA
+    # layers.  These two variants put an HCA attention in EVERY layer, which
+    # is what the follow-up protocol's `pure_hca_layer_registry_verified`
+    # gate requires.  They are registry entries only: nothing here trains or
+    # evaluates them, and they remain exploratory until a separate manifest
+    # is frozen.
+    if variant == 'hca_fixed_rope':
+        return [AttnCfgRope(kind='hca', dynamic=False, block_size=64,
+                            rope=True, rope_dim=16, qk_norm=True)
+                for _ in range(n_layers)]
+    if variant == 'hca_dynamic_rope':
+        return [AttnCfgRope(kind='hca', dynamic=True, chunking='cosine_learnable',
+                            target_block_tokens=64, temperature=0.1,
+                            comp_lambda_mult=4.0, rope=True, rope_dim=16,
+                            qk_norm=True)
+                for _ in range(n_layers)]
     if variant == 'full_rope':
         return [AttnCfgRope(kind='full', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'full_sw128_matched_rope':
@@ -906,6 +924,12 @@ def _v7_knobs_fp(device=None, batch_size=None):
 
 
 ROPE_VARIANTS = ['full_rope', 'csa_fixed_rope', 'hybrid_fixed_rope', 'csa_dynamic_rope', 'csa_fixed']
+# Pure-HCA arms (every layer is HCA).  Kept separate from ROPE_VARIANTS so the
+# historical P0R panel keeps its exact arm list; the follow-up factorial uses
+# these.  `hybrid_fixed_rope` is NOT an HCA arm.
+PURE_HCA_VARIANTS = ['hca_fixed_rope', 'hca_dynamic_rope']
+FACTORIAL_VARIANTS = ['csa_fixed_rope', 'csa_dynamic_rope',
+                      'hca_fixed_rope', 'hca_dynamic_rope']
 PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
 
 def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=20000, warm_steps=0, lr=0.0003, weight_decay=0.1, warmup=200, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=1000, eval_subset=128, val_bnd=None, device=DEVICE, log_every=1000, mlp_ratio=4, deadline_ts=None, save_ckpt=None, ckpt_dir=None, measure_eff=True, diag_every=None):
@@ -2461,7 +2485,8 @@ def run_niah_phase(payload, guard=None, label=''):
     return summary
 
 @torch.inference_mode()
-def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=None):
+def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=None,
+                    doc_index=None):
     was = model.training
     model.eval()
     out = {}
@@ -2520,6 +2545,36 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
         model.train(was)
         return out
     _val_width = int(_val_arr.shape[1])
+    # Optional per-token document ordinals [rows, tokens], aligned with
+    # `val_ids`.  They are required only for the document-level readout; the
+    # pooled PPL reduction is unchanged.  A truncated span would need a
+    # shifted/partial layout, so it is refused rather than approximated.
+    _doc_idx = None
+    _n_docs = 0
+    if doc_index is not None:
+        _doc_idx = np.asarray(doc_index)
+        if _doc_idx.ndim != 2 or int(_doc_idx.shape[0]) != int(_val_arr.shape[0]):
+            _arg_err = (f'doc_index shape {_doc_idx.shape} must be 2-D with the same '
+                        f'row count as val_ids {int(_val_arr.shape[0])}')
+        elif int(_doc_idx.shape[1]) < _val_width:
+            _arg_err = (f'doc_index has {int(_doc_idx.shape[1])} token columns but '
+                        f'val_ids has {_val_width}; the document layout must cover '
+                        'every evaluated token')
+        elif not np.issubdtype(_doc_idx.dtype, np.integer):
+            _arg_err = 'doc_index must be an integer array'
+        elif _doc_idx.size and int(_doc_idx.min()) < 0:
+            _arg_err = 'doc_index entries must be non-negative ordinals'
+        else:
+            _arg_err = None
+            _n_docs = int(_doc_idx.max()) + 1 if _doc_idx.size else 0
+            if _doc_idx.size > 1 and bool((_doc_idx[:, 1:] < _doc_idx[:, :-1]).any()):
+                _arg_err = ('doc_index must be non-decreasing within each row '
+                            '(rows are contiguous document-stream slices)')
+        if _arg_err is not None:
+            for Ln in eval_lens:
+                out[Ln] = {'error': _arg_err, 'truncated': False, 'eval_span': None}
+            model.train(was)
+            return out
     # An absolute-position model cannot score beyond its learned table.  When
     # the caller passes max_pos=None (the "full context" request) a longer
     # length must be an explicit error, never a silent last-max_pos slice.
@@ -2556,6 +2611,13 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                if (_eff_max is None or int(Ln) <= _eff_max) and int(Ln) not in _skip_within]
     _trunc_lens = [int(Ln) for Ln in eval_lens
                    if _eff_max is not None and int(Ln) > _eff_max and int(Ln) not in _over]
+    if _doc_idx is not None and _trunc_lens:
+        _err = ('document-level attribution is not defined for a truncated '
+                'evaluation span; pass max_pos=None (or a full-length slice) '
+                'when requiring doc_index')
+        for Ln in _trunc_lens:
+            out[Ln] = {'error': _err, 'truncated': True, 'eval_span': None}
+        _trunc_lens = []
     # The compression regulariser is a training side channel: disabling it for
     # scoring skips the gate-honour bookkeeping without touching any logit
     # (the block geometry is still built), exactly as eval_ppl does.
@@ -2617,6 +2679,33 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                 if Ln >= 2:
                     out[Ln]['ppl_per_seq'] = [float(L._safe_exp_ppl(float(v) / (Ln - 1))) for v in _cum[:, Ln - 2].tolist()]
                     out[Ln]['n_seq'] = int(ids.shape[0])
+                if _doc_idx is not None and Ln >= 2:
+                    # True document clusters: the target token at column c is
+                    # predicted from column c-1, so its document ordinal is
+                    # doc_index[:, c].  Rows are contiguous slices of the
+                    # document stream and the flat table is non-decreasing.
+                    _didx = torch.as_tensor(_doc_idx[:int(ids.shape[0]), 1:Ln],
+                                            dtype=torch.long, device=device)
+                    _d_nll = L._det_segment_sum(_n_docs, _didx,
+                                                nll_cols[:, :Ln - 1],
+                                                dtype=torch.float64,
+                                                sorted_indices=True)
+                    _d_ntok = L._det_segment_sum(_n_docs, _didx,
+                                                 torch.ones_like(_didx),
+                                                 dtype=torch.long,
+                                                 sorted_indices=True)
+                    _dn = [float(v) for v in _d_nll.detach().cpu().tolist()]
+                    _dt = [int(v) for v in _d_ntok.detach().cpu().tolist()]
+                    out[Ln].update({
+                        'doc_nll': _dn,
+                        'doc_ntok': _dt,
+                        'n_docs': int(_n_docs),
+                        'doc_ppl': [L._safe_exp_ppl((a / b) if b > 0 else None)
+                                    for a, b in zip(_dn, _dt)],
+                        'doc_ci': L._nll_doc_ci(_dn, _dt),
+                        'cluster_unit': 'document (loader doc_index)',
+                    })
+                    del _didx, _d_nll, _d_ntok
             del x, nll_cols, _cum
         _trunc_cache = {}
         for Ln in _trunc_lens:

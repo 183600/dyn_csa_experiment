@@ -601,11 +601,14 @@ def _valid_bootstrap_count(n_boot, *, minimum=2):
 
 
 def _nll_doc_ci(nll_per_row, n_tokens_per_row):
-    """Approximate 95% CI for PPL from per-DOCUMENT NLL (not per-token).
+    """Approximate 95% CI for PPL from per-CLUSTER NLL (not per-token).
 
-    Documents, not tokens, are the independent sampling unit; treating every
-    token as independent would make the interval look far narrower than the
-    actual evaluation-subset noise."""
+    The independent sampling unit is the cluster the caller supplies: real
+    documents when the records carry a document layout (``eval_ppl(...,
+    doc_index=...)``), otherwise the fixed evaluation rows/windows.  Treating
+    every token as independent would make the interval look far narrower than
+    the actual evaluation-subset noise; treating windows as documents has the
+    opposite labelling error, so callers must state which unit they passed."""
     # Materialise once: ``x or []`` raises for a multi-element NumPy array,
     # and a one-shot generator would be exhausted before the cluster-robust
     # residual pass below (silently reporting n_docs=0).
@@ -5255,16 +5258,15 @@ class HybridAttention(nn.Module):
         return (gate, gate.detach() > _HALF)
 
     def _gate_signals(self, x, pre_all=None):
-        # Batched form of the per-row `_gate_signal` calls.  Every op except the
-        # prefix cumsum is pointwise or a reduction over the last dim of each
-        # vector/pair, so its per-row values are independent of how many rows
-        # share the launch — bit-identical to the per-row form (the same
-        # row-independence the gate-decision hoist already relies on, design
-        # notes §6.1).  The prefix cumsum still runs per row on the same
-        # contiguous [T-1] values with the same 1-D kernel call, so its output
-        # is bit-identical to the per-row form as well.  Returns (rows,
-        # gate_bool_stacked): rows[b] is None or (gate_row, bool_row) exactly
-        # as `_gate_signal` would have returned for row b.
+        # Batched form of the per-row `_gate_signal` calls.  The op graph is
+        # the same, so the per-row values agree with the row loop to floating
+        # point *last-bit* accuracy; shape-dependent reductions (normalize /
+        # cumsum launch widths) can differ in the final ulp, so this is
+        # value-equivalent, not bitwise-identical (measured: gate probability
+        # max|diff| ~6e-8 on CPU, while the hard gate_bool decisions and the
+        # REINFORCE logp are identical).  Returns (rows, gate_bool_stacked):
+        # rows[b] is None or (gate_row, bool_row) as `_gate_signal` would have
+        # returned for row b.
         B, T, _d = x.shape
         fused = pre_all.get('fused') if pre_all is not None else None
         if fused is None:
@@ -5960,7 +5962,18 @@ class SmallGPT(nn.Module):
         # denominator must exclude those positions too (a valid token id can
         # never be negative).
         _ign = -100 if ignore_index is None else int(ignore_index)
-        n_tok = int((targets != _ign).sum().item())
+        if int(targets.shape[1]) > int(ids.shape[1]):
+            # Extra target columns have no corresponding logits.  Counting
+            # them in the denominator would silently scale the CE by
+            # ids_cols/targets_cols; refuse the malformed pair instead.
+            raise ValueError(
+                f'ce_loss: targets has {int(targets.shape[1])} columns but ids has '
+                f'{int(ids.shape[1])}; every target column must have a logits row')
+        # The denominator is the number of *scored* target positions: with
+        # shorter targets the columns beyond n_cols are never scored, so they
+        # must not be counted either.
+        n_cols = min(int(ids.shape[1]), int(targets.shape[1]))
+        n_tok = int((targets[:, :n_cols] != _ign).sum().item())
         n_tok = max(n_tok, 1)
         ce = None
         _ck = torch.is_grad_enabled() and h.requires_grad
@@ -5971,7 +5984,6 @@ class SmallGPT(nn.Module):
         # The trunk must see the full input (block geometry depends on T), but
         # a next-token target table is one column shorter; score only the rows
         # that have a target, exactly like the original logits[:, :-1] form.
-        n_cols = min(int(ids.shape[1]), int(targets.shape[1]))
         for s in range(0, n_cols, chunk):
             e = min(s + chunk, n_cols)
             if _ck:
@@ -7053,15 +7065,19 @@ def _tokenise_row_chunks(row_chunks, cap_tokens, label, tok, eos_id,
     return ids[:cap_tokens]
 
 
-def _doc_ids_for_capped_rows(rows, lengths, cap_tokens):
-    """Document ids of the rows that contributed to a capped token stream.
+def _doc_layout_for_capped_rows(rows, lengths, cap_tokens):
+    """(document ids, tokens taken per document) for a capped token stream.
 
     ``lengths`` is the per-row ``len(ids) + 1`` list produced by
     :func:`_tokenise_row_chunks`; it is aligned with the non-empty ``rows``.
-    A row is recorded when at least one of its tokens (or its EOS) falls before
-    ``cap_tokens``, matching the truncated id array exactly.
+    A document is recorded with the number of its tokens that fall before
+    ``cap_tokens``.  The two arrays are the exact layout of the truncated id
+    stream: ``np.repeat(ids, takes)`` is the per-token document index of
+    ``ids[:cap_tokens]``.  That is what turns the evaluation rows into real
+    document clusters instead of treating each fixed window as a document.
     """
-    acc = array.array('Q')
+    ids = array.array('Q')
+    takes = array.array('q')
     cursor = 0
     cap_tokens = max(0, int(cap_tokens))
     for row, length in zip(rows, lengths):
@@ -7070,12 +7086,53 @@ def _doc_ids_for_capped_rows(rows, lengths, cap_tokens):
         take = min(int(length), cap_tokens - cursor)
         if take <= 0:
             break
-        acc.append(int(_doc_id_u64(_doc_exact_fp(row))))
+        ids.append(int(_doc_id_u64(_doc_exact_fp(row))))
+        takes.append(int(take))
         cursor += take
-    return (np.frombuffer(acc, dtype=np.uint64).copy()
-            if acc else np.empty(0, dtype=np.uint64))
+    return (np.frombuffer(ids, dtype=np.uint64).copy() if ids else np.empty(0, dtype=np.uint64),
+            np.frombuffer(takes, dtype=np.int64).copy() if takes else np.empty(0, dtype=np.int64))
 
-def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
+
+def _doc_ids_for_capped_rows(rows, lengths, cap_tokens):
+    """Document ids of the rows that contributed to a capped token stream.
+
+    ``lengths`` is the per-row ``len(ids) + 1`` list produced by
+    :func:`_tokenise_row_chunks`; it is aligned with the non-empty ``rows``.
+    A row is recorded when at least one of its tokens (or its EOS) falls before
+    ``cap_tokens``, matching the truncated id array exactly.
+    """
+    return _doc_layout_for_capped_rows(rows, lengths, cap_tokens)[0]
+
+
+def _doc_index_matrix(doc_ids, doc_lengths, n_rows, seq_len):
+    """Per-token document ordinal ``[n_rows, seq_len]`` for the served slice.
+
+    Entries are ordinals into ``doc_ids`` (0..n_docs-1), not the raw hashes:
+    every row is a contiguous slice of the document-aligned token stream, so
+    the flattened ordinals are non-decreasing and can be used as segmented-sum
+    keys directly.  ``doc_ids`` keeps the provenance (raw document hashes).
+    """
+    n_rows = int(n_rows)
+    seq_len = int(seq_len)
+    need = n_rows * seq_len
+    _ids = np.asarray(doc_ids)
+    _lens = np.asarray(doc_lengths)
+    if _ids.ndim != 1 or _lens.ndim != 1 or _ids.shape[0] != _lens.shape[0]:
+        raise ValueError(
+            f'_doc_index_matrix: document ids {_ids.shape} and lengths {_lens.shape} '
+            'must be aligned 1-D arrays')
+    if _lens.size and (not np.issubdtype(_lens.dtype, np.integer) or (_lens < 0).any()):
+        raise ValueError('_doc_index_matrix: document lengths must be non-negative integers')
+    total = int(_lens.sum()) if _lens.size else 0
+    if total < need:
+        raise ValueError(
+            f'_doc_index_matrix: the capped document layout covers {total} tokens '
+            f'but the served slice needs {need} ({n_rows} x {seq_len})')
+    flat = np.repeat(np.arange(_ids.size, dtype=np.int32), _lens.astype(np.int64))[:need]
+    return flat.reshape(n_rows, seq_len)
+
+def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None,
+                  with_doc_ids=False):
     """Load the WikiText-103 **test** split as (n_seqs, seq_len) int64 rows.
 
     只读 wiki.test.raw（本地 dump 或 HF test split）作为最终评估数据
@@ -7097,6 +7154,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     te_path = os.path.join(cache_dir, f'test_ids_{tag}.npy')
     tb_path = os.path.join(cache_dir, f'test_bnd_{tag}.npy')
     td_path = os.path.join(cache_dir, f'test_doc_ids_{tag}.npy')
+    tdl_path = os.path.join(cache_dir, f'test_doc_lengths_{tag}.npy')
     me_path = os.path.join(cache_dir, f'test_meta_{tag}.json')
     tk_path = os.path.join(cache_dir, f'test_tok_{tag}.json')
     _cache_ready, _cache_why = _cache_files_loadable((te_path, tb_path), me_path)
@@ -7106,6 +7164,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         _sig_paths = {'test': te_path, 'bnd': tb_path, 'meta': me_path}
         if os.path.exists(td_path):
             _sig_paths['test_doc_ids'] = td_path
+        if os.path.exists(tdl_path):
+            _sig_paths['test_doc_lengths'] = tdl_path
         # The tokenizer bytes are part of the verified identity on every hit;
         # include every present tokenizer file in the memo key.
         if os.path.exists(tk_path):
@@ -7124,7 +7184,9 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         for _mp in sorted(_glob_memo.glob(os.path.join(cache_dir, 'meta_v5_*.json'))):
             _sig_paths[f'train_meta:{os.path.basename(_mp)}'] = _mp
         _sig = _memo_file_sig(_sig_paths)
-        _mkey = (os.path.abspath(cache_dir), tag, _sig)
+        # The cached tuple differs by requested shape (4-tuple vs
+        # 6-tuple with document ordinals), so both belong in the memo identity.
+        _mkey = (os.path.abspath(cache_dir), tag, _sig, bool(with_doc_ids))
         _hit = _WT103_TEST_MEMO.get(_mkey)
         if _hit is not None:
             print('[data] serving TEST token ids from the in-process memo (same cache files, already verified) ...')
@@ -7146,6 +7208,29 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                 _problems_td = None
         else:
             _problems_td = None
+        # The per-token document ordinals need the tokens-taken sidecar.  A
+        # cache built before that sidecar existed is still a valid cache for
+        # the normal 4-tuple API; asking for document ids from it fails closed
+        # instead of inventing a layout (and instead of re-reading the
+        # held-out split to rebuild silently).
+        _doc_index = None
+        _doc_lengths = None
+        if os.path.exists(tdl_path):
+            try:
+                _doc_lengths = np.load(tdl_path)
+            except Exception as _de:
+                if with_doc_ids:
+                    raise RuntimeError(
+                        f'load_wikitest: document-length sidecar {tdl_path} is unreadable '
+                        f'({type(_de).__name__}: {_de}); with_doc_ids requires the exact '
+                        'document layout recorded at build time') from _de
+        elif with_doc_ids:
+            raise RuntimeError(
+                'load_wikitest: this test cache predates the per-document length '
+                f'sidecar ({os.path.basename(tdl_path)}); with_doc_ids cannot be '
+                'served without inventing a document layout.  Rebuild the test '
+                'cache from the frozen source (before any further test access) '
+                'or call without with_doc_ids.')
         _problems = []
         if not meta:
             _problems.append('test cache meta is not a JSON object')
@@ -7358,7 +7443,17 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         else:
             if not _fast:
                 _validate_token_ids(test_ids, _test_vocab, 'cached test_ids')
-            out = (test_ids, _test_vocab, None, test_bnd)
+            if with_doc_ids:
+                if test_doc_ids is None or _doc_lengths is None:
+                    raise RuntimeError(
+                        'load_wikitest: with_doc_ids was requested but the cache has no '
+                        'document-id/length sidecars; rebuild the test cache before any '
+                        'further test access or call without with_doc_ids')
+                _doc_index = _doc_index_matrix(test_doc_ids, _doc_lengths,
+                                               int(n_seqs), int(seq_len))
+                out = (test_ids, _test_vocab, None, test_bnd, _doc_index, test_doc_ids)
+            else:
+                out = (test_ids, _test_vocab, None, test_bnd)
             _memo_put(_WT103_TEST_MEMO, _mkey, out, _WT103_TEST_MEMO_CAP)
             return out
     # cold build: resolve the train tokenizer FIRST, then touch the test rows.
@@ -7692,7 +7787,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     # is what makes test/train and test/val group disjointness independently
     # checkable on a later cache hit.
     _served_cap = int(n_have) * int(seq_len)
-    test_doc_ids = _doc_ids_for_capped_rows(
+    test_doc_ids, _test_doc_lengths = _doc_layout_for_capped_rows(
         [r for r in _trows if r.strip()], _test_lengths, _served_cap)
     # Prove group isolation against every train/val cache sidecar present.  The
     # build-time dedup should already guarantee zero; this turns any silent
@@ -7721,7 +7816,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             'validation document ids occur in the held-out test slice after '
             'deduplication — refusing to write a group-leaking test cache')
     for _p, _a in ((te_path, test_batch), (tb_path, test_bnd),
-                   (td_path, test_doc_ids)):
+                   (td_path, test_doc_ids), (tdl_path, _test_doc_lengths)):
         _fd, _tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(_p)), prefix=os.path.basename(_p) + '.', suffix='.tmp')
         try:
             with os.fdopen(_fd, 'wb') as _fh:
@@ -7734,7 +7829,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                 pass
             raise
     _file_sigs = _cache_file_sigs({'test': te_path, 'bnd': tb_path,
-                                   'test_doc_ids': td_path})
+                                   'test_doc_ids': td_path,
+                                   'test_doc_lengths': tdl_path})
     # Persist the test tokenizer BEFORE writing the meta, so the meta can bind
     # its exact bytes.  The cache identity therefore includes the full-file
     # sha256 (not only a hash of the fit TEXT, which two different BPE merge
@@ -7817,8 +7913,22 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         },
         'test_sequences': int(test_batch.shape[0]),
         'seq_len': int(seq_len),
+        'doc_layout': {
+            'n_docs': int(_test_doc_ids.size) if isinstance(_test_doc_ids, np.ndarray) else 0,
+            'tokens': int(_test_doc_lengths.sum()) if isinstance(_test_doc_lengths, np.ndarray) else 0,
+            'lengths_fp': _ids_fp(np.ascontiguousarray(np.asarray(_test_doc_lengths, dtype=np.int64))),
+            'note': ('per-token document ordinals are derived by repeating each '
+                     'document id for its recorded token count; the pooled PPL '
+                     'reduction is unchanged'),
+        },
     }, indent=0)
     print('[data] cached TEST token ids to disk (held-out split; final evaluation only)')
+    if with_doc_ids:
+        # The ordinals are derived from the same layout just written; no extra
+        # test read is involved.
+        _doc_index = _doc_index_matrix(test_doc_ids, _test_doc_lengths,
+                                       int(n_have), int(seq_len))
+        return (test_batch, vocab, tok, test_bnd, _doc_index, test_doc_ids)
     return (test_batch, vocab, tok, test_bnd)
 
 _FWEB_MEMO = {}
@@ -15801,13 +15911,17 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
            'params': {a: pa, b: pb},
            'flops_proxy_6nd': {a: xa, b: xb},
            'time_ratio_a_over_b': None, 'proxy_ratio_a_over_b': None,
-           'compute_matched': None, 'compute_matched_source': None,
+           'compute_matched': None, 'compute_verifiable': False,
+           'flops_matched': None,
+           'compute_matched_source': None,
            'more_compute_arm': None, 'note': None}
     ratio = None
+    _measured = False
     if ta and tb and ta > 0 and tb > 0:
         ratio = ta / tb
+        _measured = True
         out['time_ratio_a_over_b'] = float(ratio)
-        out['compute_matched_source'] = 'measured wall-clock per token'
+        out['compute_matched_source'] = 'measured wall-clock per token (a timing allocation, not FLOPs)'
     elif xa and xb and xa > 0 and xb > 0:
         ratio = xa / xb
         out['proxy_ratio_a_over_b'] = float(ratio)
@@ -15815,10 +15929,28 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
     if ratio is None:
         out['note'] = 'no timing or 6ND inputs on the records: compute matching is unverifiable for this pair'
         return out
-    out['compute_matched'] = bool(abs(ratio - 1.0) <= float(tolerance))
     out['more_compute_arm'] = (a if ratio > 1.0 else b)
+    _ratio_dev = max(ratio, 1.0 / ratio)
+    if _measured:
+        # Only a measured allocation can certify that the two arms *ran* at
+        # comparable cost; it still is not a FLOPs count, so `flops_matched`
+        # stays None and must be filled from a profiler measurement.
+        out['compute_matched'] = bool(abs(ratio - 1.0) <= float(tolerance))
+        out['compute_verifiable'] = True
+    else:
+        # A parameter x token proxy is exactly 1.0 for a parameter-matched pair
+        # even when the architectures execute different numbers of operations
+        # (e.g. parameter-matched dense attention vs sparse attention can
+        # differ by >1.8x FLOPs/token).  It therefore MUST NOT be used to
+        # certify equal compute: equality-by-proxy is unverified, not matched.
+        out['compute_matched'] = None
+        out['compute_verifiable'] = False
+        out['note'] = ('the 6ND proxy is only params x tokens; a parameter-matched '
+                       'pair can still execute very different FLOPs, so equal compute '
+                       'is NOT established (measured FLOPs or timing are required)')
+        return out
     if not out['compute_matched']:
-        out['note'] = (f'{out["more_compute_arm"]} consumed about {max(ratio, 1.0 / ratio):.2f}x the compute of the other arm '
+        out['note'] = (f'{out["more_compute_arm"]} consumed about {_ratio_dev:.2f}x the compute of the other arm '
                        f'({out["compute_matched_source"]}); this is NOT an equal-compute comparison')
     return out
 
@@ -16226,6 +16358,16 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     _cc = _compute_control_detail(recs, a, b)
                     st['compute_control'] = _cc
                     st['compute_matched'] = _cc.get('compute_matched')
+                    st['compute_verifiable'] = _cc.get('compute_verifiable')
+                    if _cc.get('compute_matched') is None and _cc.get('proxy_ratio_a_over_b') is not None:
+                        # Parameter-matched is not compute-matched.  Surface the
+                        # unverified state instead of letting a 1.0 proxy ratio
+                        # read as "equal compute" downstream.
+                        report.setdefault('compute_unverified', []).append(
+                            '%s vs %s: only the params x tokens proxy is available and it '
+                            'cannot certify equal compute for different architectures; '
+                            'report the pair as parameter-matched, compute-unverified'
+                            % (a, b))
                     if (_cc.get('compute_matched') is False or (isinstance(_cc.get('compute_matched'), np.bool_) and bool(_cc.get('compute_matched')) == False)) and isinstance(st.get('mean'), (int, float)) and math.isfinite(float(st['mean'])):
                         _mean_sign = _sign_of(st['mean'])
                         if _mean_sign == 0:
@@ -17989,7 +18131,7 @@ def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
 
 @torch.inference_mode()
 def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, return_stats=False,
-             collect_block_stats=False, val_bnd=None, bnd_tol=1):
+             collect_block_stats=False, val_bnd=None, bnd_tol=1, doc_index=None):
     # Sampling controls are exact integers; a bool or fractional value is
     # rejected.  A negative or huge seed still produces a reproducible stream.
     _seed = _as_seed_int(eval_seed)
@@ -18006,6 +18148,29 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
                 f'eval_ppl: eval_rows must be positive (use None for the full '
                 f'set), got {eval_rows!r}')
         eval_rows = _rows
+    # Optional per-token document ordinal table [rows, tokens], aligned with
+    # `val_batch`.  When supplied, the per-document NLL is accumulated over
+    # real document clusters instead of treating each fixed window as one
+    # document.  An ordinal space is int32 (docs are enumerated by the loader).
+    _doc_idx = None
+    _n_docs = 0
+    if doc_index is not None:
+        _doc_idx = np.asarray(doc_index)
+        if _doc_idx.ndim != 2 or tuple(_doc_idx.shape) != tuple(val_batch.shape):
+            raise ValueError(
+                f'eval_ppl: doc_index shape {_doc_idx.shape} must equal val_batch '
+                f'shape {tuple(val_batch.shape)}')
+        if not np.issubdtype(_doc_idx.dtype, np.integer):
+            raise ValueError('eval_ppl: doc_index must be an integer array')
+        if _doc_idx.size and int(_doc_idx.min()) < 0:
+            raise ValueError('eval_ppl: doc_index entries must be non-negative ordinals')
+        _n_docs = int(_doc_idx.max()) + 1 if _doc_idx.size else 0
+        if _doc_idx.size > 1 and bool((_doc_idx[:, 1:] < _doc_idx[:, :-1]).any()):
+            # Rows are contiguous slices of a document stream; a decreasing
+            # ordinal inside a row means the table is misaligned.
+            raise ValueError(
+                'eval_ppl: doc_index must be non-decreasing within each row '
+                '(rows are contiguous document-stream slices)')
     # `collect_block_stats=True` enables the compression-report hooks for this
     # same forward pass, so block-length/boundary diagnostics come from it too.
     # A chunk is a set of independent sequences (no cross-row op in the
@@ -18016,13 +18181,18 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
     need_reg_layers = [blk.attn for blk in model.blocks if hasattr(blk.attn, 'need_reg')]
     need_reg_prior = [_a.need_reg for _a in need_reg_layers]
     nll = torch.zeros((), dtype=torch.float64, device=device)
-    # Per-document NLL (eval-subset uncertainty must be visible, not
-    # only the seed-to-seed spread).  Rows are the fixed evaluation documents;
-    # with eval_rows sampling, a row with no sampled target gets 0 tokens and
-    # is excluded by the bootstrap consumers (_doc_bootstrap_ppl_ci /
-    # _combined_seed_doc_ci drop zero-token rows before resampling).
+    # Per-row NLL (eval-subset uncertainty must be visible, not only the
+    # seed-to-seed spread).  With eval_rows sampling, a row with no sampled
+    # target gets 0 tokens and is excluded by the bootstrap consumers
+    # (_doc_bootstrap_ppl_ci / _combined_seed_doc_ci drop zero-token rows
+    # before resampling).
     _row_nll = torch.zeros(int(val_batch.shape[0]), dtype=torch.float64, device=device) if return_stats else None
     _row_ntok = torch.zeros(int(val_batch.shape[0]), dtype=torch.long, device=device) if return_stats else None
+    # Real document clusters (only when the caller supplies a doc_index table);
+    # these are the units the document-level CI must resample.
+    _doc_nll = torch.zeros(_n_docs, dtype=torch.float64, device=device) if (_doc_idx is not None and return_stats) else None
+    _doc_ntok = torch.zeros(_n_docs, dtype=torch.long, device=device) if (_doc_idx is not None and return_stats) else None
+    _doc_idx_dev = torch.as_tensor(_doc_idx, dtype=torch.long, device=device) if _doc_idx is not None else None
     for _a in need_reg_layers:
         _a.need_reg = False
     if collect_block_stats:
@@ -18045,7 +18215,7 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
                 # equivalence, design notes §6.2).
                 _sel_host = torch.sort(_sel).values
                 _sel_sorted = _sel_host.to(device)
-                print(f'[eval_ppl] scoring a uniform sample of {_k}/{_flat} target rows (eval_rows={int(eval_rows)}, eval_seed={eval_seed}) — this is a SAMPLED estimate, not the full-set PPL')
+                print(f'[eval_ppl] scoring a uniform sample of {_k}/{_flat} target POSITIONS (eval_rows={int(eval_rows)} counts token positions, not rows; eval_seed={eval_seed}) — this is a SAMPLED estimate, not the full-set PPL')
             else:
                 print(f'[eval_ppl] eval_rows={int(eval_rows)} covers the whole {_flat}-row target space; scoring the FULL set (this is the population statistic, not a sample)')
         _vhost = None
@@ -18067,7 +18237,7 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
         _span = max(0, int(val_batch.shape[1]) - 1)
 
         def _run_rows(i, cur):
-            nonlocal ntok, V, nll, _row_nll, _row_ntok
+            nonlocal ntok, V, nll, _row_nll, _row_ntok, _doc_nll, _doc_ntok
             _lo = _hi = 0
             if _sel is not None:
                 # Host-side range count on the sorted selection: chunks with
@@ -18101,6 +18271,7 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
                 if V is None:
                     V = _rows.size(-1)
                 _tgts = ids[_ri, _ci + 1]
+                _tgt_cols = _ci + 1
                 del _ri, _ci
                 _ce = F.cross_entropy(_rows, _tgts, reduction='none').double()
                 nll += _ce.sum()
@@ -18113,8 +18284,17 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
                     # accumulator would be an identity.
                     _row_nll += _det_segment_sum(_row_nll.numel(), _src_rows, _ce, dtype=torch.float64, sorted_indices=True)
                     _row_ntok += _det_segment_sum(_row_ntok.numel(), _src_rows, torch.ones_like(_src_rows), dtype=torch.long, sorted_indices=True)
+                    if _doc_idx_dev is not None:
+                        # Document cluster for each scored target (column
+                        # `_ci + 1`); the sorted global selection keeps these
+                        # ordinals non-decreasing, so the segmented sum needs
+                        # no re-sort.
+                        _didx = _doc_idx_dev[_src_rows, _tgt_cols]
+                        _doc_nll += _det_segment_sum(_n_docs, _didx, _ce, dtype=torch.float64, sorted_indices=True)
+                        _doc_ntok += _det_segment_sum(_n_docs, _didx, torch.ones_like(_didx), dtype=torch.long, sorted_indices=True)
+                        del _didx
                 ntok += int(_tgts.numel())
-                del _rows, _tgts, _ce, _src_rows
+                del _rows, _tgts, _ce, _src_rows, _tgt_cols
             else:
                 _tgts = ids[:, 1:]
                 for _s0 in range(0, _span, 64):
@@ -18128,6 +18308,13 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
                         _b = int(_ce.shape[0])
                         _row_nll[i:i + _b] += _ce.sum(dim=1)
                         _row_ntok[i:i + _b] += int(_ce.shape[1])
+                        if _doc_idx_dev is not None:
+                            # Targets are columns 1..span; the document
+                            # ordinal of a target column c is doc_index[:, c].
+                            _didx = _doc_idx_dev[i:i + _b, 1 + _s0:1 + min(_s0 + 64, _span)]
+                            _doc_nll += _det_segment_sum(_n_docs, _didx, _ce, dtype=torch.float64, sorted_indices=True)
+                            _doc_ntok += _det_segment_sum(_n_docs, _didx, torch.ones_like(_didx), dtype=torch.long, sorted_indices=True)
+                            del _didx
                     del _lg, _ce
                 ntok += int(_tgts.numel())
                 del _tgts
@@ -18140,6 +18327,8 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
             _nll_snap = nll.clone()
             _rn_snap = _row_nll.clone() if return_stats else None
             _rt_snap = _row_ntok.clone() if return_stats else None
+            _dn_snap = _doc_nll.clone() if _doc_nll is not None else None
+            _dt_snap = _doc_ntok.clone() if _doc_ntok is not None else None
             _stats_snap = _snapshot_block_stats(model) if collect_block_stats else None
             try:
                 _run_rows(i, _cur)
@@ -18148,6 +18337,9 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
                 if return_stats:
                     _row_nll.copy_(_rn_snap)
                     _row_ntok.copy_(_rt_snap)
+                if _dn_snap is not None:
+                    _doc_nll.copy_(_dn_snap)
+                    _doc_ntok.copy_(_dt_snap)
                 if _stats_snap is not None:
                     _restore_block_stats(_stats_snap)
                 if ('out of memory' in str(_oe).lower()) and _cur > 1:
@@ -18175,6 +18367,10 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
         _empty = {'ppl': float('nan'), 'nll_sum': float('nan'), 'n_tokens': 0,
                   'nll_per_row': [], 'n_tokens_per_row': [], 'eval_rows': int(eval_rows) if eval_rows is not None else None,
                   'eval_seed': int(eval_seed), 'eval_subset': int(val_batch.shape[0])}
+        if _doc_idx is not None:
+            _empty.update({'doc_nll': [0.0] * _n_docs, 'doc_ntok': [0] * _n_docs,
+                           'n_docs': int(_n_docs), 'doc_ppl': [None] * _n_docs,
+                           'cluster_unit': 'document (loader doc_index)'})
         if collect_block_stats:
             _empty['compression'] = _compression_out
         return _empty
@@ -18194,6 +18390,17 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
         'eval_seed': int(eval_seed),
         'eval_subset': int(val_batch.shape[0]),
     }
+    if _doc_nll is not None:
+        _dn = [float(x) for x in _doc_nll.detach().cpu().tolist()]
+        _dt = [int(x) for x in _doc_ntok.detach().cpu().tolist()]
+        _out.update({
+            'doc_nll': _dn,
+            'doc_ntok': _dt,
+            'n_docs': int(_n_docs),
+            'doc_ppl': [_safe_exp_ppl((n / t) if t > 0 else None) for n, t in zip(_dn, _dt)],
+            'doc_ci': _nll_doc_ci(_dn, _dt),
+            'cluster_unit': 'document (loader doc_index)',
+        })
     if collect_block_stats:
         _out['compression'] = _compression_out
     return _out
@@ -22256,13 +22463,16 @@ def _seed_t_ci(ppls, alpha=0.05):
     return [mu - half, mu + half]
 
 def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
-    """Document-level bootstrap CI for the pooled PPL.
+    """Bootstrap CI for the pooled PPL over the records' NLL rows.
 
-    Rows are the fixed evaluation documents shared by every seed; resampling
-    ROWS (not tokens) preserves the within-document correlation.  If any
-    record lacks per-row NLL, no CI is invented — the caller must see the
-    missing-evidence state rather than a narrow interval computed from the
-    wrong unit.
+    The resampled unit is whatever ``nll_per_row`` represents: the fixed
+    evaluation windows in the v12 records (NOT documents — a window can span
+    document boundaries), or true document totals when the caller supplies
+    ``eval_ppl`` records built with ``doc_index=``.  Resampling rows (not
+    tokens) preserves within-unit correlation, but the caller must report the
+    unit honestly.  If any record lacks per-row NLL, no CI is invented — the
+    caller must see the missing-evidence state rather than a narrow interval
+    computed from the wrong unit.
     """
     _n_boot = _valid_bootstrap_count(n_boot, minimum=2)
     _seed = _rng_seed_int(seed)

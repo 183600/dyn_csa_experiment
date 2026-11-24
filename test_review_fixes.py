@@ -17,10 +17,12 @@
 运行：python test_review_fixes.py   （需要 torch；无 torch 的环境全部跳过
 并给出非零提醒码 0——CI 以「SKIPPED」字样识别）。"""
 import contextlib
+import copy as _copy
 import io
 import json
 import math
 import os
+import pathlib
 import random
 import shutil
 import sys
@@ -12197,6 +12199,227 @@ def t_v12_finaltest_manifest_fallback():
         assert 'KeyError' not in msg and 'TypeError' not in msg, msg
 
 
+
+# ---------------------------------------------------------------------------
+# N87-N95: audit-6 fixes (compute proxy, pure HCA, doc-level eval, one-shot
+# lock, exact recipe ints, kernel pool contract, manifest version, ce targets)
+# ---------------------------------------------------------------------------
+
+def t_compute_proxy_does_not_certify_matching():
+    # Parameter-matched, equal tokens: the 6ND proxy is exactly 1.0, but it
+    # cannot certify equal compute for different architectures.
+    recs = {('a', 'p', 0): {'params': 1000, 'tokens_seen': 100},
+            ('b', 'p', 0): {'params': 1000, 'tokens_seen': 100}}
+    c = L._compute_control_detail(recs, 'a', 'b')
+    assert c['compute_matched'] is None, c
+    assert c['compute_verifiable'] is False, c
+    assert c['proxy_ratio_a_over_b'] == 1.0, c
+    assert 'NOT established' in (c['note'] or ''), c
+    # A measured timing allocation can certify *time* matching (not FLOPs).
+    timed = {('a', 'p', 0): {'params': 1000, 'tokens_seen': 100, 'train_time_s': 10.0},
+             ('b', 'p', 0): {'params': 1400, 'tokens_seen': 100, 'train_time_s': 10.0}}
+    t = L._compute_control_detail(timed, 'a', 'b')
+    assert t['compute_matched'] is True and t['compute_verifiable'] is True, t
+    assert t['flops_matched'] is None, t
+    assert 'not FLOPs' in t['compute_matched_source'], t
+
+
+def t_pure_hca_variants_exist_and_are_pure():
+    for v in V7.PURE_HCA_VARIANTS:
+        cfgs = L.make_layer_cfgs(5, v)
+        assert len(cfgs) == 5
+        assert all(getattr(c, 'kind', None) == 'hca' for c in cfgs), (v, [c.kind for c in cfgs])
+    assert all(getattr(c, 'kind', None) == 'hca'
+               for c in L.make_layer_cfgs(3, 'hca_dynamic_rope'))
+    assert any(getattr(c, 'kind', None) == 'csa'
+               for c in L.make_layer_cfgs(3, 'hybrid_fixed_rope')), 'the hybrid arm must not be labelled pure HCA'
+    # Every factorial arm resolves and every layer is the declared family.
+    for v in V7.FACTORIAL_VARIANTS:
+        cfgs = L.make_layer_cfgs(2, v)
+        fam = 'hca' if v.startswith('hca_') else 'csa'
+        assert all(getattr(c, 'kind', None) == fam for c in cfgs), v
+    # Pure HCA trains and is causally prefix-stable under a future-token edit
+    # (float last-bit dispersion is allowed; information leakage is not).
+    torch.manual_seed(0)
+    dev = torch.device('cpu')
+    cfgs = L.make_layer_cfgs(2, 'hca_dynamic_rope')
+    model = L.SmallGPT(256, 64, 2, 4, 16, 128, _copy.deepcopy(cfgs)).to(dev)
+    model.eval()
+    ids = torch.randint(0, 256, (2, 64))
+    with torch.inference_mode():
+        full = model(ids)
+        pert = ids.clone()
+        pert[:, 32:] = torch.randint(0, 256, (2, 32))
+        out = model(pert)
+    assert torch.allclose(out[:, :32], full[:, :32], atol=1e-4, rtol=1e-4), 'HCA dynamic leaked future tokens'
+    model.train()
+    loss = model(ids, targets=ids, vocab=256)
+    loss.backward()
+    assert math.isfinite(float(loss)), loss
+
+
+def t_followup_validator_checks_registry():
+    import validate_followup_design as VF
+    plan = json.load(open(os.path.join(REPO, 'followup_design.template.json'), encoding='utf-8'))
+    errs = VF.validate(plan, verify_registry=True, repo=pathlib.Path(REPO))
+    assert not any('pure HCA' in e for e in errs), errs
+    assert not any('dense variant' in e for e in errs) or any('TODO' in e for e in errs), errs
+    bad = json.loads(json.dumps(plan))
+    for arm in bad['design']['factorial_arms']:
+        if arm['id'] == 'hca_fixed':
+            arm['variant'] = 'hybrid_fixed_rope'
+    errs = VF.validate(bad, verify_registry=True, repo=pathlib.Path(REPO))
+    assert any('not a pure HCA arm' in e for e in errs), errs
+    bad2 = json.loads(json.dumps(plan))
+    bad2['design']['dense_controls'][0]['variant'] = 'csa_fixed_rope'
+    errs2 = VF.validate(bad2, verify_registry=True, repo=pathlib.Path(REPO))
+    assert any('not a dense' in e for e in errs2), errs2
+
+
+def t_doc_index_eval_aggregates_real_documents():
+    torch.manual_seed(0)
+    dev = torch.device('cpu')
+    model = L.SmallGPT(256, 64, 2, 4, 16, 64,
+                       _copy.deepcopy(L.make_layer_cfgs(2, 'full_rope'))).to(dev)
+    model.eval()
+    ids = np.asarray(np.random.default_rng(3).integers(0, 256, size=(3, 65)), dtype=np.int64)
+    doc = np.repeat(np.arange(8), 30)[:3 * 65].reshape(3, 65)
+    out = V7.eval_length_gen(model, ids, [32, 64], dev, max_pos=None, doc_index=doc)
+    for Ln in (32, 64):
+        cell = out[Ln]
+        assert cell['n_docs'] == doc.max() + 1, cell.get('n_docs')
+        assert sum(cell['doc_ntok']) == cell['n_tok'] == 3 * (Ln - 1)
+        assert abs(sum(cell['doc_nll']) - cell['nll_sum']) < 1e-9
+        assert cell['cluster_unit'].startswith('document'), cell['cluster_unit']
+        assert cell['doc_ci'] is not None and cell['doc_ci']['n_docs'] >= 2
+    stats = L.eval_ppl(model, ids, dev, return_stats=True, doc_index=doc)
+    assert sum(stats['doc_ntok']) == stats['n_tokens'] == 3 * 64
+    assert abs(sum(stats['doc_nll']) - stats['nll_sum']) < 1e-9
+    assert stats['n_docs'] == doc.max() + 1
+    sampled = L.eval_ppl(model, ids, dev, chunk=1, eval_rows=100, return_stats=True, doc_index=doc)
+    assert sum(sampled['doc_ntok']) == sampled['n_tokens'] == 100
+    # Truncated spans cannot carry a document layout; the cell is an error,
+    # not a silently shifted attribution.
+    trunc = V7.eval_length_gen(model, ids, [32], dev, max_pos=10, doc_index=doc)
+    assert 'error' in trunc[32], trunc[32]
+    # Shape/order violations are refused.
+    for bad in (doc[:, :64], doc[:, ::-1][:, :65]):
+        try:
+            L.eval_ppl(model, ids, dev, return_stats=True, doc_index=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('eval_ppl accepted a misaligned doc_index')
+
+
+def t_one_shot_lock_refuses_second_read():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, 'lock.json')
+        json.dump({'stage': 'preaccess', 'test_ids_fp': None}, open(p, 'w', encoding='utf-8'))
+        V12._refuse_repeated_test_read(p)  # pre-access is not an access
+        assert V12._lock_proves_test_access(p) is False
+        json.dump({'stage': 'reading', 'test_ids_fp': None, 'locked_at': 'x'},
+                  open(p, 'w', encoding='utf-8'))
+        assert V12._lock_proves_test_access(p) is True
+        try:
+            V12._refuse_repeated_test_read(p)
+        except SystemExit as e:
+            assert 'one-shot' in str(e) or 'second read' in str(e), e
+        else:
+            raise AssertionError('a read-started lock without a bound slice must refuse a retry')
+        # Once the slice is bound, a later stage='accessed' analysis is legal.
+        json.dump({'stage': 'reading', 'test_ids_fp': 'FP'}, open(p, 'w', encoding='utf-8'))
+        V12._refuse_repeated_test_read(p)
+
+
+def t_recipe_signature_exact_integer_knobs():
+    recipe = ('steps3000_sl512_bs12_nt8000000_lr0.0003_wd0.1_d256_L6_H8_Dh32_v8192_'
+              'wu50_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee250_es8_detcpu-eager_dfdeadbeef_csX')
+    sig = {'steps': 3000, 'sl': 512, 'bs': 12, 'nt': 8000000, 'lr': 0.0003,
+           'wd': 0.1, 'd': 256, 'L': 6, 'H': 8, 'Dh': 32, 'v': 8192,
+           'wu': 50, 'cl': 0.05, 'dlm': 10.0}
+    assert V12._recipe_matches_signature(recipe, sig) is True
+    for key, bad in (('steps', 3000.002), ('bs', 12.000001), ('nt', 8000000.5)):
+        assert V12._recipe_matches_signature(recipe, dict(sig, **{key: bad})) is False, key
+    # Float knobs keep the formatting tolerance.
+    assert V12._recipe_matches_signature(recipe, dict(sig, lr=0.0003000001)) is True
+
+
+def t_manifest_version_is_enforced():
+    with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
+        m = json.load(f)
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, 'm.json')
+        bad = dict(m, manifest_version=6)
+        json.dump(bad, open(p, 'w', encoding='utf-8'))
+        try:
+            V12._load_manifest(p)
+        except SystemExit as e:
+            assert 'manifest_version' in str(e), e
+        else:
+            raise AssertionError('a future manifest version must be refused')
+        nv = dict(m)
+        nv.pop('manifest_version')
+        json.dump(nv, open(p, 'w', encoding='utf-8'))
+        try:
+            V12._load_manifest(p)
+        except SystemExit as e:
+            assert 'manifest_version' in str(e), e
+        else:
+            raise AssertionError('a recipe signature without a schema version must be refused')
+
+
+def t_ce_loss_scored_column_denominator():
+    torch.manual_seed(0)
+    dev = torch.device('cpu')
+    model = L.SmallGPT(128, 32, 1, 2, 16, 64,
+                       _copy.deepcopy(L.make_layer_cfgs(1, 'full_rope'))).to(dev)
+    ids = torch.randint(0, 128, (2, 16))
+    targets = torch.randint(0, 128, (2, 10))
+    got = float(model(ids, targets=targets, vocab=128))
+    with torch.no_grad():
+        logits = model(ids)
+        want = float(torch.nn.functional.cross_entropy(
+            logits[:, :10].reshape(-1, 128), targets.reshape(-1), reduction='mean'))
+    assert abs(got - want) < 1e-6, (got, want)
+    try:
+        model(ids, targets=torch.randint(0, 128, (2, 17)), vocab=128)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('targets wider than ids must be refused')
+
+
+def t_kernel_pool_contract_and_open_block_guard():
+    import csa_kernels as K
+    dev = torch.device('cpu')
+    T, c = 8, 4
+    geom = K.PoolGeometry([torch.tensor([4, 4])], None, T, dev, 4)
+    Xa, Za = torch.randn(1, T, c), torch.randn(1, T, c)
+    B = torch.zeros(5, c)
+    bid = torch.tensor([0, 1, 0, 1, 0, 1, 0, 1], dtype=torch.int32)
+    try:
+        K.pool_variable_blocks_kernel(Xa, None, Za, None, bid, geom, B, B, impl='ref')
+    except ValueError as e:
+        assert 'contiguous' in str(e), e
+    else:
+        raise AssertionError('non-monotone block ids must not be silently pooled')
+    ok = K.pool_variable_blocks_kernel(
+        Xa, None, Za, None, torch.arange(T, dtype=torch.int32) // 4, geom, B, B, impl='ref')
+    assert ok[0].shape == (1, 2, c)
+    # The fused entry point refuses the open-block read rule before touching x.
+    cfg = L.AttnCfg(kind='hca', dynamic=False, block_size=64,
+                    open_block_mode='prefix_singletons',
+                    selection_budget='all_closed_plus_prefix')
+    dummy = type('A', (), {'cfg': cfg})()
+    try:
+        K.sparse_layer_forward(dummy, torch.zeros(1, 4, 8), None, None, None)
+    except RuntimeError as e:
+        assert 'open_block_mode' in str(e), e
+    else:
+        raise AssertionError('sparse_layer_forward accepted open_block_mode')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -12577,6 +12800,15 @@ def main():
     _check('N84 invalid report p-values stay untestable', t_report_registers_invalid_pvalues_as_untestable)
     _check('N85 archive excludes case-colliding manifest names', t_archive_manifest_case_collision_is_excluded)
     _check('N86 v12 finaltest honours the manifest fallback', t_v12_finaltest_manifest_fallback)
+    _check('N87 compute proxy never certifies equal compute', t_compute_proxy_does_not_certify_matching)
+    _check('N88 pure HCA variants exist, are pure and causal', t_pure_hca_variants_exist_and_are_pure)
+    _check('N89 follow-up validator checks the variant registry', t_followup_validator_checks_registry)
+    _check('N90 doc_index eval aggregates real documents', t_doc_index_eval_aggregates_real_documents)
+    _check('N91 one-shot lock refuses a second test read', t_one_shot_lock_refuses_second_read)
+    _check('N92 recipe signature uses exact integer knobs', t_recipe_signature_exact_integer_knobs)
+    _check('N93 manifest schema version is enforced', t_manifest_version_is_enforced)
+    _check('N94 ce_loss denominator counts scored columns only', t_ce_loss_scored_column_denominator)
+    _check('N95 kernel pool contract + open-block guard', t_kernel_pool_contract_and_open_block_guard)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

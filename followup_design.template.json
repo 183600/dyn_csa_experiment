@@ -17,8 +17,8 @@
     "factorial_arms": [
       {"id": "csa_fixed", "family": "CSA", "segmentation": "fixed", "variant": "csa_fixed_rope"},
       {"id": "csa_dynamic", "family": "CSA", "segmentation": "dynamic", "variant": "csa_dynamic_rope"},
-      {"id": "hca_fixed", "family": "HCA", "segmentation": "fixed", "variant": "TODO_PURE_HCA_FIXED"},
-      {"id": "hca_dynamic", "family": "HCA", "segmentation": "dynamic", "variant": "TODO_PURE_HCA_DYNAMIC"}
+      {"id": "hca_fixed", "family": "HCA", "segmentation": "fixed", "variant": "hca_fixed_rope"},
+      {"id": "hca_dynamic", "family": "HCA", "segmentation": "dynamic", "variant": "hca_dynamic_rope"}
     ],
     "dense_controls": [
       {"id": "dense_param_matched", "matching": "parameter_count", "variant": "full_rope"},

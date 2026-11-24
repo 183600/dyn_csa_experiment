@@ -810,9 +810,39 @@ class FusedPool(torch.autograd.Function):
         return (None, gXa, gXb, gZa, gZb, None, None, gBpa, gBpb)
 
 
+def _check_contiguous_bid(bid, geom):
+    """Fail closed unless ``bid`` is the contiguous non-decreasing run table
+    the kernel pools assume.
+
+    The Triton/reference pool never reads ``bid``: it pools the runs encoded
+    in ``geom.counts/starts``.  Eager ``pool_variable_blocks`` also accepts
+    arbitrary block ids (it sorts them internally).  Accepting such an input
+    here would silently pool a different token set, so the public wrapper
+    refuses instead of guessing.  ``CSA_KERNEL_ASSUME_MONOTONE=1`` skips the
+    check for callers that can prove the precondition (the segmenters emit
+    contiguous monotone ids by construction).
+    """
+    if os.environ.get('CSA_KERNEL_ASSUME_MONOTONE', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        return
+    b = bid.reshape(-1).to(torch.int64)
+    if b.numel() == 0:
+        return
+    d = b[1:] - b[:-1]
+    if bool(((d == 0) | (d == 1)).all()) and int(b[0]) == 0 and int(b[-1]) == int(geom.Bm) - 1:
+        return
+    raise ValueError(
+        'kernel pool requires contiguous non-decreasing block ids 0..Bm-1; '
+        'the eager reference also accepts arbitrary ids (it sorts them), but '
+        'the fused pool would silently pool the wrong tokens.  Call the eager '
+        'path for arbitrary ids, or set CSA_KERNEL_ASSUME_MONOTONE=1 only when '
+        'the ids are provably contiguous (which every segmenter in this repo '
+        'guarantees).')
+
+
 def pool_variable_blocks_kernel(Xa, Xb, Za, Zb, bid, geom, B_pos_a, B_pos_b, impl=None):
     """`exp_lib.pool_variable_blocks` 的内核路径（批量化：R 行一次过）。
     返回 (comp [R, Bm, c], last_tok [R, Bm] int32, Bm)。"""
+    _check_contiguous_bid(bid, geom)
     impl = impl or _op_impl('POOL')
     comp = FusedPool.apply(impl, Xa, Xb, Za, Zb, bid, geom, B_pos_a, B_pos_b)
     return comp, geom.last_tok, geom.Bm
@@ -820,6 +850,7 @@ def pool_variable_blocks_kernel(Xa, Xb, Za, Zb, bid, geom, B_pos_a, B_pos_b, imp
 
 def pool_blocks_single_kernel(X, Z, bid, geom, B_pos, impl=None):
     """`exp_lib.pool_blocks_single` 的内核路径（HCA：仅 A 泳道）。"""
+    _check_contiguous_bid(bid, geom)
     impl = impl or _op_impl('POOL')
     comp = FusedPool.apply(impl, X, None, Z, None, bid, geom, B_pos, B_pos)
     return comp, geom.last_tok, geom.Bm
@@ -2727,6 +2758,14 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     - 门控正则 gate_mean 与 eager 的 (nblk-1 + Σ gate·hon)/T 逐行同式。
     """
     cfg = attn.cfg
+    # The fused path implements only the closed-block read rule.  Refuse the
+    # open-block modes here as well, not just in HybridAttention.forward: a
+    # direct caller would otherwise run a different read rule silently.
+    if str(getattr(cfg, 'open_block_mode', 'closed')) != 'closed':
+        raise RuntimeError(
+            'CSA_KERNEL does not implement open_block_mode != "closed" (the '
+            'prefix-candidate construction has no fused twin); unset CSA_KERNEL '
+            'for open-block arms or call the eager path.')
     # 逐算子解析后端：显式 impl= 强制全部三算子；
     # impl=None 时各算子吃自己的 CSA_KERNEL_{POOL,IDX,ATTN} 覆盖（空则跟随
     # 全局 CSA_KERNEL）。

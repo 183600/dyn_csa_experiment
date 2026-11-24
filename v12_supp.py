@@ -275,6 +275,48 @@ def _lock_proves_test_access(path):
     return False
 
 
+_READ_STARTED_STAGES = ('reading', 'read-started', 'read_started')
+
+
+def _refuse_repeated_test_read(path):
+    """Refuse a second read after a previous attempt began reading the split.
+
+    The two-phase lock writes ``stage='reading'`` immediately BEFORE
+    ``load_wikitest`` and upgrades it to ``'accessed'`` with the exact slice
+    fingerprint immediately after the read.  If the process dies (or a later
+    gate aborts) between those two writes, the held-out split may already have
+    been read even though no fingerprint was bound.  A retry must not read it
+    again: one-shot access is the protocol, not an aspiration.  ``V12_REFREEZE=1``
+    is the explicit, logged override (it downgrades the earlier round to
+    exploratory).
+    """
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding='utf-8') as _jf:
+            lock = json.load(_jf)
+    except Exception as _e:
+        raise SystemExit(f'[v12] REFUSE: freeze lock {path} exists but cannot be parsed '
+                         f'({type(_e).__name__}: {_e}); cannot prove whether the test split '
+                         'was already read')
+    if not isinstance(lock, dict):
+        raise SystemExit(f'[v12] REFUSE: freeze lock {path} is not a JSON object; cannot '
+                         'prove whether the test split was already read')
+    _stage = str(lock.get('stage') or '').strip().lower()
+    if _stage in _READ_STARTED_STAGES and lock.get('test_ids_fp') is None:
+        if os.environ.get('V12_REFREEZE', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+            print('[v12] WARNING: V12_REFREEZE=1 — a previous run began reading the test split '
+                  'without binding a slice; this re-read is conscious and the earlier round is '
+                  'downgraded to exploratory')
+            return
+        raise SystemExit(
+            f'[v12] REFUSE: {path} records a test-read attempt that never bound a slice '
+            f'(stage={_stage!r}, test_ids_fp=None, locked_at={lock.get("locked_at")}). '
+            'The held-out split may already have been read, so a second read would break the '
+            'one-shot protocol. Investigate the earlier failure; V12_REFREEZE=1 consciously '
+            're-freezes and downgrades the earlier round to exploratory.')
+
+
 def _p5c_post_access_guard():
     """Refuse P5C (re)training once the test split has been accessed.
 
@@ -412,6 +454,17 @@ def _load_manifest(path):
             raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an exact integer')
         return int(f)
 
+    # A manifest that pins a machine-checkable training-recipe signature is a
+    # real pre-registration, not a smoke/synthetic fixture.  Its schema version
+    # must be one this analyzer understands: a future version with different
+    # normative fields must not be silently interpreted under v5 semantics.
+    _sig_block = (m.get('binding') or {}).get('training_recipe_signature') if isinstance(m.get('binding'), dict) else None
+    if isinstance(_sig_block, dict) and _sig_block:
+        if m.get('manifest_version') is None:
+            raise SystemExit(f'[v12] REFUSE: freeze manifest {path} declares a training-recipe signature but no manifest_version — the analyzer cannot know which normative schema it must enforce')
+        _mv = _int_field(m.get('manifest_version'), 'manifest_version')
+        if _mv != 5:
+            raise SystemExit(f'[v12] REFUSE: freeze manifest {path} declares manifest_version={_mv}, but this analyzer implements version 5 only; a newer schema must not be interpreted under older semantics (update the analyzer and re-freeze consciously)')
     _exp = m.get('code_semantics_expected')
     if L._kernel_stamp():
         # The frozen plan was pre-registered for the eager measurement
@@ -953,6 +1006,19 @@ def _implementation_reason(rec, impl):
     return None
 
 
+_CKPT_SHA_RE = re.compile(r'^[0-9a-f]{64}$')
+
+
+def _ckpt_sha_reason(rec):
+    """Why a real P5T record lacks the frozen checkpoint hash binding."""
+    sha = rec.get('ckpt_sha256')
+    if not isinstance(sha, str) or _CKPT_SHA_RE.fullmatch(sha) is None:
+        return ('ckpt_sha256 is missing or not a 64-hex SHA-256; the frozen '
+                'binding.checkpoint.hash requires the evaluated weights to be '
+                'identified by their hash')
+    return None
+
+
 # The length-checkpoint writer (v7_supp.run_lenphase_cell — used by P3MT /
 # P4MT / P5C, the phases whose checkpoints P5T evaluates) records a bespoke
 # `p1l_...` recipe, NOT a run_cfg fingerprint.  It carries the same training
@@ -978,6 +1044,12 @@ def _recipe_knobs(recipe):
     out = dict(m.groupdict())
     out.update(_P1L_ARCH)
     return out
+
+
+# Structural recipe fields that must match exactly (no float tolerance).
+# lr/wd/cl/dlm/mr are the only non-count knobs the frozen signature pins.
+_RECIPE_INT_KEYS = frozenset({'steps', 'sl', 'bs', 'nt', 'v', 'wu',
+                              'd', 'L', 'H', 'Dh', 'ee', 'es'})
 
 
 def _recipe_matches_signature(recipe, sig):
@@ -1014,10 +1086,19 @@ def _recipe_matches_signature(recipe, sig):
             return False
         if isinstance(got, (bool, np.bool_)) or isinstance(want, (bool, np.bool_)):
             return False
+        if k in _RECIPE_INT_KEYS:
+            # Structural counts are exact identities: a near-miss float such
+            # as steps=3000.002 or bs=12.000001 is a different recipe, not a
+            # formatting artefact.  `_as_seed_int` refuses fractional and
+            # boolean spellings rather than truncating them.
+            _gi, _wi = L._as_seed_int(got), L._as_seed_int(want)
+            if _gi is None or _wi is None or _gi != _wi:
+                return False
+            continue
         try:
-            # Recipes format floats with limited precision (e.g. mr{:.8g});
-            # compare numerically with a tolerance far tighter than any real
-            # protocol difference but wider than the formatting round-trip.
+            # Non-count knobs (lr/wd/cl/dlm/mr) are formatted with limited
+            # precision (e.g. mr{:.8g}); compare with a tolerance far tighter
+            # than any real protocol difference but wider than that round-trip.
             if not math.isclose(float(got), float(want), rel_tol=1e-6, abs_tol=1e-9):
                 return False
         except (TypeError, ValueError, OverflowError):
@@ -2139,10 +2220,17 @@ def run_finaltest(cfg=None, guard=None):
                     print(f'  [p5t power] {_k}: n={_v.get("n_paired_seeds")} power(q=0.80)={_pw if _pw is None else round(float(_pw), 4)} min_same_sign={_v.get("min_same_sign_for_holm_confirmation")}')
                 if _pow.get('low_power_warnings'):
                     print(f'[v12] WARNING: the pre-access power artifact flags LOW POWER for {_pow["low_power_warnings"]} — the confirmation may be resolution-limited; this was known BEFORE the access')
-    # Write the pre-access attestation only AFTER every zero-GPU gate passed,
-    # and still BEFORE reading the held-out split, so a manifest mismatch is
-    # discovered before the one-shot access is used.
-    _check_or_write_freeze_lock(outdir, manifest, None, stage='preaccess',
+    # Refuse a second read if a previous attempt started one without binding
+    # a slice (crash between the two lock writes).  This check must run BEFORE
+    # the 'reading' attestation below, which would otherwise look like the
+    # current attempt's own record.
+    _refuse_repeated_test_read(_lock_path)
+    # Write the read-started attestation only AFTER every zero-GPU gate passed,
+    # and still BEFORE reading the held-out split.  `stage='reading'` (not
+    # 'preaccess') is deliberate: if the read or any later gate fails, the
+    # lock already proves that the one-shot access was consumed, so a retry
+    # cannot read the held-out split again.
+    _check_or_write_freeze_lock(outdir, manifest, None, stage='reading',
                                 train_fp=_want_train_fp)
     if test_ids is None:
         _t0 = time.time()
@@ -2447,6 +2535,10 @@ def _admit_confirmation_records(raw, manifest):
                 why = 'recipe does not match the frozen training_recipe signature (including the per-arm mr)'
             elif _implementation_reason(r, impl) is not None:
                 why = _implementation_reason(r, impl)
+            elif _require_ckpt and not r.get('plan_synthetic') and _ckpt_sha_reason(r) is not None:
+                why = _ckpt_sha_reason(r)
+            elif _want_per_doc and _want_nseq and _per_doc_rows_reason(r, _want_nseq) is not None:
+                why = _per_doc_rows_reason(r, _want_nseq)
             elif not isinstance(r.get('by_len'), dict) or not r.get('by_len'):
                 why = 'no by_len measurement'
             elif not any(isinstance(_c, dict) and L.ppl_is_usable(_c.get('ppl'))
@@ -2478,6 +2570,13 @@ def _admit_confirmation_records(raw, manifest):
         raise SystemExit(f'[p5t stats] REFUSE: admissible records span {len(fps)} different test-slice fingerprints ({sorted(fps)}) — the whole panel must be measured on ONE frozen test slice, not merely pairwise-equal fingerprints')
     if len(train_fps) > 1:
         raise SystemExit(f'[p5t stats] REFUSE: admissible records were trained on {len(train_fps)} different corpora ({sorted(train_fps)}) — all frozen arms must share the canonical training split')
+    _det_vals = set()
+    for _r in admitted.values():
+        _tk = _r.get('train_knobs')
+        if isinstance(_tk, dict) and _tk.get('det') is not None:
+            _det_vals.add(str(_tk.get('det')))
+    if len(_det_vals) > 1:
+        raise SystemExit(f'[p5t stats] REFUSE: admissible records span {len(_det_vals)} different deterministic-mode settings ({sorted(_det_vals)}) — the arms were not trained under one implementation binding, so their differences mix the arm with the run mode')
     if not _want_nseq and admitted:
         # A descriptive manifest may omit the eval block, but if the
         # records DO carry a row count it is still part of the estimand.  Do
@@ -2590,7 +2689,14 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     # within-document correlation.
     _ci_ppl = L.bootstrap_mean_ci(arr, seed=20261018)
     _ci_log = L.bootstrap_mean_ci(lr, seed=20261018)
-    return {'n_docs': int(len(doc_deltas)), 'n_seeds': len(common),
+    return {'n_docs': int(len(doc_deltas)), 'n_units': int(len(doc_deltas)),
+            'unit': 'fixed evaluation windows (sequence rows), NOT documents',
+            'unit_note': ('the frozen v12 panel is 16 fixed 4096-token windows from the '
+                          'first stream slice; a window can span document boundaries, so '
+                          'these intervals quantify window/row sampling, not document '
+                          'sampling.  A true document-level CI requires the loader '
+                          'doc_index path and is a follow-up-study requirement.'),
+            'n_seeds': len(common),
             'per_doc_delta_mean': _md,
             'per_doc_log_ratio_mean': _mlr,
             'between_doc_sd': _sdd if len(doc_deltas) > 1 else 0.0,
@@ -2599,8 +2705,8 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
             'per_doc_delta_ppl_ci95': ([_ci_ppl['ci_low'], _ci_ppl['ci_high']] if _ci_ppl else None),
             'per_doc_log_ratio_ci95': ([_ci_log['ci_low'], _ci_log['ci_high']] if _ci_log else None),
             'incomplete_doc_seed_cells': int(incomplete),
-            'ci_method': 'percentile bootstrap over documents (chunked, deterministic); conditions on the trained seeds',
-            'note': 'document-sampling uncertainty only; seed-level exact sign-flip remains the confirmatory test, and n_seqs<64 does not cover the language-population distribution — enlarge the row panel for population-level claims (design_notes section 20)'}
+            'ci_method': 'percentile bootstrap over the fixed evaluation rows/windows (chunked, deterministic), NOT over documents; conditions on the trained seeds',
+            'note': 'row/window-sampling uncertainty only (the unit is the fixed evaluation window, not a document); seed-level exact sign-flip remains the confirmatory test, and n_seqs<64 does not cover the language-population distribution — enlarge the row panel for population-level claims and use the loader doc_index path for true document clustering (design_notes section 20)'}
 
 
 def _test_probe_stats(probe_path, manifest, slice_fp):
@@ -3686,6 +3792,10 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
                 'train_fp': (_frozen_train_fp(m) or 'plan-train-fp'),
                 '_code': L.code_stamp(), 'manifest_sha256': m.get('manifest_sha256'),
                 'recipe': _recipe, 'train_knobs': _tk, 'n_seq': int(_nseq),
+                # the plan's records are synthetic and carry no checkpoint
+                # hash; admit_confirmation_records skips only that field for
+                # them (never for a real P5T record).
+                'plan_synthetic': True,
                 # the real parameter count computed for this arm's frozen shape
                 # above (never a hard-coded constant): admission does not check
                 # params, but the param-matched contract reads them from here.
