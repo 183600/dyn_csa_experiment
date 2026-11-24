@@ -315,3 +315,89 @@ candidate prior, saturated RoPE REINFORCE). Local run on the rebased tree:
 `tokenizers` imports on this box and the single skip is a sandbox
 POSIX-semaphore restriction — the CI job installs those dependencies. The
 zero-GPU preflight (`python v12_supp.py plan`) still admits 48/48 records.
+
+## 2026-11-24 — review-9: evidence-completeness gates, per-seed init fix and a minimum-power gate (no new runs; no test-split access)
+
+An external source-level review raised nine methodological points. Seven are
+design limitations that the repository already discloses and (where code can
+enforce it) machine-gates; this entry does not relabel them:
+
+- **No evidence release / non-auditable numbers** — `RELEASES.md` has no row,
+  `results_*/` and `analysis_*/` are gitignored, and `audit_gates.py release`
+  reports `no_release`. That is a deliberate source-only policy, not a hidden
+  claim; nothing here makes a numeric claim auditable.
+- **v6-v11 reused the same validation split** — recorded in the manifest
+  `purpose` and treated as exploratory by construction; not promotable.
+- **The confirmation covers fixed-chunk CSA only** — `scope.not_covered`
+  names dynamic chunking, HCA and scaling laws, and
+  `FOLLOWUP_CONFIRMATORY_PROTOCOL.md` / `followup_design.template.json` /
+  `validate_followup_design.py` pre-register the 2x2 CSA/HCA factorial plus
+  both dense references. That study is still a DRAFT (`TODO_FLOPS_MATCHED_DENSE`,
+  no power simulation, gates unset) and must not be cited as evidence.
+- **Parameter-matched, not compute-matched, Dense** — `compute_budget_disclosure`
+  and every `interpretation_caveat` state the +69% MLP / ~1.87x FLOPs /
+  25%->3.1% read-fraction mismatch; `finaltest_stats` refuses a non-descriptive
+  plan that drops the disclosure.
+- **Default `csa_dynamic` boundaries are not task-learned** — the
+  `gate.detach() > 0.5` hard cut and the `comp_reg`-only offset gradient are
+  documented in design_notes §22.5; `csa_dynamic_task` is the opt-in
+  score-function alternative and is not part of the frozen confirmation.
+- **16 evaluation documents do not cover the language population** —
+  `MIN_DOCS_FOR_POPULATION_CLAIM = 64`; stats report per-document variance and
+  set `population_claim_allowed = False` at n_docs=16.
+- **The randidx / allblocks controls are not single-variable ablations** —
+  the fixed hash pattern (with ~201k dead projection parameters, see
+  design_notes for the 1,536-parameter correction) and the 1024-block read are
+  disclosed in each `interpretation_caveat`.
+
+Two points were real implementation defects and are fixed, and the review's
+power-gate recommendation is now normative:
+
+1. **`same_init_core_fp` pooled all seeds into one set.** A correct 12-seed
+   panel gives every seed its own shared-trunk initialization, so the field was
+   guaranteed `False`: it could not detect a real arm mismatch and it
+   mislabelled every correct panel. `finaltest_stats` now compares the two arms
+   WITHIN each seed and reports `init_core_fp_pairs_checked` /
+   `init_core_fp_mismatch_seeds` / `init_core_fp_missing_seeds`; the panel-level
+   `validity` block groups by seed (`init_core_fp_distinct`,
+   `init_core_fp_conflict_seeds`). The per-seed digest is now a CONFIRMED gate
+   (manifest v6): a missing or mismatching digest is unverifiable and cannot
+   confirm.
+2. **Unverifiable provenance could confirm.** The v5 rule
+   `param_matched is not false` treated a missing parameter count exactly like
+   a measured <=1% match. Manifest v6 requires `param_matched is True`; a
+   measured mismatch or an unverifiable `None` both withhold CONFIRMED.
+3. **Low power was only a warning.** `run_finaltest` checked that
+   `p5c_power.json` existed and was bound to the plan, then printed a warning
+   and consumed the one-shot split. Manifest v6 adds
+   `statistics.power_gate` (q=0.80, min_power=0.80): every primary
+   comparison's panel-specific power must be recorded and at or above the floor
+   or the access is refused; `V12_ACCEPT_LOW_POWER=1` is the explicit override,
+   written to `results_lm_test/power_gate.json` and carried into
+   `test_stats.json`. The 12-seed design's own q=0.80 Holm power is 0.275, so
+   the gate normally fires — that is the point: the operator must add seeds
+   (with a further recorded revision) or consciously accept a
+   resolution-limited confirmation. The override does not make the design
+   adequately powered.
+
+Plan revision **v6** (still strictly before any test-split access: no
+`results_lm_test/`, no freeze lock, no mirror, no evidence row) registers the
+new `decision_rule`, `validity_assumptions` and `power_gate`, and records that
+the change is a conservative tightening: it can withhold a CONFIRMED label but
+never create one. No arm, seed, endpoint, alpha or Holm family changed; no
+measurement semantics changed, so `CODE_SEMANTICS` stays `v11.128` and no
+existing record is invalidated.
+
+Not changed on purpose: the arm set (adding Dynamic/HCA arms would be a new
+pre-registered study, not a v12 amendment), the 12-seed count, the 16-document
+evaluation panel, the dense-arm capacity reallocation, and the default dynamic
+segmenter's gradient path. Those are scientific decisions that need their own
+registered design (the follow-up protocol) and, for the Power question, GPU
+runs — not an implementation-only patch.
+
+Regression coverage: `test_review_fixes.py` N96
+(`_power_gate_problem` floor/override/malformed cases), the rewritten
+`t_finaltest_decision_rule_matches_frozen_manifest` (per-seed digest across
+seeds = True, one-seed mismatch = False, missing digest/params = not
+confirmed), the updated `_frozen_rule_confirms` tests, and the v6 manifest
+assertions in `t_shipped_manifest_consistency`.

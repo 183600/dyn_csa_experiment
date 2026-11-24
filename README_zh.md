@@ -8,7 +8,7 @@
 
 > **证据等级**：v6–v11 为探索性（在同一 validation split 上选择后观察）；只有 v12 冻结的固定分块比较是确认性。详见 `DECISION_LOG.md` 与 `docs/design_notes.md` §17/§20。
 >
-> **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.128` 是冻结清单绑定的库测量语义戳，两者故意不同号。冻结清单当前为 `manifest_version: 5`（见其 `revision.history`；v4 移除了不可机检的 ee/es 钉定并补充了 tokenizer 拟合的 token 上限说明，v5 把 v4 注记中对已实现判定规则的描述更正回注册的 v3 措辞——规范性字段未变；两者仍在任何 test 访问之前）；按清单 v3 的 `ci_loop` 注记，continuous-loop CI 应保持停用直至签署后的提交固定且 P5T 完成——依赖此约定前请用 `gh workflow list` 核实工作流的实际状态。
+> **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.128` 是冻结清单绑定的库测量语义戳，两者故意不同号。冻结清单当前为 `manifest_version: 5`（见其 `revision.history`；v4 移除了不可机检的 ee/es 钉定并补充了 tokenizer 拟合的 token 上限说明，v5 把 v4 注记中对已实现判定规则的描述更正回注册的 v3 措辞——规范性字段未变；v6（2026-11-24）注册了保守的“证据完整性 + 最小功效”闸门，详见下文——均仍在任何 test 访问之前）；按清单 v3 的 `ci_loop` 注记，continuous-loop CI 应保持停用直至签署后的提交固定且 P5T 完成——依赖此约定前请用 `gh workflow list` 核实工作流的实际状态。
 
 > **证据状态（引用数字前必读）**：`results_*/`、`analysis_*/`、`REPORT*.md` 有意不入库，且**没有随仓库发布证据归档**（`RELEASES.md` 尚无记录）。报告可由你自己产生的产物重建，但任何你没有重建过的报告数值都无法独立复核。只有当 `release_<tag>.tar.gz` 与清单发布到只读位置并通过 `archive_release.py verify` 时，相应主张才可审计。
 
@@ -256,6 +256,23 @@ V12_REFREEZE=1 显式改冻结并把前轮降级为探索性）。test split
 （`wiki.test.raw`，经 `load_wikitest`）**只**被 P5T 读取——此前所有
 phase 只读 train/valid。首次 test split 评估之后禁止追加冻结比较或种子
 （构造性选择偏差，见 `DECISION_LOG.md`）。
+
+**清单修订 v6（2026-11-24，仍在任何 test 访问之前）** 补上审查指出的三处证据
+缺口，且只收紧、不放松：
+
+- **最小功效硬门**：`statistics.power_gate`（q=0.80，min_power=0.80）把访问前
+  功效模拟从“打印警告”变成闸门——每个主比较的 panel 功效（`p5c_power.json`）
+  必须落盘且不低于下限，否则 P5T 拒绝读取 test split；显式
+  `V12_ACCEPT_LOW_POWER=1` 是唯一覆盖，决定写入
+  `results_lm_test/power_gate.json` 并进入 `test_stats.json`。12-seed 设计自身
+  q=0.80 的 Holm 保守功效仅 0.275，因此该门通常会触发：诚实做法是加种子并记录
+  修订，或显式接受“分辨率受限”的确认。
+- **参数匹配必须可验证**：CONFIRMED 现要求 `param_matched is true`（实测
+  ≤1%）；v5 的“非 false”让无法验证的 None 与已验证等价，现不再接受。
+- **逐 seed 初始化配对**：`init_core_fp` 成为 CONFIRMED 闸门，每一对可用配对的
+  两臂必须记录相同的共享主干摘要；同时修复了聚合缺陷——旧实现把所有 seed 并成
+  一个集合，正确的 12-seed 面板必然 False，既发现不了真正的臂间不匹配、又会
+  误报正确面板。
 
 **范围声明**：本确认只覆盖**固定分块 CSA 机制**的主张；动态分块优于固定分块、动态边界的语义价值、HCA 的优劣与动态分块的规模规律**不在本确认内**，需要各自的预注册冻结。
 

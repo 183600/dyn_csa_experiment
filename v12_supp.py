@@ -410,6 +410,27 @@ def _load_manifest(path):
         raise SystemExit(f'[v12] REFUSE: primary_comparisons must be a non-empty list ({m.get("primary_comparisons")!r})')
     if not isinstance(m['statistics'], dict):
         raise SystemExit(f'[v12] REFUSE: statistics must be an object ({m.get("statistics")!r})')
+    # v6 minimum-power floor: validate its SHAPE at load time so a typo is a
+    # plan defect caught by `v12_supp.py plan`, not a surprise after the
+    # training run when P5T is about to consume the one-shot test split.
+    _pg_shape = m['statistics'].get('power_gate')
+    if _pg_shape is not None:
+        if not isinstance(_pg_shape, dict):
+            raise SystemExit(f'[v12] REFUSE: statistics.power_gate must be an object ({_pg_shape!r})')
+        for _k in ('q', 'min_power'):
+            _v = _pg_shape.get(_k)
+            if isinstance(_v, (bool, np.bool_, np.datetime64, np.timedelta64,
+                               complex, np.complexfloating)):
+                raise SystemExit(f'[v12] REFUSE: statistics.power_gate.{_k}={_v!r} is not a level')
+            try:
+                _f = float(_v)
+            except (TypeError, ValueError, OverflowError):
+                raise SystemExit(f'[v12] REFUSE: statistics.power_gate.{_k}={_v!r} is not numeric') from None
+            if not (math.isfinite(_f) and 0.0 < _f < 1.0):
+                raise SystemExit(f'[v12] REFUSE: statistics.power_gate.{_k}={_v!r} must be in (0,1)')
+        _ov = _pg_shape.get('override_env')
+        if _ov is not None and (not isinstance(_ov, str) or not _ov.strip()):
+            raise SystemExit(f'[v12] REFUSE: statistics.power_gate.override_env={_ov!r} must be a non-empty string')
     for _fld, _val in (('binding', m.get('binding')), ('eval', m.get('eval'))):
         if _fld in m and _val is None:
             raise SystemExit(f'[v12] REFUSE: {_fld} is explicitly null; omit it or provide an object')
@@ -2108,6 +2129,74 @@ def _power_artifact_problem(manifest, power):
     return None
 
 
+def _power_gate_problem(gate, power):
+    """Minimum-power gate declared by ``statistics.power_gate`` (manifest v6).
+
+    The v5 code checked only that a power artifact EXISTED and was bound to
+    this plan; a low-power read printed a warning and the one-shot test split
+    was consumed anyway.  v6 makes the pre-access power floor normative.
+
+    Returns ``(problem, readings)``: ``problem`` is None when every frozen
+    comparison records a finite panel-specific power at the declared ``q`` and
+    that power is >= ``min_power``; otherwise a human-readable reason.
+    ``readings`` maps comparison name -> {'power': float|None,
+    'n_paired_seeds': int|None} so the decision can be recorded even when it
+    passes (or when it is overridden).
+
+    A malformed gate fails closed (returns a problem) — an unreadable floor
+    must not silently disable the gate.
+    """
+    if not isinstance(gate, dict):
+        return (f'statistics.power_gate is {type(gate).__name__}, not an object', {})
+    _q_raw, _min_raw = gate.get('q'), gate.get('min_power')
+    _bad_nums = (bool, np.bool_, np.datetime64, np.timedelta64,
+                 complex, np.complexfloating)
+    if isinstance(_q_raw, _bad_nums) or isinstance(_min_raw, _bad_nums):
+        return ('statistics.power_gate q/min_power is a boolean/temporal/complex value, not a level', {})
+    try:
+        _q, _min = float(_q_raw), float(_min_raw)
+    except (TypeError, ValueError, OverflowError):
+        return ('statistics.power_gate q/min_power is not numeric', {})
+    if not (math.isfinite(_q) and 0.0 < _q < 1.0):
+        return (f'statistics.power_gate q={_q!r} is not in (0,1)', {})
+    if not (math.isfinite(_min) and 0.0 < _min < 1.0):
+        return (f'statistics.power_gate min_power={_min!r} is not in (0,1)', {})
+    if not isinstance(power, dict) or power.get('status') != 'ok':
+        _status = power.get('status') if isinstance(power, dict) else None
+        return (f"the power artifact status is {_status!r}, "
+                'not \'ok\' — the declared power floor cannot be evaluated', {})
+    _comps = power.get('comparisons')
+    if not isinstance(_comps, dict) or not _comps:
+        return ('the power artifact has no comparison entries', {})
+    _key = f'q={_q:.2f}'
+    readings, _below, _unverifiable = {}, [], []
+    for _name in sorted(_comps):
+        _entry = _comps.get(_name)
+        _pw = None
+        _n = None
+        if isinstance(_entry, dict):
+            _phc = _entry.get('power_holm_conservative')
+            _raw = _phc.get(_key) if isinstance(_phc, dict) else None
+            if not isinstance(_raw, _bad_nums):
+                try:
+                    _pw = float(_raw)
+                except (TypeError, ValueError, OverflowError):
+                    _pw = None
+            _n = L._as_seed_int(_entry.get('n_paired_seeds'))
+        readings[_name] = {'power': _pw if _pw is not None and math.isfinite(_pw) else None,
+                           'n_paired_seeds': _n}
+        if _pw is None or not math.isfinite(_pw):
+            _unverifiable.append(_name)
+        elif _pw < _min:
+            _below.append(f'{_name} ({_pw:.4f})')
+    if _unverifiable:
+        return (f'panel-specific power at {_key} is missing/non-finite for {_unverifiable}', readings)
+    if _below:
+        return (f'panel-specific power at {_key} is below the declared floor '
+                f'{_min:.2f} for {_below}', readings)
+    return None, readings
+
+
 def run_finaltest(cfg=None, guard=None):
     """Evaluate the FROZEN confirmation set on the held-out test split.
 
@@ -2246,6 +2335,40 @@ def run_finaltest(cfg=None, guard=None):
                     print(f'  [p5t power] {_k}: n={_v.get("n_paired_seeds")} power(q=0.80)={_pw if _pw is None else round(float(_pw), 4)} min_same_sign={_v.get("min_same_sign_for_holm_confirmation")}')
                 if _pow.get('low_power_warnings'):
                     print(f'[v12] WARNING: the pre-access power artifact flags LOW POWER for {_pow["low_power_warnings"]} — the confirmation may be resolution-limited; this was known BEFORE the access')
+                # v6 minimum-power gate: a low-power read is no longer a warning
+                # that the run may ignore.  Either the panel clears the declared
+                # floor, or the operator must consciously accept the
+                # resolution-limited read (V12_ACCEPT_LOW_POWER=1), and that
+                # decision is written next to the results and carried into
+                # test_stats.json.  Runs BEFORE the freeze lock: a refused
+                # access is not an access and must not write one.
+                _pgate = (manifest.get('statistics') or {}).get('power_gate')
+                if _pgate is not None:
+                    _pg_why, _pg_vals = _power_gate_problem(_pgate, _pow)
+                    _pg_ack = os.environ.get('V12_ACCEPT_LOW_POWER', '').strip().lower() in ('1', 'true', 'yes', 'on')
+                    _pg_record = {
+                        'kind': 'v12_power_gate',
+                        'checked_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                        'manifest': manifest.get('manifest_sha256'),
+                        'gate': _pgate,
+                        'comparisons': _pg_vals,
+                        'problem': _pg_why,
+                        'accepted_low_power': bool(_pg_why is not None and _pg_ack),
+                        'note': ('Pre-access minimum-power gate (manifest v6). A recorded override does '
+                                 'NOT make the design adequately powered; it only makes the '
+                                 'resolution-limited read explicit and auditable.'),
+                    }
+                    L.atomic_write_json(os.path.join(outdir, 'power_gate.json'), _pg_record)
+                    if _pg_why is not None and not _pg_ack:
+                        raise SystemExit(
+                            f'[v12] REFUSE: the pre-access power read misses the frozen '
+                            f'statistics.power_gate floor: {_pg_why}. Add seeds and record the '
+                            'manifest revision BEFORE the one-shot test access (the honest fix), '
+                            'or set V12_ACCEPT_LOW_POWER=1 to consciously accept a '
+                            f'resolution-limited confirmation; the decision is recorded in '
+                            f'{os.path.join(outdir, "power_gate.json")} and test_stats.json.')
+                    if _pg_why is not None:
+                        print(f'[v12] WARNING: V12_ACCEPT_LOW_POWER=1 — the power floor is missed ({_pg_why}); the override is recorded in power_gate.json and test_stats.json')
     # Refuse a second read if a previous attempt started one without binding
     # a slice (crash between the two lock writes).  This check must run BEFORE
     # the 'reading' attestation below, which would otherwise look like the
@@ -2927,16 +3050,25 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
 
 
 def _frozen_rule_confirms(holm_entry, comp, alpha, n_seeds_fallback=8):
-    """The manifest-v3 decision rule for ONE frozen comparison.
+    """The manifest-v6 decision rule for ONE frozen comparison.
 
     CONFIRMED iff p_holm < alpha (strict — the manifest text says
     `p_holm < 0.05`, while the generic holm_adjust `reject` uses `<=`) AND
-    direction_ok is True AND `param_matched is not false` (True or the
-    unverifiable None; only a measured >1% mismatch blocks) AND the effective
-    pair count reaches the declared min_seeds_for_confirmation floor.
-    `coverage_ok` and the init-core digests are reported instrumentation,
-    never decision inputs.  Both `finaltest_stats` and the report's fallback
-    call this ONE implementation so they cannot differ.
+    direction_ok is True AND the parameter match is VERIFIED (param_matched
+    is True; an unverifiable None no longer qualifies) AND the per-seed
+    shared-trunk initialization digest is RECORDED and EQUAL within every
+    usable pair AND the effective pair count reaches the declared
+    min_seeds_for_confirmation floor.  `coverage_ok` stays reported
+    instrumentation.  Both `finaltest_stats` and the report's fallback call
+    this ONE implementation so they cannot differ.
+
+    v6 rationale (pre-access amendment, see confirmation_frozen.json
+    revision.history): v5's `param_matched is not false` gave an
+    unverifiable parameter count the same confirmatory standing as a
+    measured <=1% match, and the init digests were instrumentation only.
+    Both fields are always written by the P5T record path, so on a real
+    panel this only withholds CONFIRMED labels from malformed provenance —
+    it cannot create one.
     """
     _ph = (holm_entry or {}).get('p_holm') if isinstance(holm_entry, dict) else None
     # A boolean is a flag, not a probability (float(False) == 0.0 would be the
@@ -2960,13 +3092,24 @@ def _frozen_rule_confirms(holm_entry, comp, alpha, n_seeds_fallback=8):
     if not isinstance(_dir, (bool, np.bool_)) or not bool(_dir):
         return False
     _pm = comp.get('param_matched')
-    # `is not False` in the manifest means True or unverifiable None; a
-    # measured False blocks.  Accept NumPy booleans (the other statistics
-    # helpers do, and `np.bool_ is False` is False), but refuse any other type
-    # instead of letting a truthy string through.
-    if _pm is not None:
-        if not isinstance(_pm, (bool, np.bool_)) or not bool(_pm):
-            return False
+    # v6: a CONFIRMED label requires COMPLETE evidence, not merely evidence
+    # that fails to contradict.  `is not False` let an unverifiable None
+    # through, so a record set without parameter counts was treated exactly
+    # like a measured <=1% match.  Accept NumPy booleans (the other
+    # statistics helpers do), but refuse every other type instead of letting
+    # a truthy string through.
+    if not isinstance(_pm, (bool, np.bool_)) or not bool(_pm):
+        return False
+    # v6: the per-seed matched-initialisation digest is a confirmation gate,
+    # not instrumentation.  The exact sign-flip only exchanges signs WITHIN a
+    # seed, so both arms of every usable pair must have started from the same
+    # shared trunk.  A missing digest is unverifiable and cannot confirm.
+    if not isinstance(comp.get('init_core_fp_recorded'), (bool, np.bool_)) \
+            or not bool(comp.get('init_core_fp_recorded')):
+        return False
+    if not isinstance(comp.get('same_init_core_fp'), (bool, np.bool_)) \
+            or not bool(comp.get('same_init_core_fp')):
+        return False
     # An explicitly measured pair count is used verbatim; only a MISSING field
     # falls back.  `or` would turn a measured 0 (or False) into a different
     # count, and int(12.9) would round a fractional count UP to a valid seed
@@ -3082,14 +3225,28 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                   for r in admitted.values()) if _t is not None})
     _inits = sorted({_t for _t in (L._content_fp_text(r.get('init_core_fp'))
                                   for r in admitted.values()) if _t is not None})
+    # Per-seed (not panel-wide) init check: each seed is its own shared-trunk
+    # initialization, so "all admitted records share ONE digest" is false on
+    # every correct panel.  What must hold is that every seed's admitted arms
+    # agree on that seed's digest.
+    _init_by_seed = {}
+    for (_v, _s), _r in admitted.items():
+        _it = L._content_fp_text(_r.get('init_core_fp'))
+        if _it is not None:
+            _init_by_seed.setdefault(int(_s), set()).add(_it)
+    _init_conflict_seeds = sorted(_s for _s, _vals in _init_by_seed.items() if len(_vals) > 1)
+    _n_admitted_seeds = len({int(_s) for (_v, _s) in admitted})
     stats['validity'] = {
         'rng_fp_values': _rngs,
         'same_rng_fp': len(_rngs) <= 1,
         'init_core_fp_values': _inits,
-        'same_init_core_fp': len(_inits) <= 1,
-        'init_core_fp_recorded': bool(_inits),
+        'init_core_fp_distinct': len(_inits),
+        'init_core_fp_seeds_recorded': len(_init_by_seed),
+        'init_core_fp_conflict_seeds': _init_conflict_seeds,
+        'init_core_fp_recorded': bool(_n_admitted_seeds) and len(_init_by_seed) == _n_admitted_seeds,
+        'same_init_core_fp': bool(_n_admitted_seeds) and len(_init_by_seed) == _n_admitted_seeds and not _init_conflict_seeds,
         'n_seq_values': sorted({n for n in (_record_int(r.get('n_seq')) for r in admitted.values()) if n is not None}),
-        'note': 'exact sign-flip requires within-seed exchangeability (same data order / eval rows / corruption grid). data_fp, train_fp, n_seq and recipe are machine-checked; the shared-trunk initialization digest (init_core_fp) is reported and compared (`same_init_core_fp`); rng_fp is reported but NOT enforced (architecture-induced RNG consumption is part of the arm), so the exchangeability claim remains a declared, machine-instrumented assumption.',
+        'note': 'exact sign-flip requires within-seed exchangeability (same data order / eval rows / corruption grid). data_fp, train_fp, n_seq and recipe are machine-checked; the shared-trunk initialization digest (init_core_fp) is machine-checked PER SEED (each seed must have exactly one digest across its admitted arms) and is a CONFIRMED gate in manifest v6; rng_fp is reported but NOT enforced (architecture-induced RNG consumption is part of the arm).',
     }
     # The frozen comparison is parameter-matched, not compute-matched.
     # Refuse a non-descriptive plan that does not disclose
@@ -3231,9 +3388,15 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             res['params_unverifiable_seeds'] = [
                 int(s) for s, pa, pb in zip(usable, _params_a, _params_b)
                 if pa is None or pa <= 0 or pb is None or pb <= 0]
-        # Every usable PAIR must carry a digest for both arms.
-        _iv = []
+        # Every usable PAIR must carry a text digest for both arms AND the two
+        # arms of the SAME seed must agree.  The pre-v6 check pooled all seeds
+        # into one set, so a correct 12-seed panel (each seed has its own
+        # shared-trunk initialization) always reported False: it could not
+        # detect a real arm mismatch and it flagged every correct panel.
         _init_complete = bool(usable)
+        _init_mismatch = []
+        _init_missing = []
+        _init_checked = 0
         for _s in usable:
             _ia = L._content_fp_text(recs_a[_s].get('init_core_fp'))
             _ib = L._content_fp_text(recs_b[_s].get('init_core_fp'))
@@ -3241,10 +3404,16 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                 # A boolean/empty/non-text digest is not a shared-trunk
                 # initialization identity; both arms must carry a text digest.
                 _init_complete = False
+                _init_missing.append(int(_s))
                 continue
-            _iv.extend((_ia, _ib))
+            _init_checked += 1
+            if _ia != _ib:
+                _init_mismatch.append(int(_s))
         res['init_core_fp_recorded'] = _init_complete
-        res['same_init_core_fp'] = bool(_init_complete and len(set(_iv)) <= 1)
+        res['init_core_fp_pairs_checked'] = _init_checked
+        res['init_core_fp_mismatch_seeds'] = sorted(_init_mismatch)
+        res['init_core_fp_missing_seeds'] = sorted(_init_missing)
+        res['same_init_core_fp'] = bool(_init_complete and not _init_mismatch)
         _act = []
         for _recs in (recs_a, recs_b):
             for s in usable:
@@ -3296,16 +3465,13 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # observed direction to match the validation-panel estimate (a null
     # expected_sign marks a non-directional mechanism readout).  The strict `<`
     # matches the manifest's `p_holm < 0.05` (the generic holm_adjust uses `<=`).
-    # The pre-registered decision rule (manifest v3) requires p_holm < alpha
-    # AND the observed direction AND `param_matched is not false` (True or
-    # unverifiable — None; only a measured >1% mismatch blocks) AND at least
-    # `min_seeds_for_confirmation` complete pairs.  `coverage_ok` (all 12
-    # seeds) is reported but is not an all-or-nothing veto: one failed
-    # L4096 cell may not annihilate an otherwise complete comparison.
-    # `same_init_core_fp` / `init_core_fp_recorded` are NOT decision inputs:
-    # the manifest records the init digest as reported instrumentation
-    # ("reported and compared"), so they stay in `not_confirmed_reasons`
-    # for transparency but never gate the CONFIRMED set.
+    # The pre-registered decision rule (manifest v6) requires p_holm < alpha
+    # AND the observed direction AND a VERIFIED parameter match (True, not the
+    # unverifiable None) AND a recorded, pairwise-equal per-seed
+    # initialization digest AND at least `min_seeds_for_confirmation` complete
+    # pairs.  `coverage_ok` (all 12 seeds) is reported but is not an
+    # all-or-nothing veto: one failed L4096 cell may not annihilate an
+    # otherwise complete comparison.
     _conf = [k for k in _rej if _frozen_rule_confirms(stats['holm'].get(k, {}),
                                                        stats['comparisons'].get(k, {}),
                                                        _alpha,
@@ -3318,24 +3484,23 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                           'min_seeds_for_confirmation': stats['comparisons'].get(k, {}).get('min_seeds_for_confirmation'),
                                           'direction_ok': stats['comparisons'].get(k, {}).get('direction_ok'),
                                           'same_init_core_fp': stats['comparisons'].get(k, {}).get('same_init_core_fp'),
-                                          'init_core_fp_recorded': stats['comparisons'].get(k, {}).get('init_core_fp_recorded')}
+                                          'init_core_fp_recorded': stats['comparisons'].get(k, {}).get('init_core_fp_recorded'),
+                                          'init_core_fp_mismatch_seeds': stats['comparisons'].get(k, {}).get('init_core_fp_mismatch_seeds')}
                                       for k in _rej if k not in _conf}
     # DISCLOSURE: the implemented rule is EXACTLY the manifest decision_rule
-    # (v3/v4 wording): "p_holm < alpha AND direction matches AND
-    # param_matched is not false AND >= min_seeds_for_confirmation complete
-    # pairs".  `param_matched is not false` means True or the unverifiable
-    # None both pass — only a measured >1% mismatch blocks — and the
-    # init-core digests are reported instrumentation, never decision inputs.
+    # (v6 wording): "p_holm < alpha AND direction matches AND param_matched is
+    # true AND the per-seed init digest is recorded and equal AND
+    # >= min_seeds_for_confirmation complete pairs".
     # The disclosure block keeps any future divergence visible next to every
     # 'confirmed' list.
     stats['decision_rule_applied'] = {
         'manifest_rule': (manifest.get('statistics') or {}).get('decision_rule'),
         'implementation_gates': ['p_holm < alpha (strict <)', 'direction_ok is True',
-                                 'param_matched is not False (True or unverifiable None; a measured >1% mismatch blocks)',
+                                 'param_matched is True (a measured <=1% match; unverifiable None does not confirm)',
+                                 'init_core_fp recorded AND equal within every usable pair (per seed)',
                                  'n_effective >= min_seeds_for_confirmation'],
-        'excluded_gates': ['coverage_ok (reported, not required — v3 removed the all-seeds veto)',
-                           'same_init_core_fp / init_core_fp_recorded (reported instrumentation, never decision inputs)'],
-        'note': 'The implemented rule matches the pre-registered manifest wording exactly (one shared helper, v12_supp._frozen_rule_confirms, is used by finaltest_stats and the report fallback).',
+        'excluded_gates': ['coverage_ok (reported, not required — v3 removed the all-seeds veto)'],
+        'note': 'The implemented rule matches the pre-registered manifest wording exactly (one shared helper, v12_supp._frozen_rule_confirms, is used by finaltest_stats and the report fallback). Manifest v6 only TIGHTENS the v5 rule: it can remove a CONFIRMED label but never create one.',
     }
     _m = len(manifest['primary_comparisons'])
     _n = len(manifest['seeds'])
@@ -3361,6 +3526,24 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                 stats['doc_sampling_note'] = (f'per-document rows recorded (n_docs={_n_doc}); between-doc variance is reported per comparison in doc_sampling — '
                                               f'n_docs<{L.MIN_DOCS_FOR_POPULATION_CLAIM} does not cover the language-population distribution, so population-level claims are refused; '
                                               'the confirmed claims are about the frozen evaluation slice (design_notes section 20)')
+    # v6: carry the pre-access power decision into the confirmation stats so a
+    # resolution-limited confirmation cannot look like a clean one.  The gate
+    # itself runs in run_finaltest BEFORE the freeze lock; this only reports.
+    _pg_path = os.path.join(os.path.dirname(os.path.abspath(bylen_path)), 'power_gate.json')
+    if os.path.exists(_pg_path):
+        try:
+            with open(_pg_path, encoding='utf-8') as _jf:
+                stats['power_gate'] = json.load(_jf)
+        except Exception as _e:
+            stats['power_gate'] = {'status': 'unreadable', 'path': _pg_path,
+                                   'error': f'{type(_e).__name__}: {_e}'}
+    else:
+        stats['power_gate'] = {
+            'status': 'missing',
+            'declared': (manifest.get('statistics') or {}).get('power_gate'),
+            'note': ('no power_gate.json next to the confirmation records: P5T did not '
+                     'record the declared minimum-power decision for this panel'),
+        }
     print(f'[p5t stats] admitted {len(admitted)}/{len(manifest["arms"]) * _n} frozen (arm, seed) cells on slice {str(unified_fp)[:12]}…; {len(_fam)} frozen primary comparison(s); {len(_rej)} survive Holm; {len(_conf)} also match the pre-registered direction')
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
     stats = L.stamped_analysis('finaltest_stats', stats, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
@@ -3514,12 +3697,12 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         if _conf is None:
             # Stats files without a `confirmed` key: re-derive the
             # pre-registered decision rule EXACTLY as `finaltest_stats` does
-            # (manifest v3): strict p_holm < alpha (not holm_adjust's `<=`
-            # reject flag), direction_ok is True, `param_matched is not false`
-            # (None = unverifiable does not block), and n >= the declared
+            # (manifest v6): strict p_holm < alpha (not holm_adjust's `<=`
+            # reject flag), direction_ok is True, `param_matched is true`
+            # (an unverifiable None no longer confirms), the per-seed
+            # init_core_fp digest is recorded and equal, and n >= the declared
             # min_seeds_for_confirmation floor.  `coverage_ok` is reported,
-            # NOT required (the rule applies no all-12-seeds veto), and the
-            # init-core digests are instrumentation, not decision inputs.
+            # NOT required (the rule applies no all-12-seeds veto).
             # Use the manifest's declared confirmation floor so the report and
             # the stats artifact apply the same gate.
             _floor = None

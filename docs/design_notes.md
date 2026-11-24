@@ -1247,10 +1247,20 @@ README_zh 与 `RELEASES.md` 中均已明示。
   （`v12_allow_unhealthy_used`）、每条被放行 cell 的 bylen 记录
   （`allow_unhealthy_override` + `health_status_override`）与
   experiments.jsonl 事件——不再只是 stdout。
-- 实现版决策规则比清单 v3 文字**更严**（额外要求 same_init_core_fp
-  与 init_core_fp_recorded；param_matched 必须为 True 而非"非 false"）。
-  只会少确认、不会多确认，但须可见：`test_stats.json` 现携带
-  `decision_rule_applied`（清单原文 + 实现闸门清单 + 说明）。
+- 决策规则的版本轨迹（按顺序读）：review-5 的实现曾**擅自**比清单 v3 更严
+  （额外要求 same_init_core_fp 与 init_core_fp_recorded；param_matched 必须
+  为 True 而非"非 false"）。只会少确认，但属于未注册偏离，review-6 已把实现
+  恢复到注册文字，清单 **v5** 更正了历史注记。**v6（2026-11-24，仍在任何
+  test 访问之前）**把加严正式注册：CONFIRMED 现要求 param_matched is True
+  （不可验证的 None 不再等同已验证），且逐 seed 的 init_core_fp 必须记录并在
+  每一对内相等；实现与清单文字一致，不再有"实现更严"的偏离。v6 同时修掉
+  一个真实缺陷：旧的 `same_init_core_fp` 把**所有 seed、两个臂**的摘要并进
+  一个集合，而正确的 12-seed 面板每个 seed 本来就有各自的共享主干初始化，
+  所以该字段在正确面板上恒为 False，既无法发现真正的臂间不匹配、又会误报
+  正确面板。现在改为逐 seed 比较两臂（`init_core_fp_pairs_checked` /
+  `init_core_fp_mismatch_seeds`），面板级 validity 也改为按 seed 分组。
+  只会少确认、不会多确认，`test_stats.json` 仍携带 `decision_rule_applied`
+  （清单原文 + 实现闸门清单 + 说明）。
 - 清单 **v4**（仍在任何 test 访问之前）：ee/es 移出可机检配方签名
   （它们是诊断监控旋钮；P5C/p1l 在 P5H 所需诊断下合法携带 es=8，
   v3 的 es=128 钉定在 p1l 路径上不可校验且与实际记录不符）；
@@ -1259,7 +1269,13 @@ README_zh 与 `RELEASES.md` 中均已明示。
   在冻结臂的验证集逐种子 delta 上做 2^n 符号翻转枚举（固定 |d_i|），
   报告 Holm 保守阈值下的功效(q) 曲线与最小同向种子数，落盘
   `p5c_power.json`；P5T 在读 test 前要求该工件在场
-  （V12_SKIP_POWER=1 为显式、落盘记录的覆盖）。
+  （V12_SKIP_POWER=1 为显式、落盘记录的覆盖）。**v6** 起清单
+  `statistics.power_gate`（q=0.80，min_power=0.80）把它升级为硬门：逐比较
+  的 panel 功效缺失或低于下限时 P5T **拒绝**访问，除非显式
+  `V12_ACCEPT_LOW_POWER=1`；该决定写入 `results_lm_test/power_gate.json`
+  并带进 `test_stats.json`。12-seed 设计自身 q=0.80 的 Holm 保守功效只有
+  0.275，所以这道门通常会触发——诚实做法是加种子并记录修订，或显式接受
+  「分辨率受限」的确认（覆盖不等于设计已有足够功效）。
 
 ### 26.4 度量口径与记账
 

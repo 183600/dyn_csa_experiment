@@ -1527,14 +1527,14 @@ def t_recipe_signature():
 
 
 def t_finaltest_decision_rule_matches_frozen_manifest():
-    # The pre-registered decision rule (confirmation_frozen.json v3,
-    # statistics.decision_rule) is: CONFIRMED iff p_holm < 0.05 AND direction
-    # matches AND `param_matched is not false` AND >= min_seeds_for_confirmation
-    # complete pairs.  `coverage_ok` is reported but NOT required, and the
-    # init-core digests are reported instrumentation, never decision inputs.
-    # A stricter gate (param_matched is True / same_init_core_fp is True /
-    # coverage_ok) would exceed the frozen rule and can only fail to confirm
-    # what the pre-registered rule confirms.
+    # The pre-registered decision rule (confirmation_frozen.json plan revision
+    # v6, statistics.decision_rule) is: CONFIRMED iff p_holm < 0.05 AND the
+    # direction matches AND param_matched is TRUE (a measured <=1% match; an
+    # unverifiable None does not qualify) AND the per-seed shared-trunk init
+    # digest is RECORDED and EQUAL within every usable pair AND at least
+    # min_seeds_for_confirmation complete pairs entered the test.
+    # `coverage_ok` remains reported-but-not-required instrumentation.  v6
+    # only tightens v5: it can withhold a CONFIRMED label, never create one.
     with tempfile.TemporaryDirectory() as td:
         seeds = list(range(12))
         manifest = {
@@ -1546,7 +1546,7 @@ def t_finaltest_decision_rule_matches_frozen_manifest():
                            'descriptive_only': True},
             'manifest_sha256': 'M', 'code_semantics_expected': L.CODE_SEMANTICS,
         }
-        def _records(*, params=None, init=None):
+        def _records(*, params=None, init=None, init_by_seed=None, mismatch_seed=None):
             out = {}
             for s in seeds:
                 for arm, ppl in (('a_arm', 30.0), ('b_arm', 31.0)):
@@ -1556,7 +1556,12 @@ def t_finaltest_decision_rule_matches_frozen_manifest():
                                               'n_seq': 16, 'truncated': False}}}
                     if params is not None:
                         r['params'] = params
-                    if init is not None:
+                    if init_by_seed is not None:
+                        _iv = init_by_seed(s)
+                        if mismatch_seed is not None and arm == 'b_arm' and s == mismatch_seed:
+                            _iv = 'MISMATCH-%d' % s
+                        r['init_core_fp'] = _iv
+                    elif init is not None:
                         r['init_core_fp'] = init
                     out[(arm, s)] = r
             return out
@@ -1564,16 +1569,17 @@ def t_finaltest_decision_rule_matches_frozen_manifest():
         _old_probe = V12._test_probe_stats
         try:
             V12._test_probe_stats = lambda *a, **k: {}
-            # params missing -> param_matched is None ("not false"): the frozen
-            # rule CONFIRMS; None must not be silently treated like False.
+            # (1) params missing -> param_matched is None: UNVERIFIABLE, so v6
+            # does NOT confirm (v5 used to treat None like a measured match).
             V12._admit_confirmation_records = lambda raw, man: (_records(), None)
             st = V12.finaltest_stats(manifest=manifest,
                                      bylen_path=os.path.join(td, 'bylen.json'),
                                      probe_path=os.path.join(td, 'probe.json'),
                                      out=os.path.join(td, 'stats.json'))
             assert st['comparisons']['c1']['param_matched'] is None
-            assert st['confirmed'] == ['c1'], st['confirmed']
-            # Missing init provenance is instrumentation-only: it cannot veto.
+            assert st['confirmed'] == [], st['confirmed']
+            # (2) params verified, but the init digest is missing: unverifiable
+            # provenance cannot confirm either.
             V12._admit_confirmation_records = lambda raw, man: (_records(params=1000), None)
             st2 = V12.finaltest_stats(manifest=manifest,
                                       bylen_path=os.path.join(td, 'bylen.json'),
@@ -1581,15 +1587,44 @@ def t_finaltest_decision_rule_matches_frozen_manifest():
                                       out=os.path.join(td, 'stats2.json'))
             assert st2['comparisons']['c1']['param_matched'] is True
             assert st2['comparisons']['c1']['init_core_fp_recorded'] is False
-            assert st2['confirmed'] == ['c1'], st2['confirmed']
-            # With parameter matching AND a shared init digest it confirms.
+            assert st2['confirmed'] == [], st2['confirmed']
+            # (3) Complete evidence with one shared digest confirms.
             V12._admit_confirmation_records = lambda raw, man: (_records(params=1000, init='INIT'), None)
             st3 = V12.finaltest_stats(manifest=manifest,
                                       bylen_path=os.path.join(td, 'bylen.json'),
                                       probe_path=os.path.join(td, 'probe.json'),
                                       out=os.path.join(td, 'stats3.json'))
-            # One missing per-seed digest is unverifiable (reported False),
-            # but the init digest is not a decision input.
+            assert st3['comparisons']['c1']['same_init_core_fp'] is True, st3['comparisons']['c1']
+            assert st3['confirmed'] == ['c1'], st3['confirmed']
+            # (3b) REGRESSION for the pooling bug: a CORRECT panel gives every
+            # seed its own shared-trunk digest.  The pre-v6 check pooled all
+            # seeds into one set and reported False here.
+            _by_seed = lambda s: 'TRUNK-%02d' % s
+            V12._admit_confirmation_records = lambda raw, man: (_records(params=1000, init_by_seed=_by_seed), None)
+            st3b = V12.finaltest_stats(manifest=manifest,
+                                       bylen_path=os.path.join(td, 'bylen.json'),
+                                       probe_path=os.path.join(td, 'probe.json'),
+                                       out=os.path.join(td, 'stats3b.json'))
+            _c3b = st3b['comparisons']['c1']
+            assert _c3b['init_core_fp_recorded'] is True, _c3b
+            assert _c3b['same_init_core_fp'] is True, _c3b
+            assert _c3b['init_core_fp_pairs_checked'] == len(seeds), _c3b
+            assert _c3b['init_core_fp_mismatch_seeds'] == [], _c3b
+            assert st3b['confirmed'] == ['c1'], st3b['confirmed']
+            # (3c) One seed's arms disagree: the per-seed check must catch it
+            # (the pooled version could not) and withhold CONFIRMED.
+            V12._admit_confirmation_records = lambda raw, man: (
+                _records(params=1000, init_by_seed=_by_seed, mismatch_seed=7), None)
+            st3c = V12.finaltest_stats(manifest=manifest,
+                                       bylen_path=os.path.join(td, 'bylen.json'),
+                                       probe_path=os.path.join(td, 'probe.json'),
+                                       out=os.path.join(td, 'stats3c.json'))
+            _c3c = st3c['comparisons']['c1']
+            assert _c3c['same_init_core_fp'] is False, _c3c
+            assert _c3c['init_core_fp_mismatch_seeds'] == [7], _c3c
+            assert st3c['confirmed'] == [], st3c['confirmed']
+            assert st3c['not_confirmed_reasons']['c1']['init_core_fp_mismatch_seeds'] == [7]
+            # (4) One missing per-seed digest makes the panel unverifiable.
             _partial = _records(params=1000, init='INIT')
             _partial[('b_arm', 0)].pop('init_core_fp')
             V12._admit_confirmation_records = lambda raw, man: (_partial, None)
@@ -1597,8 +1632,10 @@ def t_finaltest_decision_rule_matches_frozen_manifest():
                                       bylen_path=os.path.join(td, 'bylen.json'),
                                       probe_path=os.path.join(td, 'probe.json'),
                                       out=os.path.join(td, 'stats4.json'))
-            # A by-length n_seq is an exact positive count, not a boolean or a
-            # fractional value.
+            assert st4['comparisons']['c1']['init_core_fp_recorded'] is False, st4['comparisons']['c1']
+            assert st4['comparisons']['c1']['same_init_core_fp'] is False, st4['comparisons']['c1']
+            assert st4['confirmed'] == [], st4['confirmed']
+            # (5) A by-length n_seq is an exact positive count, not a boolean.
             _bad_ns = _records(params=1000, init='INIT')
             for _r in _bad_ns.values():
                 _r['by_len']['4096']['n_seq'] = True
@@ -1607,15 +1644,16 @@ def t_finaltest_decision_rule_matches_frozen_manifest():
                                       bylen_path=os.path.join(td, 'bylen.json'),
                                       probe_path=os.path.join(td, 'probe.json'),
                                       out=os.path.join(td, 'stats5.json'))
-            # A boolean is a flag, not a shared-init digest: str(True) must not
-            # make two malformed arms look like the same initialization
-            # (reported), but it is still not a decision input.
+            # (6) A boolean is a flag, not a shared-init digest.
             V12._admit_confirmation_records = lambda raw, man: (_records(params=1000, init=True), None)
             st6 = V12.finaltest_stats(manifest=manifest,
                                       bylen_path=os.path.join(td, 'bylen.json'),
                                       probe_path=os.path.join(td, 'probe.json'),
                                       out=os.path.join(td, 'stats6.json'))
-            # A single pair without `params` makes the whole parameter
+            assert st6['comparisons']['c1']['init_core_fp_recorded'] is False, st6['comparisons']['c1']
+            assert st6['comparisons']['c1']['same_init_core_fp'] is False, st6['comparisons']['c1']
+            assert st6['confirmed'] == [], st6['confirmed']
+            # (7) A single pair without `params` makes the whole parameter
             # comparison unverifiable: averaging only the seeds that happen to
             # carry the count must not turn a missing measurement into True.
             _partial_params = _records(params=1000, init='INIT')
@@ -1625,22 +1663,24 @@ def t_finaltest_decision_rule_matches_frozen_manifest():
                                       bylen_path=os.path.join(td, 'bylen.json'),
                                       probe_path=os.path.join(td, 'probe.json'),
                                       out=os.path.join(td, 'stats7.json'))
+            assert st7['comparisons']['c1']['param_matched'] is None, st7['comparisons']['c1']
+            assert st7['comparisons']['c1']['param_rel_diff'] is None, st7['comparisons']['c1']
+            assert st7['comparisons']['c1']['params_unverifiable_seeds'] == [0], st7['comparisons']['c1']
+            assert st7['confirmed'] == [], st7['confirmed']
+            # (8) The panel-level validity block must also be per seed: a
+            # correct 12-seed panel has 12 distinct digests, and that is NOT a
+            # contradiction.
+            _v3b = st3b['validity']
+            assert _v3b['init_core_fp_distinct'] == len(seeds), _v3b
+            assert _v3b['init_core_fp_conflict_seeds'] == [], _v3b
+            assert _v3b['same_init_core_fp'] is True, _v3b
+            assert _v3b['init_core_fp_recorded'] is True, _v3b
         finally:
             V12._admit_confirmation_records = _old_admit
             V12._test_probe_stats = _old_probe
         assert st3['comparisons']['c1']['same_init_core_fp'] is True, st3['comparisons']['c1']
         assert st3['confirmed'] == ['c1'], st3['confirmed']
-        assert st4['comparisons']['c1']['init_core_fp_recorded'] is False, st4['comparisons']['c1']
-        assert st4['comparisons']['c1']['same_init_core_fp'] is False, st4['comparisons']['c1']
-        assert st4['confirmed'] == ['c1'], st4['confirmed']
         assert st5['by_length']['a_arm']['4096']['n_seqs'] is None, st5['by_length']['a_arm']['4096']
-        assert st6['comparisons']['c1']['init_core_fp_recorded'] is False, st6['comparisons']['c1']
-        assert st6['comparisons']['c1']['same_init_core_fp'] is False, st6['comparisons']['c1']
-        assert st6['confirmed'] == ['c1'], st6['confirmed']
-        assert st7['comparisons']['c1']['param_matched'] is None, st7['comparisons']['c1']
-        assert st7['comparisons']['c1']['param_rel_diff'] is None, st7['comparisons']['c1']
-        assert st7['comparisons']['c1']['params_unverifiable_seeds'] == [0], st7['comparisons']['c1']
-        assert st7['confirmed'] == ['c1'], st7['confirmed']
 
 
 def t_freeze_lock():
@@ -2749,6 +2789,23 @@ def t_shipped_manifest_consistency():
     assert v2.get('scope', {}).get('not_covered'), 'scope.not_covered must name the dynamic/HCA claims that are out of scope'
     # the compute-allocation caveat must be explicit, not buried in prose
     assert v2.get('compute_budget_disclosure', {}).get('flops'), 'v3 must disclose the dense-arm MLP/FLOPs mismatch'
+    # v6 (review-9): evidence completeness and a minimum-power gate are
+    # normative, and the manifest must say so.
+    _v6 = [h for h in hist if h.get('version') == 6]
+    assert _v6 and 'pre-access' in _v6[0]['change'], _v6
+    assert str(_v6[0].get('direction', '')).startswith('conservative tightening only'), _v6
+    _rule = v2['statistics']['decision_rule']
+    assert 'param_matched is true' in _rule and 'per-seed' in _rule, _rule
+    _pg = v2['statistics'].get('power_gate') or {}
+    assert abs(float(_pg.get('q', 0.0)) - 0.80) < 1e-12, _pg
+    assert abs(float(_pg.get('min_power', 0.0)) - 0.80) < 1e-12, _pg
+    assert _pg.get('override_env') == 'V12_ACCEPT_LOW_POWER', _pg
+    # The floor must be MEANINGFUL for this design: its own q=0.80 power is
+    # below it, so the gate fires unless seeds are added or the explicit
+    # override is recorded (documented intent, not an accident).
+    assert v2['statistics']['power_first_holm_gate']['q=0.80'] < float(_pg['min_power'])
+    # the per-seed init digest is a decision input in v6
+    assert 'per-seed init_core_fp' in v2['statistics']['validity_assumptions']
 
 
 def t_frozen_seeds():
@@ -9136,22 +9193,27 @@ def t_driver_paired_param_disclosure():
 
 
 def t_v12_frozen_rule_helper():
-    # One implementation of the manifest-v3 decision rule, shared by
+    # One implementation of the manifest-v6 decision rule, shared by
     # finaltest_stats and the report fallback.  Gate semantics: strict
-    # p_holm < alpha; direction_ok is True; param_matched is NOT False (None
-    # = unverifiable passes); n_effective >= min floor; coverage_ok and the
-    # init digests are never decision inputs.
+    # p_holm < alpha; direction_ok is True; param_matched must be TRUE
+    # (unverifiable None no longer confirms); the per-seed init digest must be
+    # recorded AND equal; n_effective >= min floor; coverage_ok never vetoes.
     ok_holm = {'p_holm': 0.001}
     ok_comp = {'direction_ok': True, 'param_matched': True, 'n_effective': 12,
-               'min_seeds_for_confirmation': 8}
+               'min_seeds_for_confirmation': 8,
+               'same_init_core_fp': True, 'init_core_fp_recorded': True}
     assert V12._frozen_rule_confirms(ok_holm, ok_comp, 0.05) is True
-    # param_matched None (unverifiable) passes; only a measured mismatch blocks
-    assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, param_matched=None), 0.05) is True
+    # v6: an unverifiable parameter count is not a verified <=1% match.
+    assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, param_matched=None), 0.05) is False
     assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, param_matched=False), 0.05) is False
-    # coverage_ok / init digests never veto
-    assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, coverage_ok=False,
-                                                   same_init_core_fp=False,
-                                                   init_core_fp_recorded=False), 0.05) is True
+    # v6: the init digest is a decision input, not instrumentation.  A missing
+    # digest or a per-seed mismatch withholds CONFIRMED.
+    assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, same_init_core_fp=False), 0.05) is False
+    assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, init_core_fp_recorded=False), 0.05) is False
+    assert V12._frozen_rule_confirms(ok_holm, {k: v for k, v in ok_comp.items()
+                                               if k != 'same_init_core_fp'}, 0.05) is False
+    # coverage_ok never vetoes (v3 decision).
+    assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, coverage_ok=False), 0.05) is True
     # strict < alpha (0.05 exactly does not pass)
     assert V12._frozen_rule_confirms({'p_holm': 0.05}, ok_comp, 0.05) is False
     assert V12._frozen_rule_confirms({'p_holm': 0.0500001}, ok_comp, 0.05) is False
@@ -9161,15 +9223,16 @@ def t_v12_frozen_rule_helper():
     assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, n_effective=7), 0.05) is False
     assert V12._frozen_rule_confirms(ok_holm, dict(ok_comp, n_effective=8), 0.05) is True
     # fallback floor when the comparison does not declare one
-    assert V12._frozen_rule_confirms(ok_holm, {'direction_ok': True, 'param_matched': None,
-                                               'n_effective': 8}, 0.05, 8) is True
-    assert V12._frozen_rule_confirms(ok_holm, {'direction_ok': True, 'param_matched': None,
-                                               'n_effective': 7}, 0.05, 8) is False
+    assert V12._frozen_rule_confirms(ok_holm, {k: v for k, v in ok_comp.items()
+                                               if k != 'min_seeds_for_confirmation'},
+                                     0.05, 8) is True
+    assert V12._frozen_rule_confirms(ok_holm, dict({k: v for k, v in ok_comp.items()
+                                                    if k != 'min_seeds_for_confirmation'},
+                                                   n_effective=7), 0.05, 8) is False
     # malformed inputs fail closed
     assert V12._frozen_rule_confirms({}, ok_comp, 0.05) is False
     assert V12._frozen_rule_confirms(None, None, 0.05) is False
     assert V12._frozen_rule_confirms({'p_holm': True}, ok_comp, 0.05) is False
-
 
 
 def t_report_pair_boolean_fingerprints():
@@ -9195,7 +9258,8 @@ def t_report_pair_boolean_fingerprints():
 def t_frozen_rule_malformed_inputs():
     ok_holm = {'p_holm': 0.001}
     ok_comp = {'direction_ok': True, 'param_matched': True,
-               'n_effective': 12, 'min_seeds_for_confirmation': 8}
+               'n_effective': 12, 'min_seeds_for_confirmation': 8,
+               'same_init_core_fp': True, 'init_core_fp_recorded': True}
     assert V12._frozen_rule_confirms(ok_holm, ok_comp, 0.05) is True
     # Boolean flags are not probabilities/counts; a measured zero must not fall
     # back to another count, and a fractional count must not be rounded up.
@@ -9209,13 +9273,17 @@ def t_frozen_rule_malformed_inputs():
     # A zero/negative declared floor must not make confirmation trivial.
     assert V12._frozen_rule_confirms(ok_holm, {'direction_ok': True,
                                                'param_matched': True,
+                                               'same_init_core_fp': True,
+                                               'init_core_fp_recorded': True,
                                                'n_effective': 1,
                                                'min_seeds_for_confirmation': 0},
                                      0.05) is False
     # NumPy booleans are booleans; a truthy string is not a flag.
-    assert V12._frozen_rule_confirms(
-        ok_holm, dict(ok_comp, direction_ok=np.bool_(True),
-                      param_matched=np.bool_(True)), 0.05) is True
+    _np_ok = dict(ok_comp, direction_ok=np.bool_(True),
+                  param_matched=np.bool_(True),
+                  same_init_core_fp=np.bool_(True),
+                  init_core_fp_recorded=np.bool_(True))
+    assert V12._frozen_rule_confirms(ok_holm, _np_ok, 0.05) is True
     assert V12._frozen_rule_confirms(
         ok_holm, dict(ok_comp, direction_ok=True,
                       param_matched=np.bool_(False)), 0.05) is False
@@ -9223,13 +9291,16 @@ def t_frozen_rule_malformed_inputs():
         ok_holm, dict(ok_comp, direction_ok='yes'), 0.05) is False
     assert V12._frozen_rule_confirms(
         ok_holm, dict(ok_comp, param_matched='no'), 0.05) is False
+    # A truthy string is not a verified initialization either.
+    assert V12._frozen_rule_confirms(
+        ok_holm, dict(ok_comp, same_init_core_fp='yes'), 0.05) is False
+    assert V12._frozen_rule_confirms(
+        ok_holm, dict(ok_comp, init_core_fp_recorded=1), 0.05) is False
     # The declared floor still works and a missing field falls back explicitly.
-    assert V12._frozen_rule_confirms(ok_holm, {'direction_ok': True,
-                                               'param_matched': None,
-                                               'n_effective': 8}, 0.05, 8) is True
-    assert V12._frozen_rule_confirms(ok_holm, {'direction_ok': True,
-                                               'param_matched': None,
-                                               'n': 8}, 0.05, 8) is True
+    _no_floor = {k: v for k, v in ok_comp.items() if k != 'min_seeds_for_confirmation'}
+    assert V12._frozen_rule_confirms(ok_holm, dict(_no_floor, n_effective=8), 0.05, 8) is True
+    assert V12._frozen_rule_confirms(ok_holm, dict(_no_floor, n=8), 0.05, 8) is True
+    assert V12._frozen_rule_confirms(ok_holm, dict(_no_floor, n_effective=7), 0.05, 8) is False
 
 
 def t_label_shift_uses_normalized_js():
@@ -12420,6 +12491,67 @@ def t_kernel_pool_contract_and_open_block_guard():
         raise AssertionError('sparse_layer_forward accepted open_block_mode')
 
 
+def t_v12_power_gate_floor():
+    # v6 minimum-power gate: a low panel-specific power is a REFUSAL, not a
+    # warning; malformed or missing readings fail closed.
+    gate = {'q': 0.80, 'min_power': 0.80}
+    good = {'status': 'ok', 'comparisons': {
+        'c1': {'n_paired_seeds': 12, 'power_holm_conservative': {'q=0.80': 0.85}}}}
+    why, readings = V12._power_gate_problem(gate, good)
+    assert why is None, why
+    assert readings == {'c1': {'power': 0.85, 'n_paired_seeds': 12}}, readings
+
+    # The shipped design's own q=0.80 power (0.275) is the motivating case: v5
+    # printed a warning and consumed the split; v6 refuses unless overridden.
+    low = {'status': 'ok', 'comparisons': {
+        'c1': {'n_paired_seeds': 12, 'power_holm_conservative': {'q=0.80': 0.275}}}}
+    why, readings = V12._power_gate_problem(gate, low)
+    assert why is not None and 'below' in why and 'c1' in why, why
+    assert readings['c1']['power'] == 0.275
+
+    missing = {'status': 'ok', 'comparisons': {
+        'c1': {'n_paired_seeds': 12, 'power_holm_conservative': {}}}}
+    why, _ = V12._power_gate_problem(gate, missing)
+    assert why is not None and 'missing' in why, why
+
+    # booleans are flags, not levels/powers; malformed gates fail closed.
+    for bad_gate in ({'q': True, 'min_power': 0.8}, {'q': 0.8, 'min_power': False},
+                     {'q': 1.0, 'min_power': 0.8}, {'q': 0.8, 'min_power': 0},
+                     'not-a-dict', None):
+        why, _ = V12._power_gate_problem(bad_gate, good)
+        assert why is not None, bad_gate
+    assert V12._power_gate_problem(gate, {'status': 'skipped'})[0] is not None
+    bool_power = {'status': 'ok', 'comparisons': {
+        'c1': {'n_paired_seeds': 12, 'power_holm_conservative': {'q=0.80': True}}}}
+    assert V12._power_gate_problem(gate, bool_power)[0] is not None
+    # every frozen comparison must clear the floor, not just one.
+    two = {'status': 'ok', 'comparisons': {
+        'c1': {'n_paired_seeds': 12, 'power_holm_conservative': {'q=0.80': 0.9}},
+        'c2': {'n_paired_seeds': 12, 'power_holm_conservative': {'q=0.80': 0.5}}}}
+    why, readings = V12._power_gate_problem(gate, two)
+    assert why is not None and 'c2' in why, why
+    assert set(readings) == {'c1', 'c2'}, readings
+
+    # Shape is validated at manifest LOAD time: a typo is a plan defect that
+    # `v12_supp.py plan` must catch, not a surprise after the training run.
+    with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
+        _base = json.load(f)
+    with tempfile.TemporaryDirectory() as td:
+        _path = os.path.join(td, 'm.json')
+        for bad in ({'q': True, 'min_power': 0.8}, {'q': 0.8}, {'q': 1.5, 'min_power': 0.8},
+                    {'q': 0.8, 'min_power': 0.8, 'override_env': ''}, 'x'):
+            _m = json.loads(json.dumps(_base))
+            _m['statistics']['power_gate'] = bad
+            with open(_path, 'w', encoding='utf-8') as f:
+                json.dump(_m, f)
+            try:
+                V12._load_manifest(_path)
+            except SystemExit as e:
+                assert 'power_gate' in str(e), (bad, e)
+            else:
+                raise AssertionError(f'power_gate={bad!r} accepted')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -12809,6 +12941,7 @@ def main():
     _check('N93 manifest schema version is enforced', t_manifest_version_is_enforced)
     _check('N94 ce_loss denominator counts scored columns only', t_ce_loss_scored_column_denominator)
     _check('N95 kernel pool contract + open-block guard', t_kernel_pool_contract_and_open_block_guard)
+    _check('N96 v12 minimum-power gate refuses a sub-floor panel', t_v12_power_gate_floor)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

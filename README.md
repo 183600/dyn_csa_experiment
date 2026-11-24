@@ -15,7 +15,7 @@ scope in `confirmation_frozen.json`; everything else is exploratory.
 > **Version naming.** `v12` is the driver/study generation; `CODE_SEMANTICS =`
 > `v11.128` is the library measurement-semantics stamp that the frozen plan
 > binds. They are not the same numbering scheme, and the mismatch is intentional.
-> The frozen manifest is at `manifest_version: 5` (see its `revision.history`; v4 removed the uncheckable ee/es pins and documented the tokenizer token cap, and v5 corrected the v4 note's description of the implemented decision rule back to the registered v3 wording — no normative field changed; both still strictly before any test-split access);
+> The frozen manifest is at `manifest_version: 5` (see its `revision.history`; v4 removed the uncheckable ee/es pins and documented the tokenizer token cap, v5 corrected the v4 note's description of the implemented decision rule back to the registered v3 wording — no normative field changed; and v6 (2026-11-24) registered the conservative evidence-completeness and minimum-power gates described below — all still strictly before any test-split access);
 > per the manifest's v3 `ci_loop` note the continuous-loop CI is supposed to stay
 disabled until the frozen commit is signed and P5T has run — check the workflow's
 > actual state (`gh workflow list`) before relying on this.
@@ -330,6 +330,31 @@ eager-only frozen plan. The test split
 phase reads train/valid exclusively. After the first test-split evaluation, no
 frozen comparison or seed may be added (selection bias by construction; see
 `DECISION_LOG.md`).
+
+**Plan revision v6 (2026-11-24, still before any test access)** closes three
+evidence gaps that a source-level review flagged:
+
+- **Minimum-power gate.** `statistics.power_gate` (q=0.80, min_power=0.80)
+  turns the pre-access power simulation from a printed warning into a gate:
+  every primary comparison's panel-specific power in `p5c_power.json` must be
+  recorded and at or above the floor before P5T may read the test split. A
+  miss refuses the access unless `V12_ACCEPT_LOW_POWER=1` is set; the decision
+  is written to `results_lm_test/power_gate.json` and carried into
+  `test_stats.json`. The 12-seed design's own q=0.80 power under Holm/4 is
+  0.275, so the gate normally fires: the honest remedies are added seeds (a
+  further recorded revision) or an explicit, auditable acceptance of a
+  resolution-limited confirmation.
+- **Verified parameter match.** A comparison is CONFIRMED only if
+  `param_matched is true` (a measured <=1% gap). The v5 wording (`is not
+  false`) let an unverifiable count confirm; that is no longer accepted.
+- **Per-seed matched initialization.** `init_core_fp` is a CONFIRMED gate:
+  both arms of every usable pair must record the same shared-trunk digest.
+  The per-comparison check was also fixed to compare arms **within** a seed —
+  it previously pooled all seeds into one set, so it reported `False` on every
+  correct 12-seed panel and could not detect a real mismatch.
+
+Both tightenings can only withhold a CONFIRMED label, never create one; no
+arm, seed, endpoint, alpha or Holm family changed.
 
 **Scope (review-2 issue 4)**: the confirmation covers ONLY fixed-chunk CSA
 mechanism claims. Dynamic chunking vs fixed chunking, semantic boundary value,
