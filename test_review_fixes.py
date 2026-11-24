@@ -2806,6 +2806,10 @@ def t_shipped_manifest_consistency():
     assert v2['statistics']['power_first_holm_gate']['q=0.80'] < float(_pg['min_power'])
     # the per-seed init digest is a decision input in v6
     assert 'per-seed init_core_fp' in v2['statistics']['validity_assumptions']
+    # v6 also corrects the randidx dead-parameter count (design_notes 27.6):
+    # 6 x (16,384 + 16,384 + 1,024) = 202,752, not the v5 text's 201,216.
+    _rc = next(c for c in v2['primary_comparisons'] if 'randidx' in str(c.get('name', '')))
+    assert '202,752' in _rc['interpretation_caveat'], _rc['interpretation_caveat']
 
 
 def t_frozen_seeds():

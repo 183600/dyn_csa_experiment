@@ -346,9 +346,9 @@ enforce it) machine-gates; this entry does not relabel them:
   `MIN_DOCS_FOR_POPULATION_CLAIM = 64`; stats report per-document variance and
   set `population_claim_allowed = False` at n_docs=16.
 - **The randidx / allblocks controls are not single-variable ablations** —
-  the fixed hash pattern (with ~201k dead projection parameters, see
-  design_notes for the 1,536-parameter correction) and the 1024-block read are
-  disclosed in each `interpretation_caveat`.
+  the fixed hash pattern (with 202,752 dead projection parameters; the v5
+  text's 201,216 was 1,536 short and is corrected in v6, see design_notes
+  §27.6) and the 1024-block read are disclosed in each `interpretation_caveat`.
 
 Two points were real implementation defects and are fixed, and the review's
 power-gate recommendation is now normative:
