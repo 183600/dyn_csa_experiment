@@ -1006,6 +1006,32 @@ def _implementation_reason(rec, impl):
     return None
 
 
+def _per_doc_rows_reason(rec, n_seq):
+    """Why ``rec`` lacks the per-row PPL rows the frozen plan promises.
+
+    The manifest's ``eval.per_document`` block promises per-row PPL so that
+    evaluation-set uncertainty can be read from admitted records.  A record
+    whose by_len cells omit those rows cannot support that readout, so
+    admission must not silently accept it and leave ``doc_sampling`` empty.
+    """
+    bl = rec.get('by_len')
+    if not isinstance(bl, dict) or not bl:
+        return 'no by_len cells'
+    for key, cell in bl.items():
+        if not isinstance(cell, dict) or not L.ppl_is_usable(cell.get('ppl')):
+            continue
+        rows = cell.get('ppl_per_seq')
+        if not isinstance(rows, list) or len(rows) != int(n_seq):
+            return (f'by_len[{key}].ppl_per_seq is missing or has '
+                    f'{len(rows) if isinstance(rows, list) else None} rows, not the '
+                    f'frozen {int(n_seq)}')
+        for x in rows:
+            fx = L._finite_scalar(x)
+            if fx is None or fx <= 0.0:
+                return f'by_len[{key}].ppl_per_seq contains a non-positive/non-finite PPL'
+    return None
+
+
 _CKPT_SHA_RE = re.compile(r'^[0-9a-f]{64}$')
 
 
@@ -2496,7 +2522,7 @@ def _admit_confirmation_records(raw, manifest):
     _any_train_fp = any(isinstance(_r, dict) and bool(_r.get('train_fp'))
                         for _r in (raw or {}).values())
     _require_train_fp = _train_fp_required(manifest) or bool(want_train_fp) or _any_train_fp
-    _binding = _eval_obj = manifest.get('binding')
+    _binding = manifest.get('binding')
     _binding = _binding if isinstance(_binding, dict) else {}
     _ckpt_block = _binding.get('checkpoint')
     _require_ckpt = bool(isinstance(_ckpt_block, dict) and _ckpt_block.get('hash'))
@@ -3959,10 +3985,19 @@ if __name__ == '__main__':
             run_full()
     except Exception:
         traceback.print_exc()
-        try:
-            git_push('v12: PARTIAL — interrupted, see log (re-run resumes)')
-        except Exception:
-            traceback.print_exc()
+        # Never auto-commit/push from a zero-GPU preflight or analysis mode: a
+        # failed `plan`/`smoke`/`power`/`analysis`/`report` must not publish the
+        # developer's working tree under an experiment-results message (that is
+        # how an unrelated `git add -A` reaches main).  Only a long training
+        # driver saving partial work may push, and only explicitly.
+        if mode in ('full', 'phase') and os.environ.get('V12_AUTO_PUSH', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+            try:
+                git_push('v12: PARTIAL — interrupted, see log (re-run resumes)')
+            except Exception:
+                traceback.print_exc()
+        elif mode in ('full', 'phase'):
+            print('[v12] NOTE: partial results were NOT auto-committed/pushed '
+                  '(set V12_AUTO_PUSH=1 to enable the old behaviour)')
         if mode == 'full':
             schedule_shutdown(2400)
         sys.exit(1)

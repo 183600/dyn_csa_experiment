@@ -54,7 +54,7 @@ already keeps those path families out of the repository (`docs/` retains only
 | `v9_supp.py` | **the v9 driver**: P2T (the seq-2048 topk sweep at `batch_size=1`) and P2S3 (third seed for the RoPE 20k run) |
 | `v10_supp.py` | **the v10 driver**: P3M length-extrapolation mechanism + distractor-injection probe, P3S inversion-crossover scaling, P3T topk sweep to 4 seeds |
 | `v11_supp.py` | **the v11 driver**: statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
-| `v12_supp.py` | **the v12 confirmation driver (reviewer-response + review-2 hardening)**: P5C trains all four frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms, P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-document PPL records |
+| `v12_supp.py` | **the v12 confirmation driver (reviewer-response + review-2 hardening)**: P5C trains all four frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms, P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-row PPL records (the window is the unit; `load_wikitest(with_doc_ids=True)` + `eval_ppl(doc_index=...)` give true document clusters) |
 | `open_block_supp.py` | **open-block panel driver**: maximum block length (32/64/128/no cap) × current-block reading rule (`closed` / `prefix_summary` / `prefix_singletons`), with a shared top-k budget, causal prefix construction, outside-window auxiliary panel, paired per-seed deltas and interaction statistics — see `docs/design_notes.md` §24 |
 | `test_open_block.py` | **open-block CPU gates**: config/segmenter, optimized-vs-reference prefix pooling (forward + gradients), prefix invariance, future perturbation/gradient, candidate masks, edge cases, closed regression, singleton semantics and HCA budget declaration |
 | `confirmation_frozen.json` | **pre-registered confirmation plan v2** (tracked): frozen arms, seeds 0-11 (revised 6->12 BEFORE any test-split access; power table recorded), endpoints, exact sign-flip + Holm, decision rule, machine-checkable binding block and a scope declaration — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
@@ -418,9 +418,12 @@ machine gates rather than new prose:
   with no current code stamp (no table cell, no ratio, no conclusion);
   `_agg_entry` refuses a multi-group aggregate with no current stamp.  Missing
   `truncated` flags are treated as unverifiable, not full-length.
-- **Doc-level uncertainty**: `ppl_ci95_doc_bootstrap` is displayed; v12 adds a
-  per-comparison document Δ 95% CI and refuses population-level claims below
-  64 documents.
+- **Uncertainty unit**: `ppl_ci95_doc_bootstrap` resamples the fixed
+  evaluation rows/windows, not documents (a 4096-token window can span
+  document boundaries).  v12 therefore labels that interval as
+  window-sampling and refuses population-level claims below 64 rows; genuine
+  document-level CIs need the loader `doc_index` path (used by the follow-up
+  study, not by the frozen v12 records).
 - **Efficiency**: the length phase records `measure_efficiency`; the new
   `measure_efficiency_sweep` covers batch x length, and
   `audit_gates.efficiency_pairs` only permits a "faster" claim when token
@@ -437,7 +440,8 @@ machine gates rather than new prose:
 ## Review-3 hardening (what changed)
 
 - **PPL aggregation**: training/length records now carry `nll_sum`,
-  `n_tokens` and per-document NLL; `aggregate` reports `ppl_pooled =
+  `n_tokens` and per-row NLL (per-document NLL when `eval_ppl` is called with
+  a `doc_index` table); `aggregate` reports `ppl_pooled =
   exp(ΣNLL/Σtokens)` as `ppl_primary` (with the arithmetic seed mean,
   median/IQR, seed-level t interval and document bootstrap kept alongside).
   The final PPL is still measured on the full fixed validation batch;

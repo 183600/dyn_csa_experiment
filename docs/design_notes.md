@@ -1292,3 +1292,109 @@ requires_grad（前向值不变，省无谓子图）；`CSA_ADAPTIVE_MAX_TOKENS`
 run 指纹（默认主线路径指纹逐字节不变）；`holm_min_attainable_p` 的
 ldexp 溢出改为守卫返回 1.0；鞍点近似的实测误差界（p∈[0.002,0.04] 内
 ≤2%）写进 docstring；内核路径 `bincount` 补 `.long()`（整数值不变）。
+
+## 27. 评审六（2026-11-24）：把「已披露」变成「已拒绝」，并关闭单位错标
+
+本节记录本轮代码级修复。它不移除任何既有主张，也不改变 v12 冻结清单的
+数值字段；所有改动都在**首次 test 访问之前**，且由
+`test_review_fixes.py` 的 N87–N95 与既有 377 项测试共同锁住。
+
+### 27.1 计算量匹配：代理比值不得当证书
+
+`_compute_control_detail` 过去在只有 `params × tokens`（6ND）代理时，对
+参数对齐的一对臂返回 `compute_matched=True`。参数对齐的 sparse/dense 臂
+可以相差 ~1.87× 实际 FLOPs/token（清单 `compute_budget_disclosure` 自己
+就写了这一点），所以那个 `True` 会被下游读成「等计算量」。现在：
+
+- 代理路径只报告 `proxy_ratio_a_over_b`，`compute_matched=None`、
+  `compute_verifiable=False`，并明确写「equal compute is NOT established」；
+- 只有**实测**的 per-token 墙钟落在容差内才置 `compute_matched=True`
+  （`compute_verifiable=True`），且 `flops_matched` 仍保持 `None`——
+  墙钟不是 FLOPs；
+- 聚合报告在代理路径新增 `compute_unverified` 警告清单，要求把该对比写成
+  「参数对齐、计算量未验证」。
+
+P0 的「实测 FLOPs 匹配 Dense 臂」仍需 GPU profiler 与新的冻结清单，本轮
+没有伪造一个解析式匹配臂。
+
+### 27.2 文档/窗口单位：新增真正的文档聚类路径
+
+v12 的 16 条评测行是从去重后 test 流头部切出的**固定窗口**，不是 16 篇
+文档；一个 4096-token 窗口可以跨多篇文档。旧代码把它们叫
+`per-document`、`doc_sampling`、`document bootstrap`，算术没错但单位错标。
+本轮：
+
+- `load_wikitest(..., with_doc_ids=True)` 返回 `(ids, vocab, tok, bnd,
+  doc_index, doc_ids)`：`doc_index` 是逐 token 的文档序号矩阵，
+  由构建时记录的 `test_doc_lengths_<tag>.npy` 精确展开（缓存命中时校验
+  文档数/总 token/覆盖；缺失则 fail-closed，不重读 test 去重建）；
+- `eval_ppl(..., doc_index=...)` 与 `eval_length_gen(..., doc_index=...)`
+  把逐 token NLL 按真实文档聚合，输出 `doc_nll/doc_ntok/n_docs/doc_ppl/
+  doc_ci`；`cluster_unit` 明确写 `document (...)`；
+- 逐 token 序号在流内单调，聚合走确定性分段和（无 CUDA atomics）；
+- v12 的 `doc_sampling` 现在明确标 `unit = fixed evaluation windows`，
+  `ci_method` 改为「over rows/windows, NOT over documents」，并保留
+  `n_docs` 字段做兼容；真正的文档级结论属于 follow-up 清单。
+
+这回答了「16 行不足以支撑总体泛化」的代码侧部分：单位不再被误标，且
+后续研究有了可执行的文档级聚合入口；v12 自身仍只声明覆盖该冻结切片。
+
+### 27.3 纯 HCA 臂与 follow-up 注册表校验
+
+`hybrid_*_rope` 是 CSA/HCA 交替层，不能回答 HCA-vs-CSA。新增
+`hca_fixed_rope` / `hca_dynamic_rope`（每一层都是 `kind='hca'`），并加
+`PURE_HCA_VARIANTS` / `FACTORIAL_VARIANTS`；`validate_followup_design.py`
+新增 `--verify-registry`（`--require-ready` 隐含）：导入仓库注册表，逐臂
+检查变体可解析、层类型与声明族一致、fixed/dynamic 与声明一致、Dense 控制
+确为 `full` 层。hybrid 冒充 HCA、TODO 变体、缺失变体都会在设计阶段被拒绝。
+
+`followup_design.template.json` 的 HCA 单元已指向真实变体；FLOPs-matched
+Dense 仍是 TODO——因为协议要求**实测** FLOPs，不能用一个未标定的解析式
+变体代替。
+
+### 27.4 一次性 test 访问：从「preaccess」到「reading」
+
+旧流程先写 `stage='preaccess'`、再 `load_wikitest`、成功后才写
+`stage='accessed'`。若读取后形状/泄漏审计失败，锁仍是 preaccess，
+`_lock_proves_test_access` 返回 False，重试会**再次读取** test——一次性
+访问名存实亡。现在：
+
+- 读前写 `stage='reading'`（不是 preaccess）；`_lock_proves_test_access`
+  对 reading 返回 True；
+- 新增 `_refuse_repeated_test_read`：若锁停在 reading 且没有绑定
+  `test_ids_fp`，任何重试都在读之前被拒绝（`V12_REFREEZE=1` 是显式、
+  打印的覆盖，并把上一轮降级为探索性）；
+- 失败路径不再因为「preaccess 可改清单」而放行；一旦开始读，清单就不能
+  再改。
+
+### 27.5 准入与签名的 fail-closed 收口
+
+- `_recipe_matches_signature` 对结构计数（steps/sl/bs/nt/v/wu/d/L/H/Dh/
+  ee/es）改为**精确整数**比较：`steps=3000.002`、`bs=12.000001` 不再借
+  浮点容差混入；只有 lr/wd/cl/dlm/mr 保留格式化容差。
+- `_load_manifest` 要求带 `binding.training_recipe_signature` 的清单
+  必须有 `manifest_version` 且为 5；未来 schema 不得按旧语义解释。
+- 清单声明 `binding.checkpoint.hash` 时，真实 P5T 记录必须携带 64-hex
+  `ckpt_sha256` 才可进入确认统计（`plan` 的合成记录显式标
+  `plan_synthetic`，只跳过这一项）。
+- 清单声明 `eval.per_document` 时，准入要求每个可用 `by_len` 单元都带
+  `ppl_per_seq`（长度 = 冻结 `n_seqs_clean`、值为正有限）——不再允许
+  报告阶段发现「文档不确定性」字段缺失。
+- 所有可采纳记录的 `train_knobs.det` 必须一致；混合确定性模式不能进入
+  同一确认对比。
+
+### 27.6 其它已核实修复
+
+- `ce_loss`：目标列数多于输入列数时直接拒绝；分母只数**被评分**的列
+  （旧代码在 targets 更宽时会静默把 CE 缩小 `ids_cols/targets_cols`）。
+- `csa_kernels`：融合池化的公开入口现在拒绝非连续/非单调 `bid`（eager
+  会内部排序，融合核不会，旧路径会静默池化错误的 token 集合）；
+  `sparse_layer_forward` 对 `open_block_mode != 'closed'` 直接拒绝，不再
+  依赖 `HybridAttention.forward` 的唯一守卫。
+- `audit_gates.audit_causality` 覆盖 `csa_dynamic_rope`、`hca_fixed_rope`、
+  `hca_dynamic_rope`，并新增「固定长度下扰动未来 token」的直接前缀检查；
+  HCA 的末位浮点弥散（~1e-6）在 1e-4 容差内，决策与块表相同。
+- `v12_supp.py` 的异常兜底不再对 `plan/smoke/power/analysis/report`
+  执行 `git add -A` + commit + pull --rebase + push：零 GPU 预检失败绝不
+  应把开发树发布到 main（本次审计中真实发生过一次）。长训练模式要推送
+  部分结果需显式 `V12_AUTO_PUSH=1`。
