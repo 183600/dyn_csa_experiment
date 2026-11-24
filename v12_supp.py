@@ -2496,6 +2496,12 @@ def _admit_confirmation_records(raw, manifest):
     _any_train_fp = any(isinstance(_r, dict) and bool(_r.get('train_fp'))
                         for _r in (raw or {}).values())
     _require_train_fp = _train_fp_required(manifest) or bool(want_train_fp) or _any_train_fp
+    _binding = _eval_obj = manifest.get('binding')
+    _binding = _binding if isinstance(_binding, dict) else {}
+    _ckpt_block = _binding.get('checkpoint')
+    _require_ckpt = bool(isinstance(_ckpt_block, dict) and _ckpt_block.get('hash'))
+    _want_per_doc = bool(isinstance(manifest.get('eval'), dict)
+                         and manifest['eval'].get('per_document') is not None)
     for key, r in (raw or {}).items():
         if not isinstance(r, dict):
             excluded.append(f'{key}: not a dict ({type(r).__name__})')
