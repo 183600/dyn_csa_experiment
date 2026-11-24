@@ -7897,7 +7897,16 @@ def _npy_serve_int32(path):
             if (int(_n.size) == int(src.size)
                     and tuple(_n.shape) == tuple(src.shape)
                     and np.dtype(_n.dtype) == np.dtype(np.int32)):
-                return _n
+                # The filename binds to the source stat, but a corrupt/tampered
+                # sidecar must never be served as token ids.  Re-validate the
+                # token-id contract before trusting it.
+                _sn = 0
+                _sx = -1
+                if _n.size:
+                    _sn, _sx = int(_n.min()), int(_n.max())
+                if (_sn >= 0 and _sx < 2 ** 31 and _sn == _mn and _sx == _mx
+                        and np.array_equal(_n, src)):
+                    return _n
         _dir = os.path.dirname(os.path.abspath(_side)) or '.'
         _fd, _tmp = tempfile.mkstemp(dir=_dir, prefix=os.path.basename(_side) + '.', suffix='.tmp')
         os.close(_fd)
@@ -9440,20 +9449,28 @@ def _ids_narrow(train_ids):
             # Bind the sidecar to the same identity fields the cache loaders
             # use; size+mtime alone does not identify it.
             _side = _i32_sidecar_path(_path)
+            _mn = int(train_ids.min()) if train_ids.size else 0
+            _mx = int(train_ids.max()) if train_ids.size else -1
             if os.path.exists(_side):
                 _n = np.load(_side, mmap_mode='r')
                 if (int(_n.size) == int(train_ids.size)
                         and tuple(_n.shape) == tuple(train_ids.shape)
                         and np.dtype(_n.dtype) == np.dtype(np.int32)):
-                    _narrow_memo_put(_key, train_ids, _n)
-                    return _n
+                    _sn = 0
+                    _sx = -1
+                    if _n.size:
+                        _sn, _sx = int(_n.min()), int(_n.max())
+                    # Filename binds to source stat; validate content against
+                    # source min/max and exact values to reject corrupt/stale sidecars.
+                    if (_sn >= 0 and _sx < 2 ** 31 and _sn == _mn and _sx == _mx
+                            and np.array_equal(_n, np.asarray(train_ids))):
+                        _narrow_memo_put(_key, train_ids, _n)
+                        return _n
             # Never trust a metadata `max_id` to decide the cast: a stale or
             # hand-edited value below 2**31 would make the int32 cast wrap an
             # out-of-range token into a negative id (which PyTorch then indexes
             # from the end of the embedding table).  The sidecar + binding mean
             # this full scan happens at cache build time.
-            _mn = int(train_ids.min()) if train_ids.size else 0
-            _mx = int(train_ids.max()) if train_ids.size else -1
             if _mn >= 0 and _mx < 2 ** 31:
                 _dir = os.path.dirname(os.path.abspath(_side)) or '.'
                 _fd, _tmp = tempfile.mkstemp(dir=_dir, prefix=os.path.basename(_side) + '.', suffix='.tmp')
@@ -17914,6 +17931,8 @@ def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
         # inconsistency and must be loud.
         raise ValueError('_det_segment_sum: indices out of range for the destination tensor')
     if sorted_indices:
+        if idx.numel() > 1 and bool((idx[1:] < idx[:-1]).any()):
+            raise ValueError('_det_segment_sum: sorted_indices=True but indices are not non-decreasing')
         idx_s = idx
         val_s = vals.to(out_dtype)
     else:
@@ -18503,10 +18522,20 @@ def _snapshot_block_stats(model):
 def _restore_block_stats(snap):
     for attn, state, cuts, pstate in snap:
         if state is not None:
-            attn._stats.__dict__.clear()
-            attn._stats.__dict__.update(state)
+            _st = getattr(attn, '_stats', None)
+            if isinstance(_st, _BlockStats):
+                _st.__dict__.clear()
+                _st.__dict__.update(state)
+            else:
+                _ns = _BlockStats()
+                _ns.__dict__.update(state)
+                attn._stats = _ns
         if cuts is not None:
-            attn._cuts[:] = cuts
+            _cuts_cur = getattr(attn, '_cuts', None)
+            if isinstance(_cuts_cur, list):
+                _cuts_cur[:] = cuts
+            else:
+                attn._cuts = list(cuts)
         if pstate is not None and isinstance(getattr(attn, '_prefix_stats', None), _PrefixStats):
             attn._prefix_stats.__dict__.clear()
             attn._prefix_stats.__dict__.update(pstate)
@@ -20268,7 +20297,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             _flush_loss_buffer()
         _res['losses'] = [float(v) for v in losses]
         if return_model:
-            _res['model'] = _inner_model
+            _res['_model'] = _inner_model
         return _res
     if val_batch is None:
         ppl, stats = (float('nan'), {})

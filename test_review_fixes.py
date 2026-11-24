@@ -11842,6 +11842,86 @@ def t_report_duplicate_rows_are_not_arbitrary():
         BR._LOADED.update(_loaded)
 
 
+def t_return_model_key_consistent():
+    ids = np.arange(4096, dtype=np.int64) % 997
+    val = (np.arange(64, dtype=np.int64) % 997).reshape(2, 32)
+    kw = dict(d=64, n_layers=2, n_heads=4, d_head=16, seq_len=32, batch_size=2,
+              steps=2, lr=1e-3, weight_decay=0.0, warmup=1, comp_lambda=0.0,
+              eval_every=0, mlp_ratio=4.0, device=torch.device('cpu'), log_every=0)
+    r = L.train_variant('full', ids, val, 997, seed=0, return_model=True, **kw)
+    assert '_model' in r, f'return_model=True must use _model key, got {sorted(r)}'
+    assert 'model' not in r, f'legacy model key must not be present, got {sorted(r)}'
+    assert hasattr(r['_model'], 'state_dict')
+    del r
+
+
+def t_det_segment_sum_rejects_unsorted_indices():
+    idx = torch.tensor([2, 1, 3])
+    val = torch.tensor([1., 1., 1.])
+    try:
+        L._det_segment_sum(4, idx, val, dtype=torch.float64, sorted_indices=True)
+    except ValueError as e:
+        assert 'non-decreasing' in str(e), e
+    else:
+        raise AssertionError('unsorted indices with sorted_indices=True must raise')
+    idx2 = torch.tensor([1, 1, 2])
+    val2 = torch.tensor([1., 2., 3.])
+    out = L._det_segment_sum(4, idx2, val2, dtype=torch.float64, sorted_indices=True)
+    exp = torch.zeros(4, dtype=torch.float64)
+    exp[1] = 3.0
+    exp[2] = 3.0
+    assert torch.equal(out, exp), (out, exp)
+
+
+def t_restore_block_stats_recreates_missing_stats():
+    cfg = L.AttnCfg(kind='csa', block_size=4, index_topk=2, c_kv=8, c_index=8, n_index_heads=4)
+    m = L.SmallGPT(vocab=64, d=32, n_layers=2, n_heads=4, d_head=8, max_seq=32, layer_cfgs=[cfg, cfg], mlp_ratio=4)
+    L.enable_block_stats(m, True)
+    x = torch.randint(0, 64, (1, 16))
+    _ = m(x)
+    snap = L._snapshot_block_stats(m)
+    assert any(s is not None for _, s, _, _ in snap)
+    L.enable_block_stats(m, False)
+    for blk in m.blocks:
+        blk.attn._stats = None
+    L._restore_block_stats(snap)
+    for blk, (_, state, _, _) in zip(m.blocks, snap):
+        if state is not None:
+            assert isinstance(getattr(blk.attn, '_stats', None), L._BlockStats)
+            assert blk.attn._stats.snapshot() == state
+
+
+def t_narrow_sidecar_rejects_corrupt_content():
+    d = tempfile.mkdtemp()
+    try:
+        path = os.path.join(d, 'train.npy')
+        arr = np.arange(100, dtype=np.int64)
+        np.save(path, arr)
+        src = np.load(path, mmap_mode='r')
+        n1 = L._ids_narrow(src)
+        assert np.array_equal(np.asarray(n1), arr.astype(np.int32))
+        sides = [f for f in os.listdir(d) if '.i32' in f]
+        assert sides, 'expected int32 sidecar to be created'
+        sp = os.path.join(d, sides[0])
+        np.save(sp, np.full(100, 7, dtype=np.int32))
+        L._NARROW_MEMO.clear()
+        src2 = np.load(path, mmap_mode='r')
+        n2 = L._ids_narrow(src2)
+        assert np.array_equal(np.asarray(n2), arr.astype(np.int32)), 'corrupt sidecar must be ignored/rebuilt'
+
+        # also check _npy_serve_int32
+        p2 = os.path.join(d, 'tok.npy')
+        np.save(p2, np.arange(10, dtype=np.int64))
+        _ = L._npy_serve_int32(p2)
+        sides2 = [f for f in os.listdir(d) if f.startswith('tok.npy') and '.i32' in f]
+        sp2 = os.path.join(d, sides2[0])
+        np.save(sp2, np.array([-1, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype=np.int32))
+        n3 = L._npy_serve_int32(p2)
+        assert int(np.asarray(n3).min()) == 0, 'negative-id sidecar must not be served'
+    finally:
+        shutil.rmtree(d)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -12203,6 +12283,10 @@ def main():
     _check('N65 confirmatory architecture gate honours recipe aliases', t_v12_finaltest_arch_alias_gate)
     _check('N66 baseline final keeps records without a variant field', t_baseline_final_without_variant_field)
     _check('N67 report excludes ambiguous/duplicate measurement rows', t_report_duplicate_rows_are_not_arbitrary)
+    _check('N72 return_model uses canonical _model key', t_return_model_key_consistent)
+    _check('N73 _det_segment_sum validates sorted_indices contract', t_det_segment_sum_rejects_unsorted_indices)
+    _check('N74 _restore_block_stats recreates missing stats object', t_restore_block_stats_recreates_missing_stats)
+    _check('N75 narrow int32 sidecar rejects corrupt content', t_narrow_sidecar_rejects_corrupt_content)
     _check('N68 closed zero block prior masks its S-path lanes (mixed dtype)', t_kernel_zero_soft_prior_all_block_lanes_is_no_prior)
     _check('N69 zero block prior keeps the sliding-window S path', t_kernel_zero_soft_prior_preserves_window_s_path)
     _check('N70 open zero prior removes candidate lanes from the S path', t_open_zero_soft_prior_removes_candidate_lanes_from_s_path)
