@@ -2292,11 +2292,23 @@ def _row_keys(X):
                        for v in _flat_obj)
         # Booleans are integral in Python/NumPy's canonical integer path, so
         # include them here as 0/1: an object-dtype bool table must produce the
-        # same row keys as its typed bool/int twin.
-        if _flat_obj and not _flat_dt and all(
-                isinstance(v, numbers.Integral)
-                or isinstance(v, (bool, np.bool_))
-                for v in _flat_obj):
+        # same row keys as its typed bool/int twin.  Distinguish booleans from
+        # integers: booleans route through the int64/uint64 canonical path (which
+        # also matches the typed bool path), while plain integers (including
+        # negative values) keep their own exact key to avoid mismatches when the
+        # same value appears as bool (where -1 -> True) in a typed array.
+        _all_bool = all(isinstance(v, (bool, np.bool_)) for v in _flat_obj)
+        _all_int = (_flat_obj
+                    and not _flat_dt
+                    and all(isinstance(v, numbers.Integral) and not isinstance(v, (bool, np.bool_))
+                            for v in _flat_obj))
+        if _all_bool:
+            _ivs = [int(v) for v in _flat_obj]
+            if all(-(2 ** 63) <= v <= 2 ** 63 - 1 for v in _ivs):
+                return _row_keys(np.asarray(_ivs, dtype=np.int64).reshape(src.shape))
+            if all(0 <= v <= 2 ** 64 - 1 for v in _ivs):
+                return _row_keys(np.asarray(_ivs, dtype=np.uint64).reshape(src.shape))
+        elif _all_int:
             _ivs = [int(v) for v in _flat_obj]
             if all(-(2 ** 63) <= v <= 2 ** 63 - 1 for v in _ivs):
                 return _row_keys(np.asarray(_ivs, dtype=np.int64).reshape(src.shape))
