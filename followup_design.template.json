@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "study_id": "dynamic-csa-hca-followup-v1",
+  "status": "draft",
+  "freeze": {
+    "registered_at_utc": null,
+    "source_commit": null,
+    "test_split_accessed": false,
+    "test_document_ids_frozen": false,
+    "output_dir": "results_followup_confirmatory"
+  },
+  "design": {
+    "factors": {
+      "attention_family": ["CSA", "HCA"],
+      "segmentation": ["fixed", "dynamic"]
+    },
+    "factorial_arms": [
+      {"id": "csa_fixed", "family": "CSA", "segmentation": "fixed", "variant": "csa_fixed_rope"},
+      {"id": "csa_dynamic", "family": "CSA", "segmentation": "dynamic", "variant": "csa_dynamic_rope"},
+      {"id": "hca_fixed", "family": "HCA", "segmentation": "fixed", "variant": "TODO_PURE_HCA_FIXED"},
+      {"id": "hca_dynamic", "family": "HCA", "segmentation": "dynamic", "variant": "TODO_PURE_HCA_DYNAMIC"}
+    ],
+    "dense_controls": [
+      {"id": "dense_param_matched", "matching": "parameter_count", "variant": "full_rope"},
+      {"id": "dense_flops_matched", "matching": "measured_training_flops", "variant": "TODO_FLOPS_MATCHED_DENSE"}
+    ],
+    "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    "same_seed_data_order": true,
+    "same_training_token_budget": true,
+    "same_optimizer_schedule": true
+  },
+  "compute_matching": {
+    "profiler_measured": true,
+    "training_flops_tolerance_fraction": 0.01,
+    "inference_flops_reported": true,
+    "wall_clock_is_not_flops_proxy": true,
+    "unsupported_operator_policy": "refuse_flops_matched_claim"
+  },
+  "evaluation": {
+    "test_split": "WikiText-103 held-out test",
+    "minimum_distinct_documents": 64,
+    "use_full_test_split_when_feasible": true,
+    "document_ids_frozen_before_test_access": true,
+    "document_level_bootstrap_replicates": 10000,
+    "primary_metric": "pooled_nll_per_token",
+    "secondary_metrics": ["PPL", "document_level_NLL", "throughput", "peak_memory"],
+    "test_data_used_for_tuning": false
+  },
+  "statistics": {
+    "primary_hypotheses": [
+      "dynamic_minus_fixed_within_CSA",
+      "dynamic_minus_fixed_within_HCA",
+      "HCA_minus_CSA_under_fixed_segmentation",
+      "attention_family_by_segmentation_interaction"
+    ],
+    "paired_by": "seed",
+    "test": "exact_two_sided_sign_flip",
+    "correction": "Holm",
+    "familywise_alpha": 0.05,
+    "minimum_effective_seeds": 8,
+    "power_simulation_completed": false,
+    "target_power": 0.8,
+    "report_per_seed_differences": true,
+    "report_effect_sizes_and_confidence_intervals": true,
+    "document_bootstrap_unit": "document"
+  },
+  "algorithmic_gates": {
+    "prefix_invariance": false,
+    "future_perturbation_and_gradient": false,
+    "all_block_reference_equivalence": false,
+    "fp32_and_bf16_forward_backward": false,
+    "duplicate_selection_and_overlap_tests": false,
+    "pure_hca_layer_registry_verified": false,
+    "eager_and_kernel_parity": false
+  }
+}

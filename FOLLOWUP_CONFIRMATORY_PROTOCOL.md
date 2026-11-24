@@ -1,0 +1,156 @@
+# Follow-up confirmatory study: Dynamic CSA / HCA
+
+## Status and scope
+
+This is a **new, independent protocol**. It does not amend `confirmation_frozen.json`,
+does not change the v12 confirmatory estimand, and must use a new output directory
+and a separately frozen manifest. Until the manifest is signed/frozen and the
+new study is run, all results are exploratory.
+
+The repository currently has `csa_fixed_rope`, `csa_dynamic_rope`, and
+`hybrid_fixed_rope` variants. Do not label `hybrid_fixed_rope` as a pure HCA
+arm: it alternates CSA and HCA layers. A pure HCA fixed/dynamic implementation
+must be added to the variant registry and independently tested before the
+factorial HCA hypotheses can be run. The validator deliberately rejects
+placeholder variant names when `--require-ready` is used.
+
+## Required arms
+
+| Factor | Level | Meaning |
+|---|---|---|
+| Attention family | CSA | compressed-block sparse attention |
+| Attention family | HCA | hierarchical compressed attention; pure HCA, not hybrid |
+| Segmentation | fixed | fixed block boundaries |
+| Segmentation | dynamic | online/causal dynamic boundaries |
+| Reference | Dense, parameter matched | match trainable parameter count |
+| Reference | Dense, FLOPs matched | match measured training FLOPs |
+
+Required factorial cells:
+
+1. CSA + fixed segmentation
+2. CSA + dynamic segmentation
+3. HCA + fixed segmentation
+4. HCA + dynamic segmentation
+
+Add two distinct Dense reference arms. Parameter matching and compute matching
+are different estimands and must never be conflated. A parameter-matched Dense
+arm does not establish equal-compute efficiency; a FLOPs-matched Dense arm
+need not have equal parameter count.
+
+## Fairness controls
+
+For all primary sparse factorial cells:
+
+- same tokenizer, train/validation corpus fingerprints, train-token order, seed,
+  optimizer, learning-rate schedule, batch size, sequence length, context
+  position encoding, normalization, and training-token budget;
+- same model width/depth and output head unless the registered comparison
+  explicitly requires otherwise;
+- identical checkpoint selection and validation cadence;
+- report trainable parameter count, measured training FLOPs/token, total
+  training FLOPs, measured inference FLOPs/token, peak allocated memory,
+  throughput, and wall-clock time;
+- profile all arms with the same profiler, hardware, software stack, warm-up
+  policy, and measurement repetitions;
+- for FLOPs matching, tune only predeclared capacity knobs and require the
+  measured total training-FLOPs ratio to be within 1% of the target;
+- do not use wall-clock time as a substitute for FLOPs matching.
+
+Record both analytical FLOPs estimates and profiler-measured FLOPs. The measured
+value is the primary compute-matching gate; analytical estimates are a
+cross-check. If the profiler cannot reliably count an operator (e.g. custom
+Triton kernels), disclose the unsupported operators and refuse to call the arm
+FLOPs-matched until the count is independently reconciled.
+
+## Evaluation population
+
+Use the complete held-out test split where feasible. If a sampled document panel
+is required, sample at least 64 distinct documents, stratified by document
+length, and freeze the document IDs before model evaluation. The 64-document
+floor is a minimum population gate, not a claim that 64 documents are always
+sufficient for every effect size.
+
+Do not treat multiple windows from one document as independent documents.
+Aggregate token NLL within document, then report:
+
+- pooled NLL/token and PPL;
+- per-document NLL/PPL distribution;
+- document-level bootstrap confidence intervals (at least 10,000 resamples);
+- seed-level paired effects;
+- truncation/token coverage and the exact denominator.
+
+The test set must not be used for hyperparameter selection, early stopping,
+capacity tuning, threshold selection, or code-path selection.
+
+## Primary hypotheses and statistics
+
+Predeclare four primary tests:
+
+1. Dynamic minus Fixed within CSA.
+2. Dynamic minus Fixed within HCA.
+3. HCA minus CSA under Fixed segmentation.
+4. The segmentation × attention-family interaction.
+
+Use paired comparisons by seed. The same seed must use the same data order and
+training recipe across paired arms. Use exact two-sided sign-flip tests,
+Holm correction across the four primary hypotheses, and report raw and adjusted
+p-values, paired effect sizes, per-seed differences, and confidence intervals.
+
+A 12-seed design gives an exact two-sided sign-flip resolution floor of
+`2 / 2^12`; the validator checks that the minimum attainable p-value can clear
+the first Holm threshold. This is a mathematical resolution check, not a power
+guarantee. Before test access, run a simulation-based power analysis using
+plausible paired effect sizes and the observed validation-set variance. Increase
+the seed count if the target power is not reached.
+
+For document uncertainty, resample documents (not windows) within each seed.
+Report seed-level and document-level uncertainty separately; neither substitutes
+for the other.
+
+## Algorithmic acceptance gates before training
+
+Before any confirmatory training:
+
+- dynamic segmentation prefix invariance: extending a sequence must not change
+  cuts for an already observed prefix;
+- future-token perturbation: changing future tokens must not change earlier
+  segmentation, attention outputs, or gradients;
+- all-block equivalence: when the sparse selector includes every readable block,
+  sparse attention must match the independent dense/reference implementation
+  within declared dtype-specific tolerances;
+- forward and backward comparisons for FP32 and BF16, with explicit tolerance
+  tables and finite-gradient assertions;
+- no duplicate selected block contributes twice to the normalization;
+- block/window overlap semantics are explicitly declared and tested;
+- HCA pure-arm tests establish that the model actually uses HCA in every
+  intended layer (not a hybrid alternation);
+- test both eager and Triton/reference kernel paths where supported.
+
+These are correctness tests, not evidence that one method is better.
+
+## Freeze and reporting rules
+
+1. Implement missing pure-HCA variants and tests first.
+2. Run CPU correctness gates and GPU/Triton parity gates.
+3. Tune capacity only on training/validation data.
+4. Complete simulation-based power analysis.
+5. Freeze a new manifest, source commit, variant registry, seeds, document IDs,
+   metrics, hypotheses, correction family, and FLOPs measurement protocol.
+6. Only then access the held-out test split.
+7. Write outputs to a new directory, e.g. `results_followup_confirmatory/`.
+8. Never rewrite v12 results or silently revise the frozen v12 manifest.
+9. A failed or incomplete arm remains missing; do not silently shrink the
+   paired sample size or synthesize measurements.
+10. Claims about Dynamic CSA, HCA, or equal-compute superiority are permitted
+    only if the corresponding preregistered comparison passes its gates.
+
+## Running the design validator
+
+```bash
+python validate_followup_design.py followup_design.template.json
+python validate_followup_design.py followup_design.json --require-ready
+```
+
+The template is intentionally a draft: it contains TODO variant IDs for pure
+HCA and therefore must fail `--require-ready` until those implementations are
+added and tested.
