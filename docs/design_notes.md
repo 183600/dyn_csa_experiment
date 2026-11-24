@@ -1394,6 +1394,11 @@ Dense 仍是 TODO——因为协议要求**实测** FLOPs，不能用一个未�
 - `audit_gates.audit_causality` 覆盖 `csa_dynamic_rope`、`hca_fixed_rope`、
   `hca_dynamic_rope`，并新增「固定长度下扰动未来 token」的直接前缀检查；
   HCA 的末位浮点弥散（~1e-6）在 1e-4 容差内，决策与块表相同。
+- **更正一个披露数字**：randidx 臂的死参数为
+  6 × (16,384 `W_DQ` + 16,384 `W_DK` + 1,024 `W_w`) = **202,752**
+  （11,089,904 的 1.83%），冻结清单里写的 201,216 少算了 1,536
+  （6 × 256）。清单本身是已发布预注册，本轮不改其字节；以本笔记与
+  `count_params` 实测为准，报告引用时写 202,752 / ≈1.8%。
 - `v12_supp.py` 的异常兜底不再对 `plan/smoke/power/analysis/report`
   执行 `git add -A` + commit + pull --rebase + push：零 GPU 预检失败绝不
   应把开发树发布到 main（本次审计中真实发生过一次）。长训练模式要推送

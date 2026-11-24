@@ -7,12 +7,13 @@ does not change the v12 confirmatory estimand, and must use a new output directo
 and a separately frozen manifest. Until the manifest is signed/frozen and the
 new study is run, all results are exploratory.
 
-The repository currently has `csa_fixed_rope`, `csa_dynamic_rope`, and
-`hybrid_fixed_rope` variants. Do not label `hybrid_fixed_rope` as a pure HCA
-arm: it alternates CSA and HCA layers. A pure HCA fixed/dynamic implementation
-must be added to the variant registry and independently tested before the
-factorial HCA hypotheses can be run. The validator deliberately rejects
-placeholder variant names when `--require-ready` is used.
+The repository has `csa_fixed_rope`, `csa_dynamic_rope`, `hybrid_fixed_rope`,
+and the pure-HCA arms `hca_fixed_rope` / `hca_dynamic_rope` (every layer is
+`kind='hca'`). Do not label `hybrid_fixed_rope` as a pure HCA arm: it
+alternates CSA and HCA layers. `validate_followup_design.py --verify-registry`
+imports the variant registry and rejects a hybrid arm declared as HCA, a
+fixed/dynamic mismatch, a missing variant, or a Dense control that is not a
+`full`-attention arm; `--require-ready` implies that check.
 
 ## Required arms
 
@@ -147,10 +148,12 @@ These are correctness tests, not evidence that one method is better.
 ## Running the design validator
 
 ```bash
-python validate_followup_design.py followup_design.template.json
-python validate_followup_design.py followup_design.json --require-ready
+python validate_followup_design.py followup_design.template.json --verify-registry
+python validate_followup_design.py followup_design.json --require-ready --repo .
 ```
 
-The template is intentionally a draft: it contains TODO variant IDs for pure
-HCA and therefore must fail `--require-ready` until those implementations are
-added and tested.
+The template is intentionally a draft.  The pure-HCA TODO entries are now
+real variants; the remaining blockers are the measured-FLOPs Dense arm
+(`TODO_FLOPS_MATCHED_DENSE`), the pre-test power simulation, the algorithmic
+gates, and the freeze metadata.  It must therefore still fail
+`--require-ready` until those are completed and recorded.
