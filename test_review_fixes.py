@@ -11885,10 +11885,16 @@ def t_restore_block_stats_recreates_missing_stats():
     for blk in m.blocks:
         blk.attn._stats = None
     L._restore_block_stats(snap)
-    for blk, (_, state, _, _) in zip(m.blocks, snap):
+    for blk, (_, state, cuts, pstate) in zip(m.blocks, snap):
         if state is not None:
             assert isinstance(getattr(blk.attn, '_stats', None), L._BlockStats)
             assert blk.attn._stats.snapshot() == state
+        if cuts is not None:
+            assert isinstance(getattr(blk.attn, '_cuts', None), list)
+            assert blk.attn._cuts == cuts
+        if pstate is not None:
+            assert isinstance(getattr(blk.attn, '_prefix_stats', None), L._PrefixStats)
+            assert blk.attn._prefix_stats.snapshot() == pstate
 
 
 def t_narrow_sidecar_rejects_corrupt_content():

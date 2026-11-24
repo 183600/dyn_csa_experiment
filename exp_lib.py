@@ -18536,9 +18536,15 @@ def _restore_block_stats(snap):
                 _cuts_cur[:] = cuts
             else:
                 attn._cuts = list(cuts)
-        if pstate is not None and isinstance(getattr(attn, '_prefix_stats', None), _PrefixStats):
-            attn._prefix_stats.__dict__.clear()
-            attn._prefix_stats.__dict__.update(pstate)
+        if pstate is not None:
+            _pst = getattr(attn, '_prefix_stats', None)
+            if isinstance(_pst, _PrefixStats):
+                _pst.__dict__.clear()
+                _pst.__dict__.update(pstate)
+            else:
+                _npst = _PrefixStats()
+                _npst.__dict__.update(pstate)
+                attn._prefix_stats = _npst
 
 def boundary_alignment(pred_cuts, gt_mask_row, n, tol=1, provenance=None):
     gt = np.nonzero(np.asarray(gt_mask_row)[:n - 1])[0] + 1
