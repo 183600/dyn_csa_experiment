@@ -27,7 +27,7 @@ def load(panel):
     if not os.path.exists(path):
         raise FileNotFoundError(f'fuse_analysis: results panel `{panel}` is not present ({path}).\n  The repository tracks SOURCE only — `results_*/` directories, `REPORT*.md` and the run-state files are all build products and are not committed.\n  Regenerate the panel before running this zero-GPU analysis, e.g.:  python run_gapfill.py full   (or the driver that owns `{panel}`), then re-run `python fuse_analysis.py`.')
     with open(path, encoding='utf-8') as f:
-        obj = json.load(f)
+        obj = L.strict_json_load(f)
     if not isinstance(obj, dict):
         raise TypeError(f'fuse_analysis: {path} is {type(obj).__name__}, not a JSON object')
     return obj

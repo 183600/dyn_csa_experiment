@@ -323,7 +323,12 @@ def _read_result(path):
         return None
     try:
         with open(path, encoding="utf-8") as stream:
-            result = json.load(stream)
+            try:
+                import exp_lib as _L
+                result = _L.strict_json_load(stream)
+            except ImportError:
+                stream.seek(0)
+                result = json.load(stream)
         if not isinstance(result, dict):
             raise ValueError("Child result must be a JSON object.")
         return result

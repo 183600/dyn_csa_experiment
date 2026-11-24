@@ -18555,7 +18555,9 @@ def _snapshot_block_stats(model):
 
 def _restore_block_stats(snap):
     for attn, state, cuts, pstate in snap:
-        if state is not None:
+        if state is None:
+            attn._stats = None
+        else:
             _st = getattr(attn, '_stats', None)
             if isinstance(_st, _BlockStats):
                 _st.__dict__.clear()
@@ -18564,13 +18566,17 @@ def _restore_block_stats(snap):
                 _ns = _BlockStats()
                 _ns.__dict__.update(state)
                 attn._stats = _ns
-        if cuts is not None:
+        if cuts is None:
+            attn._cuts = None
+        else:
             _cuts_cur = getattr(attn, '_cuts', None)
             if isinstance(_cuts_cur, list):
                 _cuts_cur[:] = cuts
             else:
                 attn._cuts = list(cuts)
-        if pstate is not None:
+        if pstate is None:
+            attn._prefix_stats = None
+        else:
             _pst = getattr(attn, '_prefix_stats', None)
             if isinstance(_pst, _PrefixStats):
                 _pst.__dict__.clear()

@@ -45,7 +45,7 @@ import exp_lib as L
 def _load_json_object(path, kind='panel'):
     """Read a JSON object; a valid-JSON non-object is corrupt evidence."""
     with open(path, encoding='utf-8') as f:
-        obj = json.load(f)
+        obj = L.strict_json_load(f)
     if not isinstance(obj, dict):
         raise RuntimeError(
             f'{path} is valid JSON but not an object ({type(obj).__name__}); '
