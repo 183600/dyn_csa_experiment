@@ -3002,8 +3002,9 @@ def t_evidence_metadata():
     # A boolean p must not be converted to 0.0 before the report's correction.
     old_load = BR.load
     try:
-        BR.load = lambda *a, **k: {'comparisons': {'flag': {'mean': 1.0,
-                                                           'p_exact_signflip': False}}}
+        BR.load = lambda *a, **k: {'code': BR._CUR_CS,
+                                    'comparisons': {'flag': {'mean': 1.0,
+                                                             'p_exact_signflip': False}}}
         txt = BR.sec_stats()
     finally:
         BR.load = old_load
@@ -7046,6 +7047,84 @@ def t_report_paired_row_single_config():
     assert pair[0] in ([('', 0)], [('', 1)]), pair
 
 
+def t_report_paired_row_per_seed_init():
+    """Per-seed init digests must not split one panel into one group per seed.
+
+    `init_core_fp` is the shared-trunk digest for ONE seed, so a correct panel
+    has a different digest for each seed.  It was wrongly part of the
+    across-seed grouping key, which reduced every correctly-stamped panel to
+    n=1.  The within-pair equality check (`_pair_reason`) is the correct level.
+    """
+    base = dict(train_knobs=None, data_fp='d', val_fp='v', eval_fp='e',
+                run_cfg='cfg', steps=10, tokens_seen=100)
+    a, b = {}, {}
+    for s in range(5):
+        init = f'init-{s}'
+        a[('', s)] = dict(base, variant='a', seed=s, ppl=10.0 + s * 0.1,
+                          init_core_fp=init)
+        b[('', s)] = dict(base, variant='b', seed=s, ppl=11.0 + s * 0.1,
+                          init_core_fp=init)
+    pair = BR.paired_row(a, b)
+    assert pair is not None and pair[2]['n'] == 5, pair
+    assert pair[0] == [('', s) for s in range(5)], pair[0]
+    # A seed whose two arms did NOT start from the same trunk is still refused
+    # by the per-pair check; the other seeds remain testable.
+    b[('', 2)]['init_core_fp'] = 'different-trunk'
+    pair = BR.paired_row(a, b)
+    assert pair is not None and pair[2]['n'] == 4, pair
+    assert ('', 2) not in pair[0], pair[0]
+
+
+def t_report_stale_records_are_not_quoted():
+    """A stale code stamp must not reach the stats/health/efficiency tables."""
+    import build_report as BR
+    old = BR.load
+    try:
+        BR.load = lambda *a, **k: {'code': 'v0.000',
+                                    'comparisons': {'old': {'mean': 1.0,
+                                                            'p_exact_signflip': 0.01}}}
+        txt = BR.sec_stats()
+        assert '陈旧分析已排除' in txt and '| old |' not in txt, txt
+    finally:
+        BR.load = old
+    # per_seed_records refuses both a stale and an unstamped record while
+    # keeping the current one.
+    root = tempfile.mkdtemp()
+    try:
+        od = os.path.join(root, 'results_lm_v5_scale')
+        os.makedirs(od)
+        rec = {'variant': 'a', 'ppl': 10.0, 'run_cfg': 'cfg',
+               'train_knobs': None, 'data_fp': 'd', 'val_fp': 'v',
+               'eval_fp': 'e', 'steps': 1, 'tokens_seen': 1}
+        with open(os.path.join(od, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::seed0': dict(rec, seed=0, _code=BR._CUR_CS),
+                       'a::seed1': dict(rec, seed=1, _code='v0.000'),
+                       'a::seed2': dict(rec, seed=2)}, f)
+        old_repo = BR.REPO
+        BR.REPO = root
+        BR._LOADED.clear()
+        try:
+            got = BR.per_seed_records('results_lm_v5_scale')
+        finally:
+            BR.REPO = old_repo
+            BR._LOADED.clear()
+        assert set(got.get('a', {})) == {('', 0)}, got
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_followup_requires_stopping_rule():
+    import validate_followup_design as V
+    plan = json.load(open(os.path.join(REPO, 'followup_design.template.json'), encoding='utf-8'))
+    assert plan['statistics']['stopping_rule'] == 'single_look_fixed_n'
+    assert plan['statistics']['n_looks'] == 1
+    for key, bad in (('stopping_rule', 'optional_stopping'), ('n_looks', 2)):
+        p2 = json.loads(json.dumps(plan))
+        p2['statistics'][key] = bad
+        errs = V.validate(p2)
+        assert any('stopping_rule' in e or 'n_looks' in e for e in errs), (key, errs)
+
+
 def t_driver_pairing_single_config():
     import v9_supp as V9
     def rec(cfg, ppl):
@@ -9058,7 +9137,8 @@ def t_malformed_panel_and_niah_records_are_excluded():
     # list/dict variant cannot name an arm, so the readers exclude it.
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
-            json.dump({'good::seed0': {'variant': 'good', 'seed': 0, 'ppl': 10.0},
+            json.dump({'good::seed0': {'variant': 'good', 'seed': 0, 'ppl': 10.0,
+                                       '_code': BR._CUR_CS},
                        'bad::seed0': {'variant': ['bad'], 'seed': 0, 'ppl': 9.0},
                        'bad2::seed0': {'variant': {'bad': 1}, 'seed': 0, 'ppl': 8.0}}, f)
         assert L.variant_presence(d) == {}
@@ -12209,7 +12289,7 @@ def t_report_duplicate_rows_are_not_arbitrary():
             ]
             with open(os.path.join(d, 'analysis_v7', 'flops_analytic.json'),
                       'w', encoding='utf-8') as f:
-                json.dump({'config': {}, 'rows': rows,
+                json.dump({'code': BR._CUR_CS, 'config': {}, 'rows': rows,
                            'crossover_seq_len_csa_beats_dense': 2048}, f)
             flops = BR.sec_flops()
             table = [line for line in flops.splitlines()
@@ -12506,7 +12586,7 @@ def t_experimental_readers_refuse_duplicate_json_keys():
 
 def t_report_registers_invalid_pvalues_as_untestable():
     import build_report as BR
-    stats = {'comparisons': {
+    stats = {'code': BR._CUR_CS, 'comparisons': {
         'good': {'mean': 1.0, 'p': 0.01},
         'bad': {'mean': 2.0, 'p': True},
         'omitted': {'mean': 3.0, 'omitted': 'no data'}}}
@@ -13084,6 +13164,8 @@ def main():
     _check('L3 crossover fit refusal rules + slope CI', t_crossover_scaling_refusals)
     _check('L3b scale-ladder allocation + transfer audit', t_scale_ladder_budget_and_transfer_audit)
     _check('L3c report pairing keeps one run_cfg group', t_report_paired_row_single_config)
+    _check('L3g per-seed init digests do not split a paired panel', t_report_paired_row_per_seed_init)
+    _check('L3h stale records are excluded from stats/pairing', t_report_stale_records_are_not_quoted)
     _check('L3d report refuses stale trajectories', t_report_stale_trajectory_refused)
     _check('L3e v8/v9 pairing keeps one run_cfg group', t_driver_pairing_single_config)
     _check('L3f v7 bootstrap pairing keeps one run_cfg group', t_v7_bootstrap_single_config)
@@ -13255,6 +13337,7 @@ def main():
     _check('N94 ce_loss denominator counts scored columns only', t_ce_loss_scored_column_denominator)
     _check('N95 kernel pool contract + open-block guard', t_kernel_pool_contract_and_open_block_guard)
     _check('N96 v12 minimum-power gate refuses a sub-floor panel', t_v12_power_gate_floor)
+    _check('N97 follow-up plan declares a single-look stopping rule', t_followup_requires_stopping_rule)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

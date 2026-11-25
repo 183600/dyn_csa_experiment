@@ -281,6 +281,7 @@ def main(argv=None):
     probe = {}
     lines = []
     lines.append('# fuse vs no-fuse — 零 GPU 边界统计对比（全部数字由落盘产物计算）\n')
+    lines.append(L.evidence_status_banner() + '\n')
     _abl_n = {v: len(_seeds_of(v)) for v in ('hybrid_csa_dyn', 'hybrid_csa_dyn_fuse', 'csa_dyn_fuse')}
     _core_n = len(_seeds_of('csa_dynamic'))
     if len(set(_abl_n.values())) == 1:
@@ -659,7 +660,8 @@ def main(argv=None):
             _blk_line = f'2. **分块行为在产物上并未重合（与「惰性旋钮」读法冲突，需复核）**：同面板两臂的最大单层单种子偏移为 **{_blk_txt}**（各统计量取逐层逐 seed 差的绝对值上界，越界阈值 0.01），即在该面板上 fuse 确实改变了分块行为；下文第 4 条的「没有改变块长分布」在本轮产物上**不成立**，应先查清是哪一层/哪个 seed 发生偏移再作结论。\n'
     else:
         _blk_line = '2. **分块行为的偏移量未测量**：本节无法从产物算出两臂的逐层块长差（层表不一致或统计量缺失），因此**不对「分块行为是否不变」作断言**。\n'
-    lines.append('\n## 机制结论（与上方计算结果一致）\n')
+    lines.append('\n## 结果读数（与上方计算结果一致；不是单因素机制归因）\n')
+    lines.append('> 本节的 Fuse/No-fuse 对比同时改变边界策略、读取范围与优化路径；即使统计显著，也只能读作系统级差异。机制归因需要 selection-attribution 与同骨干隔离对照，当前仓库没有这些工件。\n')
     _n_p = probe.get('n')
     _n_pp = probe.get('n_ppl')
     _n_p_eff = probe.get('n_eff_f1', _n_p)
@@ -667,8 +669,8 @@ def main(argv=None):
     _f1_d, _f1_p = (probe.get('d_f1'), probe.get('p_f1'))
     _ppl_d, _ppl_p = (probe.get('d_ppl'), probe.get('p_ppl'))
     # F1 and PPL are two displayed tests in one family.  Use the repo's
-    # reportable gate (exact-test resolution, Holm over the displayed family,
-    # and effect-vs-seed-noise) instead of calling any raw p<=0.05 result
+    # reportable gate (exact-test resolution + Holm over the displayed family)
+    # instead of calling any raw p<=0.05 result
     # "significant".
     _fuse_holm = L.holm_adjust([('f1', _f1_p), ('ppl', _ppl_p)])
 

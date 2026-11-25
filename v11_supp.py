@@ -270,7 +270,13 @@ def v11_analysis(out='analysis_v11/stats.json'):
         V9.add_paired(comparisons, name, panel_d, a, b, who='v11 ', outdir=outdir)
     add('scale384: csa_fixed - full', scale384, 'csa_fixed', 'full', 'results_lm_v5_scale')
     add('scale384: csa_fixed - full_sw128_matched', scale384, 'csa_fixed', 'full_sw128_matched', 'results_lm_v5_scale')
-    out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'scale384_panel': panel(scale384), 'comparisons': comparisons, 'holm': L.attach_holm(comparisons, family='v11 scale384 + seq2k comparisons')}
+    _gm_named = []
+    for _k, _v in (probe.get('contrasts') or {}).items():
+        _gm_named.append((f'probe|{_k}', (_v or {}).get('p_exact_signflip'), 'v11 probe'))
+    for _k, _v in comparisons.items():
+        _gm_named.append((f'scale384|{_k}', (_v or {}).get('p_exact_signflip'), 'v11 scale384'))
+    _gm = L.global_multiplicity_audit(_gm_named) if _gm_named else {'m': 0, 'rows': [], 'n_raw_significant': 0, 'n_bh_rejected': 0, 'n_bonferroni_significant': 0, 'n_untestable': 0}
+    out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'scale384_panel': panel(scale384), 'comparisons': comparisons, 'holm': L.attach_holm(comparisons, family='v11 scale384 + seq2k comparisons'), 'global_multiplicity': _gm}
     out_d = L.stamped_analysis('v11_analysis', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[v11 stats] wrote {out}')
     for k, v in contrasts_headline(probe).items():
@@ -585,6 +591,18 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
             _tag_n = f'{v['n']}' if v['n'] >= n_cells_max else f'{v['n']}（未配满，cell n={n_cells_max}）'
             A(f'| {k} | {_tag_n} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} | {v.get('p_holm') if v.get('p_holm') is not None else '—'} |')
         A('')
+        _hm = probe.get('holm_exploratory') or {}
+        if isinstance(_hm, dict) and _hm.get('family_min_attainable_p_holm') is not None:
+            _floor = _hm.get('family_min_attainable_p_holm')
+            A(f'**族级分辨率**：声明槽位 m={_hm.get("declared_slots")}，n_nonzero_max={_hm.get("n_effective_max")}；该族最小可达 Holm p = {_floor:.4g}。'
+              + ('⚠ 该值 > α=0.05：**整个族在当前种子数下不可能拒绝任何比较**——p_Holm=1.0 是分辨率上限，不是零效应。' if _hm.get('family_resolution_limited') else '该值 ≤ α，族内至少有一个比较在分辨率上可达显著。'))
+            A('')
+        A('> **检验假设边界**：精确符号翻转的尖锐零假设是「每个种子的配对差符号关于 0 对称」；同 seed/数据顺序/评测行/腐坏网格只是控制，不提供随机分配意义上的交换性。p 是 seed-level，不是 token/window-level；|mean|>std 只作稳定性诊断，不是显著性判据。')
+        A('')
+        _gm = st.get('global_multiplicity') or {}
+        if isinstance(_gm, dict) and _gm.get('m'):
+            A(f'**跨面板多重性**：本报告显示的全部 p 值 m={_gm.get("m")}；原始 p<0.05 {_gm.get("n_raw_significant", 0)} 个；BH-FDR q<0.05 {_gm.get("n_bh_rejected", 0)} 个；Bonferroni p<0.05 {_gm.get("n_bonferroni_significant", 0)} 个；无有效 p {_gm.get("n_untestable", 0)} 个（计入族大小，p 槽位=1）。跨面板引用必须按该全局视图措辞；族内 Holm 不能替代它。')
+            A('')
         n6 = [v for v in contr.values() if _floor_n(v) >= 6]
         if n6:
             sig = [v for v in n6 if v.get('p_holm') is not None and v.get('p_holm') < 0.05]
@@ -618,22 +636,26 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     ri_sig = _all_sig('randidx')
     ri_all_pos = bool(ri) and ri[0] > 0.0
     if ri_sig:
-        _ri_txt = 'randidx 全线更差且各对照格均达 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立：统计显著——n≥6、原始 p、Holm 通过；稳定性见 mean/std 列，|mean|>std 只作稳定性诊断，不是显著性判据）。'
+        _ri_txt = ('randidx 全线更差且各对照格均达 p<0.05：learned 与控制臂存在**系统级**差异（统计显著——n≥6、原始 p、Holm 通过；稳定性见 mean/std 列，|mean|>std 只作稳定性诊断）。'
+                   '但 randidx 是固定确定性哈希、allblocks 改变读取范围/STE 先验、dense 改变表示与容量，因此该差异**不能归因于「学习检索质量」这一单一机制**。')
     elif ri_all_pos:
-        _ri_txt = 'randidx 全线更差但并非各对照格都达 p<0.05：方向一致地支持「学习检索有独立贡献」，按当前分辨率只作方向性表述；「抗噪性主要来自稀疏归纳偏置本身」的较弱读法仍然成立。'
+        _ri_txt = ('randidx 全线更差但并非各对照格都达 p<0.05：方向一致，但按当前分辨率只能作方向性表述；不能写成「学习检索有独立贡献」。')
     else:
-        _ri_txt = 'randidx 至少在一格与 learned 相当或更优：抗噪性主要来自稀疏归纳偏置本身，「学习检索滤噪」的强版本不成立。'
+        _ri_txt = ('randidx 至少在一格与 learned 相当或更优：**不能**用这组对照支持「学习检索滤噪」的机制主张；'
+                   '同时也不能反推「抗噪性来自稀疏归纳偏置」——两者都不是单变量隔离。')
     if contr:
-        A(f'**机制结论（区间实时算自上方配对检验，n={n_contr_max}，Δ = 对照臂 − 学习选择臂）：**dense−learned Δ {_fmt(dn)} PPL，allblocks−learned Δ {_fmt(ab)} PPL，randidx−learned Δ {_fmt(ri)} PPL——' + _ri_txt + (f'（统计分辨率：本段引用的对比中，最全的为 n={n_contr_max}、最弱的仅 n={n_tree_min}，精确符号翻转 p 值下限因此是 {_floor_txt}，**未**跨过 0.05——上述读法只作方向性表述。）' if not probe_ok else '') + (f'（统计分辨率：本段引用的是 n={n_tree_min}–{n_contr_max} 的对比，最弱者下限 {floor_p_tree:.3f}；最弱一格仅 n={n_tree_min}，其分辨率仍不足以支撑显著性主张。）' if probe_ok and _pair_ragged else ''))
+        A(f'**系统级对比读数（区间实时算自上方配对检验，n={n_contr_max}，Δ = 对照臂 − 学习选择臂；不是单因素机制归因）：**dense−learned Δ {_fmt(dn)} PPL，allblocks−learned Δ {_fmt(ab)} PPL，randidx−learned Δ {_fmt(ri)} PPL——' + _ri_txt + (f'（统计分辨率：本段引用的对比中，最全的为 n={n_contr_max}、最弱的仅 n={n_tree_min}，精确符号翻转 p 值下限因此是 {_floor_txt}，**未**跨过 0.05——上述读法只作方向性表述。）' if not probe_ok else '') + (f'（统计分辨率：本段引用的是 n={n_tree_min}–{n_contr_max} 的对比，最弱者下限 {floor_p_tree:.3f}；最弱一格仅 n={n_tree_min}，其分辨率仍不足以支撑显著性主张。）' if probe_ok and _pair_ragged else ''))
+        A('')
+        A('> **归因边界**：直接机制证据需要 `audit_gates.py selection` 的 selection-attribution 工件（recall/mass vs 依赖 oracle）；当前仓库没有该工件，因此本节只能读作系统级臂间差异。')
         A('')
     else:
-        A('**机制结论**：`analysis_v11/stats.json` 的 `probe.contrasts` 为空，因此 dense/allblocks/randidx 相对 learned 的 Δ 区间**无数据**，本轮不给出机制读法。这不是「无差异」——是**未测量**。')
+        A('**系统级对比读数**：`analysis_v11/stats.json` 的 `probe.contrasts` 为空，因此 dense/allblocks/randidx 相对 learned 的 Δ 区间**无数据**，本轮不给出读法。这不是「无差异」——是**未测量**。')
         A('')
     A('---')
     A('')
     A(f'## P4S/P4F 交叉点标度读数 {_xo_txt}（d=384 full 臂对齐）')
     A('')
-    A('**判据**（与 v10 预注册一致）：seed 均值差距轨迹 ±1 点平滑后首次转正且不再回穿的 eval 步；窗内未交叉记删失。')
+    A('**判据**（与 v10 的预声明分析判据一致；该判据不是冻结预注册）：seed 均值差距轨迹 ±1 点平滑后首次转正且不再回穿的 eval 步；窗内未交叉记删失。')
     A('')
     A('| 规模 | 面板 | seeds | 交叉步（seed 均值轨迹） | 交叉 token | 状态 |')
     A('|---|---|---|---|---|---|')
@@ -669,7 +691,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
         A('')
     _xo256 = xo.get('d256_L6') or next((v for v in xo.values() if v.get('d') == 256), {})
     if _xo256.get('excluded_reconstructed') or any(((_xo256.get('per_seed_synth') or {}).get(str(s)) for s in _xo256.get('seeds', []))):
-        A('**注意**：d=256 的逐种子轨迹取自含 `synthesized` 重构记录的 summary，逐种子交叉步互为副本，只有均值轨迹有效。')
+        A('**注意**：d=256 面板含 `synthesized` 重构记录；这些 seed 已从逐种子轨迹、seed 均值轨迹与交叉点拟合中一并剔除（拟合状态为 `reconstruction_only`），因此该规模没有可独立复核的交叉点，本节不引用重构数值。')
     elif _xo256.get('status') == 'ok':
         A('**注意**：d=256 面板（`results_lm_v3_long`）当前不含重构记录，逐种子交叉步与 seed 均值轨迹同为有效读数。')
     A('')

@@ -1603,3 +1603,59 @@ Dense 仍是 TODO——因为协议要求**实测** FLOPs，不能用一个未�
 （实为 m=4）、`48 documents`（实为 4×12 条 arm-seed 记录）、`-(CE-baseline)`
 （实为 `+`）、默认 `csa_dynamic` 被称作 task-learned（文档明确否认）、
 随机模式按 (seed, layer) 变化（实为固定哈希，所有 ref 一致）。
+
+## 29. review 11（外部方法学审查）的逐项核验与代码处置
+
+本轮是**核验优先**的处置：先逐条对照当前 HEAD 的代码/产物，再决定改什么。
+没有新增训练面板，没有读取 test split，没有改 `confirmation_frozen.json`，
+也没有改任何测量语义（`CODE_SEMANTICS` 仍为 `v11.128`）。审查中的方向性
+结论大部分成立，但若干“代码里没有”的具体断言在当前 HEAD 已不成立；
+真正的代码缺陷集中在校验/报告层，本轮已修并加了回归测试。
+
+| # | 审查意见 | 是否成立（对照 HEAD） | 本轮处置 |
+|---|---|---|---|
+| 1 | 外部有效性：小模型/WikiText 不能外推到 LLM、预训练、DeepSeek、生产 | **成立（研究设计边界）**；README 顶部、§20、冻结清单 `scope` 均已声明 | 代码不能消除；报告/README 继续把主张限定在冻结范围 |
+| 2 | 未同时控制参数量、FLOPs、显存、优化难度 | **部分成立**；`full_matched`/`full_sw128_matched` 做了 1% 参数量匹配，`compute_budget_disclosure` 明说 +69% MLP / ~1.87x FLOPs / 读取比例不匹配；等 FLOPs 臂仍在 follow-up 的 TODO | 未新增算力臂（需新 run）；报告继续把 v12 主比较标为 `system_level_only` |
+| 3 | 1500 步/20k/40k 预算不足以支持“最终/渐近线”结论 | **部分成立**；报告已拒绝“渐近线”判定，只报窗口内读数 | 无代码改动（需要更长训练/LR 续训的新实验） |
+| 4 | 2–4 seeds 的精确检验 p 下限 | **成立（设计限制）**；`reportable_claim`/`signflip_p_floor` 已机器化并拒绝把未显著读成无效 | 无代码改动（补种子是新实验）；报告继续打印下限 |
+| 5 | 大量比较未做 FWER/FDR；exact 只保证单检验 | **部分成立**；族内 Holm 一直存在，`build_report` 也有跨面板 BH/Bonferroni；但 v10/v11 独立报告没有族级下限/全局视图，v10 的 ΔNLL/NIAH 表只印原始 p | **已修**：v10/v11 用 `attach_holm` 保留族级分辨率元数据并写进报告；新增跨面板 BH-FDR + Bonferroni；v10 的 ΔNLL/NIAH 表补 `p_Holm` 列 |
+| 6 | v7–v11 结果导向/选择性停止；预注册不足 | **部分成立**；v12 有冻结清单/一次性 test，但 follow-up 没有停止规则 | **已修**：`followup_design.template.json` 增加 `single_look_fixed_n`/`n_looks=1`/`interim_analysis_planned=false`；`validate_followup_design.py` 在 `--require-ready` 路径强制；协议写明 |
+| 7 | 长度外推：absPE 超过 max_pos 只取最后一段，和 RoPE 不可比 | **不成立（事实错误）**：`SmallGPT.trunk` 对超表输入直接 raise；v7 评估显式 `truncated=True`，报告把 absPE 排除出外推对比 | 无代码改动；保留警告 |
+| 8 | 干扰注入只测均匀随机 token，不能代表真实干扰 | **部分成立**；实现已有 uniform/natural/mask/delete/span/doc/topical 七种模式，并记录实际覆盖/改变几何；冻结 v12 探针确实只用 uniform | 无代码改动（冻结字节不动）；报告继续限定为“该腐坏模式下的响应” |
+| 9 | random/allblocks/dense 对照不能隔离机制 | **成立（设计限制）**；random 是固定哈希且有死参数，allblocks 改变读取范围/STE，dense 同时改表示/参数/核 | **已修报告措辞**：v10/v11 不再写“独立贡献/机制结论”，改“系统级差异”，并写明需要 selection-attribution 工件；fuse 报告标题同步降级 |
+| 10 | hard top-k/no_grad；未选块无注意力梯度；无 oracle/soft/recall | **成立（方法定义 + 证据缺口）**；`audit_gates.py selection` 是 fail-closed 合同，当前没有工件 | 未伪造证据；直接机制验证需要新探针/新测量 |
+| 11 | 动态分块混杂；未报告每样本块数/长度/读取 token | **部分成立**；`compression_report` 已有块数/长度/分位数和边界 F1，`audit_gates` 有块数匹配检查；逐样本读取 token 未落盘 | 未新增探针；报告保留现有聚合诊断并说明限制 |
+| 12 | 交叉点拟合点少、混杂、删失、平滑依赖、n=2 R²=1、无 CI | **部分成立**；HEAD 已强制 ≥4 个去重宽度、拒绝删失/训练量混杂、给斜率 CI/LOO；`n=2` 不会给 R² | **已修**：v10 交叉点新增 ±0/±1/±2 平滑敏感性并写进报告；Tobit/逐 seed 斜率仍是方法扩展 |
+| 13 | tokenizer/数据独立性、验证集复用、无独立 test 流程 | **不成立（事实错误）**；tokenizer 只从 train 前缀拟合，缓存命中 fail-closed 校验，`load_wikitest` 有一次性 test 流程（只是尚未执行） | 无代码改动 |
+| 14 | `eval_subset=128` 太小、只把 seed 当独立单位、无序列 bootstrap | **部分成立/表述过时**；128 只控制训练曲线，最终 PPL 用完整固定验证批；窗口 bootstrap 已实现；冻结面板确实是 16 个固定窗口 | **已修**：训练健康表的“documents/document-level”误标改为“evaluation rows/windows”；16 窗口限制继续披露 |
+| 15 | paired seed 不是严格 block；sign-flip 零假设是符号对称 | **成立（假设边界）**；§20 已写明；本轮还发现并修复一个真正的配对 bug | **已修**：`build_report._pair_condition_tail` 把**每 seed 不同**的 `init_core_fp` 当成跨 seed 分组键，导致正确面板被拆成每组 1 个 seed、n 从 4/5 掉到 1；现在只在 seed 内由 `_pair_reason` 校验，新增回归测试；v10/v11 报告补假设边界文字 |
+| 16 | 旧代码/旧配方/重构记录仍可能被引用 | **成立（真实代码缺陷）**：`sec_stats` 不看 analysis 的 code，`sec_training_health`/`sec_efficiency` 不过滤 `_code`/`synthesized`，`per_seed_records` 无 code 过滤，v8/v9 面板读取默认不过滤 | **已修**：`sec_stats`/`sec_flops` 的 analysis 戳不匹配即整节拒绝；health/efficiency 过滤 stale/synthesized；`per_seed_records` 要求当前 `_code`；`ppl_by_seed(require_code=True)` 供 v8/v9/v10/v11；`v9_supp.add_paired` 拒绝 stale code；`_CUR_CS` 不可读时 fail-closed |
+| 17 | results/analysis/REPORT 不入库，无法独立审计 | **成立（证据缺口）**；仓库是 source-only，`RELEASES.md` 无发布行；`archive_release.py` 机制存在 | 代码不能替代真实产物；报告头继续打印“不能独立审计” |
+| 18 | 依赖/环境未锁定，import 时装包/HF mirror | **部分成立/表述过时**：import 时 pip install 与 HF mirror 都已改为显式 opt-in；CPU lock 精确；CUDA 环境仍未 lock | 无代码改动；发布流程应归档 `pip freeze`/GPU 信息（`archive_release.py` 已做） |
+| 19 | 效率结论缺真实测量 | **部分成立**；`measure_efficiency` 有 warmup/重复/peak memory，报告区分解析 FLOPs；energy 未测 | **已修报告**：明确“Pareto 描述性、跨 shape/device 不可比、energy 未测”；未新增 GPU 测量 |
+| 20 | 缺 model-behavior/mechanism 直接验证 | **成立（研究设计限制）**；selection recall/oracle/distillation 未实现；NIAH 有 chance/nofar/正对照门，当前门为 false | 未伪造机制证据；`audit_gates.py selection` 继续 fail-closed |
+| 21 | 方向性证据被写成因果结论 | **部分成立**；v12 已有 system-level 限制，但 v10/v11/fuse 仍有“独立贡献/机制结论”字样 | **已修**：v10/v11/fuse 的标题/结论改为系统级读数并加归因边界；`build_report` 去掉“效应>噪声”当显著性门槛的旧措辞；`methodology_audit` 显式输出 `significant_p_only`/`stable_global` 两个判决 |
+
+**审查中与 HEAD 不符、应保留记录的事实**：`eval_subset=128` 不是最终 PPL
+评估（最终用完整固定验证批；冻结面板是 16 个窗口）；`n=2 → R²=1`/“无斜率
+CI”在 HEAD 不成立（≥4 点、CI/LOO、k=2 不给 R²）；“import 时自动装包/强制
+HF mirror”已改为 opt-in；“没有 Holm/FDR”“没有 window bootstrap”“48
+documents”“absPE 静默截断”均不成立。审查对**“参数匹配 ≠ 计算匹配”“hard
+top-k 的选择梯度只覆盖被选块”“缺少 selection-attribution”“source-only
+不可审计”**的判断成立，这些是本轮保留的限制声明，不用代码伪装成已解决。
+
+本轮代码改动（全部零实验、零 test 访问）：
+
+- `build_report.py`：修复 per-seed init 分组 bug；stats/flops/health/
+  efficiency/per-seed pairing 的 stale-code 门；单位措辞；效率/因果措辞。
+- `exp_lib.py`：`ppl_by_seed(require_code=...)`；`methodology_audit` 分离
+  `significant_p_only` 与 `stable_global`。
+- `v8_supp.py` / `v9_supp.py` / `v10_supp.py` / `v11_supp.py`：面板读取
+  要求当前 code；v9 paired 拒绝 stale code；v10/v11 族级分辨率 + 跨面板
+  BH/Bonferroni；v10 p_Holm 列、平滑敏感性、系统级措辞；v11 系统级措辞。
+- `fuse_analysis.py` / `open_block_supp.py` / `v9_supp.py`：报告头补
+  `evidence_status_banner()`；fuse 标题降级。
+- `followup_design.template.json` / `validate_followup_design.py` /
+  `FOLLOWUP_CONFIRMATORY_PROTOCOL.md`：单次固定 n 的停止规则。
+- `test_review_fixes.py`：新增 per-seed init、stale-record、stopping-rule
+  回归测试（N97 等）。

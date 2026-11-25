@@ -13787,17 +13787,33 @@ def format_variant_presence(presence, variants):
         return None
     return '; '.join(parts) + ' — omitted rather than quoting a cross-panel delta'
 
-def ppl_by_seed(outdir, full=False):
+def ppl_by_seed(outdir, full=False, require_code=False):
+    """Read a panel as {variant: {seed: ppl-or-record}}.
+
+    `require_code=True` fails closed on stale measurement semantics: a record
+    whose `_code` is not the current `code_stamp()` is excluded (and counted),
+    and a record without `_code` is unverifiable, so it is excluded too.  The
+    default stays backwards-compatible for callers that intentionally read
+    historical panels; report/statistics callers must opt in.
+    """
     _by_id = read_panel(outdir)
     out = {}
     if not _by_id:
         return out
+    _cur_code = code_stamp() if require_code else None
+    _n_stale = 0
     sp = os.path.join(outdir, 'summary.json')
     _seen_seed, _collide = ({}, {})
     for _v, _t, _s in _by_id:
+        _r = _by_id[(_v, _t, _s)][1]
+        if require_code and _r.get('_code') != _cur_code:
+            _n_stale += 1
+            continue
         if (_v, _s) in _seen_seed and _seen_seed[_v, _s] != _t:
             _collide.setdefault(_v, set()).update({_seen_seed[_v, _s], _t})
         _seen_seed[_v, _s] = _t
+    if _n_stale:
+        print(f'[stats] {sp}: {_n_stale} record(s) do not carry the current code semantics {_cur_code!r} — excluded from this read')
     if _collide:
         for _v, _tags in sorted(_collide.items()):
             print(f'[stats] WARNING: {sp}: variant `{_v}` holds SEVERAL protocol conditions for one seed (tags {sorted(_tags)}). This reader keeps ONE record per (variant, seed) — the flat map CANNOT represent the others.  A paired contrast built from it would silently quote a single condition; use `ppl_by_seed_grouped` to read the panel per condition.')
@@ -16735,7 +16751,14 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     _holm_assign(all_entries, m_family, alpha, 'p_holm_family')
     for e in all_entries:
         _ph = e.get('p_holm_global')
-        e['significant_global'] = bool(_ph is not None and float(_ph) < alpha and (not e.get('within_seed_noise')) and e.get('controlled'))
+        # Expose the two questions separately so no consumer can quote the
+        # joint "significant AND stable" verdict as if it were the p-value
+        # decision.  `significant_global` keeps its historical strict meaning
+        # (both conditions) for the verified/mechanism audit; `significant_p_only`
+        # is the statistical decision alone.
+        e['significant_p_only'] = bool(_ph is not None and float(_ph) < alpha and e.get('controlled'))
+        e['stable_global'] = bool(e['significant_p_only'] and (not e.get('within_seed_noise')))
+        e['significant_global'] = e['stable_global']
         e['significant_family'] = e['significant_global']
     report['family'] = {
         'name': ('ABLATION_DESIGN+BASELINE_DESIGN' if _scoped_baselines else 'ABLATION_DESIGN') + ' (exploratory; not pre-registered)',
@@ -16744,6 +16767,11 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         'alpha': float(alpha),
         'min_seeds_for_family_significance': signflip_min_n_for_holm(m_family, alpha),
         'note': 'Holm step-down over every declared contrast; missing arms keep their slot (dummy p=1). A panel below min_seeds_for_family_significance is resolution-limited, however large the observed effect.',
+        'significance_definition': {
+            'significant_p_only': 'Holm p<alpha on a controlled contrast (statistical decision)',
+            'stable_global': 'significant_p_only AND |mean|>std (stability diagnostic)',
+            'significant_global': 'the strict joint verdict (both of the above); it is NOT the p-value decision alone',
+        },
     }
 
     def _publish(group_name, design_group, entries_by_comp, meta, kind, require_param_match):

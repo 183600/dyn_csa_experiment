@@ -60,6 +60,9 @@
     "minimum_effective_seeds": 8,
     "power_simulation_completed": false,
     "target_power": 0.8,
+    "stopping_rule": "single_look_fixed_n",
+    "n_looks": 1,
+    "interim_analysis_planned": false,
     "report_per_seed_differences": true,
     "report_effect_sizes_and_confidence_intervals": true,
     "document_bootstrap_unit": "document"

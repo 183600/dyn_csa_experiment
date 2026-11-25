@@ -261,6 +261,16 @@ def validate(plan: dict, require_ready: bool = False, *,
     need(stats.get("report_per_seed_differences") is True, "per-seed differences must be reported")
     need(stats.get("report_effect_sizes_and_confidence_intervals") is True,
          "effect sizes and confidence intervals must be reported")
+    # A pre-registered test needs a stopping rule: without one, the number of
+    # looks (and therefore the error rate) is chosen after seeing the data.
+    # This study is a single fixed-n look; interim looks/sequential stopping
+    # would require their own alpha-spending registration.
+    need(stats.get("stopping_rule") == "single_look_fixed_n",
+         "statistics.stopping_rule must be 'single_look_fixed_n' for this design")
+    need(stats.get("n_looks") == 1,
+         "statistics.n_looks must be 1 (no interim analysis registered)")
+    need(stats.get("interim_analysis_planned") is False,
+         "interim_analysis_planned must be false for a single-look design")
 
     required_gates = (
         "prefix_invariance",

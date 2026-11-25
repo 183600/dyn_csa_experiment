@@ -136,6 +136,15 @@ guarantee. Before test access, run a simulation-based power analysis using
 plausible paired effect sizes and the observed validation-set variance. Increase
 the seed count if the target power is not reached.
 
+**Stopping rule.** This is a single-look, fixed-n study: exactly one analysis
+after all registered seeds complete (`stopping_rule =
+"single_look_fixed_n"`, `n_looks = 1`, `interim_analysis_planned = false`).
+No interim look, optional stopping, or sample-size re-estimation on the test
+split is registered. Adding looks or changing n after seeing test data would
+require a new pre-registration with its own alpha-spending plan; it cannot be
+folded into this one. The validator refuses a `--require-ready` plan without
+these fields.
+
 For document uncertainty, resample documents (not windows) within each seed.
 Report seed-level and document-level uncertainty separately; neither substitutes
 for the other.

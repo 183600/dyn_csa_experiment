@@ -12,6 +12,28 @@
 
 > **证据状态（引用数字前必读）**：`results_*/`、`analysis_*/`、`REPORT*.md` 有意不入库，且**没有随仓库发布证据归档**（`RELEASES.md` 尚无记录）。报告可由你自己产生的产物重建，但任何你没有重建过的报告数值都无法独立复核。只有当 `release_<tag>.tar.gz` 与清单发布到只读位置并通过 `archive_release.py verify` 时，相应主张才可审计。
 
+## 评审十一硬化（review 11）
+
+逐项核验见 `docs/design_notes.md` §29。本轮不新增训练面板、不改冻结清单、不读 test。
+真正的代码修复：
+
+- **配对面板 bug**：报告曾把每个 seed 不同的 `init_core_fp` 当作跨 seed 分组键，
+  正确面板被拆成每组 1 个 seed（n=1）。现在只在 seed 对内校验初始化，5 seed 面板恢复 n=5。
+- **陈旧记录 fail-closed**：`sec_stats`、`sec_flops`、健康/效率表、逐 seed 配对及 v8–v11
+  面板读取都要求当前 code stamp；旧分析/旧记录不再进入主表。
+- **多重性可见**：v10/v11 打印族级分辨率下限和跨面板 BH-FDR + Bonferroni；
+  v10 的 ΔNLL/NIAH 表补 `p_Holm`，不再在“Holm”标题下只印原始 p。
+- **机制措辞收紧**：v10/v11/fuse 不再把 random/all-block 对照写成“独立贡献/机制结论”，
+  改为系统级差异 + 归因边界 + 缺失 selection-attribution 的说明。
+- **停止规则**：follow-up 协议/校验器要求单次固定 n 分析；中途看数或改样本量需新预注册。
+- **报告卫生**：v9/open-block/fuse 补证据状态横幅；`eval_subset_rows` 不再误称 documents；
+  效率节明确 energy 未测。
+
+仍属研究设计限制、不能靠代码消除的：小模型/WikiText 外部有效性、参数匹配但非 FLOPs 匹配、
+短训练预算、2–6 seed 探索面板、16 窗口冻结面板、hard top-k 未选块无注意力梯度、
+缺 oracle/selection recall、动态分块逐样本几何不完整、无删失回归、source-only 无发布、
+CUDA 环境未锁定、未测 energy。
+
 ## 仓库结构
 
 仓库只保留**源码、驱动脚本与设计文档**。所有实验结果目录（`results_*/`）、

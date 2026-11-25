@@ -1785,7 +1785,14 @@ def _scale_crossovers():
         steps = sorted(set.intersection(*[set(das[s]) for s in common], *[set(dbs[s]) for s in common]))
         gap_mean = [float(np.mean([das[s][t] for s in common]) - np.mean([dbs[s][t] for s in common])) for t in steps]
         xo_m, crossed_m = _crossover_step(steps, gap_mean)
-        entry = {'status': 'ok', **p, 'seeds': common, 'excluded_reconstructed': _synth_seeds, 'tokens_per_step': tps, 'per_seed': per_seed, 'per_seed_synth': {str(s): bool(getattr(ha, 'per_seed_synth', {}).get(s) or getattr(hb, 'per_seed_synth', {}).get(s)) for s in common}, 'mean_crossover_step': xo_m, 'mean_crossed': crossed_m, 'mean_traj': {'steps': steps, 'gap': gap_mean},
+        # The first-positive/no-recross rule depends on the smoothing window;
+        # publish the raw and +/-1/2-point variants so a crossing that exists
+        # only at one smoothing level is visible rather than implicit.
+        _smooth_sens = {}
+        for _sm in (0, 1, 2):
+            _x_s, _c_s = _crossover_step(steps, gap_mean, smooth=_sm)
+            _smooth_sens[str(_sm)] = {'step': _x_s, 'crossed': bool(_c_s)}
+        entry = {'status': 'ok', **p, 'seeds': common, 'excluded_reconstructed': _synth_seeds, 'tokens_per_step': tps, 'per_seed': per_seed, 'per_seed_synth': {str(s): bool(getattr(ha, 'per_seed_synth', {}).get(s) or getattr(hb, 'per_seed_synth', {}).get(s)) for s in common}, 'mean_crossover_step': xo_m, 'mean_crossed': crossed_m, 'mean_traj': {'steps': steps, 'gap': gap_mean}, 'smoothing_sensitivity': _smooth_sens,
                  # Training-volume comparability: the scale fit needs the
                  # panel's actual training length, not just its width.  The
                  # last common eval step is the measured training horizon.
@@ -2277,12 +2284,20 @@ def v10_analysis(out='analysis_v10/stats.json'):
         _fam = [(k, (contrasts.get(k) or {}).get('p_exact_signflip') if k in contrasts else None)
                 for k in _fam_names]
         if _fam:
-            holm = L.holm_adjust(_fam)
+            # `attach_holm` keeps every declared slot (omitted/unmeasurable
+            # comparisons enter as p=1) and returns the family-level
+            # resolution ceiling.  The manual `holm_adjust` path used here
+            # before dropped that metadata and made the report unable to say
+            # that the whole family was resolution-limited.
+            _fam_slots = {k: (contrasts.get(k) if k in contrasts
+                              else {'omitted': 'no measurable paired cell'})
+                          for k in _fam_names}
+            holm = L.attach_holm(_fam_slots, family='v10 distractor probe contrasts')
             for _k, _v in contrasts.items():
                 if isinstance(_v, dict):
-                    _v['p_holm'] = (holm.get(_k) or {}).get('p_holm') if _k in holm else None
-            _rej = [k for k, v in holm.items() if v.get('reject')]
-            print(f'[v10 stats] Holm step-down over the {len(_fam)}-contrast family (EXPLORATORY — not pre-registered): {len(_rej)} survive at alpha=0.05' + (f': {sorted(_rej)[:4]}' if _rej else ''))
+                    _v['p_holm'] = _fam_slots.get(_k, {}).get('p_holm')
+            _rej = [k for k, v in _fam_slots.items() if v.get('p_holm') is not None and v['p_holm'] < 0.05]
+            print(f'[v10 stats] Holm step-down over the {len(_fam_slots)}-contrast family (EXPLORATORY — not pre-registered): {len(_rej)} survive at alpha=0.05' + (f': {sorted(_rej)[:4]}' if _rej else ''))
         probe = {'cells': probe_cells, 'contrasts': contrasts, 'delta_nll': delta_nll, 'holm_exploratory': holm}
         # ---- NIAH-natural (far-necessity task) ----
         _nsp = (PROBE.get('niah') or {}).get('summary')
@@ -2486,17 +2501,18 @@ def v10_analysis(out='analysis_v10/stats.json'):
             _comb.update(niah_contrasts)
             _comb_names = list(dict.fromkeys(_fam_names + _niah_declared + list(_comb)))
             if _comb_names:
-                _h2 = L.holm_adjust([
-                    (k, (_comb.get(k) or {}).get('p_exact_signflip') if k in _comb else None)
-                    for k in _comb_names])
+                _comb_slots = {k: (_comb.get(k) if k in _comb
+                                   else {'omitted': 'no measurable paired cell'})
+                               for k in _comb_names}
+                _h2 = L.attach_holm(_comb_slots,
+                                    family='v10 corruption + NIAH contrast family')
                 for _k, _v in _comb.items():
                     if isinstance(_v, dict):
-                        _e2 = _h2.get(_k)
-                        _v['p_holm'] = (_e2.get('p_holm') if isinstance(_e2, dict) else None)
+                        _v['p_holm'] = _comb_slots.get(_k, {}).get('p_holm')
                 holm = _h2
                 probe['holm_exploratory'] = _h2
                 probe['holm_family_note'] = ('Holm over the combined corruption + NIAH contrast families')
-                print(f'[v10 stats] Holm re-attached over the combined {len(_comb)}-contrast family (corruption + NIAH)')
+                print(f'[v10 stats] Holm re-attached over the combined {len(_comb_slots)}-contrast family (corruption + NIAH)')
     xo = _scale_crossovers()
 
     def _is_recon(v):
@@ -2529,7 +2545,20 @@ def v10_analysis(out='analysis_v10/stats.json'):
     add('seq2k(bs1): topk8 - topk512', seq2k, 'csa_fixed_topk8', 'csa_fixed_topk512', 'results_lm_v9_seq2k')
     panel = V8._panel_block
     scale_conf = _equal_token_slices()
-    out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'scale_confounds': scale_conf, 'seq2k_bs1_panel': panel(seq2k), 'comparisons': comparisons, 'holm': L.attach_holm(comparisons, family='v10 seq2k comparisons')}
+    # Cross-family multiplicity: the standalone v10 report displays probe,
+    # NIAH and seq2k p-values side by side.  Holm is only within one family;
+    # a reader quoting "it was significant in the probe and in NIAH" has
+    # selected over the union.  Record BH-FDR + Bonferroni over every p-value
+    # the report can display, so the report can constrain its wording.
+    _gm_named = []
+    for _k, _v in (probe.get('contrasts') or {}).items():
+        _gm_named.append((f'probe|{_k}', (_v or {}).get('p_exact_signflip'), 'v10 probe'))
+    for _k, _v in (((probe.get('niah_natural') or {}).get('contrasts')) or {}).items():
+        _gm_named.append((f'niah|{_k}', (_v or {}).get('p_exact_signflip'), 'v10 NIAH'))
+    for _k, _v in comparisons.items():
+        _gm_named.append((f'seq2k|{_k}', (_v or {}).get('p_exact_signflip'), 'v10 seq2k'))
+    _gm = L.global_multiplicity_audit(_gm_named) if _gm_named else {'m': 0, 'rows': [], 'n_raw_significant': 0, 'n_bh_rejected': 0, 'n_bonferroni_significant': 0, 'n_untestable': 0}
+    out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'scale_confounds': scale_conf, 'seq2k_bs1_panel': panel(seq2k), 'comparisons': comparisons, 'holm': L.attach_holm(comparisons, family='v10 seq2k comparisons'), 'global_multiplicity': _gm}
     out_d = L.stamped_analysis('v10_analysis', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[v10 stats] wrote {out}')
     for k, v in comparisons.items():
@@ -2802,8 +2831,17 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         p_floor = L.signflip_p_floor(n_min)
         learned_helps = ri_sig
         _dpos = bool(dn) and dn[0] > 0 and bool(ab) and ab[0] > 0
-        _dtxt = '正值表示「看得见远距噪声就会受害」，支持限制远距注意力暴露带来抗噪性' if _dpos else '区间并非全正，「远距暴露致害」的方向在本轮产物上不成立，以配对数字为准'
-        A(f'**结论（区间实时算自上方配对检验，Δ = 对照臂 − 学习选择臂）：**(1) dense−learned Δ 区间 {_fmt(dn)} PPL，allblocks−learned Δ 区间 {_fmt(ab)} PPL——{_dtxt}；(2) randidx−learned Δ 区间 {_fmt(ri)} PPL——' + ('全为正值且全部对照达到 p<0.05：学习到的检索对抗噪性有**独立贡献**（统计显著性成立；稳定性见 mean/std 列，|mean|>std 只作稳定性诊断）。' if learned_helps else f'未能在 p<0.05 上成立（randidx 对照的最小 n={n_min_ri}，全表最小 n={n_min}[{', '.join(sorted(_bind)[:2])}{('…' if len(_bind) > 2 else '')}]，精确符号翻转的 p 下限为 {p_floor:.3f}，' + ('该种子数下无法达到 0.05 显著性' if not (p_floor <= 0.05) else '分辨率已足以达到 0.05，未显著是数据结论而非分辨率上限') + '），「抗噪性来自学习到的检索质量」的强版本**不成立**；现有数据只支持「抗噪性主要来自稀疏归纳偏置本身」这一较弱表述。') + '）')
+        _dtxt = ('正值表示对照臂（dense/allblocks）在污染下损失更大，方向与「限制远距暴露会降低污染损失」一致；'
+                 '但这两个臂同时改变读取范围、KV 表示与容量，不能据此单独归因于「稀疏性」或「远端噪声」。'
+                 if _dpos else
+                 '区间并非全正，「远距暴露致害」的方向在本轮产物上不成立，以配对数字为准。')
+        _mech_note = ('> **归因边界**：`randidx` 是固定确定性哈希（不是每次前向重随机），`allblocks` 保留压缩块表示并大幅改变读取范围与 STE 先验，`dense` 同时改变表示/参数/核；'
+                      '三者都不是单变量隔离。即使 randidx 全线更差，最多支持「learned 选择优于该固定伪随机连接模式」这一系统级陈述，'
+                      '不能支持「学习到的检索质量有独立贡献」或「抗噪性来自稀疏归纳偏置」的机制结论。'
+                      '直接机制证据需要 `audit_gates.py selection` 的 selection-attribution 工件（当前仓库没有该工件）。')
+        A(f'**系统级对比读数（区间实时算自上方配对检验，Δ = 对照臂 − 学习选择臂；不是单因素机制归因）：**(1) dense−learned Δ 区间 {_fmt(dn)} PPL，allblocks−learned Δ 区间 {_fmt(ab)} PPL——{_dtxt}；(2) randidx−learned Δ 区间 {_fmt(ri)} PPL——' + ('全为正值且全部对照达到 p<0.05：learned 臂与控制臂存在**系统级**差异（统计显著性成立；稳定性见 mean/std 列，|mean|>std 只作稳定性诊断）。' if learned_helps else f'未能在 p<0.05 上成立（randidx 对照的最小 n={n_min_ri}，全表最小 n={n_min}[{', '.join(sorted(_bind)[:2])}{('…' if len(_bind) > 2 else '')}]，精确符号翻转的 p 下限为 {p_floor:.3f}，' + ('该种子数下无法达到 0.05 显著性' if not (p_floor <= 0.05) else '分辨率已足以达到 0.05，未显著是数据结论而非分辨率上限') + '），只能作方向性读数。') + '）')
+        A('')
+        A(_mech_note)
         A('')
     # ---- P3M-2：从头训练的选择器对照 ----
     _new_c = {k: v for k, v in contr.items() if k not in _legacy and not k.startswith('ΔNLL')}
@@ -2870,10 +2908,10 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         A('')
         _dnll_c = {k: v for k, v in contr.items() if k.startswith('ΔNLL')}
         if _dnll_c:
-            A('| ΔNLL 配对比较（ΔΔNLL = 臂间污染增量之差） | n | Δ mean±std | p (exact) |')
-            A('|---|---|---|---|')
+            A('| ΔNLL 配对比较（ΔΔNLL = 臂间污染增量之差） | n | Δ mean±std | p (exact) | p_Holm |')
+            A('|---|---|---|---|---|')
             for k, v in sorted(_dnll_c.items()):
-                A(f'| {k} | {v['n']} | {v['mean']:+.4f} ± {v.get('std', 0):.4f} | {v['p_exact_signflip']:.3f} |')
+                A(f'| {k} | {v['n']} | {v['mean']:+.4f} ± {v.get('std', 0):.4f} | {v['p_exact_signflip']:.3f} | {v.get('p_holm') if v.get('p_holm') is not None else '—'} |')
             A('')
         A('> **替代解释提示**：某臂 ΔNLL 小也可能因为它本来就很少利用远端上下文（干净 NLL 更高）——读表时必须把 ΔNLL 与干净 NLL 列一起看；`mask`/`delete` 行给出干净远端的收益幅度作为参照系。')
         A('')
@@ -2930,10 +2968,10 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                 A(f"| `{_k[0]}::{_k[1]}` | {_k[2]} | {_k[3]} | {_btxt(0)} | {_btxt(1)} | {_btxt(2)} | {_btxt(3)} | {c.get('distance_gradient')} |")
             A('')
         if niah.get('contrasts'):
-            A('| NIAH 配对比较（Δ = 对照臂 − 学习选择，answer NLL，>0 = 学习选择更好） | n | Δ mean±std | p (exact) |')
-            A('|---|---|---|---|')
+            A('| NIAH 配对比较（Δ = 对照臂 − 学习选择，answer NLL，>0 = 学习选择更好） | n | Δ mean±std | p (exact) | p_Holm |')
+            A('|---|---|---|---|---|')
             for k, v in sorted(niah['contrasts'].items()):
-                A(f'| {k} | {v['n']} | {v['mean']:+.3f} ± {v.get('std', 0):.3f} | {v['p_exact_signflip']:.3f} |')
+                A(f'| {k} | {v['n']} | {v['mean']:+.3f} ± {v.get('std', 0):.3f} | {v['p_exact_signflip']:.3f} | {v.get('p_holm') if v.get('p_holm') is not None else '—'} |')
             A('')
         A('> 该任务**在通过上表任务有效性判据后**才可用于「长距离信息利用」的机制读法：鲁棒性高 + 检索利用不差，才支持「稀疏选择在滤噪的同时保留了有用远距信息」；若只有鲁棒性而检索差，则更符合「本来就少用远端」的替代解释。正对照、无远端信息对照、chance 与距离梯度缺一不可；任一缺失时 NIAH 读数只能描述成败，不能解释机制。')
         A('')
@@ -2942,7 +2980,20 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     _n_all = sorted({v.get('n', 0) for v in contr.values() if isinstance(v, dict) and 'omitted' not in v})
     A(f'- 每个配对比较都给出逐种子 Δ、效应量 d_z 与该 n 下的双侧精确符号翻转 p 值下限 2/2^n（本表 n 集合 {_n_all}）。')
     A('- 上表全部 p 值按 **Holm step-down** 在本报告的对比族内做了多重校正（`analysis_v10/stats.json` 的 `probe.holm_exploratory`）；该校正族**未预先注册**，因此校正后的 p 只能防止过度宣称，不能当作确认性证据。')
+    _hm = probe.get('holm_exploratory') or {}
+    if isinstance(_hm, dict) and _hm.get('family_min_attainable_p_holm') is not None:
+        _floor = _hm.get('family_min_attainable_p_holm')
+        A(f'- **族级分辨率**：声明槽位 m={_hm.get('declared_slots')}，n_nonzero_max={_hm.get('n_effective_max')}；该族最小可达 Holm p = {_floor:.4g}。'
+          + ('⚠ 该值 > α=0.05：**整个族在当前种子数下不可能拒绝任何比较**——p_Holm=1.0 是分辨率上限，不是零效应。' if _hm.get('family_resolution_limited') else '该值 ≤ α，族内至少有一个比较在分辨率上可达显著。'))
+    A('- **检验假设边界**：精确符号翻转检验的尖锐零假设是「每个种子的配对差符号关于 0 对称」；同 seed/数据顺序/评测行/腐坏网格只是控制，不提供随机分配意义上的交换性。p 是 seed-level，不是 token/window-level；|mean|>std 只作稳定性诊断，不是显著性判据。')
     A('- v7→v11 的多轮追加实验与既有面板属于**探索性**证据；确认性检验见 `v12_supp.py`（冻结清单 `confirmation_frozen.json`：固定主比较、终点、种子数，用 wiki.test.raw 独立 test split 一次性评估）。')
+    _gm = st.get('global_multiplicity') or {}
+    if isinstance(_gm, dict) and _gm.get('m'):
+        A('')
+        A('### 跨面板多重性（BH-FDR + Bonferroni）')
+        A('')
+        A(f'- 本报告显示的全部 p 值共 m={_gm.get("m")} 个；原始 p<0.05 的 {_gm.get("n_raw_significant", 0)} 个；BH-FDR q<0.05 的 {_gm.get("n_bh_rejected", 0)} 个；Bonferroni p<0.05 的 {_gm.get("n_bonferroni_significant", 0)} 个；无有效 p 的 {_gm.get("n_untestable", 0)} 个（计入族大小，p 槽位=1）。')
+        A('- 跨面板引用（「在 probe 与 NIAH 都显著」）必须按该全局视图措辞；族内 Holm 不能替代它。该全局视图仍是探索性纪律，不把任何面板变成预注册证据。')
     A('')
     A('---')
     A('')
@@ -2983,12 +3034,23 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                 parts.append(f's{s}: {ps['crossover_step']:g}{('' if ps['crossed'] else '（删失）')}')
             A(f'- d={v['d']}: ' + '；'.join(parts))
         A('')
+    _sens_diff = []
+    for _lab, _v in xo.items():
+        _ss = _v.get('smoothing_sensitivity') if isinstance(_v, dict) else None
+        if not isinstance(_ss, dict) or not _ss:
+            continue
+        _vals = [(k, x.get('crossed'), x.get('step')) for k, x in _ss.items() if isinstance(x, dict)]
+        if _vals and len({(c, None if s is None else round(float(s), 6)) for _k, c, s in _vals}) > 1:
+            _sens_diff.append(_lab + ': ' + ', '.join(f'smooth={k}:{"crossed@" + format(float(x.get("step")), "g") if x.get("crossed") else "censored"}' for k, x in _ss.items() if isinstance(x, dict)))
+    if _sens_diff:
+        A('> **平滑敏感性**：下列面板的「首次转正且不再回穿」交叉步随 ±0/±1/±2 点平滑窗口改变（或从交叉变为删失）；单一平滑口径的交叉点不是稳健读数：' + '；'.join(_sens_diff))
+        A('')
     _xo256 = xo.get('d256_L6') or next((v for v in xo.values() if v.get('d') == 256), {})
     _xo256_step = _xo256.get('mean_crossover_step')
     _xo256_txt = f'~{_xo256_step:g} 步' if isinstance(_xo256_step, (int, float)) and math.isfinite(_xo256_step) else '步数未知（该规模无有效交叉读数）'
     _xo256_recon = bool(_xo256.get('excluded_reconstructed')) or any(((_xo256.get('per_seed_synth') or {}).get(str(s)) for s in _xo256.get('seeds', [])))
     if _xo256_recon:
-        A(f'**注意**：d=256 的轨迹取自 `results_lm_v3_long/summary.json`，其中部分记录是由聚合表重构的副本（`synthesized`），逐种子轨迹不可独立恢复——该规模的逐种子交叉步互为副本，只有 seed 均值轨迹的交叉步（{_xo256_txt}，eval 网格 1000 步）是有效读数。')
+        A('**注意**：d=256 面板含 `synthesized` 重构记录；这些 seed 已从逐种子轨迹、seed 均值轨迹与交叉点拟合中一并剔除（拟合状态为 `reconstruction_only`），因此该规模没有可独立复核的交叉点，本节不引用重构数值。')
     elif _xo256.get('status') == 'ok':
         A(f'**注意**：d=256 面板（`results_lm_v3_long`）当前不含重构记录，逐种子交叉步（{_xo256_txt} 附近）与 seed 均值轨迹同为有效读数。')
     A('')

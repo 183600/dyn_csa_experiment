@@ -111,10 +111,10 @@ def run_phase(name, guard, par=None):
     raise SystemExit(f'unknown phase {name}')
 
 def _ppl_by_seed(outdir, full=False):
-    return L.ppl_by_seed(outdir, full=full)
+    return L.ppl_by_seed(outdir, full=full, require_code=True)
 
 def _paired_records(outdir):
-    return L.ppl_by_seed(outdir, full=True)
+    return L.ppl_by_seed(outdir, full=True, require_code=True)
 
 def _seed_counts(panel, a, b, missing=()):
 
@@ -175,9 +175,20 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None):
         common = _ranked[0][1]
         print(f'[stats] {who}{name}: paired seeds span {len(_cfg_groups)} run_cfg groups — keeping only the largest/current group ({len(common)} seed(s)) instead of pooling configurations')
     dl, skipped, unstamped, why = ([], [], 0, set())
+    _cur_code = L.code_stamp()
+    _n_stale = 0
     for s in common:
         ra, rb = (panel[a][s], panel[b][s])
         unstamped += (ra.get('run_cfg') is None) + (rb.get('run_cfg') is None)
+        # A record whose measurement semantics predate the current code must
+        # not enter a paired statistic merely because both arms are equally
+        # old: the comparison would be internally paired but externally stale.
+        if ((ra.get('_code') is not None and ra['_code'] != _cur_code)
+                or (rb.get('_code') is not None and rb['_code'] != _cur_code)):
+            _n_stale += 1
+            why.add('stale code semantics')
+            skipped.append(s)
+            continue
         reason = L.pair_reason(ra, rb)
         if reason:
             why.add(reason)
@@ -192,6 +203,7 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None):
     res['seeds'] = [s for s in common if s not in set(skipped)]
     res['n_skipped_config_mismatch'] = len(skipped)
     res['n_unstamped'] = unstamped
+    res['n_stale_code_excluded'] = _n_stale
     # Parameter-control disclosure (the same 1% gate `methodology_audit`
     # applies to the declared design tables): a paired contrast whose arms
     # differ in total parameter count is capacity-confounded and may only be
@@ -284,6 +296,7 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     A = lines.append
     A('# CSA / HCA 受控机制研究 — v9 补实验报告（topk 扫描补齐 + RoPE 长跑第三种子）')
     A('> **证据等级：探索性（exploratory）**。本面板的比较/种子是观察 validation 结果后选择的；Holm 校正只限制过度宣称，不等于预注册确认。')
+    A(L.evidence_status_banner())
     A('')
     A('')
     A(f'> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}')

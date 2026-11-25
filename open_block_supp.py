@@ -810,6 +810,8 @@ def _fmt(x, nd=4):
 
 def _render_markdown(stats):
     lines = ['# Open-block panel: maximum block length × current-block reading', '']
+    lines.append(L.evidence_status_banner())
+    lines.append('')
     lines.append(f'Code: `{stats["code"]}`  |  cells: {len(stats["cells_available"])}  |  seeds: {stats["seeds_requested"]}')
     if stats.get('primary_holm_floor') is not None:
         _floor_n = stats.get("primary_holm_floor_n")

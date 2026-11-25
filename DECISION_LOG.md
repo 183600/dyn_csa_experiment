@@ -52,6 +52,74 @@ release archive produced by `archive_release.py`.
 | review 9 (2026-11-25, independent re-audit) | full verification of an external review's defect list against the current HEAD before fixing anything. Confirmed ALREADY FIXED upstream (no change needed): all six par.py dispatcher claims (parent-logical→token `CUDA_VISIBLE_DEVICES` mapping incl. UUID/MIG, worker-index slot scheduling so CPU workers truly run in parallel, validated+deduped `CSA_PAR_GPUS` with no silent all-device fallback, `mkdtemp`-unique run dirs, fail-closed rc=0-but-invalid results via `_INVALID_RESULT_STATUSES`, atomic result/job writes via `_atomic_json`); the RoPE boundary fallback honoured-mask length (`T-1`, with the empty-sequence `gate=None` path); GEMM bitwise scoping (`lightning_indexer` refuses causal-ends narrowing because a GEMM is not bitwise column-independent across shapes, the eager batched twin is declared non-bitwise and carried in `training_knobs` rather than the `_code` stamp, and the environment snapshot records per-GPU UUID/arch plus precision flags); and both claimed hotspots (`causal_adaptive_threshold` is 128 MiB chunk-budgeted with the 8192-token exact cap and a 1024-sample long-context path; `lightning_indexer` fuses selection per query chunk and never materializes the full [n,B] score table). Real defects fixed in this pass: (1) import-time `os.chdir(REPO)` in `v7_supp`/`run_gapfill`/`m0_supp`/`baseline_tune`/`error_analysis` violated the design-notes §7 import-purity contract (test isolation, foreign-cwd library imports) — moved to each CLI `__main__` entry; `par.py` children already run with `cwd=REPO`, so no dispatch path changes; (2) design_notes §22.5 now states the complete straight-through gradient contract: the indexer weights get their ONLY gradient via the soft S path, while the main attention path (q projection, KV pooling/compression/head projections, sink) receives BOTH the hard and the soft gradient — previously only the indexer half was documented. `CODE_SEMANTICS` stays `v11.128`: no measurement semantics on any valid training/eval path changed, so no existing record is invalidated; frozen manifest untouched; no test-split access. | import hygiene + documentation; exploratory panels unchanged |
 | review 10 (2026-11-25, external methodological review) | verification-first pass over the reviewer's 15-item list against the CURRENT HEAD; no training panel, no frozen-manifest byte, no measurement-semantics change (`CODE_SEMANTICS` stays v11.128). Already correct / factual corrections recorded: the score-function sign is `+(CE-baseline)*logpi` in both docs and code (not negative as the review claimed; now extracted to `exp_lib.boundary_policy_term` with a two-action toy test `t_score_function_term_sign_two_action_toy`); the default `csa_dynamic` is documented as NOT task-learned (§22.5, README, here); the random-indexer control is still the FIXED deterministic hash `(row*12.9898+col*78.233)` in HEAD and every ref (the claimed per-(seed,layer) change does not exist; the reviewer read a stale snapshot); the Holm family is m=4 (not six); the frozen test panel is 16 windows (not 48 documents; 48 = arms x seeds). Real gaps fixed: (1) evidence status banner in every report builder from the `RELEASES.md` index (source-only => numbers not independently auditable); (2) frozen manifest caveats + `compute_budget_disclosure` printed next to the v12 primary table, per-comparison `single_factor_contrast=false` / `system_level_only=true`, and CONFIRMED wording limited to system-level differences; (3) honest parameter accounting: `param_breakdown` reports `dead_params`/`active` for random-indexer arms (202,752 dead, ~1.83%), `finaltest_stats` reports per-arm active counts/relative gap, and the report prints the fixed-hash/dead-parameter caveat; (4) `reportable_claim` split into statistical / stability / practical verdicts with |mean|>std demoted to a stability diagnostic, `build_report._sig_gate` updated, and the v12 CONFIRMED rule documented as NOT using that threshold (corrected the false 'same gate' claim); (5) explicit sign-symmetry null + assumption boundary + per-comparison sign counts/leave-one-out stability/within-seed-noise in `test_stats.json`; (6) power sensitivity (q_hat + Wilson lower bound, leave-one-seed-out and outlier-seed power) in `p5c_power.json`, `V12_SKIP_POWER=1` now additionally requires `V12_ACCEPT_LOW_POWER=1` when a power gate is declared and records `power_gate.json(status=skipped)`, report renders `accepted_low_power`, and the false 'symbol projection is an upper/lower bound' docstrings are corrected; (7) corruption audit: `_corrupt_row(return_audit=True)`/`_corruption_audit` record realised coverage/unique/overlap/changed/no-op/donor (spans were already disjoint; rho is nominal) and the report prints the realised-geometry table; (8) NIAH chance level + `nofar` no-far-information control + distance-bucketed accuracy + a task-validity machine gate that refuses mechanism wording without a positive control; (9) v12 test-probe Delta-NLL rebuilt from stored nll_sum/n_tok (same-arm clean baseline) instead of absolute PPL only; (10) post-test re-freeze cannot confirm: `round_is_confirmatory` forces `confirmatory_round=false`/`confirmed=[]` and the report warns that re-freezing does not restore test independence; (11) unit wording fixed (16 windows / 64-floor house convention / frozen `per_document` field erratum), length-extrapolation scope notes (nested-prefix targets, read fraction, alternative explanations) added to reports and §16; (12) broken `REVIEW_4_RESPONSE.md` references removed, README manifest-v2 and 'compute-matched' wording corrected, README_zh brought in line. No arm, seed, endpoint, alpha, Holm family or test-split access changed; no released evidence exists, so no number is claimed auditable. | code/reporting/documentation hardening; frozen manifest untouched; no test-split access |
 
+## 2026-11-25 — review 11: verification-first disposition; real stale/paired-statistics defects fixed
+
+An external methodological review (21 numbered concerns + a "keep" list) was
+checked item by item against HEAD before changing anything.  No training panel
+was run, no test split was read, `confirmation_frozen.json` was not modified,
+and no measurement semantics changed (`CODE_SEMANTICS` stays `v11.128`).  The
+full disposition table is `docs/design_notes.md` §29; the important split is:
+
+**Real code defects fixed (this is the part that changes what the code is
+allowed to say):**
+
+1. **Paired-panel grouping bug.** `build_report._pair_condition_tail` included
+   the per-SEED `init_core_fp` in the key used to group seeds for one sign-flip
+   test.  A correct panel has a different init digest for each seed, so every
+   correct panel was split into one group per seed and `paired_row` returned
+   n=1 (P0R/P1T/P2S).  The digest is now checked only within a seed pair by
+   `_pair_reason`, which is the correct level.  Regression:
+   `t_report_paired_row_per_seed_init`.
+2. **Stale records were still quotable through report paths that did not check
+   the code stamp.**  `sec_stats` rendered an old `analysis_v7/stats.json`
+   unchanged; `sec_training_health`/`sec_efficiency` did not filter `_code` or
+   `synthesized`; `per_seed_records` (and therefore P2S) had no code filter;
+   v8/v9/v10/v11 panel readers defaulted to `require_code=False`.  All of these
+   now fail closed on a stale/missing stamp (`sec_stats`, `sec_flops`,
+   health/efficiency, `per_seed_records`, `ppl_by_seed(require_code=True)`,
+   `v9_supp.add_paired`).  Regression: `t_report_stale_records_are_not_quoted`.
+3. **v10/v11 family multiplicity.**  v10 discarded `attach_holm`'s family-level
+   resolution metadata and v10/v11 had no cross-panel FDR view; v10's ΔNLL/NIAH
+   tables printed raw p under a "Holm" heading.  The reports now publish the
+   family floor (`m * 2/2^n`), a BH-FDR + Bonferroni view over all displayed
+   p-values, and `p_Holm` columns in those tables.
+4. **Mechanism wording.**  v10/v11 said the learned selector had an
+   "independent contribution" and used "mechanism conclusion" headings; fuse
+   analysis used the same heading.  These now read as system-level contrasts
+   with an explicit attribution boundary (random is a fixed hash, all-blocks
+   changes reading scope/STE, dense changes representation/capacity, and the
+   `audit_gates.py selection` artifact is absent).
+5. **Stopping rule.**  The follow-up protocol now registers a single fixed-n
+   look (`single_look_fixed_n`, `n_looks=1`,
+   `interim_analysis_planned=false`); `validate_followup_design.py` refuses a
+   `--require-ready` plan without it.
+6. **Report hygiene.**  The three report builders that lacked the
+   `evidence_status_banner()` now print it (`v9`, open-block, fuse); the
+   training-health table no longer calls `eval_subset_rows` "documents"; the
+   efficiency section states that the Pareto frontier is descriptive,
+   cross-shape/device comparisons are not a speed claim, and energy is not
+   measured.
+
+**Acknowledged limitations, not code-fixable (must not be presented as
+solved):** external validity beyond small WikiText models; parameter- but not
+FLOPs-matched dense controls; 1500/20k-step budgets; 2–6 seed exploratory
+panels; the frozen 16-window evaluation panel; the hard top-k/no-grad
+selection path (unselected blocks get no attention gradient); the absence of
+an oracle/soft-selection/selection-recall artifact; dynamic-block geometry
+being only partially persisted; no Tobit/censored crossover regression; the
+source-only repo having no released evidence archive; the CUDA environment not
+being locked; and energy not being measured.  These require new runs, new
+artifacts or a new pre-registration.
+
+**Factual corrections retained so the next review does not repeat them:**
+`eval_subset=128` is the in-training curve subset, not the final PPL (the final
+PPL uses the full fixed validation batch; the frozen panel is 16 windows);
+`n=2 -> R^2=1` and "no slope CI" are false at HEAD (the fit requires >=4
+de-duplicated widths and reports CI/LOO; k=2 reports no R^2); import-time pip
+install and the HF mirror are opt-in; Holm within families and a cross-panel
+BH/Bonferroni audit exist; window bootstrap exists; `48` is 4 arms x 12 seeds,
+not 48 documents; and absPE truncation is flagged, not silent.
+
 ## What the v12 freeze does and does not cover
 
 Covered: fixed-chunk CSA vs parameter-matched dense, trained random-indexer and

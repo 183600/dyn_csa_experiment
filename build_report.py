@@ -679,12 +679,22 @@ def per_seed_records(outdir):
     _ck = ('psr', outdir)
     if _ck in _LOADED:
         return _LOADED[_ck]
+    if not _CUR_CS:
+        # Fail closed: without a readable current code-semantics stamp no
+        # record can be shown to be current, and pairing a stale record would
+        # publish an old number as if it were a new measurement.
+        print(f'[report] per_seed_records: no readable current code-semantics stamp — every panel is excluded from pairing')
+        return {}
     s = summary(outdir)
     _legacy_ok = _legacy_warm_tags_cached(outdir)
     out = collections.defaultdict(dict)
     _ambiguous = set()
+    _n_stale = 0
     for _k, r in s.items():
         if isinstance(r, dict) and 'ppl' in r and ('variant' in r) and ('seed' in r) and _measurable(r):
+            if r.get('_code') != _CUR_CS:
+                _n_stale += 1
+                continue
             _sv = r['seed']
             if isinstance(_sv, (bool, np.bool_)):
                 print(f"[report] record {_k!r} in {outdir} carries a boolean seed — skipped for pairing")
@@ -714,6 +724,8 @@ def per_seed_records(outdir):
                 _ambiguous.add((_v, _tk))
                 continue
             _slot[_tk] = r
+    if _n_stale:
+        print(f'[report] per_seed_records({outdir}): {_n_stale} measurable record(s) do not carry the current code-semantics stamp {_CUR_CS!r} — excluded from pairing')
     out = dict(out)
     _LOADED[_ck] = out
     return out
@@ -830,12 +842,20 @@ def _pair_reason(ra, rb):
     return None
 
 def _pair_condition_tail(r):
-    """Everything `_pair_reason` requires to agree, except run_cfg itself.
+    """Everything `_pair_reason` requires to agree ACROSS seeds, except run_cfg.
 
     These are the remaining controlled fields, so seeds that differ in
-    optimizer, corpus/eval fingerprints, init or step count are never pooled
-    into one sign-flip test: each seed pair can be internally consistent while
-    the paired observations come from different recipes.
+    optimizer, corpus/eval fingerprints or step count are never pooled into one
+    sign-flip test: each seed pair can be internally consistent while the
+    paired observations come from different recipes.
+
+    `init_core_fp` is deliberately NOT part of this key.  It is a digest of the
+    shared-trunk initialization for ONE seed, so it is *expected* to differ
+    across seeds (seed 0 and seed 1 do not start from the same weights); using
+    it as an across-seed grouping key split every correct panel into one group
+    per seed and reduced n to 1.  The within-pair requirement (both arms of a
+    seed share the same shared-trunk init) is enforced by `_pair_reason`, which
+    is the correct level for that check.
     """
     return (
         _keyable_value(r.get('train_knobs')),
@@ -844,7 +864,6 @@ def _pair_condition_tail(r):
         _content_fp_text(r.get('data_fp')),
         _content_fp_text(r.get('val_fp')),
         _content_fp_text(r.get('eval_fp')),
-        _content_fp_text(r.get('init_core_fp')),
         tuple(_int_or(r.get(_k), None) for _k in PAIR_STEP_KEYS),
     )
 
@@ -998,7 +1017,7 @@ def sec_p0r():
                 _mt_gap = g_abs_m
             if _mt_gap > 0:
                 if _mt_sig:
-                    _p0r_concl = f'**结论**：PE 错配 **不是** sparse 劣势的来源。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍落后且通过「n≥6 + Holm + 效应>噪声」门槛（{_mt_stat}），**不支持 PE 混淆解释**；但这是该受控面板上的证据，不外推为普遍机制。'
+                    _p0r_concl = f'**结论**：在该受控面板上，PE 错配不足以解释 sparse 劣势（系统级证据，不是单因素机制归因）。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍落后且通过「n≥6 + Holm」统计门槛（|mean|>std 只作稳定性诊断）（{_mt_stat}），**不支持 PE 混淆解释**；但这是该受控面板上的证据，不外推为普遍机制。'
                 else:
                     _p0r_concl = f'**结论（方向性，未确认）**：PE 错配的证据方向与「sparse 劣势」一致。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）方向仍为落后（{_mt_stat}），但未通过显著性/族校正门槛，因此只能说**不能据此排除** PE 混淆，不能写成「混淆假设被证伪」或「机制性落后」。'
             else:
@@ -1983,12 +2002,12 @@ def sec_p2s():
             if st['mean'] > 0:
                 _gate_ok = _sig_gate(st, label=f'P2S {_ba} - {_bb}',
                                      family='P2S', register=False)
-                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：' + ('该差距通过 n≥6 + Holm + 效应>噪声门槛，方向为 sparse 更差。' if _gate_ok else '该差距**未通过** n≥6 + Holm + 效应>噪声门槛，只能作方向性读数，不能写成「已经反转」。') + '该面板同时改变宽度、层数、序列长度与训练量，**不能把差异单独归因于「dense 的容量红利」**；需要参数/计算/训练量匹配的规模臂才能做机制归因。' + (f'{_tag}' if _tag else '✓')
+                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：' + ('该差距通过 n≥6 + Holm 统计门槛，方向为 sparse 更差（|mean|>std 只作稳定性诊断；这不是单因素机制归因）。' if _gate_ok else '该差距**未通过** n≥6 + Holm 统计门槛，只能作方向性读数，不能写成「已经反转」。') + '该面板同时改变宽度、层数、序列长度与训练量，**不能把差异单独归因于「dense 的容量红利」**；需要参数/计算/训练量匹配的规模臂才能做机制归因。' + (f'{_tag}' if _tag else '✓')
             else:
                 _gate_ok = _sig_gate(st, label=f'P2S {_ba} - {_bb}',
                                      family='P2S', register=False)
                 _lead = ('该规模下 sparse 仍领先，早期优势未随规模消失。' if _gate_ok
-                         else '该差距**未通过** n≥6 + Holm + 效应>噪声门槛，只能作方向性读数，不能写成「优势仍在」。')
+                         else '该差距**未通过** n≥6 + Holm 统计门槛，只能作方向性读数，不能写成「优势仍在」。')
                 concl = (f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**'
                          f'（n={len(common)}，p={st['p_exact_signflip']:.3f}）：' + _lead
                          + '该面板同时改变宽度、层数、序列长度与训练量，**不能把差异单独归因于「dense 的容量红利」**；需要参数/计算/训练量匹配的规模臂才能做机制归因。'
@@ -2000,6 +2019,12 @@ def sec_flops():
     d = load(os.path.join(REPO, 'analysis_v7', 'flops_analytic.json'))
     if not d:
         return '## 解析 FLOPs / KV-cache — （无结果）\n\n'
+    _dcode = d.get('code') if isinstance(d, dict) else None
+    if not _CUR_CS or _dcode != _CUR_CS:
+        print(f'[report] sec_flops: flops_analytic.json carries code={_dcode!r}, current={_CUR_CS!r} — stale analytic artifact EXCLUDED')
+        return ('## 解析 FLOPs / KV-cache — （无可验证结果）\n\n'
+                f'> **陈旧解析产物已排除**：`analysis_v7/flops_analytic.json` 的代码语义戳为 `{_dcode}`，'
+                f'与当前 `{_CUR_CS}` 不一致（或缺失）；本节不引用其 FLOPs/交叉点数值。\n\n')
     cfg = d.get('config', {})
     rows = d.get('rows', [])
     if not isinstance(rows, (list, tuple)):
@@ -2327,14 +2352,23 @@ def _result_summaries():
 
 def sec_training_health():
     rows = []
+    _n_stale = 0
     for name, s in _result_summaries().items():
         for key, rec in s.items():
             if not isinstance(rec, dict):
+                continue
+            # A stale-code or synthesized record must not enter a numeric
+            # table: the same fail-closed rule as the aggregate tables.
+            if rec.get('synthesized') or not _CUR_CS or rec.get('_code') != _CUR_CS:
+                if isinstance(rec.get('curve_health'), dict):
+                    _n_stale += 1
                 continue
             h = rec.get('curve_health')
             if not isinstance(h, dict):
                 continue
             rows.append((name, key, rec, h))
+    if _n_stale:
+        print(f'[report] sec_training_health: {_n_stale} stale/synthesized curve-health record(s) excluded')
     if not rows:
         return ''
     lines = ['## Training-curve health (train/validation gap, over/under-fitting)', '',
@@ -2355,20 +2389,27 @@ def sec_training_health():
             fm(rec.get('ppl')), fm(h.get('final_minus_best')),
             fm(h.get('train_ce_slope_per_step'), 6), fm(h.get('val_ce_slope_per_step'), 6),
             fm(h.get('gap_last'), 4), rec.get('eval_subset_rows'), _ci))
-    lines += ['', '> `overfitting` = train CE falling while val CE rises; `underfitting_or_stalled` = neither falls; `nonfinite` = a NaN/Inf point was recorded (see the NaN diagnostics in the same record). Curve points use `eval_subset_rows` fixed documents while the final PPL uses the full fixed validation batch; the 95% CI is a document-level interval for the curve estimate, so small differences inside the interval are evaluation noise, not a mechanism effect.', '']
+    lines += ['', '> `overfitting` = train CE falling while val CE rises; `underfitting_or_stalled` = neither falls; `nonfinite` = a NaN/Inf point was recorded (see the NaN diagnostics in the same record). Curve points use `eval_subset_rows` fixed evaluation rows/windows (NOT documents; a window can span articles) while the final PPL uses the full fixed validation batch; the 95% CI resamples those rows/windows for the curve estimate, so small differences inside the interval are evaluation noise, not a mechanism effect.', '']
     return '\n'.join(lines) + '\n'
 
 
 def sec_efficiency():
     rows = []
+    _n_stale = 0
     for name, s in _result_summaries().items():
         for key, rec in s.items():
             if not isinstance(rec, dict):
+                continue
+            if rec.get('synthesized') or not _CUR_CS or rec.get('_code') != _CUR_CS:
+                if isinstance(rec.get('efficiency'), dict):
+                    _n_stale += 1
                 continue
             eff = rec.get('efficiency')
             if not isinstance(eff, dict) or eff.get('status') != 'ok':
                 continue
             rows.append((name, key, rec, eff))
+    if _n_stale:
+        print(f'[report] sec_efficiency: {_n_stale} stale/synthesized efficiency record(s) excluded')
     if not rows:
         return ''
     lines = ['## Measured efficiency', '',
@@ -2407,7 +2448,7 @@ def sec_efficiency():
         lines += ['', '**Pareto frontier (lower PPL at no higher prefill time)**:', '']
         for lat, ppl, name, key in _frontier:
             lines.append(f'- `{name}` / `{key}`: PPL {fm(ppl)}, prefill p50 {fm(lat, 2)} ms')
-    lines += ['', '> A PPL improvement should be read together with this table: a small gain accompanied by a much higher prefill time or footprint is not a deployable improvement.', '']
+    lines += ['', '> A PPL improvement should be read together with this table: a small gain accompanied by a much higher prefill time or footprint is not a deployable improvement. The Pareto frontier is descriptive: rows may have been measured at different sequence lengths/batch shapes and devices, so only same-shape/same-device pairs support a speed claim (`audit_gates.py efficiency_pairs`). **Energy is not measured**; no J/token or power claim is supported.', '']
     return '\n'.join(lines) + '\n'
 
 
@@ -2415,6 +2456,17 @@ def sec_stats():
     d = load(os.path.join(REPO, 'analysis_v7', 'stats.json'))
     if not d:
         return ''
+    # A bootstrap/statistics artifact is quotable only if it was derived by the
+    # current measurement semantics.  The old code silently rendered a cached
+    # analysis (e.g. code='v10.000') next to current numbers; that is exactly
+    # the stale-record path the reporting policy forbids.
+    _dcode = d.get('code') if isinstance(d, dict) else None
+    if not _CUR_CS or _dcode != _CUR_CS:
+        print(f'[report] sec_stats: analysis_v7/stats.json carries code={_dcode!r}, current={_CUR_CS!r} — stale/unverifiable analysis EXCLUDED')
+        return ('## 配对符号翻转检验（sign-flip permutation）— （无可验证结果）\n\n'
+                f'> **陈旧分析已排除**：`analysis_v7/stats.json` 的代码语义戳为 `{_dcode}`，'
+                f'与当前 `{_CUR_CS}` 不一致（或缺失）。本节不引用其 p 值/Holm 值，也不给出显著性结论；'
+                '用当前代码重建该分析后再纳入。\n\n')
     lines = ['## 配对符号翻转检验（sign-flip permutation）', '', '符号翻转检验：n≤20 枚举全部 2^n 种符号组合得精确双侧 p 值；20<n≤40 用 meet-in-the-middle 精确计数；n>40 用确定性的 Lugannani-Rice 鞍点尾近似（不是随机 Monte-Carlo）。n 很小时 p 的分辨率下限为 2/2^n，报告 Δ、方向同向性与该下限。', '', '> **证据等级：探索性（v7 面板）**。Holm 列在本报告展示的对比族内做 step-down 校正，防止把多格 p<0.05 读成多个发现；它不是预注册确认，也不能把 v7–v11 已看过的数据变成确认性证据（见 docs/design_notes.md §17）。', '', '| 比较 | Δ(mean) | p | p_Holm |', '|---|---|---|---|']
     items = d.get('comparisons', {}) if isinstance(d, dict) else {}
     if not isinstance(items, dict):

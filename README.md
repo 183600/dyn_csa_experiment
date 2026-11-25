@@ -85,6 +85,42 @@ item-by-item disposition is in `docs/design_notes.md` §28.  Highlights:
   statistical derivation.  PPL@4096 scores nested-prefix targets, so it is not
   a same-target context-length comparison.
 
+## Review-11 hardening (what changed)
+
+The review-11 response is verification-first: no new training panel, no frozen
+manifest byte change, no test access.  The item-by-item disposition (including
+the claims that are factually stale at HEAD) is `docs/design_notes.md` §29.
+Real code fixes in this pass:
+
+- **Paired-panel bug fixed.** The report grouped seeds for a sign-flip test
+  using the per-seed `init_core_fp`, which split every correct panel into one
+  group per seed and returned n=1.  Initialization is now checked only within
+  a seed pair; a 5-seed panel again yields n=5.
+- **Stale records fail closed.** `sec_stats`, `sec_flops`, the health/efficiency
+  tables, per-seed pairing and the v8–v11 panel readers now reject records whose
+  code stamp is not current (previously several paths still rendered old values).
+- **Multiplicity made visible in the standalone reports.** v10/v11 publish the
+  family resolution floor and a cross-panel BH-FDR + Bonferroni view; v10's
+  ΔNLL/NIAH tables now print Holm p-values instead of raw p-values under a
+  "Holm" heading.
+- **Mechanism wording narrowed.** v10/v11/fuse no longer call a random/all-block
+  contrast an "independent contribution" or a "mechanism conclusion"; they state
+  the attribution boundary and the missing selection-attribution artifact.
+- **Stopping rule registered.** The follow-up protocol/validator now require a
+  single fixed-n look; interim looks or sample-size changes need a new
+  pre-registration.
+- **Report hygiene.** v9/open-block/fuse reports print the evidence-status
+  banner; the "documents" mislabel on `eval_subset_rows` is fixed; the
+  efficiency section states that energy is not measured.
+
+Still acknowledged as design limitations (not solved by code): small WikiText
+models only, parameter- but not FLOPs-matched dense controls, short training
+budgets, 2–6 seed exploratory panels, the 16-window frozen panel, hard top-k
+selection with no attention gradient on unselected blocks, no oracle/selection
+recall artifact, partial dynamic-block per-sample geometry, no censored
+crossover regression, source-only (no released evidence), unlocked CUDA
+environment, and no energy measurement.
+
 ## Repository layout
 
 The repository keeps only **source code, driver scripts and design

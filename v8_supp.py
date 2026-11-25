@@ -70,10 +70,10 @@ def run_phase(name, guard, par=None):
     raise SystemExit(f'unknown phase {name}')
 
 def _ppl_by_seed(outdir, full=False):
-    return L.ppl_by_seed(outdir, full=full)
+    return L.ppl_by_seed(outdir, full=full, require_code=True)
 
 def _paired_records(outdir):
-    return L.ppl_by_seed(outdir, full=True)
+    return L.ppl_by_seed(outdir, full=True, require_code=True)
 
 def _cfg_key(value):
     """Hashable identity for a run_cfg metadata value.
