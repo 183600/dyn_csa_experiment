@@ -30,7 +30,10 @@ def _soft_check_call(*a, **k):
         print(f'[v7] pip install skipped ({type(e).__name__}: {e})')
         return 0
 REPO = os.path.dirname(os.path.abspath(__file__))
-os.chdir(REPO)
+# Import purity (design notes §7): importing a driver must not move the
+# process cwd.  The CLI entry chdir's to REPO explicitly (see __main__);
+# par.py children already run with cwd=REPO, and library importers
+# (audit_gates / tests) keep their own working directory.
 sys.path.insert(0, REPO)
 subprocess.check_call = _soft_check_call
 try:
@@ -3403,6 +3406,8 @@ def run_smoke():
     bootstrap_report(['results_lm_v3_1500'], out='analysis_v7_smoke/stats.json')
     print('\n[smoke] PASSED')
 if __name__ == '__main__':
+    # CLI entry: relative state/output paths are REPO-relative by contract.
+    os.chdir(REPO)
     mode = sys.argv[1] if len(sys.argv) > 1 else 'full'
     try:
         sys.stdout.reconfigure(line_buffering=True)

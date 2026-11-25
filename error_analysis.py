@@ -32,7 +32,8 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 REPO = os.path.dirname(os.path.abspath(__file__))
-os.chdir(REPO)
+# Import purity (design notes §7): no chdir at import time; the CLI entry
+# below chdir's to REPO, and library callers keep their own working directory.
 sys.path.insert(0, REPO)
 
 import numpy as np
@@ -414,4 +415,6 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+    # CLI entry: relative state/output paths are REPO-relative by contract.
+    os.chdir(REPO)
     main()

@@ -9,7 +9,8 @@ for _stream in (sys.stdout, sys.stderr):
         except (ValueError, OSError):
             pass
 REPO = os.path.dirname(os.path.abspath(__file__))
-os.chdir(REPO)
+# Import purity (design notes §7): no chdir at import time; the CLI entry
+# below chdir's to REPO, and par.py children run with cwd=REPO already.
 sys.path.insert(0, REPO)
 import exp_lib as L
 import torch
@@ -981,6 +982,8 @@ def run_smoke():
     shutil.rmtree('results_smoke', ignore_errors=True)
     print('\n[smoke] PASSED — the full pipeline works end to end; smoke outputs were deleted and no experiment directory was touched.')
 if __name__ == '__main__':
+    # CLI entry: relative state/output paths are REPO-relative by contract.
+    os.chdir(REPO)
     if len(sys.argv) > 2:
         print(f"[v6] unexpected arguments {sys.argv[2:]!r}; expected at most one mode argument ('smoke', 'overfit', 'topup' or 'full' — no argument means 'full'). Nothing was started.")
         raise SystemExit(2)

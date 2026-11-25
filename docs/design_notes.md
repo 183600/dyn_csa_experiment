@@ -255,7 +255,9 @@ RNG 流、不改返回内容，因此不触碰 §3.1 的可比性（`CODE_SEMANT
   缓存重建、未来 DataLoader 的随机源）；每个训练单元随后在 `train_variant`
   内重新按自己的种子定界，因此面板级播种不会改变任何记录。
 - 模块导入必须零副作用：不读写状态文件、不下载、不改随机种子。依赖产物的
-  检查在产物缺席时必须可跳过而不是失败。
+  检查在产物缺席时必须可跳过而不是失败。驱动脚本的 `os.chdir(REPO)` 只在
+  CLI 入口（`__main__`）执行，不在导入期；`par.py` 子进程由派发方显式给定
+  `cwd=REPO`，库调用方（audit 门 / 测试）保留自己的工作目录。
 
 ## 8. 仓库边界
 
@@ -838,6 +840,15 @@ statement / mechanism / `predicted_sign` / `primary_metric` / falsifier；
   `fuse_conv` 只从 `comp_reg` 得到梯度，`W_DQ/W_DK/W_w` 走的是 soft
   attention 的 straight-through 代理，不是 top-k 身份。因此默认臂应描述为
   「余弦阈值 + 由压缩率正则训练的标量偏移」。
+- straight-through 的完整梯度契约：前向值只取 hard 选择注意力，但反向里
+  `attn + (soft_attn - soft_attn.detach())` 让一切进入 `soft_attn` 的
+  参数都多得到一份 soft 路径梯度。即除了 indexer 权重（`W_DQ/W_DK/W_w`，
+  这是它们唯一的梯度来源）之外，主注意力路径的参数（q 投影、KV 池化/压
+  缩/头投影与 sink）会**同时**收到 hard 与 soft 两条梯度。这是有意的
+  surrogate 估计器设计：eager 与 kernel 参考实现按同一契约对拍
+  （`test_review_fixes.py` 的 `t_kernel_*` 梯度测试锁定该契约），不是
+  「只有 indexer 获得梯度」。收紧或放宽该契约属于测量语义变更，必须更新
+  `CODE_SEMANTICS` 并重跑相关面板。
 - 新增 opt-in `csa_dynamic_task`：切分决策按 gate 概率采样，训练损失加入
   score-function 项 `+(CE - baseline) * logπ / n_decisions`（CE 是被最小化的
   成本：advantage 为正时该项的梯度下降会**降低**该切分模式的采样概率；

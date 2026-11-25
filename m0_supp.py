@@ -53,7 +53,8 @@ for _stream in (sys.stdout, sys.stderr):
         except (ValueError, OSError):
             pass
 REPO = os.path.dirname(os.path.abspath(__file__))
-os.chdir(REPO)
+# Import purity (design notes §7): no chdir at import time; the CLI entry
+# below chdir's to REPO, and par.py children run with cwd=REPO already.
 sys.path.insert(0, REPO)
 import exp_lib as L
 import torch
@@ -969,6 +970,8 @@ def run_full():
         print('[m0] WARNING: final push failed — instance stays up 40 min for a retry, then shuts down. Results are safe on the data disk either way.')
 
 if __name__ == '__main__':
+    # CLI entry: relative state/output paths are REPO-relative by contract.
+    os.chdir(REPO)
     mode = sys.argv[1] if len(sys.argv) > 1 else ''
     if mode in ('-h', '--help'):
         print(__doc__ or '')
