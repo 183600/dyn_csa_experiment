@@ -3849,7 +3849,7 @@ def _random_mode_of(random_select):
     raise ValueError(f'lightning_indexer: random_select must be a bool or mode name, got {random_select!r}')
 
 
-def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_mask=True, query_chunk=2048, random_select=False, pre_qI=None, pre_w=None, out_valid=None, causal_ends_host=None, need_soft=True):
+def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_mask=True, query_chunk=2048, random_select=False, pre_qI=None, pre_w=None, out_valid=None, causal_ends_host=None, need_soft=True, pattern_seed=0):
     """Selection-mode table (``random_select``):
 
     learned (False)      -- the trained indexer (W_DQ/W_DK/W_w projections).
@@ -3858,9 +3858,14 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     'random_each'        -- per-forward re-randomized hash keyed by the row's
                              hidden state (the pattern changes as H evolves
                              every forward; deterministic and recompute-stable,
-                             consumes no RNG stream).
+                             consumes no RNG stream).  ``pattern_seed`` (an
+                             integer independent of the training seed) mixes a
+                             constant into the row key so one training seed
+                             can be rerun under different connection patterns;
+                             0 keeps the review-14 bits exactly.
     'random_dist'        -- the same content-keyed hash weighted by a causal
-                             distance kernel (locality-matched random draw).
+                             distance kernel (locality-matched random draw);
+                             ``pattern_seed`` applies as for 'random_each'.
     'nearest'            -- recency control (the k most recent readable
                              blocks).
     'stride'             -- uniform-stride control (evenly spaced readable
@@ -3868,13 +3873,22 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
 
     The four new modes are the follow-up protocol's mechanism-isolation
     controls (FOLLOWUP_CONFIRMATORY_PROTOCOL.md); none of them is part of the
-    frozen v12 plan, and 'random' keeps its historical bits exactly.
+    frozen v12 plan, and 'random' keeps its historical bits exactly.  A
+    nonzero ``pattern_seed`` is only valid together with 'random_each' /
+    'random_dist'; any other mode raises (a silent no-op would let a seeded
+    control arm be misrecorded as the unseeded variant).
     """
     n = H.shape[0]
     B = comp_kv.shape[0]
     dev = H.device
     hd = W_DQ.shape[1] // nIH
     _rmode = _random_mode_of(random_select)
+    _ps = int(pattern_seed)
+    if _ps != 0 and _rmode not in ('random_each', 'random_dist'):
+        raise ValueError(
+            f'lightning_indexer: pattern_seed={_ps} is only defined for the hash-based '
+            f're-randomized controls (random_each/random_dist), got random_select={random_select!r}; '
+            f'pass pattern_seed=0 (or omit it) for every other mode')
     if _rmode is not None:
         qI = kI = w_idx = None
     else:
@@ -4006,7 +4020,16 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
                 # .detach(): a control mode must not add a gradient path through
                 # its own scores (the legacy hash is constant for the same
                 # reason).
+                # pattern_seed (review-15): the connection-pattern seed is
+                # INDEPENDENT of the training seed — it shifts the row key by
+                # a seed-derived float64 constant so one training seed can be
+                # rerun under many connection patterns (separating pattern
+                # noise from training noise).  _ps == 0 skips the shift
+                # entirely, so the review-14 op chain — and therefore every
+                # selected index — stays bit-identical when the seed is unset.
                 _hk = H[s:e].detach().to(torch.float64).sum(-1)
+                if _ps:
+                    _hk = _hk + (_ps * 0.6180339887498949)
                 z = _hk[:, None] * 12.9898 + _jc
                 z.sin_()
                 z.mul_(43758.5453)
@@ -4217,7 +4240,8 @@ def lightning_indexer_open(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
 
 def _indexer_trainable(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
                        random_select=False, pre_qI=None, pre_w=None,
-                       out_valid=None, causal_ends_host=None, need_soft=True):
+                       out_valid=None, causal_ends_host=None, need_soft=True,
+                       pattern_seed=0):
     """Training wrapper around `lightning_indexer` with activation recompute.
 
     The indexer builds `raw`/`c`/`soft` tables of shape [T, B_blocks, nIH]
@@ -4226,14 +4250,15 @@ def _indexer_trainable(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
     (no RNG in the learned path or in any `random_select` mode: the legacy
     'random' hash is a fixed function of the row/column ids, and the
     random_each/random_dist modes hash a deterministic reduction of the saved
-    inputs — every mode is recompute-stable without RNG state).
+    inputs — every mode is recompute-stable without RNG state, including the
+    pattern_seed shift, which is a pure function of the config integer).
     """
     def _run(_h, _ck, _lt):
         _m, _idx, _soft = lightning_indexer(
             _h, _ck, _lt, W_DQ, W_DK, W_w, nIH, topk, return_mask=False,
             random_select=random_select, pre_qI=pre_qI, pre_w=pre_w,
             out_valid=out_valid, causal_ends_host=causal_ends_host,
-            need_soft=need_soft)
+            need_soft=need_soft, pattern_seed=pattern_seed)
         return _m, _idx, _soft
     # If an outer block/MLP checkpoint already owns this forward, do not nest
     # a second checkpoint (the outer recompute covers the indexer too).
@@ -4903,6 +4928,18 @@ class AttnCfg:
     # so the task objective can actually learn the boundary policy instead of
     # only the compression-rate regularizer.
     boundary_policy: str = 'threshold'
+    # Connection-pattern seed for the re-randomized hash controls
+    # (random_each / random_dist).  0 keeps the review-14 behaviour exactly
+    # (the pattern is keyed on the hidden state only).  A nonzero value mixes
+    # an independent seed into the row key so the follow-up protocol can
+    # rerun the SAME training seed under DIFFERENT connection patterns and
+    # separate pattern noise from training noise (FOLLOWUP doc,
+    # mechanism-isolation controls).  Fail-closed: a nonzero pattern_seed on
+    # any other indexer_mode (including the FROZEN fixed-hash 'random' and
+    # the learned indexer) is a configuration error, not a silent no-op —
+    # the frozen arm must stay bit-identical and the deterministic geometry
+    # controls (nearest/stride) have no pattern to seed.
+    pattern_seed: int = 0
 
     def __post_init__(self):
         # Dispatch strings select different forward paths; reject unknown
@@ -4978,6 +5015,18 @@ class AttnCfg:
             if hi is not None and not f <= hi:
                 raise ValueError(f'{label} must be <= {hi}, got {value!r}')
             return f
+
+        # pattern_seed normalisation + fail-closed mode check (see the field
+        # comment: only the two hash-based re-randomized controls consume it).
+        # Runs after the _cfg_int helper is defined.
+        self.pattern_seed = _cfg_int('pattern_seed', self.pattern_seed, 0)
+        if self.pattern_seed != 0 and self.indexer_mode not in ('random_each', 'random_dist'):
+            raise ValueError(
+                f'pattern_seed={self.pattern_seed} is only defined for the hash-based '
+                f're-randomized controls (indexer_mode random_each/random_dist); '
+                f'indexer_mode={self.indexer_mode!r} has no connection-pattern seed to mix '
+                f'(the frozen fixed-hash arm must stay bit-identical, nearest/stride are '
+                f'deterministic geometry, and the learned indexer is trained, not seeded)')
 
         self.cos_threshold = _cfg_float('cos_threshold', self.cos_threshold, lo=-1.0, hi=1.0)
         self.temperature = _cfg_float('temperature', self.temperature, lo=0.0, lo_open=True)
@@ -5674,7 +5723,7 @@ class HybridAttention(nn.Module):
                 # 并以 soft_form=True 固定走软分支的硬部分解——两者前向 bit 与
                 # 传入 soft 的形式完全一致。有梯度时条件为 False，走传入 soft
                 # 的完整图。
-                _, topk_idx, soft = _indexer_trainable(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, random_select=(cfg.indexer_mode if cfg.indexer_mode != 'learned' else False), pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=None, need_soft=_need_soft)
+                _, topk_idx, soft = _indexer_trainable(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, random_select=(cfg.indexer_mode if cfg.indexer_mode != 'learned' else False), pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=None, need_soft=_need_soft, pattern_seed=(getattr(cfg, 'pattern_seed', 0) if cfg.indexer_mode in ('random_each', 'random_dist') else 0))
                 # _indexer_selection 的 top-k 是无放回选择：有效槽位的块 id 逐行互不
                 # 相同（order 是列排列、kept 落在互异的 cumsum 秩列上），pad 槽位的
                 # 重复块 0 已被 sel_valid 置无效。故 gathered_attention 的
@@ -22728,11 +22777,149 @@ PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
 
 _MLP_RATIO_MEMO = {}
 
-def variant_mlp_ratio(variant, vocab, *, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=None, ref_variant='csa_dynamic'):
+def analytic_attn_flops_token(cfg, seq_len, *, n_heads=8, d_head=32):
+    """Per-layer, per-token FORWARD attention FLOPs under the repo's declared
+    analytical accounting (the same model behind the frozen manifest's
+    ``compute_budget_disclosure``: dense 2.30M vs csa 1.23M per layer per
+    token at L512, ratio 1.87x):
+
+      full attention        4 * H * Dh * n                  (scores + values)
+      full with window w    4 * H * Dh * min(w, n)
+      csa                   selection 2*c_index*B + 2*nIH*B
+                            + gathered core 4*H*Dh*min(k, B)
+                            + window 4*H*Dh*min(w, n)
+      hca                   4*H*Dh*B_h + 4*H*Dh*min(w, n)
+
+    B = ceil(n / block_size) (the trailing partial block exists, matching
+    blocks_fixed), B_h likewise.  Projections (qkvo / KV compression /
+    indexer), pooling, embeddings and the LM head are EXCLUDED for every arm:
+    this is a *capacity planning* model for the follow-up FLOPs-matched Dense
+    knob, never a compute-matching certificate — design notes 27.1 keeps
+    measured profiler FLOPs (within 1%) as the only acceptance gate for an
+    ``equal compute'' claim.
+    """
+    H, Dh, n = int(n_heads), int(d_head), int(seq_len)
+    kind = str(getattr(cfg, 'kind', 'csa'))
+    if kind == 'full':
+        # NOTE: the dense arm's optional sliding window is `cfg.window`
+        # (default 0 = true full attention); `sliding_window` is the CSA/HCA
+        # local branch knob and is irrelevant for a full-attention layer
+        # (_full_batched dispatches on cfg.window only).
+        w = int(getattr(cfg, 'window', 0) or 0)
+        if w > 0:
+            return 4 * H * Dh * min(w, n)
+        return 4 * H * Dh * n
+    w = int(getattr(cfg, 'sliding_window', 0) or 0)
+    m = max(int(getattr(cfg, 'block_size', 4) or 1), 1)
+    B = max((n + m - 1) // m, 1)
+    if kind == 'hca':
+        return 4 * H * Dh * B + 4 * H * Dh * min(w, n)
+    if kind == 'csa':
+        k = int(getattr(cfg, 'index_topk', 32) or 0)
+        c_index = int(getattr(cfg, 'c_index', 64) or 0)
+        nIH = int(getattr(cfg, 'n_index_heads', 4) or 0)
+        sel = 2 * c_index * B + 2 * nIH * B
+        core = 4 * H * Dh * min(k, B) + 4 * H * Dh * min(w, n)
+        return sel + core
+    raise ValueError(f'analytic_attn_flops_token: unknown attention kind {kind!r}')
+
+
+def analytic_train_flops_token(cfg, mlp_ratio, *, d=256, seq_len=512, n_heads=8, d_head=32):
+    """Analytical per-layer, per-token training-planning FLOPs = attention
+    term + MLP ``4 * d * hidden`` (up and down matmuls, MAC = 2).  Same
+    exclusions as `analytic_attn_flops_token` (projections / pooling / head
+    are not counted for ANY arm, so cross-arm comparisons stay consistent with
+    the frozen manifest's disclosure numbers).
+    """
+    return (analytic_attn_flops_token(cfg, seq_len, n_heads=n_heads, d_head=d_head)
+            + 4.0 * float(d) * float(d) * float(mlp_ratio))
+
+
+_FLOPS_RATIO_MEMO = {}
+
+
+def flops_matched_mlp_ratio(dense_variant, ref_variant, vocab, *, d=256, n_layers=6,
+                            n_heads=8, d_head=32, seq_len=512, ref_mlp_ratio=4.0):
+    """Solve the dense arm's ``mlp_ratio`` so its ANALYTICAL per-token
+    training FLOPs equal the reference (sparse) arm's at the training length.
+
+    This closes the follow-up protocol's ``TODO_FLOPS_MATCHED_DENSE`` *planning*
+    half: the capacity knob is now derivable from the declared analytical
+    model instead of a hand-guessed number.  The *acceptance* half stays
+    measured: per FOLLOWUP_CONFIRMATORY_PROTOCOL.md the arm may only be called
+    FLOPs-matched when the profiler-measured total training FLOPs are within
+    1% of the reference (an analytical equality is explicitly NOT a
+    certificate — design notes 27.1).
+
+    Frozen-config cross-check (the self-test in test_review_fixes.py locks
+    it): csa_fixed_rope at mr=4 gives 1,229,824 FLOPs/token/layer, full_rope
+    at the param-matched mr=6.76348876953125 gives 2,297,523 (1.87x), and the
+    solved FLOPs-matched dense ratio is exactly 689/256 = 2.69140625
+    (attention saving 524,288 - 181,248 = 343,040 buys back an MLP hidden of
+    689 instead of 1024).
+    """
+    _mkey = (str(dense_variant), str(ref_variant), int(vocab), int(d), int(n_layers),
+             int(n_heads), int(d_head), int(seq_len), float(ref_mlp_ratio))
+    _hit = _FLOPS_RATIO_MEMO.get(_mkey)
+    if _hit is not None:
+        return _hit
+    dense_cfgs = make_layer_cfgs(1, dense_variant)
+    ref_cfgs = make_layer_cfgs(1, ref_variant)
+    if len(dense_cfgs) != 1 or len(ref_cfgs) != 1:
+        raise RuntimeError('flops_matched_mlp_ratio needs single-layer probe cfgs')
+    if str(getattr(dense_cfgs[0], 'kind', '')) != 'full':
+        raise RuntimeError(
+            f'flops_matched_mlp_ratio: the target variant {dense_variant!r} must be a '
+            f'full-attention (dense) arm; FLOPs matching shrinks its MLP to pay for the '
+            f'dense attention, which is only meaningful against a dense baseline')
+    ref_f = analytic_train_flops_token(ref_cfgs[0], ref_mlp_ratio, d=d, seq_len=seq_len,
+                                       n_heads=n_heads, d_head=d_head)
+    dense_attn = analytic_attn_flops_token(dense_cfgs[0], seq_len, n_heads=n_heads,
+                                           d_head=d_head)
+    ratio = (ref_f - dense_attn) / (4.0 * float(d) * float(d))
+    if ratio == 4.0:
+        ratio = math.nextafter(4.0, 0.0)
+    if ratio <= 1.0:
+        raise RuntimeError(
+            f'[{dense_variant}] FLOPs-matched mlp_ratio would be {ratio:.2f} (<= 1): the '
+            f'reference arm {ref_variant} has no attention-FLOPs surplus over dense at '
+            f'seq_len={seq_len}, so an analytical FLOPs match is impossible here')
+    _FLOPS_RATIO_MEMO[_mkey] = ratio
+    print(f'[{dense_variant}] flops-planned mlp_ratio = {ratio:.6f} '
+          f'(analytical {ref_f:.0f} vs dense-attn {dense_attn:.0f} FLOPs/token/layer '
+          f'@ seq {seq_len}, ref {ref_variant}; measured-FLOPs gate still required)')
+    return ratio
+
+
+def variant_mlp_ratio(variant, vocab, *, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=None, ref_variant='csa_dynamic', flops_matched=None, flops_match_ref=None):
     if matched is None:
         matched = PARAM_MATCHED
     if isinstance(matched, (bool, np.bool_)):
         matched = PARAM_MATCHED if bool(matched) else set()
+    # FLOPs-planned path (review-15): arms listed in the run cfg's
+    # ``flops_matched`` set take their capacity knob from the ANALYTICAL
+    # FLOPs solver instead of parameter matching.  Two different estimands
+    # (follow-up protocol: parameter matching and compute matching must never
+    # be conflated), so the sets are disjoint by construction: an arm in both
+    # is a configuration error, not a silent precedence decision.
+    _fm = flops_matched or ()
+    if isinstance(_fm, (bool, np.bool_)):
+        _fm = ()
+    try:
+        _fm = {str(_x) for _x in _fm}
+    except TypeError:
+        _fm = set()
+    if _fm:
+        if variant in _fm and variant in matched:
+            raise RuntimeError(
+                f'[{variant}] is listed in BOTH matched (parameter) and flops_matched '
+                f'(compute) sets: parameter matching and FLOPs matching are different '
+                f'estimands and cannot apply to the same arm')
+        if variant in _fm:
+            _fref = str(flops_match_ref or ref_variant)
+            return flops_matched_mlp_ratio(variant, _fref, vocab, d=d, n_layers=n_layers,
+                                           n_heads=n_heads, d_head=d_head,
+                                           seq_len=seq_len)
     if variant not in matched:
         return 4.0
     # The ratio is a pure function of these arguments (the parameter count
@@ -24131,7 +24318,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
     key = f'{v}::seed{seed}'
     ratios = {} if ratios is None else ratios
     if v not in ratios:
-        ratios[v] = variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=cfg.get('matched'), ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'))
+        ratios[v] = variant_mlp_ratio(v, vocab, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], matched=cfg.get('matched'), ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'), flops_matched=cfg.get('flops_matched'), flops_match_ref=cfg.get('flops_match_ref'))
     out = {'status': 'ok', 'key': key, 'variant': v, 'seed': seed}
     _run_id = new_experiment_id('cell')
     _started_at = time.strftime('%Y-%m-%dT%H:%M:%S')
@@ -24423,7 +24610,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         _r = {}
         for _v in _variants:
             try:
-                _r[_v] = variant_mlp_ratio(_v, int(vocab_), d=int(d), n_layers=int(n_layers), n_heads=int(n_heads), d_head=int(d_head), seq_len=int(cfg.get('seq_len', 512)), matched=cfg.get('matched'), ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'))
+                _r[_v] = variant_mlp_ratio(_v, int(vocab_), d=int(d), n_layers=int(n_layers), n_heads=int(n_heads), d_head=int(d_head), seq_len=int(cfg.get('seq_len', 512)), matched=cfg.get('matched'), ref_variant=cfg.get('mlp_match_ref', 'csa_dynamic'), flops_matched=cfg.get('flops_matched'), flops_match_ref=cfg.get('flops_match_ref'))
             except Exception:
                 _r[_v] = None
         return _r

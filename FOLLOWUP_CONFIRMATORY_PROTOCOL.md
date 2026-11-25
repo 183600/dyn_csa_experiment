@@ -85,9 +85,15 @@ any mechanism wording:
   arms before training).  `random_each` re-randomizes every forward via a
   content-keyed hash of the hidden state (recompute-stable, no RNG stream);
   `random_dist` weights the same hash by a causal distance kernel
-  (tau = 512 tokens).  Connection-pattern seeds independent of the training
-  seed are still required by this protocol and are NOT yet wired — the
-  current variants key the pattern on the hidden state only.
+  (tau = 512 tokens).  **Connection-pattern seeds independent of the
+  training seed are wired now** (review-15): `AttnCfg.pattern_seed`
+  (default 0 = review-14 bits exactly; fail-closed on every non-hash mode)
+  mixes an independent integer into the row key of `random_each` /
+  `random_dist`, and the registry exposes the `..._randidx_each_ps<N>` /
+  `..._randidx_dist_ps<N>` twins, so one training seed can be rerun under
+  many connection patterns.  Declare the controls (and their pattern seeds)
+  in `design.selection_controls`; the validator cross-checks each declared
+  seed against the resolved registry cfgs.
 - **Reading-scope controls.** A learned-top-k vs all-block contrast changes
   reading scope and the STE soft prior, not only selection; pair it with a
   same-scope learned-vs-random contrast, and report block/read counts.
@@ -203,8 +209,13 @@ python validate_followup_design.py followup_design.template.json --verify-regist
 python validate_followup_design.py followup_design.json --require-ready --repo .
 ```
 
-The template is intentionally a draft.  The pure-HCA TODO entries are now
-real variants; the remaining blockers are the measured-FLOPs Dense arm
-(`TODO_FLOPS_MATCHED_DENSE`), the pre-test power simulation, the algorithmic
-gates, and the freeze metadata.  It must therefore still fail
-`--require-ready` until those are completed and recorded.
+The template is intentionally a draft.  The pure-HCA entries are real
+variants, the four selection controls and their pattern-seeded twins are
+registered, and the FLOPs-matched Dense arm now has a registry entry plus an
+ANALYTICAL capacity plan (`full_rope_flops_matched`; the run cfg routes it
+through `exp_lib.flops_matched_mlp_ratio`, whose frozen-config solution is
+mr = 689/256 = 2.69140625).  The remaining blockers are the
+profiler-MEASURED FLOPs verification (the analytical plan is never the
+certificate), the pre-test power simulation, the algorithmic gates, and the
+freeze metadata.  It must therefore still fail `--require-ready` until those
+are completed and recorded.

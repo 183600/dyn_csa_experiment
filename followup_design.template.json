@@ -22,7 +22,17 @@
     ],
     "dense_controls": [
       {"id": "dense_param_matched", "matching": "parameter_count", "variant": "full_rope"},
-      {"id": "dense_flops_matched", "matching": "measured_training_flops", "variant": "TODO_FLOPS_MATCHED_DENSE"}
+      {"id": "dense_flops_matched", "matching": "measured_training_flops", "variant": "full_rope_flops_matched",
+       "note": "capacity planning is analytical via exp_lib.flops_matched_mlp_ratio (run-cfg flops_matched set + flops_match_ref; frozen-config solution mr=689/256=2.69140625); the arm is compute-matched ONLY when the profiler-measured total training FLOPs fall within 1% of the reference — the analytical equality is never the certificate"}
+    ],
+    "selection_controls": [
+      {"id": "csa_random_fixed_hash", "variant": "csa_fixed_rope_randidx", "pattern_seed": 0},
+      {"id": "csa_random_each_ps0", "variant": "csa_fixed_rope_randidx_each", "pattern_seed": 0},
+      {"id": "csa_random_each_ps1", "variant": "csa_fixed_rope_randidx_each_ps1", "pattern_seed": 1},
+      {"id": "csa_random_each_ps2", "variant": "csa_fixed_rope_randidx_each_ps2", "pattern_seed": 2},
+      {"id": "csa_random_dist_ps1", "variant": "csa_fixed_rope_randidx_dist_ps1", "pattern_seed": 1},
+      {"id": "csa_nearest", "variant": "csa_fixed_rope_nearidx"},
+      {"id": "csa_stride", "variant": "csa_fixed_rope_strideidx"}
     ],
     "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
     "same_seed_data_order": true,

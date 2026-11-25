@@ -600,3 +600,53 @@ finite forwards), N112 (`mech_selection` smoke produces an audit-accepted
 artifact); `t_param_breakdown_reports_dead_indexer_params` (L5b) extended to
 the new modes.  `test_open_block.py` 15/15 and `validate_followup_design.py`
 registry checks still pass.
+
+## Review 15 (2026-11-26): independent re-verification of the six-category review + per-function exp_lib audit; pattern-seed wiring, mass_covered fix, FLOPs-matched dense planning
+
+Decision: verify every review-14 disposition claim independently against HEAD
+before changing anything, then perform the requested per-function audit of the
+dynamic segmenter / CSA-HCA forward / gradient paths.  No new training panel,
+no test-split access, no frozen-manifest byte change, `CODE_SEMANTICS` stays
+`v11.128`, `v12_supp.py plan` must keep admitting 48/48 records.
+
+Outcomes:
+
+1. **`mech_selection.mass_covered` was a real metric defect** (implementation
+   contradicted the `audit_gates.audit_selection` contract): the denominator
+   used the readable-block COUNT instead of the row's total attention mass,
+   deflating the metric by ~n_readable and making it incomparable with the
+   k/n_blocks random baseline.  Fixed (denominator = the softmax normaliser
+   over readable blocks); N114 locks the formula against an independent
+   recomputation.  Scientific impact: the pre-fix smoke read
+   `mass 0.09 < base 0.13` purely from the bug; the corrected smoke reads
+   `mass 0.38 > base 0.13`.
+2. **Connection-pattern seeds are wired** (FOLLOWUP protocol previously
+   declared them "NOT yet wired"): `AttnCfg.pattern_seed` (0 = review-14 bits
+   exactly, guard skips the shift entirely; any non-hash mode with a nonzero
+   seed fails closed in BOTH AttnCfg and lightning_indexer — the frozen
+   fixed-hash arm stays bit-identical), `lightning_indexer` /
+   `_indexer_trainable` / `_single` pass-through, registry twins
+   `csa_fixed_rope_randidx_{each,dist}_ps<N>`, `design.selection_controls`
+   in the follow-up template with a validator cross-check.  N113.
+3. **FLOPs-matched Dense planning** replaces `TODO_FLOPS_MATCHED_DENSE`:
+   `analytic_attn_flops_token` / `analytic_train_flops_token` (the disclosure
+   accounting: attention core + MLP, projections excluded for every arm;
+   dense's optional window is `cfg.window`, not CSA's `sliding_window`)
+   reproduce 1,229,824 vs 2,297,296 FLOPs/token/layer (1.87x) exactly;
+   `flops_matched_mlp_ratio` solves the dense knob (frozen-config solution
+   mr = 689/256 = 2.69140625); `full_rope_flops_matched` registered and routed
+   through `variant_mlp_ratio(flops_matched=..., flops_match_ref=...)`,
+   mutually exclusive with parameter matching (fail-closed).  The analytical
+   equality is planning only — the 1% profiler-measured gate stays the sole
+   "equal compute" acceptance; the follow-up template still fails
+   `--require-ready` by design.  N115.
+4. Per-function audit findings recorded in design_notes §32.4: the STE soft
+   prior, REINFORCE sign/baseline ordering, per-row/layer logp accumulation,
+   the four control-mode selection semantics, and the batched-twin dispatch
+   mirror were all verified sound (no gradient-estimation or
+   control-equivalence defect beyond item 1).
+
+Regression coverage: N113 (bit-identity at seed 0 vs the review-14 formula,
+reproducibility, distinctness, fail-closed modes, registry twins, model-path
+consumption), N114 (contract-formula lock + smoke), N115 (analytic numbers,
+solver, routing, mutual exclusion, registry, finite forward).

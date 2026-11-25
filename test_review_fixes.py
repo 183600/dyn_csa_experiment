@@ -3516,6 +3516,277 @@ def t_mech_selection_probe_smoke():
     assert r == 0, 'mech_selection smoke must exit 0'
 
 
+def t_pattern_seed_isolation_semantics():
+    """Review-15: the connection-pattern seed is independent of the training
+    seed — 0 keeps the review-14 bits exactly, distinct seeds give distinct
+    patterns, the same seed reproduces, and every non-hash mode fails closed
+    instead of silently ignoring the seed."""
+    import torch
+
+    torch.manual_seed(0)
+    n, B, d, nIH, K = 40, 20, 8, 2, 4
+    g = torch.Generator().manual_seed(0)
+    H = torch.randn(n, d, generator=g)
+    comp = torch.randn(B, d, generator=g)
+    W_DQ = torch.randn(d, d, generator=g)
+    W_DK = torch.randn(d, d, generator=g)
+    W_w = torch.randn(nIH, d, generator=g)
+    last = torch.arange(B, dtype=torch.long) * 2 + 1
+    readable = L.block_readable(L._arange_cache(n, H.device), last)
+
+    def _sel(mode, ps=0):
+        box = []
+        _, idx, _ = L.lightning_indexer(H, comp, last, W_DQ, W_DK, W_w, nIH, K,
+                                        return_mask=False, random_select=mode,
+                                        out_valid=box, need_soft=True,
+                                        pattern_seed=ps)
+        return idx, box[0]
+
+    # ps=0 is bit-identical to the unseeded call (no kwarg) and to the
+    # review-14 formula replicated independently.
+    a, va = _sel('random_each', 0)
+    b, vb = _sel('random_each')
+    assert torch.equal(a, b) and torch.equal(va, vb), 'pattern_seed=0 changed the unseeded bits'
+    _hk = H.to(torch.float64).sum(-1)
+    _jc = torch.arange(B, dtype=torch.float64)[None, :] * 78.233
+    z = torch.sin(_hk[:, None] * 12.9898 + _jc) * 43758.5453
+    z = z - torch.floor(z)
+    z = z * 2.0 - 1.0
+    for r in range(n):
+        order = torch.argsort(z[r].masked_fill(~readable[r], float('-inf')), descending=True, stable=True)
+        expect = sorted(j for j in order[:K].tolist() if bool(readable[r, j]))
+        got = sorted(int(v) for v, ok in zip(a[r].tolist(), vb[r].tolist()) if bool(ok))
+        if len(expect) == len(got):
+            assert got == expect, f'random_each ps=0 diverged from the review-14 formula at row {r}'
+
+    # distinct seeds -> distinct patterns; same seed -> reproducible
+    c1, vc1 = _sel('random_each', 1)
+    c2, vc2 = _sel('random_each', 2)
+    c1b, vc1b = _sel('random_each', 1)
+    assert torch.equal(c1, c1b) and torch.equal(vc1, vc1b), 'same pattern_seed must reproduce'
+    assert not torch.equal(a, c1) and not torch.equal(a, c2) and not torch.equal(c1, c2), \
+        'distinct pattern seeds must give distinct connection patterns'
+    d1, _ = _sel('random_dist', 1)
+    d2, _ = _sel('random_dist', 2)
+    assert not torch.equal(d1, d2), 'random_dist must honour the pattern seed'
+
+    # fail-closed: a seed on any non-hash mode is a configuration error
+    for mode in ('random', 'nearest', 'stride'):
+        try:
+            _sel(mode, ps=3)
+            raise AssertionError(f'pattern_seed must be refused for mode {mode!r}')
+        except ValueError:
+            pass
+    try:
+        L.lightning_indexer(H, comp, last, W_DQ, W_DK, W_w, nIH, K,
+                            return_mask=False, need_soft=False, pattern_seed=3)
+        raise AssertionError('pattern_seed must be refused for the learned path')
+    except ValueError:
+        pass
+
+    # AttnCfg validation: normalises integral floats, rejects bools/negatives,
+    # and refuses a seed outside the two hash modes
+    assert L.AttnCfg(kind='csa', indexer_mode='random_each', pattern_seed=3).pattern_seed == 3
+    assert L.AttnCfg(kind='csa', indexer_mode='random_each', pattern_seed=3.0).pattern_seed == 3
+    for bad_cfg in ({'indexer_mode': 'random_each', 'pattern_seed': True},
+                    {'indexer_mode': 'random_each', 'pattern_seed': -1},
+                    {'indexer_mode': 'random', 'pattern_seed': 1},
+                    {'indexer_mode': 'nearest', 'pattern_seed': 2},
+                    {'indexer_mode': 'learned', 'pattern_seed': 5}):
+        try:
+            L.AttnCfg(kind='csa', **bad_cfg)
+            raise AssertionError(f'AttnCfg must reject {bad_cfg}')
+        except ValueError:
+            pass
+
+    # registry twins: _psN suffix variants resolve the declared seed on every
+    # layer, and a seeded tiny model forward/backward stays finite
+    for name, mode, ps in (('csa_fixed_rope_randidx_each_ps3', 'random_each', 3),
+                           ('csa_fixed_rope_randidx_each_ps11', 'random_each', 11),
+                           ('csa_fixed_rope_randidx_dist_ps2', 'random_dist', 2)):
+        cfgs = L.make_layer_cfgs(2, name)
+        assert len(cfgs) == 2
+        for c in cfgs:
+            assert getattr(c, 'indexer_mode', None) == mode
+            assert int(getattr(c, 'pattern_seed', 0)) == ps
+            assert bool(getattr(c, 'rope', False))
+    torch.manual_seed(9)
+    cfgs = [L.AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=L.OVERLAP,
+                      index_topk=4, indexer_mode='random_each', pattern_seed=7)
+            for _ in range(2)]
+    m = L.SmallGPT(64, 32, 2, 2, 16, 128, cfgs, mlp_ratio=2)
+    x = torch.randint(0, 64, (2, 128))
+    o1 = m(x)
+    o2 = m(x)
+    assert torch.equal(o1, o2), 'a seeded control must be deterministic (recompute-stable)'
+    assert torch.isfinite(o1).all()
+    o1.float().pow(2).mean().backward()
+    bad = [nme for nme, p in m.named_parameters()
+           if p.grad is not None and not torch.isfinite(p.grad).all()]
+    assert not bad, f'non-finite grads under pattern_seed=7: {bad[:3]}'
+    # the model-level call path really consumes cfg.pattern_seed: same weights,
+    # different seed -> different output
+    torch.manual_seed(9)
+    cfgs0 = [L.AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=L.OVERLAP,
+                       index_topk=4, indexer_mode='random_each', pattern_seed=0)
+             for _ in range(2)]
+    m0 = L.SmallGPT(64, 32, 2, 2, 16, 128, cfgs0, mlp_ratio=2)
+    m0.load_state_dict(m.state_dict())
+    assert not torch.equal(m0(x), o1), 'cfg.pattern_seed must reach lightning_indexer'
+
+
+def t_mech_selection_mass_covered_is_mass_fraction():
+    """Review-15 (real defect): mass_covered is the FRACTION of the row's
+    attention mass inside the learned selection (denominator = the softmax
+    normaliser over readable blocks), not the mass divided by the
+    readable-block COUNT.  The count denominator deflated the metric by
+    ~n_readable and made it incomparable with the k/n_blocks baseline —
+    the review-14 smoke reported mass=0.09 < base=0.13 purely from the bug.
+    This test recomputes the metric from the captured probe passes with an
+    independent implementation of the contract formula and requires the
+    artifact numbers to match it."""
+    import argparse
+    import numpy as np
+    import torch
+
+    import mech_selection as MS
+
+    torch.manual_seed(7)
+    cfgs = [L.AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=L.OVERLAP,
+                      index_topk=4) for _ in range(2)]
+    model = L.SmallGPT(64, 32, 2, 2, 16, 128, cfgs, mlp_ratio=2)
+    model.eval()
+    g = torch.Generator().manual_seed(11)
+    batch = torch.randint(0, 64, (2, 128), generator=g).numpy().astype(np.int64)
+    device = torch.device('cpu')
+
+    # independent recomputation of the two probe passes
+    cap = MS._Capture()
+    orig_gat = MS._install_capture(cap)
+    orig_it = L._indexer_trainable
+    try:
+        with torch.no_grad():
+            cap.calls.clear()
+            _ = float(L.eval_ppl(model, batch, device, chunk=2))
+            learned = [(c['topk_idx'], c['sel_valid']) for c in cap.calls]
+            blocks = list(model.blocks)
+            for blk in blocks:
+                blk.attn.cfg.index_topk = 10 ** 6
+            cap.calls.clear()
+            _ = float(L.eval_ppl(model, batch, device, chunk=2))
+            assert len(cap.calls) == len(learned)
+            recalls, covers = [], []
+            for call, (l_idx, l_valid) in zip(cap.calls, learned):
+                got = MS._oracle_from_call(call, 4)
+                if got is None:
+                    continue
+                o_idx, o_valid, mass, readable = got
+                l_sets = MS._row_sets(l_idx, l_valid)
+                o_sets = MS._row_sets(o_idx, o_valid)
+                mass_np = mass.cpu().numpy()
+                read_np = readable.cpu().numpy()
+                for r in range(len(l_sets)):
+                    o_set = o_sets[r]
+                    total = float(mass_np[r][read_np[r]].sum())
+                    if not o_set or not math.isfinite(total) or total <= 0.0:
+                        continue
+                    l_set = l_sets[r]
+                    if l_set:
+                        recalls.append(len(l_set & o_set) / len(o_set))
+                        covers.append(float(sum(mass_np[r, b] for b in l_set)) / total)
+                    else:
+                        recalls.append(0.0)
+                        covers.append(0.0)
+    finally:
+        MS._restore_capture(orig_gat)
+        L._indexer_trainable = orig_it
+        for blk in blocks:
+            blk.attn.cfg.index_topk = 4
+
+    st = MS._probe_arm(model, batch, device, k=4)
+    assert st['recall_at_k'] is not None and st['mass_covered'] is not None
+    assert abs(st['recall_at_k'] - float(np.mean(recalls))) < 1e-9, \
+        'probe recall diverged from the independent recomputation'
+    assert abs(st['mass_covered'] - float(np.mean(covers))) < 1e-9, \
+        'probe mass_covered diverged from the contract formula (mass fraction, denominator = row total mass)'
+    # the corrected metric is a genuine fraction of mass: with the row total
+    # normalised to ~1, coverage must be ~the raw selected-block mass, NOT
+    # that mass divided by a ~16x block count.
+    assert st['mass_covered'] > 1.0 / 64.0, 'mass_covered collapsed to a count-deflated value'
+    # smoke (the shipped self-check) must still satisfy the audit contract
+    r = MS.cmd_smoke(argparse.Namespace())
+    assert r == 0, 'mech_selection smoke must still exit 0 after the denominator fix'
+
+
+def t_analytic_flops_model_and_flops_matched_dense():
+    """Review-15: the analytical per-token FLOPs model reproduces the frozen
+    manifest's compute_budget_disclosure numbers exactly, the FLOPs-matched
+    Dense capacity knob is solved (not guessed), the solver routes through
+    variant_mlp_ratio, and param/compute matching stay mutually exclusive."""
+    import torch
+
+    csa_cfg = L.make_layer_cfgs(1, 'csa_fixed_rope')[0]
+    dense_cfg = L.make_layer_cfgs(1, 'full_rope')[0]
+    hca_cfg = L.make_layer_cfgs(1, 'hca_fixed_rope')[0]
+    sw_cfg = L.make_layer_cfgs(1, 'full_sw128_matched_rope')[0]
+
+    # attention terms at the frozen train length L=512
+    assert L.analytic_attn_flops_token(csa_cfg, 512) == 181248, 'csa attention term'
+    assert L.analytic_attn_flops_token(dense_cfg, 512) == 524288, 'dense attention term'
+    assert L.analytic_attn_flops_token(hca_cfg, 512) == 139264, 'hca attention term'
+    assert L.analytic_attn_flops_token(sw_cfg, 512) == 131072, 'windowed dense attention term'
+
+    # whole per-layer per-token totals reproduce the disclosure
+    csa_total = L.analytic_train_flops_token(csa_cfg, 4.0, d=256, seq_len=512)
+    dense_total = L.analytic_train_flops_token(dense_cfg, 6.76348876953125, d=256, seq_len=512)
+    assert csa_total == 1229824, csa_total
+    assert dense_total == 2297296, dense_total  # 524,288 + 262,144 * 6.76348876953125
+    assert abs(dense_total / csa_total - 1.87) < 0.005, 'the 1.87x disclosure ratio'
+
+    # the FLOPs-matched dense knob: exact solution 689/256 at the frozen config
+    mr = L.flops_matched_mlp_ratio('full_rope_flops_matched', 'csa_fixed_rope', 8192,
+                                   d=256, seq_len=512)
+    assert mr == 689.0 / 256.0, mr
+    # by construction the analytical totals then agree
+    solved = L.analytic_train_flops_token(dense_cfg, mr, d=256, seq_len=512)
+    assert abs(solved - csa_total) < 1e-6, 'solved ratio must equalise the analytical totals'
+
+    # routing through variant_mlp_ratio: flops_matched set wins for that arm,
+    # and listing an arm in BOTH sets is a configuration error
+    got = L.variant_mlp_ratio('full_rope_flops_matched', 8192, matched={'full_rope'},
+                              ref_variant='csa_fixed_rope',
+                              flops_matched={'full_rope_flops_matched'},
+                              flops_match_ref='csa_fixed_rope')
+    assert got == mr, 'variant_mlp_ratio must route the flops_matched arm through the solver'
+    try:
+        L.variant_mlp_ratio('full_rope', 8192, matched={'full_rope'},
+                            ref_variant='csa_fixed_rope',
+                            flops_matched={'full_rope'},
+                            flops_match_ref='csa_fixed_rope')
+        raise AssertionError('an arm in both matched and flops_matched must fail closed')
+    except RuntimeError:
+        pass
+    # unknown arms keep the plain default; flops_matched does not perturb them
+    assert L.variant_mlp_ratio('csa_fixed_rope', 8192, matched=set(),
+                               flops_matched={'full_rope_flops_matched'}) == 4.0
+
+    # the registry entry exists, is a full-attention arm, and builds a finite model
+    cfgs = L.make_layer_cfgs(2, 'full_rope_flops_matched')
+    assert all(str(getattr(c, 'kind', '')) == 'full' and bool(getattr(c, 'rope', False)) for c in cfgs)
+    torch.manual_seed(4)
+    model = L.SmallGPT(64, 32, 2, 2, 16, 96, [_copy.deepcopy(c) for c in cfgs], mlp_ratio=mr)
+    out = model(torch.randint(0, 64, (1, 96)))
+    assert torch.isfinite(out).all(), 'the FLOPs-matched dense arm must run'
+
+    # the solver refuses non-dense targets (FLOPs matching only pays off against
+    # the dense attention it shrinks)
+    try:
+        L.flops_matched_mlp_ratio('csa_fixed_rope', 'csa_fixed_rope', 8192, seq_len=512)
+        raise AssertionError('the solver must refuse a non-dense target variant')
+    except RuntimeError:
+        pass
+
+
 def t_refreeze_round_cannot_confirm():
     """Review 10, issue 15: a post-test re-freeze cannot issue CONFIRMED
     labels (the same held-out slice was already observed)."""
@@ -13773,6 +14044,9 @@ def main():
     _check('N110 indexer control-mode selection semantics', t_indexer_control_modes_selection_semantics)
     _check('N111 indexer control-mode model paths', t_indexer_control_modes_model_paths)
     _check('N112 mech-selection probe smoke', t_mech_selection_probe_smoke)
+    _check('N113 pattern-seed isolation for the hash controls', t_pattern_seed_isolation_semantics)
+    _check('N114 mech-selection mass_covered is a mass fraction', t_mech_selection_mass_covered_is_mass_fraction)
+    _check('N115 analytical FLOPs model + FLOPs-matched dense planning', t_analytic_flops_model_and_flops_matched_dense)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

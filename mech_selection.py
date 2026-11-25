@@ -138,7 +138,11 @@ def _install_replay(replay: list):
 
     def _it_wrap(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
                  random_select=False, pre_qI=None, pre_w=None,
-                 out_valid=None, causal_ends_host=None, need_soft=True):
+                 out_valid=None, causal_ends_host=None, need_soft=True,
+                 pattern_seed=0):
+        # pattern_seed is accepted (and ignored) for signature compatibility:
+        # the replay path forces recorded selections, so the control-arm seed
+        # knob is irrelevant here; the probed arm is the learned indexer.
         if _state["i"] >= len(replay):
             raise RuntimeError(
                 "mech probe replay: more indexer calls than captured — the "
@@ -253,8 +257,18 @@ def _probe_arm(model, val_batch, device, k: int):
                 rec_vals, cov_vals = [], []
                 for r in range(len(l_sets)):
                     o_set = o_sets[r]
-                    denom = float(read_np[r].sum())
-                    if not o_set or denom <= 0.0:
+                    # mass_covered denominator (review-15 fix): the row's TOTAL
+                    # attention mass over its readable blocks (softmax rows sum
+                    # to ~1), NOT the readable-block COUNT.  The contract in
+                    # audit_gates.audit_selection defines mass_covered as "the
+                    # fraction of the oracle attention mass inside the selected
+                    # blocks"; dividing by the block count deflated the metric
+                    # by ~n_readable and made it incomparable with the
+                    # k/n_blocks random baseline (a smoke artifact reported
+                    # mass=0.09 < base=0.13 even though the learned rows were
+                    # mass-concentrated).
+                    denom = float(mass_np[r][read_np[r]].sum())
+                    if not o_set or not math.isfinite(denom) or denom <= 0.0:
                         continue
                     l_set = l_sets[r]
                     if l_set:
@@ -345,8 +359,13 @@ ARTIFACT_DEFINITION = {
                "all-block read (softmax over readable blocks, averaged over heads) — "
                "a dependency oracle for the selection question, not token-level attention"),
     "recall_at_k": "fraction of the oracle top-k blocks found by the learned selection",
-    "mass_covered": "fraction of the oracle mass inside the learned selection",
-    "random_baseline": "k / n_blocks",
+    "mass_covered": ("fraction of the oracle attention mass inside the learned selection "
+                     "(numerator: mass of the selected blocks; denominator: the row's total "
+                     "readable-block mass, i.e. the softmax normalizer ~1) — NOT divided by "
+                     "the readable-block count"),
+    "random_baseline": ("k / n_blocks — the uniform-random recall floor; for a peaked mass "
+                        "row the uniform-random MASS coverage is <= k/n_readable, so treat "
+                        "it as a floor, not an expectation"),
     "ppl_readouts": ("descriptive outcome readouts: learned / oracle-forced / allblocks "
                      "(read everything) / frozen fixed-hash random at the same k"),
     "data": "validation stream or synthetic ids; the test split is never read",

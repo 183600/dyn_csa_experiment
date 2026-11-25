@@ -1779,3 +1779,109 @@ top-k 的选择梯度只覆盖被选块”“缺少 selection-attribution”“s
 `CODE_SEMANTICS` 保持 `v11.128`：learned 路径与冻结的固定哈希路径逐位不变
 （N110 的 True=='random' bit-identity 断言、`v12_supp.py plan` 48/48 通过），
 新增模式是 opt-in 的新臂，未进入任何默认面板或冻结臂。冻结清单字节未改。
+
+## 32. review 15（外部六类方法学复审的独立复核 + 逐函数代码审查）的逐项核验与代码处置
+
+本轮是**对 review-14 处置的独立复核**：同一份六类意见先被逐条对照 HEAD 重新
+验证（不采信 review-14 的自述），再对 `exp_lib.py` 的动态分段器、CSA/HCA
+前向、梯度回传与训练目标做逐函数审查（用户明确要求的「梯度估计偏差、对照
+实现不等价或其他会影响科学结论的实现问题」）。没有新增训练面板，没有读取
+test split，没有改 `confirmation_frozen.json` 的任何字节，`CODE_SEMANTICS`
+保持 `v11.128`（所有改动均为 opt-in 新路径或纯函数新增；learned 路径与冻结
+固定哈希路径逐位不变，N113 断言 pattern_seed=0 的 bit-identity）。
+
+### 32.1 六类意见对照 HEAD 的独立复核结论
+
+| # | 审查意见 | 独立复核结论（相对 review-14 之后的 HEAD） | 本轮处置 |
+|---|---|---|---|
+| 1 | 动态分块未被任务损失端到端训练 | **成立且属实**：`_single`/`_gate_signal`/`_gate_signals` 三处的默认 `threshold` 路径均为 `gate.detach() > _HALF`（exp_lib 5358/5397/5481/5491 行族）；`delta_logit` 的唯一梯度来源是 comp_reg 的 STE（`gate_mean = (nblk-1 + _shs - _shs.detach())/T`）。`csa_dynamic_task`（REINFORCE）实现正确：`boundary_policy_term` 的符号、EMA 基线（先取优势后更新基线）、逐行逐层 logp 累积均无误，但不在冻结范围 | 设计边界维持披露口径，无代码缺陷可修 |
+| 2 | 冻结实验未覆盖 Dynamic/HCA | **成立**：`confirmation_frozen.json` 的 4 臂确无 dynamic/HCA；`scope.not_covered` 已声明；FOLLOWUP 协议 + 纯 HCA 变体 + 验证器存在 | 不改冻结清单；本轮把 FOLLOWUP 的两处「NOT yet wired / TODO」落地（见 32.3） |
+| 3.1 | Dense 参数匹配 ≠ 计算量公平 | **成立**：`compute_budget_disclosure` 的 1.23M/2.30M/1.87x 数字本轮被解析模型**精确复现**（181,248 + 4·256²·4 = 1,229,824；524,288 + 4·256²·6.76348876953125 = 2,297,296） | 见 32.3 的 FLOPs 匹配 Dense planning 臂 |
+| 3.2 | 随机对照是固定哈希 + 死参数；四类对照缺失 | **review-14 已补**：`random_each`/`random_dist`/`nearest`/`stride` 四模式存在且语义正确（本轮逐模式复核：nearest=可读块最大 id、stride=行自适应步长、random_dist=tau=512 因果核）；**遗留缺口**：协议要求的「连接模式种子独立于训练种子」未接通（内容哈希无种子旋钮） | **本轮实现** pattern_seed（见 32.2） |
+| 3.3 | allblocks 读取预算不匹配 | **成立且已披露**（32x 读取、STE 软先验 log(1/32) vs log(1/1024) 均在 caveat） | 臂定义不变 |
+| 4.1 | 12 seeds 功效 27.5% | **成立**；power_gate（v6）已在清单与代码落地 | 已覆盖，无残余 |
+| 4.2 | sign-flip 零假设与 CI | **成立且已披露**；`paired_bootstrap_ci`/`unpaired_bootstrap_ci`/LOO/Wilcoxon 均在统计工件里 | 已覆盖，无残余 |
+| 5 | 16 窗口非独立文档 | **成立**（`n_seqs: 16`）；§27.2 的 doc_index 文档聚类路径存在；FOLLOWUP 的 64 文档门槛存在 | 设计边界维持披露 |
+| 6 | 缺 Oracle/Recall@K/Mass Covered | **review-14 已建生产者** `mech_selection.py`；但本轮逐行审查发现其 **mass_covered 实现与自身契约矛盾**（见 32.2 的缺陷一） | **本轮修复**该缺陷 |
+| 工程 | 8M 缓存 / 18.4M 窗口量 / CUDA 未锁 | 均为已披露边界（冻结 data fingerprint、§25.3b 唯一 token 覆盖率、archive 环境快照） | 不改 |
+
+### 32.2 逐函数深查发现的两个真实缺陷（本轮全部修复）
+
+**缺陷一（影响科学结论的指标 bug）：`mech_selection._probe_arm` 的
+mass_covered 分母用错了。** 契约（`audit_gates.audit_selection` docstring 与
+工件 `ARTIFACT_DEFINITION`）定义 mass_covered 为「落在学习式选择内的 oracle
+注意力质量**分数**」，分母应是该行可读块上的总质量（softmax 归一化后 ≈1）；
+实现却除以了**可读块计数**（`read_np[r].sum()`），把指标系统性缩小约
+n_readable 倍且逐行权重不一致——review-14 的 smoke 读数 mass=0.0917 <
+base=0.125 完全是该缺陷造成的假象（修复后同一 smoke 为 mass=0.3799，学习式
+选择在未训练模型上就已覆盖 38% 的 oracle 质量，明显高于均匀随机地板
+12.5%）。若带着该 bug 跑真实面板，「选择器是否找到重要块」的机制结论会被
+整体翻转。修复：分母改为 `mass_np[r][read_np[r]].sum()`（逐行总质量），并加
+NaN/非正守卫；N114 用独立实现的契约公式对拍锁定。
+
+**缺陷二（协议要求未接通）：连接模式种子与训练种子不独立。**
+`random_each`/`random_dist` 的模式是隐状态内容的确定函数，没有任何旋钮能把
+「模式噪声」与「训练噪声」分开重跑。修复：
+- `AttnCfg.pattern_seed`（默认 0 = review-14 逐位不变；`_ps=0` 时完全跳过
+  位移，op 链不变）；非哈希模式（含冻结固定哈希 `random`、nearest/stride、
+  learned）配非零种子一律 fail-closed 拒绝——冻结臂的 bit-identity 是硬约束；
+- `lightning_indexer(..., pattern_seed=)` 把种子混入行键
+  （`_hk + ps*0.618...`），`_indexer_trainable` 与模型前向调用点透传；
+- v7_supp 注册 `csa_fixed_rope_randidx_each_ps<N>` / `..._dist_ps<N>` 变体族
+  （registry-only）；
+- `validate_followup_design.py` 对 `design.selection_controls` 声明的
+  pattern_seed 与注册表解析值做机器对账；
+- N113 锁定：ps=0 bit-identity、同种子可复现、异种子异模式、错误模式
+  fail-closed、模型前向真实消费 cfg.pattern_seed。
+
+### 32.3 FOLLOWUP 协议遗留 TODO 的落地
+
+- **FLOPs 匹配 Dense 臂（原 `TODO_FLOPS_MATCHED_DENSE`）**：新增解析模型
+  `analytic_attn_flops_token` / `analytic_train_flops_token`（注意力核+MLP，
+  投影/池化/embedding 对所有臂一致地排除；注意 dense 的可选滑窗是
+  `cfg.window` 而非 CSA 的 `sliding_window`），求解器
+  `flops_matched_mlp_ratio` 解析解出容量旋钮——冻结配置下
+  **mr = 689/256 = 2.69140625**（hidden 689：Dense 注意力在 L512 每层每
+  token 多花 343,040 FLOPs，MLP 从 1024 缩到 689 来支付）。注册
+  `full_rope_flops_matched` 变体；run cfg 通过 `flops_matched` 集合 +
+  `flops_match_ref` 走 `variant_mlp_ratio` 的新路由，与参数匹配集
+  **互斥 fail-closed**（同臂同列是配置错误——两种 estimand 不得混同）。
+  模板 JSON 的 TODO 已替换。**边界维持 §27.1 的纪律：解析等式不是证书**，
+  只有 profiler 实测总训练 FLOPs 落在参照 1% 内才允许「等计算」措辞；模板
+  仍按设计 `--require-ready` 失败（measured 验证、功效模拟、算法门、冻结
+  元数据仍是阻塞项）。
+- **模式种子对照族**：模板 `design.selection_controls` 声明固定哈希 /
+  random_each(ps 0/1/2) / random_dist(ps1) / nearest / stride，与验证器对账。
+
+### 32.4 逐函数审查中确认无问题的部分（记录备查）
+
+- STE 软先验：前向值 = 硬选择（`(soft_attn - soft_attn.detach()).add_(attn)`
+  精确相消），梯度经 soft_attn 直通；零先验块被掩出 S 路径支撑集，与
+  reference/Triton 反向一致；
+- `_indexer_trainable` 的 checkpoint 重算对全部选择模式无 RNG 依赖（含
+  pattern_seed——纯配置整数的函数）；
+- REINFORCE 项符号与 EMA 基线更新次序（先优势后更新）正确；
+- 四个对照模式的 top-k 语义与 `_indexer_selection` 的无放回/因果收窄共享
+  同一机器；`_uses_batched_eager` 的相等检查修复（review-14）仍在位；
+- `_full_batched` 对 `cfg.window`（dense 滑窗）与 CSA `sliding_window`
+  （局部分支）的分派互不串扰。
+
+### 32.5 本轮改动清单（全部零实验、零 test 访问、冻结清单零字节改动）
+
+- `exp_lib.py`：`AttnCfg.pattern_seed` 字段 + fail-closed 校验；
+  `lightning_indexer`/`_indexer_trainable`/`_single` 调用点的种子透传；
+  `analytic_attn_flops_token` / `analytic_train_flops_token` /
+  `flops_matched_mlp_ratio` 三个纯函数；`variant_mlp_ratio` 的
+  flops_matched 路由（互斥 fail-closed）与两处调用点透传。
+- `mech_selection.py`：mass_covered 分母修复 + 契约文本明确分母；
+  replay 包装接受 pattern_seed（签名兼容）。
+- `v7_supp.py`：`_ps<N>` 变体族与 `full_rope_flops_matched` 注册。
+- `validate_followup_design.py`：`selection_controls` 注册表对账、factorial
+  臂 pattern_seed 一致性检查、FLOPs 匹配 Dense 声明的 planning 来源要求。
+- `followup_design.template.json`：TODO 替换 + selection_controls 声明。
+- `test_review_fixes.py`：N113–N115 三个新回归。
+- `FOLLOWUP_CONFIRMATORY_PROTOCOL.md` / `README.md` / `README_zh.md` /
+  本节：对应文档更新。
+
+`CODE_SEMANTICS` 保持 `v11.128`；`v12_supp.py plan` 在本轮改动后仍须
+48/48 通过（CI 门未动）。

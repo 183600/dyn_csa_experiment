@@ -846,6 +846,36 @@ def make_layer_cfgs_v7(n_layers, variant):
     if variant == 'csa_fixed_rope_strideidx':
         # 均匀间隔选择器：按 readable_i//k 的行自适应步长均匀读块。
         return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, indexer_mode='stride', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
+    # ---- pattern-seeded twins of the hash controls (review-15) --------------
+    # FOLLOWUP 协议要求「连接模式种子独立于训练种子」：同一训练 seed 在多个
+    # 连接模式下重跑，把模式噪声与训练噪声分开。exp_lib.AttnCfg.pattern_seed
+    # （默认 0 = review-14 逐位不变）现在承接该种子；这里的 `_psN` 后缀变体
+    # 是注册表入口，例如 csa_fixed_rope_randidx_each_ps3 =
+    # csa_fixed_rope_randidx_each + pattern_seed=3。registry-only：默认面板
+    # 不训练它们；validate_followup_design.py --verify-registry 可核对
+    # design 里声明的 pattern_seed 与 cfg 一致。
+    _m = re.match(r'^(csa_fixed_rope_randidx_(?:each|dist))_ps(\d+)$', variant)
+    if _m:
+        base, ps = _m.group(1), int(_m.group(2))
+        mode = 'random_each' if base.endswith('_each') else 'random_dist'
+        return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP,
+                            index_topk=32, indexer_mode=mode, pattern_seed=ps,
+                            rope=True, rope_dim=16, qk_norm=True)
+                for _ in range(n_layers)]
+    if variant == 'full_rope_flops_matched':
+        # FLOPs 匹配 Dense 臂（follow-up 协议 TODO_FLOPS_MATCHED_DENSE 的
+        # planning 半边，review-15）。容量旋钮不再手猜：mlp_ratio 由
+        # exp_lib.flops_matched_mlp_ratio('full_rope_flops_matched',
+        # 'csa_fixed_rope', ...) 从解析 FLOPs 模型解出——冻结配置下
+        # mr = 689/256 = 2.69140625（hidden 689：Dense 注意力在 L512 的
+        # 524,288 FLOPs/token/层 多花 343,040，MLP 因此从 1024 缩到 689）。
+        # run cfg 需把它列入 flops_matched 集合 + flops_match_ref 引用稀疏
+        # 参照臂；PARAM 匹配（matched 集）与 FLOPs 匹配（flops_matched 集）
+        # 互斥，同臂同列是配置错误。注意：解析等式不是证书——只有 profiler
+        # 实测总训练 FLOPs 落在参照 1% 内才允许「等计算」措辞
+        # （FOLLOWUP_CONFIRMATORY_PROTOCOL.md / design_notes 27.1）。
+        # registry-only：默认面板不训练。
+        return [AttnCfgRope(kind='full', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'csa_fixed_rope_allblocks':
         # 从头训练的全块读取对照：与 csa_fixed_rope 同架构（同 c_kv 压缩、
         # 池化、q/k 的 L2-normalize→RMSNorm 顺序、RoPE、sink、窗口分支），

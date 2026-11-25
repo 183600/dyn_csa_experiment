@@ -57,6 +57,14 @@ dense 仅 RMSNorm、scale=1/sqrt(d_head)）、缺同投影/同 sink 的 dense �
 - **selection-attribution 工件有了生成器**：`mech_selection.py` 是 `audit_gates.py selection` 契约背后的机制探针——逐 seed 的 recall@k / mass covered / k-n_blocks（oracle = 同层 all-block 读的块级注意力质量），外加 learned / oracle-forced / allblocks / 同 k 固定哈希随机的描述性 PPL 读数；`smoke` 在小合成模型上端到端通过审计契约，`run` 只读验证流或合成 ids、拒绝任何触及 `results_lm_test` 的路径。在真实面板上跑过之前，选择召回主张门槛仍为 `not_verifiable_locally`。
 - **真实报告缺陷修复**：`_uses_batched_eager` 对 `indexer_mode` 只做真值检查而实际分派要求 `== 'learned'`——random 臂会被误报为走了批处理孪生；已改为与分派一致的相等检查。死参数计数（`param_breakdown`）泛化到全部非 learned 模式。
 
+## 评审十五硬化（review 15）
+
+对同一份六类意见做**独立复核**（不采信 review-14 自述），并按外部要求对 `exp_lib.py` 的动态分段器 / CSA-HCA 前向 / 梯度回传 / 训练目标做逐函数审查。逐项判定见 `docs/design_notes.md` §32。零训练、零 test 访问、冻结清单零字节改动、`CODE_SEMANTICS` 保持 `v11.128`。六类设计边界结论复核后均成立且已披露；本轮修掉三个仍可修的缺口：
+
+- **`mech_selection.py` 的 mass_covered 是真实指标缺陷**：分母误用可读块**计数**而非该行可读块**总注意力质量**，指标被系统性缩小约 n_readable 倍且与 k/n_blocks 基线不可比——review-14 smoke 的 mass=0.09 < base=0.13 纯属该 bug 的假象（修复后同一 smoke 为 mass=0.38 > base=0.13）。分母已改为 softmax 归一化项，与 `audit_gates.audit_selection` 契约一致；N114 用独立实现的公式对拍锁定。
+- **连接模式种子已接通**（原「NOT yet wired」）：`AttnCfg.pattern_seed`（0 = review-14 逐位不变；非哈希模式配非零种子一律 fail-closed）把独立整数混入 `random_each`/`random_dist` 行键，同一训练 seed 可在多个连接模式下重跑；注册 `_ps<N>` 变体族，followup 模板新增 `design.selection_controls` 声明，验证器对账（N113）。
+- **FLOPs 匹配 Dense 臂有了解析容量计划**：`analytic_attn_flops_token`/`analytic_train_flops_token` 精确复现冻结披露数字（1,229,824 vs 2,297,296 FLOPs/token/层，1.87x），`flops_matched_mlp_ratio` 解出 `full_rope_flops_matched` 的旋钮——冻结配置解 **mr = 689/256 = 2.69140625**——替换 `TODO_FLOPS_MATCHED_DENSE` 占位符；经 run cfg 的 `flops_matched` 集合路由、与参数匹配互斥 fail-closed。**解析等式不是证书**：1% profiler 实测门仍是「等计算」措辞的唯一验收，模板按设计仍 `--require-ready` 失败。
+
 ## 仓库结构
 
 仓库只保留**源码、驱动脚本与设计文档**。所有实验结果目录（`results_*/`）、

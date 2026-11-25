@@ -85,6 +85,58 @@ def _registry_errors(plan: dict, repo: Path) -> list[str]:
             errors.append(f"{aid}: declared dynamic but not every layer is dynamic: {dynamic}")
         if seg == "fixed" and any(dynamic):
             errors.append(f"{aid}: declared fixed but at least one layer is dynamic: {dynamic}")
+        # pattern_seed (review-15): a control arm may declare the
+        # connection-pattern seed explicitly; the registry must resolve the
+        # SAME seed on every layer, and only the hash-based re-randomized
+        # controls (random_each / random_dist) may carry a nonzero one.
+        declared_ps = arm.get("pattern_seed")
+        if declared_ps is not None:
+            if (not isinstance(declared_ps, int) or isinstance(declared_ps, bool)
+                    or declared_ps < 0):
+                errors.append(f"{aid}: pattern_seed must be a non-negative integer, "
+                              f"got {declared_ps!r}")
+            else:
+                resolved = {int(getattr(c, "pattern_seed", 0) or 0) for c in cfgs}
+                modes = {str(getattr(c, "indexer_mode", "learned")) for c in cfgs}
+                if len(resolved) != 1 or resolved != {int(declared_ps)}:
+                    errors.append(f"{aid}: declared pattern_seed={declared_ps} but the "
+                                  f"variant resolves to {sorted(resolved)}")
+                if declared_ps != 0 and not modes <= {"random_each", "random_dist"}:
+                    errors.append(f"{aid}: a nonzero pattern_seed requires the hash-based "
+                                  f"controls (random_each/random_dist), got modes {sorted(modes)}")
+
+    for entry in design.get("selection_controls") or []:
+        # The protocol's mechanism-isolation selection controls (random /
+        # re-randomized / distance-matched / nearest / stride selectors, each
+        # optionally under connection-pattern seeds independent of the
+        # training seed).  Same registry checks as a factorial arm: the
+        # declared variant must exist, and a declared pattern_seed must be
+        # what the registry actually resolves.
+        if not isinstance(entry, dict):
+            continue
+        variant = entry.get("variant")
+        sid = entry.get("id")
+        if not isinstance(variant, str) or not variant or variant.startswith("TODO"):
+            errors.append(f"{sid}: selection-control variant is not an implemented "
+                          f"registry entry: {variant!r}")
+            continue
+        try:
+            cfgs = L.make_layer_cfgs(3, variant)
+        except Exception as exc:
+            errors.append(f"{sid}: make_layer_cfgs({variant!r}) failed: "
+                          f"{type(exc).__name__}: {exc}")
+            continue
+        declared_ps = entry.get("pattern_seed")
+        if declared_ps is not None:
+            if (not isinstance(declared_ps, int) or isinstance(declared_ps, bool)
+                    or declared_ps < 0):
+                errors.append(f"{sid}: pattern_seed must be a non-negative integer, "
+                              f"got {declared_ps!r}")
+            else:
+                resolved = {int(getattr(c, "pattern_seed", 0) or 0) for c in cfgs}
+                if len(resolved) != 1 or resolved != {int(declared_ps)}:
+                    errors.append(f"{sid}: declared pattern_seed={declared_ps} but the "
+                                  f"variant resolves to {sorted(resolved)}")
 
     for entry in design.get("dense_controls") or []:
         if not isinstance(entry, dict):
@@ -102,6 +154,17 @@ def _registry_errors(plan: dict, repo: Path) -> list[str]:
             continue
         if any(str(getattr(c, "kind", "")) != "full" for c in cfgs):
             errors.append(f"{eid}: variant {variant!r} is not a dense/full-attention arm")
+        # A FLOPs-matched declaration must point at a run cfg that actually
+        # routes the arm through the analytical solver (flops_matched set +
+        # reference); the registry entry alone only fixes the layer shape.
+        if str(entry.get("matching", "")) == "measured_training_flops":
+            _note = str(entry.get("note", ""))
+            if "analytical" not in _note and "flops_matched_mlp_ratio" not in _note:
+                errors.append(
+                    f"{eid}: a measured_training_flops control must document its capacity "
+                    f"planning source (run-cfg flops_matched set -> flops_matched_mlp_ratio) "
+                    f"and that the 1% profiler gate, not the analytical equality, accepts "
+                    f"the arm as compute-matched")
     return errors
 
 

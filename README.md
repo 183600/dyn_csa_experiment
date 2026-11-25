@@ -225,6 +225,45 @@ disclosed; this pass closes the two gaps that were actually fixable:
   eligibility check now mirrors the dispatch.  Dead-parameter accounting
   (`param_breakdown`) covers every non-learned mode, not just `random`.
 
+## Review-15 hardening (what changed)
+
+Independent re-verification of the same six-category review against the
+post-review-14 HEAD, plus the requested per-function audit of the dynamic
+segmenter / CSA-HCA forward / gradient paths (`docs/design_notes.md` §32).
+No new training panel, no test-split access, no frozen-manifest byte change,
+`CODE_SEMANTICS` stays `v11.128`, and `v12_supp.py plan` still admits
+48/48 records.  The six design-boundary findings re-verified as holding and
+already disclosed; this pass closes the three gaps that were still fixable:
+
+- **`mech_selection.py` mass_covered had a real metric defect.**  Its
+  denominator was the readable-block COUNT instead of the row's total
+  attention mass, deflating the metric by ~n_readable and breaking its
+  comparability with the k/n_blocks baseline (the review-14 smoke's
+  `mass=0.09 < base=0.13` was purely the bug; the corrected smoke reads
+  `mass=0.38 > base=0.13`).  The denominator is now the softmax normaliser
+  over the readable blocks, matching the `audit_gates.audit_selection`
+  contract; N114 locks the formula against an independent recomputation.
+- **Connection-pattern seeds are wired (protocol requirement, was "NOT yet
+  wired").**  `AttnCfg.pattern_seed` (0 = review-14 bits exactly; any
+  non-hash mode with a nonzero seed fails closed) mixes an independent
+  integer into the `random_each`/`random_dist` row key, so one training seed
+  can be rerun under many connection patterns.  Registry twins
+  `csa_fixed_rope_randidx_each_ps<N>` / `..._dist_ps<N>`,
+  `design.selection_controls` declarations in the follow-up template, and a
+  validator cross-check land with it (N113).
+- **The FLOPs-matched Dense control has an analytical capacity plan.**
+  `exp_lib.analytic_attn_flops_token` /
+  `analytic_train_flops_token` reproduce the frozen disclosure numbers
+  exactly (1,229,824 vs 2,297,296 FLOPs/token/layer, 1.87x), and
+  `flops_matched_mlp_ratio` solves the dense arm's knob — frozen-config
+  solution `mr = 689/256 = 2.69140625` — replacing the
+  `TODO_FLOPS_MATCHED_DENSE` placeholder (`full_rope_flops_matched`,
+  registry-only, routed via the run cfg's `flops_matched` set, mutually
+  exclusive with parameter matching).  The analytical equality is planning
+  only: the 1% profiler-measured gate (design_notes §27.1) remains the sole
+  acceptance for any "equal compute" claim, so the follow-up template still
+  fails `--require-ready` by design.
+
 ## Repository layout
 
 The repository keeps only **source code, driver scripts and design
