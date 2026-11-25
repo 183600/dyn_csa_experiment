@@ -27,6 +27,98 @@ REQUIRED_HYPOTHESES = {
 }
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
+# The power-simulation artifact must certify the plan it is quoted by: the
+# binding below cross-checks study id, hypothesis family, seed count, target
+# power, familywise alpha and the minimum simulated power.  A boolean alone
+# ("power_simulation_completed": true) stops being acceptable evidence.
+POWER_ARTIFACT_TOOL = "followup_power_sim.py"
+
+
+def _power_artifact_errors(stats: dict, study_id, seeds, alpha, target_power, *,
+                            repo: Path | None, manifest_dir: Path | None) -> list[str]:
+    """Bind statistics.power_simulation_artifact to the design it certifies.
+
+    Fail-closed: an unreadable artifact, a tool mismatch, or any field that
+    does not match the declared plan is an error — the boolean
+    ``power_simulation_completed`` alone is not evidence.
+    """
+    errors: list[str] = []
+
+    def _safe_float(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return f if math.isfinite(f) else None
+
+    plan_alpha = _safe_float(alpha)
+    plan_target = _safe_float(target_power)
+    seed_list = list(seeds) if isinstance(seeds, list) else []
+    art = stats.get("power_simulation_artifact")
+    if not isinstance(art, str) or not art.strip() or art.startswith("TODO"):
+        errors.append("statistics.power_simulation_artifact must name the "
+                      "followup_power_sim.py output JSON when "
+                      "power_simulation_completed is true")
+        return errors
+    candidates = []
+    for base in (manifest_dir, repo):
+        if base is not None:
+            p = (Path(base) / art).resolve()
+            if p not in candidates:
+                candidates.append(p)
+    payload = None
+    for p in candidates:
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+            break
+        except Exception:
+            continue
+    if not isinstance(payload, dict):
+        errors.append(f"power_simulation_artifact {art!r} is not a readable "
+                      f"JSON object (searched: {[str(c) for c in candidates]})")
+        return errors
+    if payload.get("tool") != POWER_ARTIFACT_TOOL:
+        errors.append(f"power_simulation_artifact {art!r} was not produced by "
+                      f"{POWER_ARTIFACT_TOOL} (tool={payload.get('tool')!r})")
+    if payload.get("status") != "ok":
+        errors.append(f"power_simulation_artifact status is {payload.get('status')!r}, "
+                      f"not 'ok'")
+    if payload.get("study_id") != study_id:
+        errors.append(f"power_simulation_artifact study_id {payload.get('study_id')!r} "
+                      f"does not match the plan's {study_id!r}")
+    if set(payload.get("hypotheses") or []) != REQUIRED_HYPOTHESES:
+        errors.append(f"power_simulation_artifact hypotheses "
+                      f"{sorted(payload.get('hypotheses') or [])} do not match the "
+                      f"pre-registered family {sorted(REQUIRED_HYPOTHESES)}")
+    if payload.get("test") != "exact_two_sided_sign_flip" or payload.get("correction") != "holm":
+        errors.append("power_simulation_artifact must record the exact "
+                      "two-sided sign-flip test with Holm correction")
+    art_seeds = payload.get("n_seeds")
+    if not isinstance(art_seeds, int) or isinstance(art_seeds, bool) or art_seeds != len(seed_list):
+        errors.append(f"power_simulation_artifact n_seeds {art_seeds!r} does not match "
+                      f"the declared seed panel ({len(seed_list)} seeds)")
+    art_alpha = _safe_float(payload.get("alpha"))
+    if plan_alpha is None or art_alpha is None or abs(art_alpha - plan_alpha) > 1e-12:
+        errors.append(f"power_simulation_artifact alpha {payload.get('alpha')!r} differs from "
+                      f"the declared familywise alpha {alpha!r}")
+    art_target = _safe_float(payload.get("target_power"))
+    if plan_target is None or art_target is None or abs(art_target - plan_target) > 1e-12:
+        errors.append(f"power_simulation_artifact target_power {payload.get('target_power')!r} "
+                      f"differs from the declared target {target_power!r}")
+    reps = payload.get("mc_replicates")
+    if not isinstance(reps, int) or isinstance(reps, bool) or reps < 200:
+        errors.append(f"power_simulation_artifact mc_replicates {reps!r} is below the "
+                      f"200-replicate floor (fewer certifies nothing)")
+    min_power = payload.get("min_power")
+    mp = _safe_float(min_power)
+    if mp is None or (plan_target is not None and mp < plan_target):
+        errors.append(f"power_simulation_artifact min_power {min_power!r} does not clear "
+                      f"the declared target power {target_power!r} — increase the seed "
+                      f"count or revise the design, do not shrink the target")
+    return errors
+
 
 def _registry_errors(plan: dict, repo: Path) -> list[str]:
     """Check that the design's variant IDs exist AND have the declared shape.
@@ -169,7 +261,8 @@ def _registry_errors(plan: dict, repo: Path) -> list[str]:
 
 
 def validate(plan: dict, require_ready: bool = False, *,
-             verify_registry: bool = False, repo: Path | None = None) -> list[str]:
+             verify_registry: bool = False, repo: Path | None = None,
+             manifest_dir: Path | None = None) -> list[str]:
     errors: list[str] = []
 
     def need(condition: bool, message: str) -> None:
@@ -319,8 +412,15 @@ def validate(plan: dict, require_ready: bool = False, *,
     p_floor = 2 / (2 ** n) if n else math.inf
     need(alpha_ok and n > 0 and m * p_floor < alpha,
          f"exact sign-flip resolution cannot clear first Holm threshold: m*2/2^n={m*p_floor:g}")
-    need(stats.get("power_simulation_completed") is True,
-         "simulation-based power analysis must be completed before freeze")
+    sim_done = stats.get("power_simulation_completed") is True
+    need(sim_done, "simulation-based power analysis must be completed before freeze")
+    if sim_done:
+        # Fail closed: bind the boolean to the artifact followup_power_sim.py
+        # actually produced — study id, family, seed panel, alpha, target and
+        # minimum simulated power must all match the declared plan.
+        errors.extend(_power_artifact_errors(
+            stats, plan.get("study_id"), seeds, alpha, stats.get("target_power"),
+            repo=repo, manifest_dir=manifest_dir))
     need(stats.get("report_per_seed_differences") is True, "per-seed differences must be reported")
     need(stats.get("report_effect_sizes_and_confidence_intervals") is True,
          "effect sizes and confidence intervals must be reported")
@@ -399,7 +499,8 @@ def main() -> int:
         return 2
     errors = validate(plan, require_ready=args.require_ready,
                       verify_registry=args.verify_registry,
-                      repo=args.repo or args.manifest.resolve().parent)
+                      repo=args.repo or args.manifest.resolve().parent,
+                      manifest_dir=args.manifest.resolve().parent)
     if errors:
         print(f"NOT READY ({len(errors)} issue(s))")
         for error in errors:

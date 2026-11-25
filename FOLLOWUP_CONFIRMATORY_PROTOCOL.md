@@ -111,6 +111,21 @@ cross-check. If the profiler cannot reliably count an operator (e.g. custom
 Triton kernels), disclose the unsupported operators and refuse to call the arm
 FLOPs-matched until the count is independently reconciled.
 
+**The measured-FLOPs gate tool is wired** (review-16): `followup_flops_gate.py`.
+`measure` counts training-step FLOPs with `torch.utils.flop_counter.FlopCounterMode`
+(aten-dispatch level — the ONLY counter family that attributes
+`scaled_dot_product_attention`; `torch.profiler(with_flops=True)` covers only
+mm/bmm/addmm and silently drops the attention kernels, so the profiler pass runs
+alongside purely to DISCLOSE what it missed). A second identical block must
+reproduce the count exactly (shape-based counting is deterministic; any drift
+means the computation changed and the number certifies nothing). The custom CSA
+kernel path refuses to measure at all (custom Triton kernels never dispatch
+aten ops and would be undercounted). `gate` compares two artifacts with the 1%
+tolerance on the total training FLOPs (`flops_per_step x declared_total_steps`);
+CPU runs are recorded as smoke evidence and never certify — only runs on the
+declared certifying device (default `cuda`) can produce a `FLOPS_MATCHED`
+verdict.
+
 ## Evaluation population
 
 Use the complete held-out test split where feasible. If a sampled document panel
@@ -151,6 +166,19 @@ the first Holm threshold. This is a mathematical resolution check, not a power
 guarantee. Before test access, run a simulation-based power analysis using
 plausible paired effect sizes and the observed validation-set variance. Increase
 the seed count if the target power is not reached.
+
+**The simulation tool is wired** (review-16): `followup_power_sim.py`
+projects per-hypothesis Holm power under a declared effect model (`normal`
+mean/sd or a `bootstrap` over the observed validation deltas), using the exact
+statistics the confirmatory analysis will use (`exp_lib.exact_signflip_p` +
+`exp_lib.holm_adjust`); `--seed-sweep` reports the minimum seed count that
+clears the declared target. The artifact JSON binds to the validator:
+`statistics.power_simulation_completed = true` now REQUIRES
+`statistics.power_simulation_artifact` (a path to the tool's output) whose
+study id, hypothesis family, seed panel, alpha, target power and minimum
+simulated power all match the plan — a bare boolean no longer passes
+`--require-ready`. The declared effect sizes / variance inputs are recorded in
+the artifact's `effect_model` block so the projection is auditable.
 
 **Stopping rule.** This is a single-look, fixed-n study: exactly one analysis
 after all registered seeds complete (`stopping_rule =
@@ -207,6 +235,10 @@ These are correctness tests, not evidence that one method is better.
 ```bash
 python validate_followup_design.py followup_design.template.json --verify-registry
 python validate_followup_design.py followup_design.json --require-ready --repo .
+python followup_power_sim.py power_sim_spec.json --seed-sweep 12,16,20,24,32
+python followup_flops_gate.py measure --variant full_rope_flops_matched \
+    --mlp-ratio 2.69140625 --device cuda:0 --out measure_dense.json
+python followup_flops_gate.py gate measure_csa.json measure_dense.json
 ```
 
 The template is intentionally a draft.  The pure-HCA entries are real
@@ -215,7 +247,11 @@ registered, and the FLOPs-matched Dense arm now has a registry entry plus an
 ANALYTICAL capacity plan (`full_rope_flops_matched`; the run cfg routes it
 through `exp_lib.flops_matched_mlp_ratio`, whose frozen-config solution is
 mr = 689/256 = 2.69140625).  The remaining blockers are the
-profiler-MEASURED FLOPs verification (the analytical plan is never the
-certificate), the pre-test power simulation, the algorithmic gates, and the
+profiler-MEASURED FLOPs verification (now runnable via
+`followup_flops_gate.py` on the certifying device; the analytical plan is
+never the certificate), the pre-test power simulation (now runnable via
+`followup_power_sim.py`, but it must be run on real validation-derived
+effect/variance inputs and its artifact bound into
+`statistics.power_simulation_artifact`), the algorithmic gates, and the
 freeze metadata.  It must therefore still fail `--require-ready` until those
 are completed and recorded.

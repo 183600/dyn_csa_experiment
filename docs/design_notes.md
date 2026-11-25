@@ -1885,3 +1885,88 @@ NaN/非正守卫；N114 用独立实现的契约公式对拍锁定。
 
 `CODE_SEMANTICS` 保持 `v11.128`；`v12_supp.py plan` 在本轮改动后仍须
 48/48 通过（CI 门未动）。
+
+
+## 33. review 16（旧证据退役 + 两项 pre-freeze 工具落地）的决策与实现
+
+### 33.1 背景：v12 证据退役（owner 决策，2026-11-26）
+
+v12 冻结确认轮的四臂（`csa_fixed_rope` / `full_rope` /
+`csa_fixed_rope_randidx` / `csa_fixed_rope_allblocks`）不含 Dynamic/HCA 臂，
+其 Dense 对照是参数匹配而非算力匹配，随机对照是固定哈希模式，测试面板
+只有 16 个窗口——这些边界在 §17/§20/§22 中已如实披露，且历史结论本身
+无实现缺陷（review-15 逐函数复核）。owner 决定**退役 v12 证据作为任何
+方法学声明的依据**：本仓库此后不得引用 v12 的数字（含 CONFIRMED 标签）
+支持 CSA/HCA/Dynamic 的有效性或等算力声明；确认性证据只能来自
+follow-up 协议（§31/§32 注册的 2×2 全因子 + 双 Dense 参照 + 机制探针）。
+
+处置方式：**冻结清单 `confirmation_frozen.json` 一个字节都不动**（它是
+历史预注册记录，改写等于篡改；v12_supp 的 plan 预检与 CI 门继续对它
+运行）；退役只发生在证据声明层——README 的证据等级说明、RELEASES.md
+的状态行、DECISION_LOG 的决策条目。这遵循本仓库的一贯原则：废弃靠
+声明与索引，不靠改写历史（与 re-freeze 不得 CONFIRMED 同源，§28）。
+
+### 33.2 pre-freeze 阻塞项的工具化：followup_power_sim.py
+
+协议要求测试集访问前完成「基于合理效应量与验证集实测方差的仿真功效
+分析」。v12 的 `_power_enumeration` 是对已观测增量的精确枚举（事后设计
+辅助），回答不了「这个种子数能不能检出预注册效应」。新工具补齐缺口：
+
+- 效应模型两种：`normal`（声明均值/标准差）或 `bootstrap`（重采样观测
+  验证增量）；四个主假设各自的效应与方差独立声明，随 artifact 存档，
+  投影可审计；
+- 检验统计量与确认性分析完全同源：每 replicate 的 p 用
+  `exp_lib.exact_signflip_p`、族校正用 `exp_lib.holm_adjust`（批处理路径
+  `_batch_exact_signflip_p` 与标量契约逐行一致，N116 锁定，n≤20 走
+  2^n 向量化枚举，n>20 回退 MITM/saddlepoint）；
+- 输出每假设功效 + Monte-Carlo Wilson 95% CI、min_power、
+  `--seed-sweep` 的最小达标种子数推荐、保守解析投影（q=0.80@12seeds
+  =0.2749，与审查报告的 27.5% 一致，交叉参照）；
+- fail-closed：alpha>0.05、布尔种子数、零方差、<200 replicate、假设族
+  不完整等一律 invalid_spec；同 spec 同 rng_seed 产物逐字节确定。
+
+**验证器绑定（N117）**：`statistics.power_simulation_completed = true`
+现在必须携带 `statistics.power_simulation_artifact`（工具输出 JSON 路径），
+且 study id / 假设族 / 种子面板 / alpha / 目标功效 / min_power 全部与
+设计对账；篡改任何一项都被拒绝——布尔位不再是可以拍脑袋置的证据。
+
+### 33.3 pre-freeze 阻塞项的工具化：followup_flops_gate.py
+
+FLOPs 匹配 Dense 的 1% 接受门此前只有解析规划（review-15），无测量路径。
+关键实测发现驱动了设计：
+
+- `torch.profiler(with_flops=True)` 只给 mm/bmm/addmm 归因，
+  **SDPA 注意力内核（CPU flash / CUDA flash / cudnn）一律零归因**——
+  只用 profiler 会系统性漏掉注意力计算量，且静默漏掉；
+- `torch.utils.flop_counter.FlopCounterMode` 在 aten 调度层计数，含
+  SDPA（按张量形状的满公式 4*B*H*Tq*Tk*D，与本仓库解析模型同为非因果
+  口径）；计数基于形状，确定可复现；
+- 自定义 CSA Triton 内核不经过 aten 调度，对任何 op 级计数器不可见——
+  活跃内核路径直接拒绝测量（fail-closed），宁可拒证不可少计。
+
+工具结构：`measure`（warm-up 后计数 K 步训练步 = fwd+bwd+optimizer；
+第二同构块必须逐位复现，否则说明计算本身变了、数字不是测量）+
+`gate`（两 artifact 的总训练 FLOPs 比值 ≤1% 才 FLOPS_MATCHED；CPU 运行
+只算 smoke 证据永不签证书；per-step 与 total 不一致的 artifact 拒收）。
+profiler 通道降级为披露表：记录「带时间却无 flops 归因」的算子清单，
+显式展示调度级计数器必须覆盖什么。冒烟实测（tiny 几何）：
+full_rope 403M FLOPs/步、csa_fixed_rope 1.17G FLOPs/步——**逐行 eager
+实现的 op 级实际计算量约为 dense SDPA 路径的 3 倍**，解析模型（仅注意力
+核+MLP，排除投影/池化/索引器投影）看不到这项实现开销。这正是协议坚持
+「实测 FLOPs 为唯一等算力接受门」的原因，也再次确认 kernel/dtype parity
+必须是与 FLOPs 门并行的独立验收。
+
+### 33.4 本轮改动清单（零实验、零 test 访问、冻结清单零字节改动）
+
+- 新增 `followup_power_sim.py`（仿真功效分析 + 种子扫描 + artifact）；
+- 新增 `followup_flops_gate.py`（FlopCounterMode 测量 + 1% 门 +
+  fail-closed 政策）；
+- `validate_followup_design.py`：功效 artifact 绑定（study/族/种子/
+  alpha/目标/min_power 六项对账，unreadable 拒绝）；
+- `test_review_fixes.py`：N116–N119 四个新回归（420/420 全绿）；
+- `FOLLOWUP_CONFIRMATORY_PROTOCOL.md`：两个工具的用法与绑定语义；
+- `README.md` / `README_zh.md`：review-16 节 + v12 证据退役声明；
+- `RELEASES.md` / `DECISION_LOG.md`：退役状态行与决策条目。
+
+`CODE_SEMANTICS` 保持 `v11.128`；`v12_supp.py plan` 48/48 与
+`test_open_block.py` 15/15 未受影响（本轮零核心库改动）。

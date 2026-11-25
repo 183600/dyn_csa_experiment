@@ -9,6 +9,14 @@ environment, checkpoint hashes, failure/coverage records and the freeze lock.
 No formal evidence release is bundled in this source snapshot. Every future
 release must add a row here (and should be recorded in `DECISION_LOG.md`):
 
+> **Status note (2026-11-26).** The v12 confirmatory results are RETIRED as a
+> claim basis (owner decision; `DECISION_LOG.md` review 16, design_notes
+> §33.1): no future release row may cite v12 numbers as evidence for
+> CSA/HCA/Dynamic effectiveness or equal-compute superiority. Confirmatory
+> evidence can only come from the follow-up protocol
+> (`FOLLOWUP_CONFIRMATORY_PROTOCOL.md`); until that study is run, frozen,
+> and released, this index remains empty by design.
+
 | tag | date | Git commit | archive URL / object key | archive SHA-256 | manifest SHA-256 | verifier |
 |---|---|---|---|---|---|---|
 | _none yet_ | — | — | — | — | — | — |

@@ -3787,6 +3787,270 @@ def t_analytic_flops_model_and_flops_matched_dense():
         pass
 
 
+def _ps_spec(mean, sd, n=12, reps=250, seed=20261126, target=0.8, alpha=0.05):
+    import followup_power_sim as PS
+    return {
+        'schema_version': 1, 'study_id': 'dynamic-csa-hca-followup-v1',
+        'hypotheses': sorted(PS.REQUIRED_HYPOTHESES),
+        'effect_model': {'dist': 'normal',
+                         'mean': {h: mean for h in PS.REQUIRED_HYPOTHESES},
+                         'sd': {h: sd for h in PS.REQUIRED_HYPOTHESES}},
+        'n_seeds': n, 'mc_replicates': reps, 'rng_seed': seed,
+        'alpha': alpha, 'target_power': target,
+    }
+
+
+def t_followup_power_sim_contract():
+    """Review-16: the pre-freeze simulation-based power analysis exists as a
+    runnable tool — fail-closed spec validation, exact-statistic contract
+    (the batched sign-flip p equals exp_lib's), correct power semantics,
+    determinism, and a seed sweep that recommends the minimum n clearing
+    the declared target."""
+    import argparse
+
+    import followup_power_sim as PS
+
+    # --- fail-closed spec validation -------------------------------------
+    bad = _ps_spec(-0.1, 0.1)
+    for mutate, fragment in (
+            (lambda s: s.__setitem__('alpha', 0.06), 'alpha'),
+            (lambda s: s.__setitem__('n_seeds', True), 'n_seeds'),
+            (lambda s: s['effect_model'].__setitem__('dist', 'poisson'), 'dist'),
+            (lambda s: s['effect_model']['sd'].__setitem__(
+                sorted(PS.REQUIRED_HYPOTHESES)[0], 0.0), 'sd'),
+            (lambda s: s.__setitem__('mc_replicates', 25), 'mc_replicates'),
+            (lambda s: s.__setitem__('hypotheses', s['hypotheses'][:3]), 'hypotheses'),
+    ):
+        s = _copy.deepcopy(bad)
+        mutate(s)
+        r = PS.simulate_power(s)
+        assert r['status'] == 'invalid_spec', f'mutating {fragment} must fail closed'
+        assert any(fragment in p for p in r['problems']), (fragment, r['problems'])
+    # a valid spec never returns problems
+    ok = PS.simulate_power(_ps_spec(-0.1, 0.1))
+    assert ok['status'] == 'ok' and not ok.get('problems')
+
+    # --- the batched p is exp_lib's exact p --------------------------------
+    rng = np.random.default_rng(9)
+    for n in (4, 8, 12):
+        D = rng.normal(-0.4, 1.2, size=(10, n))
+        D[3] = 0.0  # exact-zero row (bootstrap panels can contain zeros)
+        pb = PS._batch_exact_signflip_p(D)
+        pl = np.asarray([L.exact_signflip_p(list(row))['p'] for row in D])
+        assert np.allclose(pb, pl, atol=1e-9), f'batch p must equal exp_lib p at n={n}'
+
+    # --- power semantics ---------------------------------------------------
+    # zero effect -> rejection near the familywise size, far below any target
+    null = PS.simulate_power(_ps_spec(0.0, 1.0, n=12))
+    assert null['min_power'] < 0.10, null['min_power']
+    # a large pre-registered effect -> essentially certain rejection
+    huge = PS.simulate_power(_ps_spec(-0.30, 0.10, n=12))
+    assert huge['min_power'] >= 0.95, huge['min_power']
+    # power is monotone in the effect size at fixed n
+    mid = PS.simulate_power(_ps_spec(-0.12, 0.10, n=12))
+    assert null['min_power'] < mid['min_power'] < huge['min_power']
+    # the conservative analytic projection is recorded for cross-reference
+    # (12 seeds, m=4, q=0.80 reproduces the review's 27.5% figure)
+    assert abs(huge['analytic_projection_conservative']['q=0.80'] - 0.274877906944) < 1e-9
+
+    # --- determinism ---------------------------------------------------------
+    assert PS.simulate_power(_ps_spec(-0.1, 0.1)) == PS.simulate_power(_ps_spec(-0.1, 0.1))
+
+    # --- seed sweep recommends the minimum n clearing the target -----------
+    spec = _ps_spec(-0.09, 0.10, n=12)
+    sweep = PS.run_seed_sweep(spec, [12, 16, 20])
+    assert sweep['status'] == 'ok'
+    pts = {s['n_seeds']: s for s in sweep['seed_sweep']}
+    assert set(pts) == {12, 16, 20}
+    assert pts[12]['meets_target'] is False, '12 seeds must miss the target here'
+    assert sweep['recommended_n_seeds'] == 16, sweep['recommended_n_seeds']
+    # the artifact records the declared model (auditable inputs)
+    assert sweep['effect_model']['mean'] == spec['effect_model']['mean']
+
+    # --- the CLI writes the artifact and exits 0 ----------------------------
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        spec_path = pathlib.Path(td) / 'spec.json'
+        spec_path.write_text(json.dumps(_ps_spec(-0.3, 0.1, reps=250)), encoding='utf-8')
+        rc = PS.main([str(spec_path), '--out', str(pathlib.Path(td) / 'art.json')])
+        assert rc == 0, 'a valid spec must exit 0'
+        art = json.loads((pathlib.Path(td) / 'art.json').read_text(encoding='utf-8'))
+        assert art['status'] == 'ok' and art['meets_target'] is True
+        # an invalid spec exits nonzero and still writes the failure artifact
+        spec_path.write_text(json.dumps(_ps_spec(-0.1, 0.1, alpha=0.5)), encoding='utf-8')
+        rc = PS.main([str(spec_path), '--out', str(pathlib.Path(td) / 'bad.json')])
+        assert rc == 1
+        assert json.loads((pathlib.Path(td) / 'bad.json').read_text(
+            encoding='utf-8'))['status'] == 'invalid_spec'
+
+
+def t_followup_validator_binds_power_artifact():
+    """Review-16: statistics.power_simulation_completed=true now REQUIRES the
+    followup_power_sim.py artifact and cross-checks it against the plan
+    (study, family, seed panel, alpha, target, minimum simulated power) —
+    the boolean alone is no longer a rubber stamp."""
+    import tempfile
+
+    import followup_power_sim as PS
+    import validate_followup_design as V
+
+    plan = json.loads(pathlib.Path(os.path.join(REPO, 'followup_design.template.json'))
+                      .read_text(encoding='utf-8'))
+    seeds = plan['design']['seeds']
+    tmp = pathlib.Path(tempfile.mkdtemp())
+
+    # completed=true without an artifact -> explicit error
+    p1 = _copy.deepcopy(plan)
+    p1['statistics']['power_simulation_completed'] = True
+    errs = V.validate(p1, repo=pathlib.Path(REPO), manifest_dir=tmp)
+    assert any('power_simulation_artifact' in e for e in errs), errs
+
+    # a genuine artifact bound to THIS plan removes the power-related errors
+    spec = _ps_spec(-0.30, 0.10, n=len(seeds), reps=250)
+    art = PS.simulate_power(spec)
+    assert art['min_power'] >= 0.95
+    (tmp / 'power_sim.json').write_text(json.dumps(art), encoding='utf-8')
+    p2 = _copy.deepcopy(plan)
+    p2['statistics']['power_simulation_completed'] = True
+    p2['statistics']['power_simulation_artifact'] = 'power_sim.json'
+    errs = V.validate(p2, repo=pathlib.Path(REPO), manifest_dir=tmp)
+    assert not [e for e in errs if 'power' in e.lower()], errs
+
+    # tampering is caught: min_power below target
+    for mutate, fragment in (
+            (lambda a: a.__setitem__('min_power', 0.31), 'min_power'),
+            (lambda a: a.__setitem__('n_seeds', 20), 'n_seeds'),
+            (lambda a: a.__setitem__('tool', 'someone_else.py'), 'tool'),
+            (lambda a: a.__setitem__('status', 'invalid_spec'), 'status'),
+            (lambda a: a.__setitem__('mc_replicates', 40), 'mc_replicates'),
+            (lambda a: a.__setitem__('hypotheses', a['hypotheses'][:3]), 'hypotheses'),
+    ):
+        a = _copy.deepcopy(art)
+        mutate(a)
+        (tmp / 't.json').write_text(json.dumps(a), encoding='utf-8')
+        p3 = _copy.deepcopy(p2)
+        p3['statistics']['power_simulation_artifact'] = 't.json'
+        errs = V.validate(p3, repo=pathlib.Path(REPO), manifest_dir=tmp)
+        assert any(fragment in e for e in errs), (fragment, errs)
+
+    # an unreadable artifact path fails closed
+    p4 = _copy.deepcopy(p2)
+    p4['statistics']['power_simulation_artifact'] = 'missing.json'
+    errs = V.validate(p4, repo=pathlib.Path(REPO), manifest_dir=tmp)
+    assert any('not a readable JSON object' in e for e in errs), errs
+
+    # the untouched template still fails on the OLD message (no binding yet)
+    errs = V.validate(plan, repo=pathlib.Path(REPO), manifest_dir=tmp)
+    assert any('power analysis must be completed' in e for e in errs), errs
+
+
+def t_followup_flops_gate_math():
+    """Review-16: the measured-FLOPs acceptance gate refuses everything it
+    should — non-certifying devices, the active custom-kernel path,
+    non-reproducible counts, non-ok artifacts — and the 1% tolerance math
+    (including the declared-total-steps scaling) is exact."""
+    import followup_flops_gate as FG
+
+    def art(**over):
+        base = {'schema_version': 1, 'tool': FG.TOOL_NAME, 'mode': 'measure',
+                'status': 'ok', 'problems': [], 'variant': 'x', 'mlp_ratio': 2.0,
+                'geometry': {}, 'device': 'cuda:0', 'torch_version': 'x',
+                'warmup_steps': 1, 'measured_steps': 3,
+                'flops_total_measured': 3_000_000, 'flops_repeat_block': 3_000_000,
+                'reproducible': True, 'flops_per_step': 1_000_000.0,
+                'tokens_per_step': 1024,
+                'analytic_attn_mlp_forward_per_token_layer': None,
+                'analytic_attn_mlp_forward_total': None,
+                'declared_total_steps': None,
+                'profiler_unsupported_ops_ms': {}, 'kernel_module_available': False,
+                'kernel_path_active': False, 'certifying_device': 'cuda',
+                'certifies': True, 'unsupported_operator_policy': 'refuse_flops_matched_claim',
+                'note': ''}
+        base.update(over)
+        return base
+
+    # equal totals -> FLOPS_MATCHED
+    v = FG._gate(art(), art(), 0.01, 'cuda', False)
+    assert v['verdict'] == 'FLOPS_MATCHED' and not v['problems'], v
+    assert abs(v['ratio'] - 1.0) < 1e-12
+
+    # declared_total_steps scaling: 200/step x 500 steps vs 100/step x 1000 steps
+    v = FG._gate(art(flops_per_step=100.0, flops_total_measured=300.0,
+                     declared_total_steps=1000),
+                 art(flops_per_step=200.0, flops_total_measured=600.0,
+                     declared_total_steps=500), 0.01, 'cuda', False)
+    assert v['verdict'] == 'FLOPS_MATCHED' and abs(v['ratio'] - 1.0) < 1e-12, v
+
+    # a 1.02x ratio exceeds the 1% tolerance
+    v = FG._gate(art(), art(flops_per_step=1_020_000.0,
+                            flops_total_measured=3_060_000,
+                            flops_repeat_block=3_060_000), 0.01, 'cuda', False)
+    assert v['verdict'] == 'REFUSED' and any('tolerance' in p for p in v['problems']), v
+
+    # each fail-closed path refuses on its own
+    for over, fragment in (
+            ({'certifies': False, 'device': 'cpu'}, 'does not certify'),
+            ({'kernel_path_active': True}, 'custom kernel path'),
+            ({'reproducible': False}, 'not reproducible'),
+            ({'status': 'refused'}, 'status'),
+            ({'tool': 'other.py'}, 'was not produced by'),
+            ({'flops_per_step': 0.0, 'flops_total_measured': 0}, 'positive finite'),
+            ({'flops_per_step': 700_000.0}, 'is inconsistent with'),
+    ):
+        v = FG._gate(art(), art(**over), 0.01, 'cuda', False)
+        assert v['verdict'] == 'REFUSED' and any(fragment in p for p in v['problems']), (over, v)
+
+    # the CPU smoke escape hatch: allowed, but the verdict says SMOKE_ONLY
+    v = FG._gate(art(), art(certifies=False, device='cpu'), 0.01, 'cuda', True)
+    assert v['verdict'] == 'FLOPS_MATCHED_SMOKE_ONLY', v
+    assert 'SMOKE_ONLY' in v['note']
+
+
+def t_followup_flops_measure_smoke():
+    """Review-16: the measurement harness runs a real variant end-to-end on
+    CPU — reproducible dispatch-level FLOPs, the SDPA disclosure table the
+    profiler alone would miss, the smoke/certifying device split — and the
+    same config measured twice gates to an exact 1.0 ratio."""
+    import argparse
+
+    import followup_flops_gate as FG
+
+    def ns(**over):
+        base = dict(variant='full_rope', mlp_ratio=2.0, vocab=128, d=64,
+                    n_layers=2, n_heads=2, d_head=32, seq=96, batch=2,
+                    steps=2, warmup=1, device='cpu', certifying_device='cuda',
+                    declared_total_steps=None, out=None)
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    a = FG._measure_variant(ns())
+    assert a['status'] == 'ok', a.get('problems')
+    assert a['reproducible'] is True, 'shape-based counting must reproduce exactly'
+    assert a['flops_total_measured'] > 0 and a['flops_per_step'] > 0
+    assert a['certifies'] is False, 'a CPU run is smoke evidence, never a certificate'
+    assert a['kernel_path_active'] is False
+    # the disclosure table names the attention kernels the CPU profiler
+    # cannot attribute (the whole reason the harness counts at dispatch level)
+    joined = ' '.join(a['profiler_unsupported_ops_ms']).lower()
+    assert 'scaled_dot_product' in joined or 'flash' in joined, a['profiler_unsupported_ops_ms']
+    # the analytical cross-check column is present and consistent with the
+    # registry cfg (attention + MLP, projections/head excluded)
+    assert a['analytic_attn_mlp_forward_per_token_layer'] is not None
+
+    # measuring the SAME config again is bit-identical -> ratio exactly 1.0
+    b = FG._measure_variant(ns())
+    assert b['flops_total_measured'] == a['flops_total_measured']
+    v = FG._gate(a, b, 0.01, 'cuda', True)
+    assert v['verdict'] == 'FLOPS_MATCHED_SMOKE_ONLY' and abs(v['ratio'] - 1.0) < 1e-12, v
+
+    # a malformed config refuses instead of measuring
+    bad = FG._measure_variant(ns(steps=0))
+    assert bad['status'] == 'refused' and bad['problems']
+    # an unknown variant refuses
+    bad = FG._measure_variant(ns(variant='no_such_variant'))
+    assert bad['status'] == 'refused' and any('make_layer_cfgs' in p for p in bad['problems'])
+
+
 def t_refreeze_round_cannot_confirm():
     """Review 10, issue 15: a post-test re-freeze cannot issue CONFIRMED
     labels (the same held-out slice was already observed)."""
@@ -14047,6 +14311,10 @@ def main():
     _check('N113 pattern-seed isolation for the hash controls', t_pattern_seed_isolation_semantics)
     _check('N114 mech-selection mass_covered is a mass fraction', t_mech_selection_mass_covered_is_mass_fraction)
     _check('N115 analytical FLOPs model + FLOPs-matched dense planning', t_analytic_flops_model_and_flops_matched_dense)
+    _check('N116 follow-up power simulation contract (spec, exact p, sweep)', t_followup_power_sim_contract)
+    _check('N117 validator binds the power-simulation artifact', t_followup_validator_binds_power_artifact)
+    _check('N118 follow-up measured-FLOPs gate math (1% + fail-closed)', t_followup_flops_gate_math)
+    _check('N119 follow-up FLOPs measurement harness smoke (CPU)', t_followup_flops_measure_smoke)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

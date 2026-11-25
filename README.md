@@ -23,6 +23,19 @@ disabled until the frozen commit is signed and P5T has run — check the workflo
 > **Evidence levels.** v6-v11 are exploratory (selected on the same validation
 split). Only the frozen v12 fixed-chunk comparisons are confirmatory. See
 `DECISION_LOG.md` and `docs/design_notes.md` §17/§20.
+>
+> **v12 evidence RETIRED as a claim basis (2026-11-26, owner decision).** The
+v12 confirmatory panel is superseded: its four arms never covered
+Dynamic/HCA, its Dense control is parameter- (not compute-) matched, its
+random control is a fixed hash, and its test panel is 16 windows — all
+disclosed boundaries, but the owner has retired the round's numbers as
+support for any methodological claim. No current or future statement in this
+repository may cite v12 results (CONFIRMED labels included) as evidence for
+CSA/HCA/Dynamic effectiveness or equal-compute superiority. Confirmatory
+evidence can only come from `FOLLOWUP_CONFIRMATORY_PROTOCOL.md` (see the
+follow-up design). The frozen manifest `confirmation_frozen.json` stays
+byte-identical as the historical pre-registration record; `v12_supp.py plan`
+and the CI preflight keep running against it unchanged (design_notes §33.1).
 
 > **Evidence status (read this before quoting a number).** `results_*/`,
 > `analysis_*/` and `REPORT*.md` are intentionally not tracked, and **no
@@ -263,6 +276,45 @@ already disclosed; this pass closes the three gaps that were still fixable:
   only: the 1% profiler-measured gate (design_notes §27.1) remains the sole
   acceptance for any "equal compute" claim, so the follow-up template still
   fails `--require-ready` by design.
+
+## Review-16 hardening (what changed)
+
+The owner retired the v12 evidence as a claim basis (blockquote above), and the
+follow-up protocol's two remaining pre-freeze TOOLING blockers are now
+runnable. No new training panel, no test-split access, no frozen-manifest byte
+change, `CODE_SEMANTICS` stays `v11.128`, `v12_supp.py plan` still 48/48,
+`test_review_fixes.py` 420/420, `test_open_block.py` 15/15 (design_notes §33):
+
+- **`followup_power_sim.py` — the pre-test simulation-based power analysis.**
+  The protocol requires it before test access ("plausible paired effect sizes
+  and the observed validation-set variance"); v12's exact enumeration over
+  observed magnitudes cannot answer "will THIS seed count detect the
+  pre-registered effect". The tool simulates the four-hypothesis Holm family
+  under a declared effect model (normal mean/sd, or a bootstrap over the
+  observed validation deltas) with the exact statistics the confirmatory
+  analysis will use (`exp_lib.exact_signflip_p` + `exp_lib.holm_adjust`; the
+  batched enumeration is contract-locked to the scalar path, N116), reports
+  per-hypothesis power with Monte-Carlo CIs, and `--seed-sweep` recommends the
+  minimum seed count clearing the declared target.
+- **The validator binds the power artifact (N117).**
+  `statistics.power_simulation_completed = true` now requires
+  `statistics.power_simulation_artifact` — the tool's output JSON — and
+  cross-checks study id, hypothesis family, seed panel, alpha, target power and
+  minimum simulated power against the plan. Tampering with any field fails
+  `--require-ready`; the boolean alone is no longer evidence.
+- **`followup_flops_gate.py` — the measured-FLOPs acceptance gate.**
+  Measurement uses `torch.utils.flop_counter.FlopCounterMode` (aten-dispatch
+  level): it is the only counter family that attributes
+  `scaled_dot_product_attention` — `torch.profiler(with_flops=True)` covers
+  only mm/bmm/addmm and silently drops every attention kernel (the profiler
+  pass runs alongside purely to DISCLOSE that gap per artifact). A repeat
+  block must reproduce the count exactly; the active custom CSA kernel path
+  refuses to measure (custom Triton kernels are invisible to op-level
+  counting); `gate` applies the 1% tolerance to total training FLOPs and never
+  certifies CPU smoke runs. CPU smoke measurement already shows the honest
+  reason this gate matters: the per-row eager CSA implementation executes
+  ~3x the op-level FLOPs of the dense SDPA path at a tiny geometry — an
+  implementation cost the analytical planning model does not see.
 
 ## Repository layout
 

@@ -650,3 +650,71 @@ Regression coverage: N113 (bit-identity at seed 0 vs the review-14 formula,
 reproducibility, distinctness, fail-closed modes, registry twins, model-path
 consumption), N114 (contract-formula lock + smoke), N115 (analytic numbers,
 solver, routing, mutual exclusion, registry, finite forward).
+
+## Review 16 (2026-11-26): retire v12 confirmatory evidence as a claim basis; land the two pre-freeze tooling blockers (power simulation, measured-FLOPs gate)
+
+**Trigger.** The owner decided to retire (抛弃) the v12 experimental results
+as the basis for any methodological claim, and asked for the remaining
+actionable fixes ahead of the follow-up confirmatory runs. Per the review-14/15
+dispositions, all six design-boundary findings are disclosed rather than
+hidden; with the v12 evidence retired, the only scientifically valuable
+modifications are (a) the forward-looking tooling the follow-up protocol still
+lacked, and (b) an explicit retirement record so no reader mistakes v12 for
+current evidence. The algorithm core (`gate.detach()` chunking, CSA/HCA
+forward, REINFORCE arm) is intentionally untouched — review-15 verified it
+sound, and the boundary is scope, not implementation.
+
+**Decisions.**
+
+1. **v12 evidence retirement is declared, not rewritten.**
+   `confirmation_frozen.json` stays byte-identical (rewriting a frozen
+   pre-registration is tampering, worse than the disclosed limitation it would
+   "fix"); `v12_supp.py plan` and the CI preflight keep running against it.
+   The retirement lives in the claim layer: README/README_zh evidence-levels
+   blockquotes, RELEASES.md status note, this entry, design_notes §33.1. No
+   current or future statement may cite v12 numbers (CONFIRMED labels
+   included) as support for CSA/HCA/Dynamic effectiveness or equal-compute
+   superiority; confirmatory evidence can only come from
+   FOLLOWUP_CONFIRMATORY_PROTOCOL.md.
+2. **`followup_power_sim.py` lands the pre-test simulation-based power
+   analysis** the protocol required but no tool provided. Effect model:
+   declared normal mean/sd or a bootstrap over observed validation deltas,
+   recorded in the artifact. Statistics are the exact confirmatory ones
+   (`exp_lib.exact_signflip_p` + `holm_adjust`; the batched enumeration is
+   contract-locked to the scalar path, N116). `--seed-sweep` recommends the
+   minimum seed count clearing the declared target power; the conservative
+   analytic projection (q=0.80 @ 12 seeds = 0.2749) is recorded as a
+   cross-check column.
+3. **The validator binds the artifact, not the boolean (N117).**
+   `statistics.power_simulation_completed = true` now requires
+   `statistics.power_simulation_artifact` naming the tool's output; study id,
+   hypothesis family, seed panel, alpha, target power and minimum simulated
+   power are cross-checked against the plan. Tampering with any field fails
+   `--require-ready`.
+4. **`followup_flops_gate.py` lands the measured-FLOPs acceptance gate.**
+   Empirical driver: `torch.profiler(with_flops=True)` attributes only
+   mm/bmm/addmm and silently drops every SDPA attention kernel, while
+   `torch.utils.flop_counter.FlopCounterMode` (aten-dispatch level) counts
+   SDPA with the same non-halved convention as the repo's analytical model.
+   Measurement = FlopCounterMode over K post-warm-up training steps
+   (fwd+bwd+optimizer); a repeat block must reproduce the count exactly; the
+   active custom CSA Triton kernel path refuses to measure (invisible to
+   op-level counting); the profiler pass runs only to DISCLOSE the
+   unattributed ops. `gate` applies the 1% tolerance to total training FLOPs
+   (`flops_per_step x declared_total_steps`); CPU runs are smoke evidence and
+   never certify. First smoke numbers recorded in design_notes §33.3: at a
+   tiny geometry the per-row eager CSA implementation executes ~3x the
+   op-level FLOPs of the dense SDPA path — an implementation cost the
+   analytical planning model cannot see, which is precisely why the protocol
+   demands measured FLOPs as the sole equal-compute acceptance.
+5. **No change to:** the frozen manifest (zero bytes), `CODE_SEMANTICS`
+   (`v11.128`), the variant registry, the algorithm core, or the CI gates.
+   `test_review_fixes.py` 420/420 (N116–N119 added), `test_open_block.py`
+   15/15, `v12_supp.py plan` 48/48.
+
+**What this does NOT do.** It does not run the power simulation on real
+validation-derived effect sizes (the inputs must come from the follow-up
+validation panel, then be bound into the design); it does not run the FLOPs
+measurement on the certifying device (GPU access required for a certificate);
+it does not run the algorithmic gates; and it does not freeze the follow-up
+manifest. All four remain preconditions for `--require-ready`, by design.

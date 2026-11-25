@@ -8,6 +8,8 @@
 
 > **证据等级**：v6–v11 为探索性（在同一 validation split 上选择后观察）；只有 v12 冻结的固定分块比较是确认性。详见 `DECISION_LOG.md` 与 `docs/design_notes.md` §17/§20。
 >
+> **v12 证据已退役（2026-11-26，owner 决策）**：v12 确认轮被取代——四臂不含 Dynamic/HCA、Dense 对照是参数匹配非算力匹配、随机对照是固定哈希、测试面板仅 16 窗口（均为已披露边界），owner 决定退役该轮数字作为任何方法学声明的依据。本仓库今后不得引用 v12 结果（含 CONFIRMED 标签）支持 CSA/HCA/Dynamic 有效性或等算力主张；确认性证据只能来自 `FOLLOWUP_CONFIRMATORY_PROTOCOL.md`。冻结清单 `confirmation_frozen.json` 字节不动（历史预注册记录，改写即篡改）；`v12_supp.py plan` 与 CI 预检照旧对它运行（design_notes §33.1）。
+>
 > **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.128` 是冻结清单绑定的库测量语义戳，两者故意不同号。冻结清单当前为 `manifest_version: 5`（见其 `revision.history`；v4 移除了不可机检的 ee/es 钉定并补充了 tokenizer 拟合的 token 上限说明，v5 把 v4 注记中对已实现判定规则的描述更正回注册的 v3 措辞——规范性字段未变；v6（2026-11-24）注册了保守的“证据完整性 + 最小功效”闸门，详见下文——均仍在任何 test 访问之前）；按清单 v3 的 `ci_loop` 注记，continuous-loop CI 应保持停用直至签署后的提交固定且 P5T 完成——依赖此约定前请用 `gh workflow list` 核实工作流的实际状态。
 
 > **证据状态（引用数字前必读）**：`results_*/`、`analysis_*/`、`REPORT*.md` 有意不入库，且**没有随仓库发布证据归档**（`RELEASES.md` 尚无记录）。报告可由你自己产生的产物重建，但任何你没有重建过的报告数值都无法独立复核。只有当 `release_<tag>.tar.gz` 与清单发布到只读位置并通过 `archive_release.py verify` 时，相应主张才可审计。
@@ -64,6 +66,14 @@ dense 仅 RMSNorm、scale=1/sqrt(d_head)）、缺同投影/同 sink 的 dense �
 - **`mech_selection.py` 的 mass_covered 是真实指标缺陷**：分母误用可读块**计数**而非该行可读块**总注意力质量**，指标被系统性缩小约 n_readable 倍且与 k/n_blocks 基线不可比——review-14 smoke 的 mass=0.09 < base=0.13 纯属该 bug 的假象（修复后同一 smoke 为 mass=0.38 > base=0.13）。分母已改为 softmax 归一化项，与 `audit_gates.audit_selection` 契约一致；N114 用独立实现的公式对拍锁定。
 - **连接模式种子已接通**（原「NOT yet wired」）：`AttnCfg.pattern_seed`（0 = review-14 逐位不变；非哈希模式配非零种子一律 fail-closed）把独立整数混入 `random_each`/`random_dist` 行键，同一训练 seed 可在多个连接模式下重跑；注册 `_ps<N>` 变体族，followup 模板新增 `design.selection_controls` 声明，验证器对账（N113）。
 - **FLOPs 匹配 Dense 臂有了解析容量计划**：`analytic_attn_flops_token`/`analytic_train_flops_token` 精确复现冻结披露数字（1,229,824 vs 2,297,296 FLOPs/token/层，1.87x），`flops_matched_mlp_ratio` 解出 `full_rope_flops_matched` 的旋钮——冻结配置解 **mr = 689/256 = 2.69140625**——替换 `TODO_FLOPS_MATCHED_DENSE` 占位符；经 run cfg 的 `flops_matched` 集合路由、与参数匹配互斥 fail-closed。**解析等式不是证书**：1% profiler 实测门仍是「等计算」措辞的唯一验收，模板按设计仍 `--require-ready` 失败。
+
+## 评审十六硬化（review 16）
+
+owner 退役 v12 证据作为主张依据（见顶部引注），follow-up 协议中两个仍缺工具的 pre-freeze 阻塞项落地。零训练、零 test 访问、冻结清单零字节改动、`CODE_SEMANTICS` 保持 `v11.128`、`v12_supp.py plan` 48/48、`test_review_fixes.py` 420/420、`test_open_block.py` 15/15（详见 `docs/design_notes.md` §33）：
+
+- **`followup_power_sim.py`——测试集访问前的仿真功效分析**：协议要求「合理配对效应量 + 验证集实测方差」的仿真，而 v12 的精确枚举只针对已观测增量。工具在声明的效应模型（正态均值/方差，或 bootstrap 重采样观测验证增量）下仿真四假设 Holm 族，检验统计量与确认性分析同源（`exp_lib.exact_signflip_p` + `holm_adjust`，批处理与标量契约对拍锁定，N116）；`--seed-sweep` 报告达到目标功效的最小种子数。
+- **验证器绑定功效工件（N117）**：`power_simulation_completed = true` 必须携带 `power_simulation_artifact`（工具输出 JSON），study/假设族/种子面板/alpha/目标/min_power 六项对账，篡改即拒——布尔位不再能拍脑袋置。
+- **`followup_flops_gate.py`——实测 FLOPs 接受门**：测量用 `torch.utils.flop_counter.FlopCounterMode`（aten 调度层，唯一能归因 `scaled_dot_product_attention` 的计数器——`torch.profiler(with_flops=True)` 只覆盖 mm/bmm/addmm，注意力内核一律静默漏计，profiler 通道降级为披露表）；重复块必须逐位复现；自定义 CSA Triton 内核路径拒绝测量；`gate` 对总训练 FLOPs 施加 1% 容差，CPU 冒烟永不签证书。CPU 冒烟实测已给出诚实的理由：tiny 几何下逐行 eager CSA 实现的 op 级计算量约为 dense SDPA 路径的 3 倍——解析规划模型看不到的实现开销。
 
 ## 仓库结构
 

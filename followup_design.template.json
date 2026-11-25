@@ -69,6 +69,7 @@
     "familywise_alpha": 0.05,
     "minimum_effective_seeds": 8,
     "power_simulation_completed": false,
+    "power_simulation_artifact": null,
     "target_power": 0.8,
     "stopping_rule": "single_look_fixed_n",
     "n_looks": 1,
