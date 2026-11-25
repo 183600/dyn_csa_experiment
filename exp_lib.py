@@ -169,7 +169,10 @@ def _uses_batched_eager(cfgs, device=None, batch_size=None, forced=None):
         # layer is batched only when it is NOT a rope layer.
         and not bool(getattr(c, 'rope', False))
         and getattr(c, 'fuse_mode', 'none') == 'none'
-        and getattr(c, 'indexer_mode', 'learned')
+        # Mirror of the dispatch condition in HybridAttention.forward (the
+        # batched twin only covers the learned indexer): a bare truthiness
+        # check here misreported indexer_mode='random' layers as batched.
+        and getattr(c, 'indexer_mode', 'learned') == 'learned'
         and getattr(c, 'open_block_mode', 'closed') == 'closed'
         and int(getattr(c, 'max_block', 128) or 0) == 128
         for c in cfgs
@@ -3819,12 +3822,60 @@ def _pool_ends_host(bid):
             pass
     return ends
 
+_RANDOM_INDEXER_MODES = ('random', 'random_each', 'random_dist', 'stride', 'nearest')
+# distance-matched random draw: locality scale in tokens (one train context
+# length for the WikiText arms; a single fixed constant keeps the control's
+# definition reproducible across the follow-up panels).
+_RAND_DIST_TAU_TOKENS = 512.0
+
+
+def _random_mode_of(random_select):
+    """Normalize the indexer's ``random_select`` argument to a mode name.
+
+    ``False``/``None`` -> ``None`` (the learned path); ``True`` -> the frozen
+    legacy ``'random'`` hash (bit-for-bit unchanged); a string selects one of
+    the follow-up protocol's mechanism-isolation control modes.  Unknown
+    values fail closed instead of silently falling back to another selection
+    rule.
+    """
+    if random_select is None or random_select is False:
+        return None
+    if random_select is True:
+        return 'random'
+    if isinstance(random_select, str):
+        if random_select in _RANDOM_INDEXER_MODES:
+            return random_select
+        raise ValueError(f'lightning_indexer: unknown random_select mode {random_select!r}; expected one of {_RANDOM_INDEXER_MODES}')
+    raise ValueError(f'lightning_indexer: random_select must be a bool or mode name, got {random_select!r}')
+
+
 def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_mask=True, query_chunk=2048, random_select=False, pre_qI=None, pre_w=None, out_valid=None, causal_ends_host=None, need_soft=True):
+    """Selection-mode table (``random_select``):
+
+    learned (False)      -- the trained indexer (W_DQ/W_DK/W_w projections).
+    'random'             -- the FROZEN fixed hash pattern ((row*12.9898 +
+                             col*78.233), identical for every seed/layer/step).
+    'random_each'        -- per-forward re-randomized hash keyed by the row's
+                             hidden state (the pattern changes as H evolves
+                             every forward; deterministic and recompute-stable,
+                             consumes no RNG stream).
+    'random_dist'        -- the same content-keyed hash weighted by a causal
+                             distance kernel (locality-matched random draw).
+    'nearest'            -- recency control (the k most recent readable
+                             blocks).
+    'stride'             -- uniform-stride control (evenly spaced readable
+                             blocks, row-adaptive stride readable_i // k).
+
+    The four new modes are the follow-up protocol's mechanism-isolation
+    controls (FOLLOWUP_CONFIRMATORY_PROTOCOL.md); none of them is part of the
+    frozen v12 plan, and 'random' keeps its historical bits exactly.
+    """
     n = H.shape[0]
     B = comp_kv.shape[0]
     dev = H.device
     hd = W_DQ.shape[1] // nIH
-    if random_select:
+    _rmode = _random_mode_of(random_select)
+    if _rmode is not None:
         qI = kI = w_idx = None
     else:
         qI = (pre_qI if pre_qI is not None else H @ W_DQ).view(n, nIH, hd).transpose(0, 1)
@@ -3873,7 +3924,7 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
         if _wk not in _TOPK_CLAMP_WARNED:
             _TOPK_CLAMP_WARNED.add(_wk)
             print(f'[lightning_indexer] requested topk={int(topk)} but only B={int(B)} blocks are available; effective selection is clamped to all {int(k)} blocks for this call')
-    if random_select:
+    if _rmode is not None:
         _ri_key = (_dev_str(dev), 'rs_ri', int(n))
         _jc_key = (_dev_str(dev), 'rs_jc', int(B))
         _ri = _cache_get(_IDX_CACHE, _ri_key)
@@ -3929,18 +3980,63 @@ def lightning_indexer(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, return_m
     out_dtype = None
     for s in range(0, n, query_chunk):
         e = min(s + query_chunk, n)
-        if random_select:
-            # same elementwise op chain with in-place tails: each op is the
-            # same kernel on the same values (no fusion, no reassociation —
-            # note x-floor(x) is NOT frac() for negatives), so the scores are
-            # bit-identical.
-            z = _ri[s:e] * 12.9898 + _jc
-            z.sin_()
-            z.mul_(43758.5453)
-            z.sub_(torch.floor(z))
-            z.mul_(2.0).sub_(1.0)
-            c = z.to(H.dtype)
-            del z
+        if _rmode is not None:
+            if _rmode == 'random':
+                # same elementwise op chain with in-place tails: each op is the
+                # same kernel on the same values (no fusion, no reassociation —
+                # note x-floor(x) is NOT frac() for negatives), so the scores are
+                # bit-identical.
+                z = _ri[s:e] * 12.9898 + _jc
+                z.sin_()
+                z.mul_(43758.5453)
+                z.sub_(torch.floor(z))
+                z.mul_(2.0).sub_(1.0)
+                c = z.to(H.dtype)
+                del z
+            elif _rmode in ('random_each', 'random_dist'):
+                # Per-forward re-randomization (follow-up protocol control):
+                # the row key is a deterministic float64 reduction of the
+                # hidden state fed through the same GLSL-style hash, so the
+                # pattern changes every forward as H evolves (across steps,
+                # layers, seeds and rows) while remaining a fixed function of
+                # the saved inputs — activation recompute and resume
+                # reproduce it bit-for-bit on the same device, and no RNG
+                # stream is consumed (cross-device bit-stability of a random
+                # control's pattern is deliberately not claimed).
+                # .detach(): a control mode must not add a gradient path through
+                # its own scores (the legacy hash is constant for the same
+                # reason).
+                _hk = H[s:e].detach().to(torch.float64).sum(-1)
+                z = _hk[:, None] * 12.9898 + _jc
+                z.sin_()
+                z.mul_(43758.5453)
+                z.sub_(torch.floor(z))
+                if _rmode == 'random_each':
+                    z.mul_(2.0).sub_(1.0)
+                else:
+                    # distance-matched random: the content hash weighted by a
+                    # causal locality kernel (tau in tokens,
+                    # _RAND_DIST_TAU_TOKENS), so the draw matches the learned
+                    # selector's recency profile instead of the flat prior.
+                    _dist = pos[s:e].to(torch.float64)[:, None] - last_tok.to(torch.float64)[None, :]
+                    z.mul_(torch.exp(-_dist.clamp_min(0.0) / _RAND_DIST_TAU_TOKENS))
+                c = z.to(H.dtype)
+                del z
+            else:
+                # Deterministic geometry controls, integer functions of the
+                # row/col ids: 'nearest' ranks by recency (score = block id);
+                # 'stride' scores -(j mod s_i) with s_i = max(1, readable_i //
+                # k), i.e. evenly spaced readable blocks per row.
+                _cc, _ = _causal_of(s, e)
+                _cread = _cc.sum(-1)
+                _jI = torch.arange(B, device=dev)
+                if _rmode == 'nearest':
+                    z = _jI.to(torch.float64)[None, :].expand(e - s, B).clone()
+                else:
+                    _st = torch.clamp_min(_cread // max(int(k), 1), 1)
+                    _mod = _jI[None, :] - (_jI[None, :] // _st[:, None]) * _st[:, None]
+                    z = (-_mod).to(torch.float64)
+                c = z.to(H.dtype)
         else:
             raw = torch.einsum('ind,ibd->inb', qI[:, s:e], kI)
             raw.mul_(_iscale)
@@ -4127,8 +4223,10 @@ def _indexer_trainable(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
     The indexer builds `raw`/`c`/`soft` tables of shape [T, B_blocks, nIH]
     (plus the [T, topk] prior).  Backward recomputes the whole pure function,
     matching the FusedIndexer save policy.  Values and gradients are unchanged
-    (no RNG in the learned path
-    unless `random_select`, which is a fixed function of the row/column ids).
+    (no RNG in the learned path or in any `random_select` mode: the legacy
+    'random' hash is a fixed function of the row/column ids, and the
+    random_each/random_dist modes hash a deterministic reduction of the saved
+    inputs — every mode is recompute-stable without RNG state).
     """
     def _run(_h, _ck, _lt):
         _m, _idx, _soft = lightning_indexer(
@@ -4814,8 +4912,8 @@ class AttnCfg:
             raise ValueError(f'unknown attention kind {self.kind!r}; expected full/csa/hca')
         if self.chunking not in ('fixed', 'cosine_learnable', 'cosine_abs', 'cosine_adaptive'):
             raise ValueError(f'unknown chunking {self.chunking!r}; expected fixed/cosine_learnable/cosine_abs/cosine_adaptive')
-        if self.indexer_mode not in ('learned', 'random'):
-            raise ValueError(f'unknown indexer_mode {self.indexer_mode!r}; expected learned/random')
+        if self.indexer_mode not in ('learned', 'random', 'random_each', 'random_dist', 'stride', 'nearest'):
+            raise ValueError(f'unknown indexer_mode {self.indexer_mode!r}; expected learned/random/random_each/random_dist/stride/nearest')
         if self.content_mode not in ('pooled', 'zero'):
             raise ValueError(f'unknown content_mode {self.content_mode!r}; expected pooled/zero')
         if self.fuse_mode not in ('none', 'learned'):
@@ -5156,7 +5254,7 @@ class HybridAttention(nn.Module):
         pre = {}
         if cfg.kind == 'full':
             return None
-        _want_idx = cfg.kind != 'hca' and cfg.indexer_mode != 'random'
+        _want_idx = cfg.kind != 'hca' and cfg.indexer_mode == 'learned'
         # The concatenated weight is only a cached constant on the eval path.
         # The separate projections produce the same independent output columns.
         if x.device.type != 'cuda' or torch.is_grad_enabled():
@@ -5166,7 +5264,9 @@ class HybridAttention(nn.Module):
             pre['Za'] = x @ self.W_aZ if self.W_aZ is not None else None
             pre['Zb'] = x @ self.W_bZ if self.W_bZ is not None else None
             if cfg.kind != 'hca':
-                if cfg.indexer_mode == 'random':
+                if cfg.indexer_mode != 'learned':
+                    # every non-learned control mode bypasses the indexer
+                    # projections (dead parameters; see param_breakdown).
                     pre['qI'] = pre['w_idx'] = None
                 else:
                     pre['qI'] = x @ self.W_DQ
@@ -5574,7 +5674,7 @@ class HybridAttention(nn.Module):
                 # 并以 soft_form=True 固定走软分支的硬部分解——两者前向 bit 与
                 # 传入 soft 的形式完全一致。有梯度时条件为 False，走传入 soft
                 # 的完整图。
-                _, topk_idx, soft = _indexer_trainable(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, random_select=cfg.indexer_mode == 'random', pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=None, need_soft=_need_soft)
+                _, topk_idx, soft = _indexer_trainable(x, index_kv, last_tok, self.W_DQ, self.W_DK, self.W_w.weight, cfg.n_index_heads, topk, random_select=(cfg.indexer_mode if cfg.indexer_mode != 'learned' else False), pre_qI=pre['qI'] if pre is not None else None, pre_w=pre['w_idx'] if pre is not None else None, out_valid=_sel_valid_box, causal_ends_host=None, need_soft=_need_soft)
                 # _indexer_selection 的 top-k 是无放回选择：有效槽位的块 id 逐行互不
                 # 相同（order 是列排列、kept 落在互异的 cumsum 秩列上），pad 槽位的
                 # 重复块 0 已被 sel_valid 置无效。故 gathered_attention 的
@@ -9978,7 +10078,9 @@ def param_breakdown(m):
     # path), so those parameters are allocated but DEAD.  Total-parameter
     # matching alone therefore overstates the random control's effective
     # capacity by ~1.8%.  Count them explicitly so a report cannot hide the
-    # active-parameter mismatch.
+    # active-parameter mismatch.  (Follow-up review: EVERY non-learned
+    # indexer_mode — random/random_each/random_dist/stride/nearest — bypasses
+    # the same projections, so the dead-parameter accounting covers them all.)
     _dead = 0
     for name, p in m.named_parameters():
         if not name.startswith('blocks.') or '.attn.' not in name:
@@ -9991,14 +10093,14 @@ def param_breakdown(m):
         except (IndexError, ValueError, AttributeError, TypeError):
             continue
         try:
-            if getattr(_blk.attn.cfg, 'indexer_mode', 'learned') == 'random':
+            if getattr(_blk.attn.cfg, 'indexer_mode', 'learned') != 'learned':
                 _dead += int(p.numel())
         except Exception:
             continue
     out['dead_params'] = int(_dead)
     out['dead_indexer_params'] = int(_dead)
     out['active'] = int(out['total'] - _dead)
-    out['active_note'] = ('active excludes parameters allocated but bypassed by indexer_mode=random '
+    out['active_note'] = ('active excludes parameters allocated but bypassed by non-learned indexer_mode '
                           '(W_DQ/W_DK/W_w); total-parameter matching does not match active capacity')
     out['attention_share'] = (out['attention'] / out['total']) if out['total'] else 0.0
     return out

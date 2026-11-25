@@ -77,7 +77,17 @@ any mechanism wording:
   re-randomized selector, a distance-matched random selector, a nearest-block
   selector, and a uniform-stride selector; repeat with connection-pattern seeds
   independent of the training seed so training noise and pattern noise can be
-  separated.
+  separated.  **These four selectors are now implemented** (review-14):
+  `lightning_indexer` modes `random_each` / `random_dist` / `nearest` /
+  `stride`, registered as the rope variants `csa_fixed_rope_randidx_each`,
+  `csa_fixed_rope_randidx_dist`, `csa_fixed_rope_nearidx`,
+  `csa_fixed_rope_strideidx` (registry-only; declare them in this design's
+  arms before training).  `random_each` re-randomizes every forward via a
+  content-keyed hash of the hidden state (recompute-stable, no RNG stream);
+  `random_dist` weights the same hash by a causal distance kernel
+  (tau = 512 tokens).  Connection-pattern seeds independent of the training
+  seed are still required by this protocol and are NOT yet wired — the
+  current variants key the pattern on the hidden state only.
 - **Reading-scope controls.** A learned-top-k vs all-block contrast changes
   reading scope and the STE soft prior, not only selection; pair it with a
   same-scope learned-vs-random contrast, and report block/read counts.

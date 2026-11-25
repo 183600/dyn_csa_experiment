@@ -3348,7 +3348,172 @@ def t_param_breakdown_reports_dead_indexer_params():
     assert pb2['dead_indexer_params'] == expected_dead
     assert pb2['active'] == pb2['total'] - expected_dead
     assert pb2['active'] < pb2['total']
-    assert 'random' in pb2['active_note']
+    # Review follow-up: the dead-parameter accounting now covers EVERY
+    # non-learned indexer_mode (random/random_each/random_dist/stride/
+    # nearest) — the note wording changed accordingly.
+    assert 'non-learned indexer_mode' in pb2['active_note']
+    # the new control modes count as dead indexer parameters too
+    for mode in ('random_each', 'random_dist', 'stride', 'nearest'):
+        m = L.SmallGPT(64, 32, 2, 2, 16, 16,
+                       [L.AttnCfg(kind='csa', dynamic=False, block_size=4,
+                                  overlap=L.OVERLAP, index_topk=8,
+                                  indexer_mode=mode) for _ in range(2)])
+        pbc = L.param_breakdown(m)
+        assert pbc['dead_params'] == pbc['attention_indexer'] > 0, (mode, pbc['dead_params'])
+        assert pbc['active'] == pbc['total'] - pbc['dead_params']
+
+
+def t_indexer_control_modes_selection_semantics():
+    """Review follow-up: the four mechanism-isolation control modes select what
+    they claim, fail closed on unknown modes, and keep the legacy 'random'
+    hash bit-identical (True == 'random')."""
+    import torch
+
+    assert L._random_mode_of(False) is None and L._random_mode_of(None) is None
+    assert L._random_mode_of(True) == 'random'
+    for m in ('random', 'random_each', 'random_dist', 'stride', 'nearest'):
+        assert L._random_mode_of(m) == m
+    for bad in ('bogus', 'Random', 1, 0.5, ()):
+        try:
+            L._random_mode_of(bad)
+            raise AssertionError(f'unknown mode {bad!r} must fail closed')
+        except ValueError:
+            pass
+
+    torch.manual_seed(0)
+    n, B, d, nIH, K = 40, 20, 8, 2, 4
+    g = torch.Generator().manual_seed(0)
+    H = torch.randn(n, d, generator=g)
+    comp = torch.randn(B, d, generator=g)
+    W_DQ = torch.randn(d, d, generator=g)
+    W_DK = torch.randn(d, d, generator=g)
+    W_w = torch.randn(nIH, d, generator=g)
+    last = torch.arange(B, dtype=torch.long) * 2 + 1
+    assert int(last.max()) < n
+    readable = L.block_readable(L._arange_cache(n, H.device), last)
+    cread = readable.sum(-1)
+
+    def _sel(mode, H_t=H):
+        box = []
+        _, idx, _ = L.lightning_indexer(H_t, comp, last, W_DQ, W_DK, W_w, nIH, K,
+                                        return_mask=False, random_select=mode,
+                                        out_valid=box, need_soft=True)
+        return idx, box[0]
+
+    def _rowset(idx_row, valid_row):
+        return set(int(v) for v, ok in zip(idx_row.tolist(), valid_row.tolist()) if bool(ok))
+
+    # nearest: the k most recent readable blocks per row
+    idx, valid = _sel('nearest')
+    for r in range(n):
+        avail = [j for j in range(B) if bool(readable[r, j])]
+        assert _rowset(idx[r], valid[r]) == set(avail[-K:]), f'nearest row {r}'
+
+    # stride: the readable-prefix multiples of st_i = max(1, readable_i // k)
+    idx, valid = _sel('stride')
+    for r in range(n):
+        ci = int(cread[r])
+        st = max(1, ci // K)
+        mults = set(j for j in range(B) if j < ci and j % st == 0)
+        got = _rowset(idx[r], valid[r])
+        if len(mults) >= K:
+            assert got.issubset(mults) and len(got) == K, f'stride row {r}: {sorted(got)} vs {sorted(mults)}'
+        else:
+            assert mults.issubset(got) and len(got) == min(K, ci), (r, sorted(got))
+
+    # legacy 'random': True and 'random' must stay bit-identical
+    a, va = _sel(True)
+    b, vb = _sel('random')
+    assert torch.equal(a, b) and torch.equal(va, vb), "bool True and 'random' diverged"
+
+    # random_each: deterministic per inputs (recompute-stable), varies with H,
+    # and does not collapse onto the legacy fixed pattern
+    c1, vc1 = _sel('random_each')
+    c2, vc2 = _sel('random_each')
+    assert torch.equal(c1, c2) and torch.equal(vc1, vc2), 'random_each not recompute-stable'
+    H2 = H * torch.linspace(1.0, 2.0, n)[:, None]
+    c3, _ = _sel('random_each', H_t=H2)
+    assert not torch.equal(c1, c3), 'random_each must change when the hidden state changes'
+    assert not torch.equal(c1, b), 'random_each collapsed onto the legacy fixed hash'
+
+    # random_dist: independent formula replication of the score ranking
+    d1, vd1 = _sel('random_dist')
+    _hk = H.to(torch.float64).sum(-1)
+    _jc = torch.arange(B, dtype=torch.float64)[None, :] * 78.233
+    z = _hk[:, None] * 12.9898 + _jc
+    z = torch.sin(z) * 43758.5453
+    z = z - torch.floor(z)
+    dist = torch.arange(n, dtype=torch.float64)[:, None] - last.to(torch.float64)[None, :]
+    score = z * torch.exp(-dist.clamp_min(0.0) / L._RAND_DIST_TAU_TOKENS)
+    for r in range(n):
+        order = torch.argsort(score[r].masked_fill(~readable[r], float('-inf')), descending=True, stable=True)
+        expect = [j for j in order[:K].tolist() if bool(readable[r, j])]
+        assert sorted(_rowset(d1[r], vd1[r])) == sorted(expect), f'random_dist row {r}'
+
+    # cfg validation accepts the new modes and rejects typos
+    for m in ('random_each', 'random_dist', 'stride', 'nearest'):
+        L.AttnCfg(kind='csa', indexer_mode=m)
+    try:
+        L.AttnCfg(kind='csa', indexer_mode='nope')
+        raise AssertionError('AttnCfg must reject unknown indexer modes')
+    except ValueError:
+        pass
+
+
+def t_indexer_control_modes_model_paths():
+    """Review follow-up: every control mode survives a tiny model forward and
+    backward with finite values, is excluded from the batched twin (mirroring
+    the forward dispatch), and its rope registry entries exist for the
+    follow-up protocol."""
+    import copy as _copy
+    import torch
+
+    def _tiny(mode):
+        torch.manual_seed(3)
+        cfgs = [L.AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=L.OVERLAP,
+                          index_topk=4, indexer_mode=mode) for _ in range(2)]
+        return L.SmallGPT(64, 32, 2, 2, 16, 128, cfgs, mlp_ratio=2)
+
+    for mode in ('random', 'random_each', 'random_dist', 'stride', 'nearest'):
+        m = _tiny(mode)
+        out = m(torch.randint(0, 64, (2, 128)))
+        assert torch.isfinite(out).all(), f'non-finite forward under {mode}'
+        out.float().pow(2).mean().backward()
+        bad = [nme for nme, p in m.named_parameters()
+               if p.grad is not None and not torch.isfinite(p.grad).all()]
+        assert not bad, f'non-finite grads under {mode}: {bad[:3]}'
+
+    # the batched-twin eligibility check mirrors the dispatch: only 'learned'
+    for m in ('random', 'random_each', 'random_dist', 'stride', 'nearest'):
+        cfg = L.AttnCfg(kind='csa', indexer_mode=m)
+        assert L._uses_batched_eager([cfg], forced=True) is False, (m, 'non-learned must stay on the row path')
+    assert L._uses_batched_eager([L.AttnCfg(kind='csa', indexer_mode='learned')], forced=True) is True
+
+    # rope registry entries for the follow-up protocol, with a finite forward
+    for name, mode in (('csa_fixed_rope_randidx_each', 'random_each'),
+                       ('csa_fixed_rope_randidx_dist', 'random_dist'),
+                       ('csa_fixed_rope_nearidx', 'nearest'),
+                       ('csa_fixed_rope_strideidx', 'stride')):
+        cfgs = L.make_layer_cfgs(2, name)
+        assert len(cfgs) == 2
+        for c in cfgs:
+            assert getattr(c, 'indexer_mode', None) == mode and bool(getattr(c, 'rope', False))
+            assert int(getattr(c, 'index_topk', 0)) == 32
+        torch.manual_seed(5)
+        model = L.SmallGPT(64, 32, 2, 2, 16, 128, [_copy.deepcopy(c) for c in cfgs], mlp_ratio=4)
+        out = model(torch.randint(0, 64, (1, 96)))
+        assert torch.isfinite(out).all(), f'rope forward non-finite under {name}'
+
+
+def t_mech_selection_probe_smoke():
+    """Review follow-up: the mechanism probe produces a selection-attribution
+    artifact that audit_selection accepts (status ok, no problems) — the
+    selection-recall contract stops being 'not_verifiable_locally'."""
+    import argparse
+    import mech_selection as MS
+
+    r = MS.cmd_smoke(argparse.Namespace())
+    assert r == 0, 'mech_selection smoke must exit 0'
 
 
 def t_refreeze_round_cannot_confirm():
@@ -13605,6 +13770,9 @@ def main():
     _check('N107 scale params + p-floor fields', t_scale_param_counts_and_p_floor_fields)
     _check('N108 archive record refuses unverifiable identity', t_archive_record_rejects_unverifiable_identity)
     _check('N109 P3MTC uses the same recipe as P3MT', t_p3mtc_matches_p3mt_recipe)
+    _check('N110 indexer control-mode selection semantics', t_indexer_control_modes_selection_semantics)
+    _check('N111 indexer control-mode model paths', t_indexer_control_modes_model_paths)
+    _check('N112 mech-selection probe smoke', t_mech_selection_probe_smoke)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

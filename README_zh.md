@@ -49,6 +49,14 @@ dense 仅 RMSNorm、scale=1/sqrt(d_head)）、缺同投影/同 sink 的 dense �
 - **证据可审计性**：`evidence_release_status` 对发布行做 schema 校验（ISO 日期、7–40 hex commit、http(s)/s3/gs URL、两个 64-hex 摘要、非占位 verifier），垃圾行不再把所有报告横幅翻成 `released`；`archive_release.py` 补打 TimeGuard `run_time_state*.json(.k)` 账本，拒绝只有 analysis 的归档（至少一个 `summary.json`/`run_manifest.json`），环境快照补 GPU 数量/名称/UUID/算力/驱动/TF32 与 pip freeze 截断标志；v7 报告末尾新增输入清单（逐文件 SHA-256 + git HEAD）并写 `analysis_v7/report_inputs.json`，把该报告绑定到具体 results/analysis 批次；v10/v11/v12 报告尚未生成该清单。
 - **crossover 范围**：v10 明确 d 与层数绑定（128/4L…512/10L）、batch/seq/eval 网格不同，斜率不是单一规模变量；「预注册」改为「分析前声明的探索性判据」。
 
+## 评审十四硬化（review 14）
+
+对六类外部方法学意见做**核验优先**的处置：不新增训练面板、不读 test、不改冻结清单字节、不改测量语义（`CODE_SEMANTICS` 仍为 `v11.128`；`v12_supp.py plan` 仍 48/48 通过）。逐项判定见 `docs/design_notes.md` §31。审查的设计边界结论（动态分块非任务学习、冻结臂不含 Dynamic/HCA、dense 参数≠计算匹配、27.5% 功效、16 窗口面板）均成立且此前已披露；本轮修掉的是两个真正可修的缺口和一个逐行核验发现的真实缺陷：
+
+- **协议要求的四个随机选择对照已实现**：`lightning_indexer` 新增 `random_each`（每前向重随机：隐状态 content 哈希，可重算复现、无 RNG 流）、`random_dist`（距离匹配随机：因果衰减 tau=512 tokens）、`nearest`（近邻）、`stride`（均匀间隔）四个模式，并注册为 rope 变体 `csa_fixed_rope_randidx_each`/`_randidx_dist`/`nearidx`/`strideidx`（仅注册表，默认面板不训练）。冻结的固定哈希 `random` 路径逐位不变（N110 断言）。
+- **selection-attribution 工件有了生成器**：`mech_selection.py` 是 `audit_gates.py selection` 契约背后的机制探针——逐 seed 的 recall@k / mass covered / k-n_blocks（oracle = 同层 all-block 读的块级注意力质量），外加 learned / oracle-forced / allblocks / 同 k 固定哈希随机的描述性 PPL 读数；`smoke` 在小合成模型上端到端通过审计契约，`run` 只读验证流或合成 ids、拒绝任何触及 `results_lm_test` 的路径。在真实面板上跑过之前，选择召回主张门槛仍为 `not_verifiable_locally`。
+- **真实报告缺陷修复**：`_uses_batched_eager` 对 `indexer_mode` 只做真值检查而实际分派要求 `== 'learned'`——random 臂会被误报为走了批处理孪生；已改为与分派一致的相等检查。死参数计数（`param_breakdown`）泛化到全部非 learned 模式。
+
 ## 仓库结构
 
 仓库只保留**源码、驱动脚本与设计文档**。所有实验结果目录（`results_*/`）、
@@ -59,7 +67,8 @@ dense 仅 RMSNorm、scale=1/sqrt(d_head)）、缺同投影/同 sink 的 dense �
 
 | 路径 | 说明 |
 |---|---|
-| `exp_lib.py` | **核心库，也是唯一的代码来源**：模型、CSA/HCA 注意力、池化、indexer、分段器、训练循环、聚合与统计 |
+| `exp_lib.py` | **核心库，也是唯一的代码来源**：模型、CSA/HCA 注意力、池化、indexer（learned + 五种选择对照模式）、分段器、训练循环、聚合与统计 |
+| `mech_selection.py` | **选择归因机制探针**（review 14）：`analysis_mechanism/selection_attribution.json` 的生成器——逐 seed 的 learned-vs-oracle recall@k / mass covered / 随机基线，外加 learned / oracle-forced / allblocks / 同 k 固定哈希随机的 PPL 读数；`smoke` 端到端自检 `audit_gates.py selection` 契约，`run` 只读验证流或合成 ids（拒绝一切触及 `results_lm_test` 的路径） |
 | `csa_kernels.py` | **三算子融合内核路径**（已退役算力规划的 M0 工作包）：块压缩池化、索引 top-k 选择与稀疏注意力的 Triton 内核（附带同一套算法分解、任意设备可跑的 torch 参考孪生实现）；`CSA_KERNEL` 选开、默认关闭——见下文「Triton 内核路径（M0/G0）」 |
 | `run_gapfill.py` | **v6 驱动**：最小可发表补充实验，支持断点续跑，受运行时上限约束，每阶段完成后自动 push，结束后自动关机 |
 | `par.py` | **任务级并行执行器（可选）**：每个独立实验占一张 GPU 卡——见下文「任务级并行」 |

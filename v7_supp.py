@@ -823,6 +823,29 @@ def make_layer_cfgs_v7(n_layers, variant):
         # 「测试时把已训练模型的选择器换成随机」——后者（v10 P3MP 的
         # randidx 臂）测的是依赖性，本变体测的是选择方式本身的优劣。
         return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, indexer_mode='random', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
+    # ---- follow-up protocol mechanism-isolation controls (review response) --
+    # FOLLOWUP_CONFIRMATORY_PROTOCOL.md 要求的四个随机选择对照：固定哈希
+    # randidx 只支持「learned 优于这一种固定伪随机模式」；这四个变体把
+    # 对照族补齐为协议要求的 per-forward 重随机 / 距离匹配随机 / 近邻 /
+    # 均匀间隔选择器（lightning_indexer 的 random_each/random_dist/
+    # nearest/stride 模式）。它们与 csa_fixed_rope_randidx 一样是
+    # registry-only 条目：默认面板不训练它们，仅供 follow-up 预注册研究
+    # 声明为对照臂（validate_followup_design.py --verify-registry 可核对）。
+    if variant == 'csa_fixed_rope_randidx_each':
+        # 每前向重随机：content-keyed 哈希，模式随隐状态演化逐层/逐步/逐
+        # seed/逐行改变，且确定性可重算（无 RNG 流）——「真随机基线」的
+        # 可复现近似。
+        return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, indexer_mode='random_each', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
+    if variant == 'csa_fixed_rope_randidx_dist':
+        # 距离匹配随机：同一 content 哈希乘因果距离衰减核（tau=512
+        # tokens），使抽样的距离分布带局部性先验，而不是平坦先验。
+        return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, indexer_mode='random_dist', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
+    if variant == 'csa_fixed_rope_nearidx':
+        # 近邻选择器：永远读最近的 k 个可读块（recency 对照）。
+        return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, indexer_mode='nearest', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
+    if variant == 'csa_fixed_rope_strideidx':
+        # 均匀间隔选择器：按 readable_i//k 的行自适应步长均匀读块。
+        return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, indexer_mode='stride', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'csa_fixed_rope_allblocks':
         # 从头训练的全块读取对照：与 csa_fixed_rope 同架构（同 c_kv 压缩、
         # 池化、q/k 的 L2-normalize→RMSNorm 顺序、RoPE、sink、窗口分支），

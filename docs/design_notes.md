@@ -1719,3 +1719,63 @@ top-k 的选择梯度只覆盖被选块”“缺少 selection-attribution”“s
 
 `CODE_SEMANTICS` 保持 `v11.128`：所有改动都是统计/报告/归档层，没有改任何
 训练或评测路径上的数值语义，因此不会使已有记录失效。冻结清单字节未改。
+
+## 31. review 14（外部方法学审查）的逐项核验与代码处置
+
+本轮仍是**核验优先**：先逐条对照当前 HEAD 的代码/产物，再决定改什么。没有新增
+训练面板，没有读取 test split，没有改 `confirmation_frozen.json` 的任何字节，
+冻结计划预检（`v12_supp.py plan`）在本轮改动后仍 48/48 通过。审查的六类意见
+对照 HEAD 的结论与处置如下：
+
+| # | 审查意见 | 对照 HEAD 的结论 | 本轮处置 |
+|---|---|---|---|
+| 1 | 动态分块未被任务损失端到端训练（`gate.detach()>0.5`，delta_logit/fuse_conv 主要由 comp_reg 训练） | **成立（默认臂的定义），且已如实文档化**（README review-3、§22.5）；opt-in `csa_dynamic_task` 是 REINFORCE 边界臂，不在冻结范围 | 无代码可改：这是设计决定，不是缺陷；措辞边界继续维持「余弦相似度+压缩率正则的阈值分块」 |
+| 2 | 冻结实验未覆盖 Dynamic/HCA（无 `csa_dynamic_rope`/纯 HCA/动态 vs 固定确认性对照） | **成立（设计边界）**：`scope.not_covered` 明确声明；FOLLOWUP 协议 + 纯 HCA 变体 + 验证器已存在 | 不改冻结清单（预注册纪律）；这些主张仍需其自己的冻结研究 |
+| 3.1 | Dense 参数匹配 ≠ 计算量公平（1.87× 训练 FLOPs、kernel/归一化/sink 差异） | **成立且已披露**（`compute_budget_disclosure` + 逐对比对 `interpretation_caveat` + `reporting_rule` 禁止「等计算」措辞） | 无代码可改；FLOPs 匹配 Dense 仍是 follow-up 的 `TODO_FLOPS_MATCHED_DENSE`（需 GPU 实测） |
+| 3.2 | 随机对照是固定哈希模式（同一 seed/层/步），且带 202,752 个死参数；「更合适的对照应含每次前向重随机、距离匹配、均匀间隔」 | **成立**；固定哈希与死参数已披露，但审查建议的四类对照**此前不存在** | **本轮实现**：`lightning_indexer` 新增 `random_each`/`random_dist`/`stride`/`nearest` 四个选择模式（见下），并以 `csa_fixed_rope_randidx_each`/`_dist`/`nearidx`/`strideidx` 注册为 rope 变体，满足 FOLLOWUP 协议 mechanism-isolation 一节的四类对照要求 |
+| 3.3 | allblocks 读取预算不匹配（32× 读取、STE 软先验差） | **成立且已披露**（caveat 中 32x 与 log(1/32) vs log(1/1024) 均已写明） | 无代码可改：这是臂的定义；同读取预算对照由 FOLLOWUP 的 same-scope 条款要求 |
+| 4.1 | 12 seeds 的 q=0.80 Holm 保守功效仅 27.5% | **成立**；manifest v6 已把功效模拟变成闸门（power_gate，miss 即拒绝或显式 V12_ACCEPT_LOW_POWER=1） | 已由 review-13 完成；无残余代码缺口 |
+| 4.2 | sign-flip 尖锐零假设的适用前提；需 CI/bootstrap 敏感性 | **成立且已文档化**（`validity_assumptions`；配对/非配对 bootstrap、Wilcoxon、LOO 已在 review-12 落盘并打印） | 已在前几轮完成；无残余代码缺口 |
+| 5 | 测试集 16 窗口非独立文档；训练 512 vs 评估 4096 是长度外推；嵌套前缀目标不同 | **成立（设计边界）**：单位披露（窗口≠文档）、`population_claim_allowed=False`、64 文档 house 门槛、doc-level 路径（`doc_index`）留给 follow-up；训练/评估长度差与嵌套前缀口径均在 README/报告声明 | 无代码可改；完整测试集/≥64 分层文档抽样已写入 FOLLOWUP 协议 |
+| 6 | 缺 Oracle Block Selection / Recall@K / Mass Covered / 同预算随机 / 选择消融的直接机制证据 | **成立**：`audit_gates.audit_selection` 只定义了工件契约，报告一直 `not_verifiable_locally`——**工件从未被生成过** | **本轮实现** `mech_selection.py`：机制探针（oracle=同层 all-block 读的块级注意力质量分布；recall@k/mass_covered/random_baseline 逐 seed 工件 + oracle-forced/allblocks/固定哈希随机 PPL 读数），smoke 模式产出的工件通过 audit_selection 的结构校验；探针拒绝读取 test split |
+
+工程三项（8M 训练缓存、18.4M 窗口抽取量 ≠ 唯一 token、CUDA 环境未锁）在 HEAD
+分别由冻结绑定 `training_data_fingerprint`、§25.3b 的唯一 token 覆盖率字段、
+以及 `archive_release.py` 的 GPU/驱动/TF32 环境快照覆盖，均属已披露边界，本轮
+不改。
+
+本轮另修复一个**逐行核验中发现的真实缺陷**：`_uses_batched_eager` 对
+`indexer_mode` 只做真值检查，而 `HybridAttention.forward` 的实际分派要求
+`== 'learned'`——`random` 臂（以及任何非 learned 模式）会被误报为走了批处理
+孪生路径。已改为与分派一致的相等检查（N111 回归覆盖）。
+
+新选择模式的语义（详见 `lightning_indexer` docstring 与代码注释）：
+
+- `random_each`——per-forward 重随机：行键是隐状态的确定性 float64 归约过同一
+  GLSL 哈希，模式随 H 演化逐步/逐层/逐 seed/逐行改变，同时保持「固定输入→固定
+  输出」，激活重算与续跑逐位可复现（无 RNG 流；跨设备逐位稳定性不声明、也不需要）。
+  `.detach()` 保证随机对照不给自己的分数引入梯度路径。
+- `random_dist`——同一 content 哈希乘因果距离衰减核（tau=512 tokens，
+  `_RAND_DIST_TAU_TOKENS`），使抽样带局部性先验（「距离匹配」的随机对照）。
+- `nearest`——recency 对照：每行读最近 k 个可读块。
+- `stride`——均匀间隔对照：行自适应步长 `max(1, readable_i // k)` 的整数函数。
+
+四个模式全部走既有 `_indexer_selection` 的 top-k/因果收窄/STE 软先验机器，因此
+与固定哈希臂共享同一选择语义约定；CSA_KERNEL 与 open-block 路径对非 learned
+模式的既有拒绝自动覆盖它们；死参数计数（`param_breakdown`）从 `== 'random'`
+泛化为 `!= 'learned'`。
+
+本轮代码改动（全部零实验、零 test 访问）：
+
+- `exp_lib.py`：`_random_mode_of` 模式归一化（未知值 fail-closed）；
+  `lightning_indexer` 四个新模式；`AttnCfg` 白名单扩展；`_pre` 的 qI/w_idx
+  跳过条件从 `== 'random'` 泛化为 `!= 'learned'`；`_uses_batched_eager`
+  相等检查修复；`param_breakdown` 死参数与文案泛化。
+- `v7_supp.py`：四个 rope 对照变体注册（registry-only，默认面板不训练）。
+- `mech_selection.py`（新文件）：selection-attribution 机制探针（run/smoke/
+  audit 三个子命令；产出并校验 `analysis_mechanism/selection_attribution.json`）。
+- `test_review_fixes.py`：N110–N112 新回归 + L5b 断言更新（死参数文案）。
+
+`CODE_SEMANTICS` 保持 `v11.128`：learned 路径与冻结的固定哈希路径逐位不变
+（N110 的 True=='random' bit-identity 断言、`v12_supp.py plan` 48/48 通过），
+新增模式是 opt-in 的新臂，未进入任何默认面板或冻结臂。冻结清单字节未改。

@@ -524,3 +524,79 @@ Regression coverage: `test_review_fixes.py` N96
 seeds = True, one-seed mismatch = False, missing digest/params = not
 confirmed), the updated `_frozen_rule_confirms` tests, and the v6 manifest
 assertions in `t_shipped_manifest_consistency`.
+
+## Review 14 (2026-11-25): verify the six-category methodology review; wire the four random-selection controls and the selection-attribution probe
+
+Verification-first pass, no new training panel, no test-split access, no frozen
+manifest byte change.  The review's six categories map to HEAD as follows:
+
+1. "Dynamic chunking is not task-trained" — TRUE by the default arm's
+   definition (`gate.detach() > 0.5`; `delta_logit` trained by `comp_reg` only)
+   and already documented as such; `csa_dynamic_task` is the opt-in REINFORCE
+   boundary arm.  No code change possible without a new study.
+2. "The frozen confirmation does not cover Dynamic/HCA" — TRUE by design
+   (`scope.not_covered`); the follow-up protocol, pure-HCA variants and the
+   validator already exist.  Amending the frozen manifest is forbidden by
+   pre-registration discipline.
+3. Control confounds — TRUE and disclosed (1.87x training FLOPs, kernel /
+   normalization / sink differences, 32x allblocks read, dead parameters).
+   The actionable part was the MISSING control family: the protocol requires a
+   per-forward re-randomized selector, a distance-matched random selector, a
+   nearest-block selector and a uniform-stride selector — none existed.
+4. Statistics (power 27.5%, sharp-null assumptions) — TRUE; the v6 manifest
+   power gate (review 13) is normative and the robustness fields
+   (bootstrap/Wilcoxon/LOO, assumptions text) shipped in review 12.
+5. "16 evaluation windows are not documents" — TRUE and disclosed
+   (unit wording, `population_claim_allowed=False`, 64-document house gate,
+   doc-level path reserved for the follow-up).
+6. "No oracle / recall@k / mass-covered mechanism evidence" — TRUE: the
+   `audit_gates.audit_selection` contract existed but no producer ever
+   generated the artifact.
+
+Fixed this round:
+
+1. **Four selection-control modes** in `lightning_indexer`
+   (`random_each` / `random_dist` / `stride` / `nearest`), registered as the
+   rope variants `csa_fixed_rope_randidx_each` / `_randidx_dist` /
+   `nearidx` / `strideidx` (registry-only; nothing trains them by default).
+   `random_each` is a content-keyed hash of the hidden state: the pattern
+   re-randomizes every forward as H evolves, yet is a fixed function of the
+   saved inputs, so activation recompute and resume reproduce it without any
+   RNG stream (`.detach()` keeps it out of the gradient path).
+   `random_dist` multiplies the same hash by a causal distance kernel
+   (tau = 512 tokens); `nearest`/`stride` are integer geometry controls.  All
+   four flow through the existing causal/top-k/STE machinery and are refused
+   by CSA_KERNEL and open-block paths exactly like the legacy hash.
+2. **`mech_selection.py`** — the selection-attribution mechanism probe:
+   learned-vs-oracle recall@k, mass covered and k/B baseline per seed, plus
+   descriptive PPL readouts (learned / oracle-forced / allblocks /
+   fixed-hash-random at the same k).  It writes the exact
+   `analysis_mechanism/selection_attribution.json` contract that
+   `audit_selection` validates (`smoke` passes the audit end to end), refuses
+   any path that touches `results_lm_test`, and reads only the validation
+   stream or synthetic ids.
+3. **A real reporting defect found by line-by-line review**:
+   `_uses_batched_eager` tested `indexer_mode` for truthiness while the
+   forward dispatch requires `== 'learned'`, so random layers were
+   misreported as taking the batched twin.  Fixed to the equality check.
+4. **Generalized dead-parameter accounting** — every non-learned
+   `indexer_mode` bypasses W_DQ/W_DK/W_w, so `param_breakdown` now counts
+   them all as dead (the note text changed accordingly).
+
+Deliberately not changed: the frozen arms/seeds/panel, the default dynamic
+segmenter's gradient path, the 12-seed count, the 16-window panel, and the
+dense capacity reallocation — all of them need their own registered design
+and GPU runs, not an implementation patch.
+
+`CODE_SEMANTICS` stays `v11.128`: the learned path and the legacy fixed-hash
+path are bit-identical (N110 asserts `True == 'random'`); `v12_supp.py plan`
+still admits 48/48 synthetic records after the change.
+
+Regression coverage: `test_review_fixes.py` N110 (mode normalization,
+selection semantics of all four modes vs independent formula/geometry
+replication, legacy bit-identity, fail-closed modes), N111 (tiny-model
+forward/backward per mode, batched-twin mirror fix, rope registry entries,
+finite forwards), N112 (`mech_selection` smoke produces an audit-accepted
+artifact); `t_param_breakdown_reports_dead_indexer_params` (L5b) extended to
+the new modes.  `test_open_block.py` 15/15 and `validate_followup_design.py`
+registry checks still pass.

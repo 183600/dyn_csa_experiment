@@ -181,10 +181,49 @@ normalization and attention-scale differences (CSA: L2-normalize→RMSNorm,
 scale 1.0; dense: RMSNorm only, scale 1/sqrt(d_head)), no true
 same-projection/same-sink dense control, short training budgets, 2–6 seed
 exploratory panels, the 16-window frozen panel, hard top-k selection with no
-attention gradient on unselected blocks, no oracle/selection recall artifact,
+attention gradient on unselected blocks, no oracle/selection recall artifact on
+the real panel (the `mech_selection.py` probe exists and passes its audit
+contract on smoke, but the artifact itself still requires a GPU run over the
+trained checkpoints),
 partial dynamic-block per-sample geometry, no censored crossover regression,
 source-only (no released evidence; `archive_release.py record` exists but no
 archive is published), unlocked CUDA environment, and no energy measurement.
+
+## Review-14 hardening (what changed)
+
+Verification-first pass over a six-category external methodology review (no
+new training panel, no test-split access, no frozen-manifest byte change, no
+measurement-semantics change — `CODE_SEMANTICS` stays `v11.128`, and
+`v12_supp.py plan` still admits 48/48 records).  The item-by-item disposition is
+`docs/design_notes.md` §31.  The review's design-boundary findings (dynamic
+chunking not task-learned, no Dynamic/HCA arm in the freeze, param-vs-compute
+dense confound, 27.5% power, 16-window panel) all hold and were already
+disclosed; this pass closes the two gaps that were actually fixable:
+
+- **The four protocol-required random-selection controls exist now.**
+  `lightning_indexer` gains `random_each` (per-forward re-randomized,
+  content-keyed and recompute-stable — no RNG stream), `random_dist`
+  (distance-matched random, causal decay tau=512 tokens), `nearest`
+  (recency) and `stride` (uniform spacing) modes, registered as the rope
+  variants `csa_fixed_rope_randidx_each` / `csa_fixed_rope_randidx_dist` /
+  `csa_fixed_rope_nearidx` / `csa_fixed_rope_strideidx` (registry-only;
+  default panels train none of them).  The frozen fixed-hash `random` path
+  is bit-identical to before (N110 asserts it).
+- **The selection-attribution artifact now has a producer.**
+  `mech_selection.py` is the mechanism probe behind
+  `audit_gates.py selection`: per-seed recall@k / mass covered / k-n_blocks
+  against a same-layer all-block attention-mass oracle, plus descriptive
+  PPL readouts (learned vs oracle-forced vs allblocks vs fixed-hash random
+  at the same k).  `python mech_selection.py smoke` builds an artifact on a
+  tiny synthetic model and passes the audit contract end to end; `run`
+  probes real checkpoints on the VALIDATION stream or synthetic ids and
+  refuses anything that touches `results_lm_test`.  Until it is run on the
+  real panel, the selection-recall claim gate stays `not_verifiable_locally`.
+- **A real reporting defect fixed.**  `_uses_batched_eager` tested
+  `indexer_mode` for truthiness while the dispatch requires `== 'learned'`,
+  so random-indexer layers were misreported as taking the batched twin; the
+  eligibility check now mirrors the dispatch.  Dead-parameter accounting
+  (`param_breakdown`) covers every non-learned mode, not just `random`.
 
 ## Repository layout
 
@@ -199,7 +238,8 @@ already keeps those path families out of the repository (`docs/` retains only
 
 | path | what |
 |---|---|
-| `exp_lib.py` | **the library — and the source of truth**: model, CSA/HCA attention, pooling, indexer, segmenters, training loop, aggregation and statistics |
+| `exp_lib.py` | **the library — and the source of truth**: model, CSA/HCA attention, pooling, indexer (learned + the five selection-control modes), segmenters, training loop, aggregation and statistics |
+| `mech_selection.py` | **selection-attribution mechanism probe** (review-14): the producer of `analysis_mechanism/selection_attribution.json` — learned-vs-oracle recall@k / mass covered / random baseline per seed, plus learned / oracle-forced / allblocks / fixed-hash-random PPL readouts; `smoke` self-checks the `audit_gates.py selection` contract, `run` probes real checkpoints (validation stream or synthetic ids only; the frozen test split is refused) |
 | `csa_kernels.py` | **the fused-kernel path for the three core operators** (the retired compute-plan M0 work package): block-compression pooling, indexer top-k selection and sparse attention as Triton kernels (plus a CPU-runnable torch-reference twin of the same algorithmic decomposition); opt-in via `CSA_KERNEL`, off by default — see "Triton kernel path (M0/G0)" below |
 | `run_gapfill.py` | **the v6 driver**: the minimum-publishable supplementary runs, resumable, guarded by a run-time cap, pushes after every phase, auto-shuts the instance down |
 | `par.py` | **task-level parallel executor (opt-in)**: one GPU card per independent run — see "Task-level parallelism" below |
