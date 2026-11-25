@@ -30,9 +30,11 @@
   效率节明确 energy 未测。
 
 仍属研究设计限制、不能靠代码消除的：小模型/WikiText 外部有效性、参数匹配但非 FLOPs 匹配、
-短训练预算、2–6 seed 探索面板、16 窗口冻结面板、hard top-k 未选块无注意力梯度、
-缺 oracle/selection recall、动态分块逐样本几何不完整、无删失回归、source-only 无发布、
-CUDA 环境未锁定、未测 energy。
+dense/CSA 的 q/k 归一化与 attention scale 不同（CSA 先 L2-normalize 再 RMSNorm、scale=1.0；
+dense 仅 RMSNorm、scale=1/sqrt(d_head)）、缺同投影/同 sink 的 dense 对照、短训练预算、
+2–6 seed 探索面板、16 窗口冻结面板、hard top-k 未选块无注意力梯度、缺 oracle/selection recall、
+动态分块逐样本几何不完整、无删失回归、source-only 无发布（`archive_release.py record` 已有，
+但尚无归档）、CUDA 环境未锁定、未测 energy。
 
 ## 评审十二硬化（review 12）
 
@@ -44,7 +46,7 @@ CUDA 环境未锁定、未测 energy。
 - **多重性补全**：v10 的全局 BH/Bonferroni 族补入其展示的 scale 端点与等 token 切片 p 值（此前 m 偏小，打印的 q 值偏乐观）；P3T 补 `p_Holm` 与分辨率下限；v9 增加自己的全局 BH/Bonferroni 视图。
 - **逐臂资源披露**：新报告节打印每臂 total/attention/indexer/MLP/active/dead、层数、结构 KV elem/token、实际压缩权重与 ΔLR 倍数，并声明「参数量匹配 ≠ 计算/有效容量匹配，逐臂 FLOPs 未实测」。
 - **旧「证伪」措辞**：P0-3 不再写「P0-3 的证伪」；boundary-F1 不再称分块「genuinely semantic」；两者都降为探索性方向读数。
-- **证据可审计性**：`evidence_release_status` 对发布行做 schema 校验（ISO 日期、7–40 hex commit、http(s)/s3/gs URL、两个 64-hex 摘要、非占位 verifier），垃圾行不再把所有报告横幅翻成 `released`；`archive_release.py` 补打 TimeGuard `run_time_state*.json(.k)` 账本，拒绝只有 analysis 的归档（至少一个 `summary.json`/`run_manifest.json`），环境快照补 GPU 数量/名称/UUID/算力/驱动/TF32 与 pip freeze 截断标志；每份报告末尾新增输入清单（逐文件 SHA-256 + git HEAD）并写 `analysis_v7/report_inputs.json`，把报告绑定到具体 results/analysis 批次。
+- **证据可审计性**：`evidence_release_status` 对发布行做 schema 校验（ISO 日期、7–40 hex commit、http(s)/s3/gs URL、两个 64-hex 摘要、非占位 verifier），垃圾行不再把所有报告横幅翻成 `released`；`archive_release.py` 补打 TimeGuard `run_time_state*.json(.k)` 账本，拒绝只有 analysis 的归档（至少一个 `summary.json`/`run_manifest.json`），环境快照补 GPU 数量/名称/UUID/算力/驱动/TF32 与 pip freeze 截断标志；v7 报告末尾新增输入清单（逐文件 SHA-256 + git HEAD）并写 `analysis_v7/report_inputs.json`，把该报告绑定到具体 results/analysis 批次；v10/v11/v12 报告尚未生成该清单。
 - **crossover 范围**：v10 明确 d 与层数绑定（128/4L…512/10L）、batch/seq/eval 网格不同，斜率不是单一规模变量；「预注册」改为「分析前声明的探索性判据」。
 
 ## 仓库结构

@@ -824,11 +824,13 @@ def make_layer_cfgs_v7(n_layers, variant):
         # randidx 臂）测的是依赖性，本变体测的是选择方式本身的优劣。
         return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, indexer_mode='random', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'csa_fixed_rope_allblocks':
-        # 从头训练的全块读取对照：与 csa_fixed_rope 同一
-        # c_kv 压缩 / qk_norm / RoPE / sink / 窗口投影，仅 index_topk 覆盖
-        # 全部块（lightning_indexer 内部 k=min(topk, B)）。它同时是
-        # 「逐项对齐的 dense」——与 full_rope 的差别只有 KV 压缩投影与
-        # 分块读取方式；投影/归一化/编码保持一致。
+        # 从头训练的全块读取对照：与 csa_fixed_rope 同架构（同 c_kv 压缩、
+        # 池化、q/k 的 L2-normalize→RMSNorm 顺序、RoPE、sink、窗口分支），
+        # 仅 index_topk 覆盖全部块（lightning_indexer 内部 k=min(topk, B)）。
+        # 它**不是** dense 对照：相对 full_rope 还差 KV 压缩/池化、
+        # q/k 归一化位置与宽度、attention scale（1.0 vs 1/sqrt(d_head)）、
+        # sink、窗口分支、kernel 与 MLP 宽度。只能用于「选择方式」的
+        # 同架构对照，不能把 dense−allblocks 差值归因于单一组件。
         return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=1000000, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'csa_dynamic_rope':
         return [AttnCfgRope(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
@@ -860,6 +862,15 @@ def make_layer_cfgs_v7(n_layers, variant):
                 for _ in range(n_layers)]
     if variant == 'full_rope':
         return [AttnCfgRope(kind='full', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
+    if variant == 'full_rope_cos':
+        # Closer dense control for the CSA comparison: cosine-normalized q/k
+        # with scale 1.0 (like CSA) instead of the standard 1/sqrt(d_head).
+        # It is still NOT a single-factor control: CSA normalizes q BEFORE
+        # RMSNorm and K before/after the KV-head projection, keeps compressed
+        # KV + pooling, a sink and a sliding-window branch; this arm has
+        # per-token K/V, RMSNorm-only ordering, no sink and no window branch.
+        # Registered for the follow-up factorial; no panel trains it yet.
+        return [AttnCfgRope(kind='full', rope=True, rope_dim=16, qk_norm=True, full_cosine=True) for _ in range(n_layers)]
     if variant == 'full_sw128_matched_rope':
         return [AttnCfgRope(kind='full', window=128, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'csa_fix_m1':
@@ -927,6 +938,9 @@ def _v7_knobs_fp(device=None, batch_size=None):
 
 
 ROPE_VARIANTS = ['full_rope', 'csa_fixed_rope', 'hybrid_fixed_rope', 'csa_dynamic_rope', 'csa_fixed']
+# Optional closer-but-not-exact dense control.  Kept out of ROPE_VARIANTS so the
+# historical P0R arm list (and its results) is unchanged.
+ALIGNED_DENSE_VARIANTS = ['full_rope_cos']
 # Pure-HCA arms (every layer is HCA).  Kept separate from ROPE_VARIANTS so the
 # historical P0R panel keeps its exact arm list; the follow-up factorial uses
 # these.  `hybrid_fixed_rope` is NOT an HCA arm.

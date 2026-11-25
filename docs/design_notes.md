@@ -539,11 +539,16 @@ test 文档重叠基线）；若更换 train 语料，请删除整个 `wt103_cac
   差读数，**不是**已完成的因果失配分解。评审二轮·意见五的原表述
   「正值是不能归因于失配的性能损失部分」方向错误，已从代码注释与
   报告口径中删除；简单相减不得解释为因果分解。
-- `csa_fixed_rope_allblocks` 同时充当**逐项对齐的 dense**（与
-  `full_rope` 只剩 KV 压缩投影与分块读取方式之差）——评审点 5 的
-  「在尽可能相同的投影、归一化、位置编码下分别改变分块方式与选择方式」
-  的落点。`arch-aligned` 对比（full_rope − allblocks 孪生）因此是比
-  dense−csa 更干净的分块/压缩效应读数。
+- `csa_fixed_rope_allblocks` 是 **同架构的全块读取对照**（与
+  `csa_fixed_rope` 只差 `index_topk`），因此 `csa_fixed_rope` −
+  `csa_fixed_rope_allblocks` 是同投影/同归一化/同位置编码下只改选择方式
+  的落点，评审点 5 的选择侧结论应建立在这一对上。
+- 它**不是** dense 对照：相对 `full_rope` 仍差 KV 压缩投影、块池化、
+  q/k 归一化位置与宽度（CSA 为 L2-normalize→RMSNorm，dense 仅 RMSNorm）、
+  attention scale（1.0 vs 1/sqrt(d_head)）、sink、滑窗分支、kernel 与
+  MLP 宽度（参数匹配改变的是 MLP 容量分配）。`full_rope` − allblocks
+  只能作**系统级**读数，代码中已由 `arch-aligned` 更名为
+  `system-level`，不得再写成压缩/分块的单因素效应。
 
 ## 19. 对比实验 / 消融 / 统计可靠性的自动审计
 

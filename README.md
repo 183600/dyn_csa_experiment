@@ -166,21 +166,25 @@ were still reproducible:
   `run_time_state*.json(.k)` ledger the docstring promises, refuses an
   analysis-only bundle (at least one `summary.json`/`run_manifest.json` is
   required), and records the full GPU/driver/TF32/pip-freeze environment.
-  Each report ends with an input manifest (per-file SHA-256 + git HEAD) and
-  writes `analysis_v7/report_inputs.json`, so a report is bound to the exact
-  results/analysis batch that produced it.
+  The v7 report ends with an input manifest (per-file SHA-256 + git HEAD) and
+  writes `analysis_v7/report_inputs.json`, so that report is bound to the exact
+  results/analysis batch that produced it; the v10/v11/v12 builders do not yet
+  emit this manifest.
 - **Crossover scope.** The v10 fit text now states that d is bound to depth
   (128/4L … 512/10L) and that batch/seq/eval grids differ, so the slope is not
   a single-scale-variable estimate; “pre-registered” was corrected to an
   exploratory pre-declared criterion.
 
 Still acknowledged as design limitations (not solved by code): small WikiText
-models only, parameter- but not FLOPs-matched dense controls, short training
-budgets, 2–6 seed exploratory panels, the 16-window frozen panel, hard top-k
-selection with no attention gradient on unselected blocks, no oracle/selection
-recall artifact, partial dynamic-block per-sample geometry, no censored
-crossover regression, source-only (no released evidence), unlocked CUDA
-environment, and no energy measurement.
+models only, parameter- but not FLOPs-matched dense controls, dense/CSA q/k
+normalization and attention-scale differences (CSA: L2-normalize→RMSNorm,
+scale 1.0; dense: RMSNorm only, scale 1/sqrt(d_head)), no true
+same-projection/same-sink dense control, short training budgets, 2–6 seed
+exploratory panels, the 16-window frozen panel, hard top-k selection with no
+attention gradient on unselected blocks, no oracle/selection recall artifact,
+partial dynamic-block per-sample geometry, no censored crossover regression,
+source-only (no released evidence; `archive_release.py record` exists but no
+archive is published), unlocked CUDA environment, and no energy measurement.
 
 ## Repository layout
 
@@ -204,7 +208,7 @@ already keeps those path families out of the repository (`docs/` retains only
 | `v9_supp.py` | **the v9 driver**: P2T (the seq-2048 topk sweep at `batch_size=1`) and P2S3 (third seed for the RoPE 20k run) |
 | `v10_supp.py` | **the v10 driver**: P3M length-extrapolation mechanism + distractor-injection probe, P3S inversion-crossover scaling, P3T topk sweep to 4 seeds |
 | `v11_supp.py` | **the v11 driver**: statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
-| `v12_supp.py` | **the v12 confirmation driver (reviewer-response + review-2 hardening)**: P5C trains all four frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms, P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-row PPL records (the window is the unit; `load_wikitest(with_doc_ids=True)` + `eval_ppl(doc_index=...)` give true document clusters) |
+| `v12_supp.py` | **the v12 confirmation driver (reviewer-response + review-2 hardening)**: P5C trains all four frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms (exploratory; not in the frozen primary family), P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-row PPL records (the **evaluation window is the unit**; true document clusters via `load_wikitest(with_doc_ids=True)` + `eval_ppl(doc_index=...)` are a follow-up, not what P5T currently does) |
 | `open_block_supp.py` | **open-block panel driver**: maximum block length (32/64/128/no cap) × current-block reading rule (`closed` / `prefix_summary` / `prefix_singletons`), with a shared top-k budget, causal prefix construction, outside-window auxiliary panel, paired per-seed deltas and interaction statistics — see `docs/design_notes.md` §24 |
 | `test_open_block.py` | **open-block CPU gates**: config/segmenter, optimized-vs-reference prefix pooling (forward + gradients), prefix invariance, future perturbation/gradient, candidate masks, edge cases, closed regression, singleton semantics and HCA budget declaration |
 | `confirmation_frozen.json` | **pre-registered confirmation plan, manifest v5 (revision history v1–v6)** (tracked): frozen arms, seeds 0-11 (revised 6->12 BEFORE any test-split access; power table recorded), endpoints, exact sign-flip + Holm, decision rule, machine-checkable binding block and a scope declaration — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
@@ -212,7 +216,7 @@ already keeps those path families out of the repository (`docs/` retains only
 | `pyproject.toml` / `requirements.txt` | Python ≥3.12 and dependency declarations; install explicitly (no import-time pip install) |
 | `DECISION_LOG.md` | **decision log** (tracked; reconstructed 2026-10-18 from the README/design notes/manifest because the snapshot has one squashed commit): why each version ran what it ran, what was seen, and what was decided next — the exploration/confirmation paper trail; formal releases additionally archive per-seed results via `archive_release.py` |
 | `audit_gates.py` | **review-2/4 verification entry points** (zero-experiment): data-leakage audits (tokenizer provenance, vocab identity, train/test overlap), CPU causality unit checks (prefix invariance, label shift, decode consistency), block-attribution / boundary-vs-random / length-consistency / baseline-fairness / failure-concentration / budget-reconciliation audits and prefill-decode-kv-growth measurement utilities |
-| `archive_release.py` | **immutable evidence archiver**: packs per-release artifacts (results, analyses, reports, freeze lock, decision log, environment, checkpoint hashes) into a tar.gz with a per-file SHA-256 manifest and an independent `verify` subcommand — the git repo stays source-only (design_notes §8) while every formal release gets an auditable fixed archive |
+| `archive_release.py` | **immutable evidence archiver**: packs per-release artifacts (results, analyses, reports, freeze lock, decision log, environment, checkpoint hashes, git diff/status hashes) into a tar.gz with a per-file SHA-256 manifest, an independent `verify` subcommand, and a `record` subcommand that binds a verified, uploaded archive URL + both digests into `RELEASES.md` — the git repo stays source-only (design_notes §8) while every formal release gets an auditable fixed archive |
 | `m0_supp.py` | **the M0/S1 driver (adopted B tier)**: entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention throughput benchmark), `full` (the S1 panel); see "B-tier M0/S1" below |
 | `build_report.py` | zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk; protocol constants and analytic FLOPs assumptions are explicit inputs, not measurements) |
 | `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
@@ -253,9 +257,12 @@ pip install -r requirements.lock
 # If the Hub is unreachable, `load_wikitext` falls back to a local raw dump:
 # point `WT103_RAW_TXT` at a directory holding `wiki.train.raw` /
 # `wiki.valid.raw` (the search also tries `./wt103_raw` next to the repo and
-# `/root/wt103_raw`).  Only those two files are read, and tokenising them
-# reproduces the `wt103_cache/*.npy` cache token-for-token, so the
-# fallback is a pure availability path and never changes a measurement.
+# `/root/wt103_raw`).  The frozen P5T confirmation additionally needs
+# `wiki.test.raw` in the same directory: `load_wikitest` reads it as the
+# held-out split and checks test documents against both train and validation.
+# Tokenising the raw files reproduces the `wt103_cache/*.npy` cache
+# token-for-token, so the fallback is a pure availability path and never
+# changes a measurement.
 # When `wt103_cache/` is already populated the corpus is served from the cache
 # and no dump or network access is needed at all.  Set `WT103_CACHE_DIR` to
 # relocate the cache; the loaders, `audit_leakage` and P5T all resolve the same
@@ -437,8 +444,10 @@ python v10_supp.py report         # rebuild REPORT_v10.md from disk (zero GPU)
 
 Phases (each resumable): P3MT (retrain the two RoPE arms, the P1L recipe),
 P3MTC (**from-scratch selector controls under the exact same budget**:
-`csa_fixed_rope_randidx` / `csa_fixed_rope_allblocks`; the latter doubles as
-the item-by-item-aligned dense twin), P3MP (eval-only far-distance distractor
+`csa_fixed_rope_randidx` / `csa_fixed_rope_allblocks`; the latter is a
+same-CSA all-block *selection* control, **not** a dense twin — it retains KV
+compression/pooling, cosine q/k with scale 1.0, sink and the window branch),
+P3MP (eval-only far-distance distractor
 injection: paired corrupted contexts, clean 512-token target, learned-selection
 vs dense vs random-indexer vs see-everything arms, **uniform /
 realistic-token (natural) / mask / delete + review-2 span / doc / topical

@@ -33,6 +33,7 @@ import json
 import os
 import platform
 import posixpath
+import re
 import subprocess
 import sys
 import tarfile
@@ -86,7 +87,18 @@ def _git_state():
         # A failed probe must not be recorded as a clean tree — an empty
         # dirty_files list means "verified clean"; record None instead.
         return {'git_head': head, 'git_branch': _branch, 'dirty_files': None, 'dirty_check': 'failed'}
-    return {'git_head': head, 'git_branch': _branch, 'dirty_files': dirty.splitlines()}
+    out = {'git_head': head, 'git_branch': _branch, 'dirty_files': dirty.splitlines()}
+    # Bind the exact uncommitted code to the archive identity.  The diff body
+    # itself is not packed (the release is built on the experiment machine);
+    # the hash lets a reader prove which dirty tree produced the record and
+    # lets `exp_lib` provenance be cross-checked.
+    diff = _run('diff', 'HEAD')
+    if diff is not None:
+        out['git_diff_sha256'] = hashlib.sha256(diff.encode('utf-8')).hexdigest()
+    status = _run('status', '--porcelain=v1')
+    if status is not None:
+        out['git_status_sha256'] = hashlib.sha256(status.encode('utf-8')).hexdigest()
+    return out
 
 
 def _env_snapshot():
@@ -640,6 +652,138 @@ def cmd_verify(tar_path):
         return 0
 
 
+def cmd_record(tag, tar_path, url, verifier='archive_release.py verify', dry_run=False):
+    """Record an already-uploaded, verified release in RELEASES.md.
+
+    This is the missing publication bookkeeping step: `make` builds the
+    archive and `verify` proves its hashes, but a reader can only audit a
+    number after the archive URL and both digests are bound to a commit in
+    the tracked index.  The command refuses to write a row unless `verify`
+    passes and every field is machine-readable.  Uploading remains an
+    explicit external action (release attachment / object store); this
+    command does not need GitHub credentials.
+    """
+    if _safe_tag(tag) is None or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', tag):
+        print(f'[archive] REFUSE: release tag {tag!r} is not a single safe filename component / Markdown cell')
+        return 1
+    if not isinstance(url, str) or not (url.startswith(('https://', 'http://', 's3://', 'gs://'))):
+        print(f'[archive] REFUSE: archive URL/object key {url!r} must start with https://, http://, s3:// or gs://')
+        return 1
+    if any(_c in url for _c in ('|', '\n', '\r', '\t', ' ')):
+        print(f'[archive] REFUSE: archive URL {url!r} contains whitespace or a Markdown cell separator')
+        return 1
+    if not isinstance(verifier, str) or not verifier.strip() or verifier.strip() in ('-', '—', 'pending'):
+        print(f'[archive] REFUSE: verifier {verifier!r} is empty/placeholder — a release without a verifier is not auditable')
+        return 1
+    if any(_c in verifier for _c in ('|', '\n', '\r', '\t')):
+        print(f'[archive] REFUSE: verifier {verifier!r} contains a Markdown cell separator/newline')
+        return 1
+    if cmd_verify(tar_path) != 0:
+        print('[archive] REFUSE: archive verification failed — nothing recorded')
+        return 1
+    d = os.path.dirname(os.path.abspath(tar_path)) or '.'
+    base = os.path.basename(tar_path)
+    for suf in ('.tar.gz', '.tgz'):
+        if base.endswith(suf):
+            base = base[:-len(suf)]
+            break
+    else:
+        base = os.path.splitext(base)[0]
+    side = tar_path + '.sha256'
+    man_path = os.path.join(d, f'{base}.MANIFEST.sha256')
+    if not os.path.isfile(man_path):
+        print(f'[archive] REFUSE: external manifest {man_path} is missing — cannot bind the manifest digest')
+        return 1
+    try:
+        with open(side, encoding='utf-8') as f:
+            _parts = f.read().split()
+        archive_sha = _parts[0] if _parts else ''
+    except OSError as e:
+        print(f'[archive] REFUSE: cannot read {side} ({type(e).__name__}: {e})')
+        return 1
+    if not re.fullmatch(r'[0-9a-fA-F]{64}', archive_sha or ''):
+        print(f'[archive] REFUSE: archive SHA-256 {archive_sha!r} is not 64 hex characters')
+        return 1
+    manifest_sha = _sha256(man_path)
+    try:
+        with open(man_path, 'rb') as _mf:
+            _external_man_bytes = _mf.read()
+    except OSError as e:
+        print(f'[archive] REFUSE: cannot read external manifest {man_path} ({type(e).__name__}: {e})')
+        return 1
+    try:
+        tf = tarfile.open(tar_path, 'r:gz')
+        with tf:
+            names = [n for n in tf.getnames() if n.endswith('.MANIFEST.sha256')]
+            if len(names) != 1:
+                print(f'[archive] REFUSE: expected exactly one in-archive manifest, found {len(names)}')
+                return 1
+            with tf.extractfile(names[0]) as f:
+                _internal_man_bytes = f.read()
+            man = json.loads(_internal_man_bytes)
+    except Exception as e:
+        print(f'[archive] REFUSE: cannot read the in-archive manifest ({type(e).__name__}: {e})')
+        return 1
+    if _external_man_bytes != _internal_man_bytes:
+        print('[archive] REFUSE: the external MANIFEST.sha256 differs from the manifest inside the archive — the published digest would not identify the verified tree')
+        return 1
+    if not isinstance(man, dict):
+        print('[archive] REFUSE: in-archive manifest is not an object')
+        return 1
+    git = man.get('git') if isinstance(man.get('git'), dict) else {}
+    commit = str(git.get('git_head') or '')
+    if not re.fullmatch(r'[0-9a-fA-F]{7,40}', commit):
+        print(f'[archive] REFUSE: archive commit {commit!r} is not 7–40 hex characters')
+        return 1
+    created = str(man.get('created_at') or '')[:10]
+    try:
+        time.strptime(created, '%Y-%m-%d')
+    except ValueError:
+        print(f'[archive] REFUSE: archive created_at {man.get("created_at")!r} does not yield an ISO date')
+        return 1
+    row = f'| {tag} | {created} | {commit} | {url} | {archive_sha.lower()} | {manifest_sha.lower()} | {verifier.strip()} |\n'
+    rel = os.path.join(REPO, 'RELEASES.md')
+    try:
+        with open(rel, encoding='utf-8') as f:
+            text = f.read()
+    except OSError as e:
+        print(f'[archive] REFUSE: cannot read {rel} ({type(e).__name__}: {e})')
+        return 1
+    # Idempotence / no overwrite: a tag, URL or archive digest already in the
+    # index means this release was recorded (or a different one is being
+    # smuggled under the same identity).
+    for needle in (f'| {tag} |', url, archive_sha.lower()):
+        if needle in text:
+            print(f'[archive] REFUSE: {needle!r} already appears in {rel} — refusing to duplicate/overwrite a release row')
+            return 1
+    if dry_run:
+        print('[archive] DRY-RUN row (not written):')
+        print(row.rstrip())
+        return 0
+    # Insert into the index TABLE, not at the end of the file: RELEASES.md has
+    # prose after the table, and a row appended there would not render as a
+    # table row (nor be found by a human reader).
+    lines = text.splitlines()
+    header_i = next((i for i, _l in enumerate(lines)
+                     if _l.strip().startswith('| tag |') and 'verifier' in _l.lower()), None)
+    if header_i is None:
+        print(f'[archive] REFUSE: {rel} has no release-index table header (| tag | ... | verifier |) — refusing to append an orphan row')
+        return 1
+    end_i = header_i + 1
+    while end_i < len(lines) and lines[end_i].lstrip().startswith('|'):
+        end_i += 1
+    placeholder_i = next((i for i in range(header_i + 1, end_i)
+                          if lines[i].strip().startswith('| _none yet_ |')), None)
+    if placeholder_i is not None:
+        lines[placeholder_i] = row.rstrip('\n')
+    else:
+        lines.insert(end_i, row.rstrip('\n'))
+    with open(rel, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+    print(f'[archive] recorded release {tag!r} in {rel}')
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description='immutable evidence archive for formal experiment releases')
     sub = ap.add_subparsers(dest='cmd', required=True)
@@ -654,6 +798,12 @@ def main(argv=None):
     p_make.add_argument('--out', default='archive')
     p_ver = sub.add_parser('verify', help='verify an archive against its manifest')
     p_ver.add_argument('tar')
+    p_rec = sub.add_parser('record', help='record a verified, uploaded release in RELEASES.md')
+    p_rec.add_argument('tag')
+    p_rec.add_argument('tar')
+    p_rec.add_argument('--url', required=True, help='published archive URL/object key')
+    p_rec.add_argument('--verifier', default='archive_release.py verify')
+    p_rec.add_argument('--dry-run', action='store_true')
     args = ap.parse_args(argv)
     if args.cmd == 'plan':
         cmd_plan(args.tag, args.dirs, args.include_ckpt)
@@ -662,6 +812,8 @@ def main(argv=None):
         return cmd_make(args.tag, args.dirs, args.include_ckpt, args.out)
     if args.cmd == 'verify':
         return cmd_verify(args.tar)
+    if args.cmd == 'record':
+        return cmd_record(args.tag, args.tar, args.url, args.verifier, args.dry_run)
     return 2
 
 

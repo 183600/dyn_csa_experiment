@@ -13,13 +13,24 @@ release must add a row here (and should be recorded in `DECISION_LOG.md`):
 |---|---|---|---|---|---|---|
 | _none yet_ | — | — | — | — | — | — |
 
-Build and verify:
+Build, verify, publish and record:
 
 ```bash
 python archive_release.py plan  v13 --dirs results_lm_test analysis_v12
 python archive_release.py make  v13 --dirs results_lm_test analysis_v12 --include-ckpt
 python archive_release.py verify archive/release_v13.tar.gz
+# upload the tar.gz + .sha256 + .MANIFEST.sha256 to a read-only release/object
+# store, then bind the published URL and both digests into this index:
+python archive_release.py record v13 archive/release_v13.tar.gz \
+    --url https://github.com/183600/dyn_csa_experiment/releases/download/evidence-v13/release_v13.tar.gz \
+    --verifier "archive_release.py verify @ <verifier-log-url>"
 ```
+
+`record` refuses to write a row unless `verify` passes, both digests are
+64-hex, the commit is 7–40 hex, the date is ISO, and the URL starts with
+http(s)://, s3:// or gs://.  It inserts the row into the index table; it never
+rewrites an existing tag/URL/digest.  Uploading is deliberately an external action, so
+the tool needs no GitHub credentials.
 
 `archive_release.py` packs `DECISION_LOG.md`, `confirmation_frozen.json`,
 `RELEASES.md`, `pyproject.toml`, `requirements.txt`, `requirements.lock` (if

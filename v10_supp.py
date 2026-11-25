@@ -97,7 +97,11 @@ P3MT_PAYLOAD_CONTROLS = dict(P3MT_PAYLOAD, variants=SCRATCH_CONTROLS)
 PROBE_MODES = {'uniform': [0.0, 0.125, 0.25, 0.5], 'natural': [0.125, 0.25, 0.5], 'mask': [1.0], 'delete': [1.0], 'span': [0.125, 0.25, 0.5], 'doc': [1.0], 'topical': [0.25, 0.5]}
 PROBE_SPAN_LEN = 32
 NIAH_NATURAL = dict(summary='results_v10_mech/niah_natural.json', n_pairs=8, n_seq=16, conditions=['clean', 'distract', 'nofar'], rho=0.5)
-PROBE = dict(outdir='results_v10_mech', ckpt_dir='results_v10_mech/ckpt', summary='results_v10_mech/distractor.json', variants=['csa_fixed_rope', 'full_rope'], seeds=[0, 1, 2], eval_lens=[2048, 4096], rhos=[0.0, 0.125, 0.25, 0.5], modes=dict(PROBE_MODES), target=512, n_seq=16, chunk=4, arms=['dense', 'learned', 'randidx', 'allblocks'], arm_overrides={}, niah=dict(NIAH_NATURAL))
+# The from-scratch selector controls are trained by P3MTC and must also be
+# PROBED by P3MP: otherwise `retrain-gap` / `csa_randtrain` contrasts can never
+# be measured from a v10-only run.  P5MP already adds them explicitly; keeping
+# the same variants/overrides here makes the v10 phase self-contained.
+PROBE = dict(outdir='results_v10_mech', ckpt_dir='results_v10_mech/ckpt', summary='results_v10_mech/distractor.json', variants=['csa_fixed_rope', 'full_rope'] + list(SCRATCH_CONTROLS), seeds=[0, 1, 2], eval_lens=[2048, 4096], rhos=[0.0, 0.125, 0.25, 0.5], modes=dict(PROBE_MODES), target=512, n_seq=16, chunk=4, arms=['dense', 'learned', 'randidx', 'allblocks'], arm_overrides={_v: ['learned'] for _v in SCRATCH_CONTROLS}, niah=dict(NIAH_NATURAL))
 
 def _arm_of(variant, arm, cfg=None):
     _ov = (cfg or {}).get('arm_overrides') or {}
@@ -1838,6 +1842,11 @@ def _panel_endpoint(hists, tps):
     out['seeds'] = sorted(per_seed)
     out['tokens'] = (float(last) * tps) if tps else None
     out['per_seed'] = per_seed
+    if not (isinstance(out.get('p_floor'), (int, float)) and math.isfinite(float(out['p_floor']))):
+        # All-zero deltas make the exact test return p_floor=NaN; the
+        # RESOLUTION of the test is still 2/2^n and must be displayed.
+        _n = int(out.get('n') or 0)
+        out['p_floor'] = math.ldexp(2.0, -_n) if _n > 0 else float('nan')
     return out
 
 def _panel_convergence(hists):
@@ -1869,7 +1878,33 @@ def _panel_convergence(hists):
             rel = (q[1] - last[1]) / denom
             per_seed[s] = {'rel_improve_last_quarter': float(rel), 'plateaued': bool(rel < 0.01)}
         _vals = [x['rel_improve_last_quarter'] for x in per_seed.values() if math.isfinite(x['rel_improve_last_quarter'])]
-        out[v] = {'per_seed': per_seed, 'median_rel_improve': float(np.median(_vals)) if _vals else float('nan'), 'n_plateaued': int(sum((1 for x in per_seed.values() if x['plateaued']))), 'n': len(per_seed), 'diagnostic': 'plateau-in-training-window (NOT proof of convergence: lr decay, stalls or eval noise can also satisfy it)', 'claim_allowed': 'crossing-after-plateau-in-window only; asymptotic/post-convergence claims need longer training + lr-continuation + replication'}
+        _n_insufficient = sum(1 for x in per_seed.values() if not math.isfinite(x['rel_improve_last_quarter']))
+        out[v] = {'per_seed': per_seed, 'median_rel_improve': float(np.median(_vals)) if _vals else float('nan'), 'n_plateaued': int(sum((1 for x in per_seed.values() if x['plateaued']))), 'n': len(per_seed), 'n_considered': len(_vals), 'n_insufficient_evals': int(_n_insufficient), 'diagnostic': 'plateau-in-training-window (NOT proof of convergence: lr decay, stalls or eval noise can also satisfy it)', 'claim_allowed': 'crossing-after-plateau-in-window only; asymptotic/post-convergence claims need longer training + lr-continuation + replication'}
+    return out
+
+_PANEL_PARAM_CACHE = {}
+
+def _panel_param_counts(spec):
+    """CPU parameter counts for the two panel arms.
+
+    These are structural counts (default mlp_ratio=4), matching the scale
+    panels' actual construction.  They are published because the CSA/dense
+    capacity gap shrinks with width (P3SS csa +34.6%, P3SL +9.5%), so an
+    apparent cross-scale change in the CSA-dense gap cannot be attributed to
+    scale before that confound is stated.
+    """
+    key = (int(spec['d']), int(spec['n_layers']), int(spec['seq']))
+    if key in _PANEL_PARAM_CACHE:
+        return dict(_PANEL_PARAM_CACHE[key])
+    out = {}
+    n_heads = max(1, int(spec['d']) // 32)
+    for _v in ('csa_fixed', 'full'):
+        _cfgs = L.make_layer_cfgs(int(spec['n_layers']), _v)
+        _m = L.SmallGPT(8192, int(spec['d']), int(spec['n_layers']),
+                        n_heads, 32, int(spec['seq']), _cfgs)
+        out[_v] = int(L.count_params(_m))
+        del _m
+    _PANEL_PARAM_CACHE[key] = dict(out)
     return out
 
 def _equal_token_slices():
@@ -1880,6 +1915,11 @@ def _equal_token_slices():
     attributed to scale alone."""
     conf = {}
     _panel_hists = {}
+    try:
+        _proxy_steps = _flop_matched_steps(P3SS_CFG, P3SL_CFG)
+    except Exception as _e:
+        print(f'[stats] WARNING: cannot derive the 6ND-proxy step budget ({type(_e).__name__}: {_e}) — P3SL_FLOP steps will be reported as unknown')
+        _proxy_steps = None
     for name, spec in _SCALE_PANEL_SPECS.items():
         _sp = os.path.join(spec['outdir'], 'summary.json')
         _raw = None
@@ -1925,6 +1965,21 @@ def _equal_token_slices():
         entry = {'status': 'ok', **{k: v for k, v in spec.items() if k != 'steps'}, 'tokens_per_step': tps, 'convergence': _panel_convergence(hists) if (ha or hb) else {}}
         if spec['steps'] is not None:
             entry['declared_steps'] = spec['steps']
+            entry['steps_run'] = spec['steps']
+            entry['steps_run_source'] = 'declared total steps'
+        else:
+            entry['steps_run'] = _proxy_steps
+            entry['steps_run_source'] = '6ND parameter-ratio proxy (NOT measured FLOPs)'
+        if ha or hb:
+            try:
+                _pc = _panel_param_counts(spec)
+                entry['params'] = _pc
+                _pf = _pc.get('full')
+                entry['param_rel_diff_csa_vs_full'] = ((float(_pc['csa_fixed']) - float(_pf)) / float(_pf)) if _pf else None
+            except Exception as _e:
+                print(f'[stats] {name}: parameter count failed ({type(_e).__name__}: {_e}) — capacity confound reported as unknown')
+                entry['params'] = None
+                entry['param_rel_diff_csa_vs_full'] = None
         _ep = _panel_endpoint(hists, tps)
         if _ep is not None:
             entry['endpoint'] = _ep
@@ -1983,8 +2038,13 @@ def _equal_token_slices():
                     continue
                 dg = [_g_l[s] - _g_s[s] for s in common]
                 res = V.exact_sign_permutation(dg)
+                if not (isinstance(res.get('p_floor'), (int, float)) and math.isfinite(float(res['p_floor']))):
+                    _n_res = int(res.get('n') or 0)
+                    res['p_floor'] = math.ldexp(2.0, -_n_res) if _n_res > 0 else float('nan')
                 tokens = step * _tps_s
-                slices[f'{name} - P3SS @ {tokens / 1000000.0:.2f}M tokens (gap_L - gap_S)'] = {'n': res['n'], 'mean': res['mean'], 'std': res.get('std', 0.0), 'p_exact_signflip': res['p_exact_signflip'], 'per_seed': res.get('per_seed'), 'p_floor': res.get('p_floor'), 'cohens_dz': res.get('cohens_dz'), 'seeds': common, 'gap_L': {str(s): _g_l[s] for s in common}, 'gap_S': {str(s): _g_s[s] for s in common}, 'small_step': step, 'large_step': step_l, 'tokens_small': target_tokens, 'tokens_large': tokens_large, 'note': 'positive = the CSA-dense gap is larger in the large arm at (approximately) the same cumulative tokens'}
+                _steps_s = (conf.get('P3SS') or {}).get('steps_run')
+                _steps_l_total = (conf.get(name) or {}).get('steps_run')
+                slices[f'{name} - P3SS @ {tokens / 1000000.0:.2f}M tokens (gap_L - gap_S)'] = {'n': res['n'], 'mean': res['mean'], 'std': res.get('std', 0.0), 'p_exact_signflip': res['p_exact_signflip'], 'per_seed': res.get('per_seed'), 'p_floor': res.get('p_floor'), 'n_nonzero': res.get('n_nonzero'), 'cohens_dz': res.get('cohens_dz'), 'seeds': common, 'gap_L': {str(s): _g_l[s] for s in common}, 'gap_S': {str(s): _g_s[s] for s in common}, 'gap_L_mean': float(np.mean([_g_l[s] for s in common])), 'gap_S_mean': float(np.mean([_g_s[s] for s in common])), 'small_step': step, 'large_step': step_l, 'tokens_small': target_tokens, 'tokens_large': tokens_large, 'tokens_per_step_small': _tps_s, 'tokens_per_step_large': _tps_l, 'steps_small': _steps_s, 'steps_large': _steps_l_total, 'lr_schedule_aligned': bool(_steps_s is not None and _steps_l_total is not None and int(_steps_s) == int(_steps_l_total)), 'note': 'positive = the CSA-dense gap is larger in the large arm at (approximately) the same cumulative tokens'}
     return {'panels': conf, 'equal_token_slices': slices}
 
 def v10_analysis(out='analysis_v10/stats.json'):
@@ -2185,13 +2245,17 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     if not tt or not sc or not _pairable(tt, sc, Ln, rho, tag):
                         continue
                     _add_contrast(_cname, sc, tt)
-                # architecture-aligned dense: full_rope minus
-                # the all-blocks CSA twin (same projections/norm/RoPE/sink)
+                # system-level dense contrast: full_rope minus the all-blocks
+                # CSA twin.  This is NOT architecture-aligned: the CSA twin
+                # keeps compressed KV, pooling, cosine q/k + scale=1, sink and
+                # the sliding-window branch, while full_rope has per-token K/V,
+                # RMSNorm-only q/k, scale=1/sqrt(d_head), no sink and a wider
+                # MLP.  It may be reported only as a system-level difference.
                 dense = cell_mean('full_rope', 'dense', Ln, rho, 'uniform')
                 allt = cell_mean('csa_fixed_rope_allblocks', 'learned', Ln, rho, 'uniform')
-                _cname = f'L{Ln} r{rho}: arch-aligned: full_rope - csa_alltrain'
+                _cname = f'L{Ln} r{rho}: system-level: full_rope - csa_alltrain'
                 _declared_contrasts.append(_cname)
-                if dense and allt and _pairable(dense, allt, Ln, rho, 'arch-aligned'):
+                if dense and allt and _pairable(dense, allt, Ln, rho, 'system-level'):
                     _add_contrast(_cname, allt, dense)
         # ---- delta-NLL on the corruption modes ----
         delta_nll = {}
@@ -2308,6 +2372,26 @@ def v10_analysis(out='analysis_v10/stats.json'):
                             res = V.exact_sign_permutation(dl)
                             res['seeds'] = common
                             contrasts[_cname] = res
+                    # Same delta-NLL contrast for the from-scratch selector
+                    # controls.  Without this row P3MTC's controls are only
+                    # visible in the raw-PPL table, not under the corruption
+                    # increment that the mechanism claim is about.
+                    for tag, sv in (('csa_randtrain', 'csa_fixed_rope_randidx'), ('csa_alltrain', 'csa_fixed_rope_allblocks')):
+                        _cname = f'ΔNLL L{Ln} {mode} r{rho}: {tag} - csa+learned'
+                        _declared_contrasts.append(_cname)
+                        _ok = f'{sv}::learned::L{Ln}::{mode}::r{rho}'
+                        other = delta_nll.get(_ok)
+                        if not learned or not other:
+                            continue
+                        if _dn_id.get(_lk, (None,) * 9)[2:] != _dn_id.get(_ok, (None,) * 9)[2:]:
+                            print(f'[v10 stats] ΔNLL L{Ln} {mode} r{rho}: {tag} and learned were measured under different probe_params/code/recipe — contrast omitted')
+                            continue
+                        common = sorted(set(learned['per_seed']) & set(other['per_seed']))
+                        if len(common) >= 2:
+                            dl = [other['per_seed'][s] - learned['per_seed'][s] for s in common]
+                            res = V.exact_sign_permutation(dl)
+                            res['seeds'] = common
+                            contrasts[_cname] = res
         # ---- Holm correction over the whole contrast family ----
         holm = {}
         # Declared-but-unmeasurable contrasts keep a p=1 family slot; filtering
@@ -2330,7 +2414,32 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     _v['p_holm'] = _fam_slots.get(_k, {}).get('p_holm')
             _rej = [k for k, v in _fam_slots.items() if v.get('p_holm') is not None and v['p_holm'] < 0.05]
             print(f'[v10 stats] Holm step-down over the {len(_fam_slots)}-contrast family (EXPLORATORY — not pre-registered): {len(_rej)} survive at alpha=0.05' + (f': {sorted(_rej)[:4]}' if _rej else ''))
-        probe = {'cells': probe_cells, 'contrasts': contrasts, 'delta_nll': delta_nll, 'holm_exploratory': holm}
+        # ---- clean far-context benefit (mask / delete controls) ----
+        # The reviewer's alternative explanation for a small corruption delta
+        # is that the arm simply uses the far context very little.  The
+        # benefit of the clean far context is exactly
+        # NLL_corrupted - NLL_clean (positive = clean helped); it is the same
+        # paired contrast as Delta-NLL, published under an interpretable name
+        # and next to the clean-NLL level.  It is NOT the negative of Delta-NLL.
+        far_benefit = {}
+        for _k, _e in delta_nll.items():
+            if _e.get('mode') not in ('mask', 'delete'):
+                continue
+            _per = {s: float(v) for s, v in (_e.get('per_seed') or {}).items()}
+            if not _per:
+                continue
+            _res = V.exact_sign_permutation(list(_per.values()))
+            if not (isinstance(_res.get('p_floor'), (int, float)) and math.isfinite(float(_res['p_floor']))):
+                _n_res = int(_res.get('n') or 0)
+                _res['p_floor'] = math.ldexp(2.0, -_n_res) if _n_res > 0 else float('nan')
+            _res.update({'variant': _e['variant'], 'arm': _e['arm'],
+                         'eval_len': _e['eval_len'], 'mode': _e['mode'],
+                         'rho': _e['rho'], 'per_seed': _per,
+                         'clean_nll_by_seed': _e.get('clean_nll_by_seed'),
+                         'note': 'benefit = NLL_corrupted - NLL_clean; positive = clean far context helps'})
+            far_benefit[_k] = _res
+        probe = {'cells': probe_cells, 'contrasts': contrasts, 'delta_nll': delta_nll,
+                 'far_benefit': far_benefit, 'holm_exploratory': holm}
         # ---- NIAH-natural (far-necessity task) ----
         _nsp = (PROBE.get('niah') or {}).get('summary')
         if _nsp and os.path.exists(_nsp):
@@ -2708,6 +2817,15 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             mech_sum = {}
     lines = []
     A = lines.append
+
+    def _fnum(x, spec='.3f'):
+        """Render a finite number, or an em dash for None/NaN/inf."""
+        try:
+            xf = float(x)
+        except (TypeError, ValueError, OverflowError):
+            return '—'
+        return format(xf, spec) if math.isfinite(xf) else '—'
+
     A('# CSA / HCA 受控机制研究 — v10 补实验报告（外推机制 + 反转点标度 + topk 补种子）')
     A('> **证据等级：探索性（exploratory）**。本面板的比较/种子是观察 validation 结果后选择的；Holm 校正只限制过度宣称，不等于预注册确认。')
     A(L.evidence_status_banner())
@@ -2753,11 +2871,11 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                     n_by_v = {v: {r['seed'] for r in _rv} for v, _rv in _rows_by_v.items() if _rv}
                 else:
                     print(f'[v10 report] WARNING: by-length arms share NO seed ({ {v: sorted(s) for v, s in n_by_v.items()} }) — the table below quotes per-arm means over DIFFERENT seed sets and is not a paired comparison')
-        A(f'**P3MT 复现对照**（train@512 → 同权重 eval；PPL = 跨 seed 的 token-pooled 估计，记录缺 NLL 时退回算术平均并标 `*`；ratio = pooled PPL@L / pooled PPL@512；n={(min((len(s) for s in n_by_v.values())) if n_by_v else 0)}）：')
+        A(f'**P3MT/P3MTC 干净上下文复现对照**（train@512 → 同权重 eval；P3MT 两臂与 P3MTC 从头训练选择器对照并列；PPL = 跨 seed 的 token-pooled 估计，记录缺 NLL 时退回算术平均并标 `*`；ratio = pooled PPL@L / pooled PPL@512；n={(min((len(s) for s in n_by_v.values())) if n_by_v else 0)}）。**注意**：这是干净上下文读数，不是干扰探针；`csa_fixed_rope_allblocks` 仍保留 CSA 压缩结构，不是 dense 对照。')
         A('')
         A('| variant | PPL@512 | PPL@2048 | PPL@4096 | ratio@4096 |')
         A('|---|---|---|---|---|')
-        for v in P3MT_PAYLOAD['variants']:
+        for v in list(P3MT_PAYLOAD['variants']) + list(SCRATCH_CONTROLS):
             rows = _rows_by_v.get(v, [])
             if not rows:
                 continue
@@ -2846,14 +2964,17 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
               f' 没有任何按长度记录携带当前代码语义戳 `{L.code_stamp()}`；按「旧代码/旧配方/旧数据指纹不得进入主要结论」的规则，'
               '本表不引用这些数值，也不据此计算 ratio 或外推结论。重跑对应训练阶段后再纳入。')
             A('')
-    A(f'**P3MP 干扰注入设计**：eval 长度 2048/4096；把**远距上下文**（目标区之前的全部输入位置，即除最后 {PROBE['target']} 个干净目标 token 及其紧邻前置位置以外的位置）中比例为 ρ ∈ {{0, 1/8, 1/4, 1/2}} 的 token 替换为均匀随机 token——同一 (序列, ρ) 的腐坏对所有臂逐字节相同（按 (eval_len, 序列号, ρ) 播种，与臂/模型种子无关），臂间严格配对。只在干净目标区计 PPL。四个臂：')
+    A(f'**P3MP 干扰注入设计**：eval 长度 2048/4096；腐坏只作用于**远距上下文**（目标区之前的输入位置，即除最后 {PROBE['target']} 个干净目标 token 及其紧邻前置位置以外的位置），同一 (序列, ρ, mode) 的腐坏对所有臂逐字节相同（按 (eval_len, 序列号, ρ, mode) 播种，与臂/模型种子无关），臂间严格配对；只在干净目标区计 PPL/NLL。测试时四臂（dense 基线 + 在已训练 CSA 权重上替换选择方式的三臂）加两个 P3MTC 从头训练对照：')
     A('')
     A('- `full_rope`（dense，必须直面远距噪声）')
     A('- `csa_fixed_rope` 学习选择（原机制）')
     A('- `csa_fixed_rope` + 随机 indexer（选择被打乱，v4 消融开关，eval 时注入）')
-    A('- `csa_fixed_rope` + topk=全块（看得见一切，≈ 带压缩的 dense）')
+    A('- `csa_fixed_rope` + topk=全块（看得见一切，仍是带压缩的 CSA，不是 dense）')
+    A('- `csa_fixed_rope_randidx` / `csa_fixed_rope_allblocks`（P3MTC 从头训练的选择器对照，只跑其自身 `learned` 臂）')
     A('')
-    A('「稀疏掩码滤除远距噪声」假设预测：**学习选择臂的 ρ 曲线平坦，其余三臂随 ρ 陡峭退化**。')
+    A('腐坏模式共 7 种：`uniform` / `natural` / `span` / `doc` / `topical` / `mask` / `delete`；`doc` 是整段真实文档切片替换，最接近「自然语言干扰」，`span`/`natural`/`topical` 只覆盖特定替换几何。')
+    A('')
+    A('「稀疏掩码滤除远距噪声」假设预测：**学习选择臂的 ρ 曲线平坦，其余对照随 ρ 陡峭退化**；但该预测本身不是证据——只有配对 ΔNLL 与干净远端收益同时支持时才可作系统级读数。')
     A('')
     cells = probe.get('cells', [])
     if cells:
@@ -2881,16 +3002,19 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                         print(f'[report] {v}+{arm} L={Ln} rho={rho}: {len(_cc)} parameterisations of the cell exist — the table omits the cell (the paired test refuses it too)')
                 A(f'| `{v}`+{arm} | ' + ' | '.join(row) + ' |')
             A('')
+    else:
+        A('> **P3MP 探针 cell 缺失**：`results_v10_mech/distractor.json` 不存在或没有可用 cell。此时本报告不提供干扰鲁棒性读数；测试时干预与从头训练对照的差异**没有被测量**，不能把设计文字当作结果。请先跑 `python v10_supp.py phase P3MTC`（训练对照）与 `phase P3MP`（探针）。')
+        A('')
     contr = probe.get('contrasts', {})
     _legacy_keys = [k for k in contr if ' - csa+learned' in k and any((t in k for t in ('full_rope(dense)', 'csa+randidx', 'csa+allblocks'))) and not k.startswith('ΔNLL')]
     _legacy = {k: contr[k] for k in _legacy_keys}
     if _legacy:
         A('**配对检验（exact sign-flip，Δ = 对照臂 − 学习选择臂，>0 表示学习选择更抗噪；uniform 模式）：**')
         A('')
-        A('| 比较 | n | Δ mean±std | p (exact) | p_Holm |')
-        A('|---|---|---|---|---|')
+        A('| 比较 | n | Δ mean±std | p (exact) | p 下限 | p_Holm |')
+        A('|---|---|---|---|---|---|')
         for k, v in _legacy.items():
-            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} | {v.get('p_holm') if v.get('p_holm') is not None else '—'} |')
+            A(f"| {k} | {v['n']} | {_fnum(v.get('mean'), '+.2f')} ± {_fnum(v.get('std'), '.2f')} | {_fnum(v.get('p_exact_signflip'))} | {_fnum(v.get('p_floor'))} | {v.get('p_holm') if v.get('p_holm') is not None else '—'} |")
         A('')
 
         def _rng(tag):
@@ -2949,21 +3073,24 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     if _new_c:
         A('### P3M-2 从头训练的选择器对照（同规模）')
         A('')
-        A('**背景**：测试时把已训练模型的选择器替换为随机/全块，只能回答「模型是否依赖原选择器」，不能回答「学习式选择是否优于训练充分的随机选择或全块读取」——后两者的测试时干预改变了模型训练时适应的输入分布，效果下降可能来自失配本身。P3MTC 按与 P3MT **完全相同的配方**（同数据、同种子）从头训练两个对照：`csa_fixed_rope_randidx`（训练期选择即随机）与 `csa_fixed_rope_allblocks`（训练期就读全部块；与 `csa_fixed_rope` 逐项同构——同 c_kv 压缩、同 qk_norm、同 RoPE、同 sink/窗口，仅选择方式不同，因此它同时是**逐项对齐的 dense 对照**）。')
+        A('**背景**：测试时把已训练模型的选择器替换为随机/全块，只能回答「模型是否依赖原选择器」，不能回答「学习式选择是否优于训练充分的随机选择或全块读取」——后两者的测试时干预改变了模型训练时适应的输入分布，效果下降可能来自失配本身。P3MTC 按与 P3MT **完全相同的配方**（同数据、同种子）从头训练两个对照：`csa_fixed_rope_randidx`（训练期选择即随机）与 `csa_fixed_rope_allblocks`（训练期就读全部块；与 `csa_fixed_rope` 同架构，仅选择方式不同）。**注意**：`allblocks` 仍保留 CSA 的 KV 压缩、池化、q/k 归一化与 scale=1、sink 和窗口分支，因此它只是**选择方式的同架构对照**，不是 dense 对照；把它与 `full_rope` 相减只能作系统级读数，不能把差值归因于单一组件。')
         A('')
         A('| 比较 | n | Δ mean±std | d_z | p (exact) | p 下限 |')
         A('|---|---|---|---|---|---|')
         for k, v in sorted(_new_c.items()):
-            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v.get('cohens_dz', float('nan')):+.2f} | {v['p_exact_signflip']:.3f} | {v.get('p_floor', float('nan')):.3f} |')
+            A(f"| {k} | {v['n']} | {_fnum(v.get('mean'), '+.2f')} ± {_fnum(v.get('std'), '.2f')} | {_fnum(v.get('cohens_dz'), '+.2f')} | {_fnum(v.get('p_exact_signflip'))} | {_fnum(v.get('p_floor'))} |")
         A('')
-        A('> `retrain-gap(…)` 行 = 测试时干预 − 同规模从头训练对照（同 L、同 ρ）。对越低越好的损失，正值说明干预比重新训练**更差**，该差距本身**可能包含**训练—测试失配的代价，也混合了优化适应与参数差异——它是「干预与重新训练的效果差」，**不是**已完成的因果失配分解，不得把简单相减解释为「不能归因于失配的部分」。`arch-aligned` 行 = dense − 全块 CSA 孪生（两者仅剩 KV 压缩投影与分块读取方式之差）。')
+        A('> `retrain-gap(…)` 行 = 测试时干预 − 同规模从头训练对照（同 L、同 ρ）。对越低越好的损失，正值说明干预比重新训练**更差**，该差距本身**可能包含**训练—测试失配的代价，也混合了优化适应与参数差异——它是「干预与重新训练的效果差」，**不是**已完成的因果失配分解，不得把简单相减解释为「不能归因于失配的部分」。`system-level` 行 = dense − 全块 CSA 孪生；两者仍差 KV 压缩、池化、q/k 归一化位置与宽度、attention scale、sink、窗口分支与 MLP 宽度，**不是**逐项对齐的对照。')
+        A('')
+    else:
+        A('> **P3M-2 对照未测量**：P3MTC 的从头训练随机/全块选择器没有对应的 probe cell（或这些 cell 因 recipe/code/val 指纹不一致被拒绝），因此「学习式选择 vs 训练充分的替代选择」在本报告中**没有数字**。测试时干预只能回答「模型是否依赖原选择器」，不能替代这一对照。')
         A('')
     # ---- ΔNLL：污染增量 ----
     dnll = probe.get('delta_nll') or {}
     if dnll:
         A('### P3M-3 污染增量 ΔNLL（按 NLL 口径，含干净条件基线）')
         A('')
-        A('**口径**：ΔNLL = NLL_污染 − NLL_干净（nats/目标 token，逐种子配对）。腐坏模式：`uniform`（均匀随机 token，既有协议）、`natural`（其他真实序列同位置 token）、`mask`（远端整体屏蔽为 `<pad>`）、`delete`（远端整体删除，仅剩目标区）。`mask`/`delete` 回答「干净远端上下文到底带来多少收益」；`natural` 与 `uniform` 之差只回答「真实语料同位置 token 替换是否比均匀随机替换更难过滤」；它不是主题干扰、语义相近干扰、重复文本或对抗干扰，不能据此声称普遍抗噪性。')
+        A('**口径**：ΔNLL = NLL_污染 − NLL_干净（nats/目标 token，逐种子配对）。腐坏模式共 7 种：`uniform`（均匀随机 token，既有协议）、`natural`（其他真实序列同位置 token）、`span`（连续句段替换）、`doc`（整段换成另一条真实序列的连续切片，最接近自然文档干扰）、`topical`（主题相近供体的同位置替换）、`mask`（远端整体屏蔽为 `<pad>`）、`delete`（远端整体删除，仅剩目标区）。`mask`/`delete` 回答「干净远端上下文到底带来多少收益」；`doc` 是自然文档级干扰，`natural`/`span`/`topical` 只回答特定 token/句段替换下的鲁棒性，不能据此声称普遍抗噪性；`uniform` 与 `natural` 之差也不等于「自然语言干扰」的完整效应。')
         A('')
         # Review 10 issue 12: rho is NOMINAL.  Publish what each mode actually
         # covered/changed so modes are not compared as if the same rho meant
@@ -3009,13 +3136,30 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         A('')
         _dnll_c = {k: v for k, v in contr.items() if k.startswith('ΔNLL')}
         if _dnll_c:
-            A('| ΔNLL 配对比较（ΔΔNLL = 臂间污染增量之差） | n | Δ mean±std | p (exact) | p_Holm |')
-            A('|---|---|---|---|---|')
+            A('| ΔNLL 配对比较（ΔΔNLL = 臂间污染增量之差） | n | Δ mean±std | p (exact) | p 下限 | p_Holm |')
+            A('|---|---|---|---|---|---|')
             for k, v in sorted(_dnll_c.items()):
-                A(f'| {k} | {v['n']} | {v['mean']:+.4f} ± {v.get('std', 0):.4f} | {v['p_exact_signflip']:.3f} | {v.get('p_holm') if v.get('p_holm') is not None else '—'} |')
+                A(f"| {k} | {v['n']} | {_fnum(v.get('mean'), '+.4f')} ± {_fnum(v.get('std'), '.4f')} | {_fnum(v.get('p_exact_signflip'))} | {_fnum(v.get('p_floor'))} | {v.get('p_holm') if v.get('p_holm') is not None else '—'} |")
             A('')
         A('> **替代解释提示**：某臂 ΔNLL 小也可能因为它本来就很少利用远端上下文（干净 NLL 更高）——读表时必须把 ΔNLL 与干净 NLL 列一起看；`mask`/`delete` 行给出干净远端的收益幅度作为参照系。')
         A('')
+        # ---- clean far-context benefit (mask/delete) ----
+        _fb = probe.get('far_benefit') or {}
+        if _fb:
+            A('### P3M-3b 干净远端上下文的收益（mask/delete）')
+            A('')
+            A('**口径**：收益 = NLL_污染 − NLL_干净 = ΔNLL；正值表示**干净远端上下文有用**，接近 0 表示该臂几乎不依赖远端。这个量是判断「ΔNLL 小是否只是因为本来就不用远端」的直接参照：收益小 + 污染增量小 = 低依赖，而不是强鲁棒。')
+            A('')
+            A('| 臂 | L | 条件 | 收益 mean±std (nats/token) | n | 干净 NLL | p (exact) | p 下限 |')
+            A('|---|---|---|---|---|---|---|---|')
+            for _k in sorted(_fb, key=lambda x: (_fb[x]['eval_len'], _fb[x]['variant'], _fb[x]['arm'], _fb[x]['mode'])):
+                _e = _fb[_k]
+                _clean = _e.get('clean_nll_by_seed') or {}
+                _ct = (float(np.mean(list(_clean.values()))) if _clean else float('nan'))
+                A(f"| `{_e['variant']}::{_e['arm']}` | {_e['eval_len']} | {_e['mode']} | {_fnum(_e.get('mean'), '+.4f')} ± {_fnum(_e.get('std'), '.4f')} | {_e['n']} | {_fnum(_ct, '.4f')} | {_fnum(_e.get('p_exact_signflip'))} | {_fnum(_e.get('p_floor'))} |")
+            A('')
+            A('> `mask`/`delete` 都改变远端输入分布（`<pad>` 是分布外 token；`delete` 改变长度与位置），因此两者的收益幅度不能互相校准；它们只用于回答「该臂是否使用远端」，不用于估计「自然干扰下的鲁棒性」。本表的 p 是**单样本**符号翻转，未进入上面的 Holm 族，只作描述性读数；不得据此单独宣称显著。')
+            A('')
     # ---- NIAH-natural：远端必要信息任务 ----
     niah = probe.get('niah_natural') or {}
     if niah.get('cells'):
@@ -3069,10 +3213,10 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                 A(f"| `{_k[0]}::{_k[1]}` | {_k[2]} | {_k[3]} | {_btxt(0)} | {_btxt(1)} | {_btxt(2)} | {_btxt(3)} | {c.get('distance_gradient')} |")
             A('')
         if niah.get('contrasts'):
-            A('| NIAH 配对比较（Δ = 对照臂 − 学习选择，answer NLL，>0 = 学习选择更好） | n | Δ mean±std | p (exact) | p_Holm |')
-            A('|---|---|---|---|---|')
+            A('| NIAH 配对比较（Δ = 对照臂 − 学习选择，answer NLL，>0 = 学习选择更好） | n | Δ mean±std | p (exact) | p 下限 | p_Holm |')
+            A('|---|---|---|---|---|---|')
             for k, v in sorted(niah['contrasts'].items()):
-                A(f'| {k} | {v['n']} | {v['mean']:+.3f} ± {v.get('std', 0):.3f} | {v['p_exact_signflip']:.3f} | {v.get('p_holm') if v.get('p_holm') is not None else '—'} |')
+                A(f"| {k} | {v['n']} | {_fnum(v.get('mean'), '+.3f')} ± {_fnum(v.get('std'), '.3f')} | {_fnum(v.get('p_exact_signflip'))} | {_fnum(v.get('p_floor'))} | {v.get('p_holm') if v.get('p_holm') is not None else '—'} |")
             A('')
         A('> 该任务**在通过上表任务有效性判据后**才可用于「长距离信息利用」的机制读法：鲁棒性高 + 检索利用不差，才支持「稀疏选择在滤噪的同时保留了有用远距信息」；若只有鲁棒性而检索差，则更符合「本来就少用远端」的替代解释。正对照、无远端信息对照、chance 与距离梯度缺一不可；任一缺失时 NIAH 读数只能描述成败，不能解释机制。')
         A('')
@@ -3180,6 +3324,8 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
               '**横轴不是单一规模变量**：d 与层数一一绑定（128/4L、256/6L、384/8L、512/10L），各面板的 batch/seq/eval 网格也不同，'
               '因此斜率同时混入深度、优化动态与评测网格差异；它只能读作「这些配置的轨迹交叉点随 d 的描述性变化」。')
             A('')
+    A('**规模轴混杂（无论拟合是否被拒都必须读）**：d 与层数一一绑定（128/4L、256/6L、384/8L、512/10L），各面板的 batch/seq/eval 网格与训练 token 数也不同；即使趋势拟合被拒绝，也不能把跨面板差异读作单一「规模」效应。')
+    A('')
     sc = st.get('scale_confounds') or {}
     if sc:
         A('### P3S-2 规模混杂控制（等训练 token / 6ND 代理规模 / 规模内平台期）')
@@ -3187,37 +3333,108 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         A('**背景**：P3SS（d=128/4L，小模型臂）与 P3SL（d=512/10L，大模型臂）的累计训练 token 不同——跨规模终点差异不能单独归因于规模。本节把同一批曲线在**相同累计 token**处切片配对（gap_L − gap_S，逐种子），并给出等 token（`P3SL_TOK`）与 6ND 参数量代理规模（`P3SL_FLOP`，按参数量比例缩步数——**代理规模，非实测等 FLOPs**）两个大模型臂，以及各面板的规模内平台期诊断（平台期 ≠ 收敛，只支持「规模内平台期后」读数）。')
         A('')
         _panels = sc.get('panels') or {}
+        _budget = {'P3SS': 'raw 8000 steps', 'P3SL': 'raw 4000 steps',
+                   'P3SL_TOK': 'equal-token 8000 steps', 'P3SL_FLOP': '6ND proxy (NOT FLOPs)'}
         if _panels:
-            A('| 面板 | 规模 | 末步 token | 末点 gap (csa−full) mean±std | n | 末点 p (exact) | 平台化种子 |')
-            A('|---|---|---|---|---|---|---|')
+            A('| 面板 | 规模 | 预算口径 | 总步数 | 末步 token | 参数 csa/full (csa−full)/full | 末点 gap (csa−full) mean±std | n | 末点 p (exact) | p 下限 | 平台化种子 |')
+            A('|---|---|---|---|---|---|---|---|---|---|---|')
             for name in ('P3SS', 'P3SL', 'P3SL_TOK', 'P3SL_FLOP'):
                 e = _panels.get(name) or {}
                 if not e or e.get('status') != 'ok':
-                    A(f'| {name} | — | — | 数据缺失 | 0 | — | — |')
+                    A(f'| {name} | — | {_budget.get(name, "—")} | — | — | — | 数据缺失 | 0 | — | — | — |')
                     continue
                 _ep = e.get('endpoint') or {}
-                _tok = e.get('tokens_per_step')
                 _ntok = (f"{(_ep.get('tokens') or 0) / 1000000.0:.2f}M" if _ep and _ep.get('tokens') else 'n/a')
+                _pc = e.get('params') or {}
+                _ptxt = '—'
+                if _pc.get('csa_fixed') and _pc.get('full'):
+                    _pd = e.get('param_rel_diff_csa_vs_full')
+                    _ptxt = f"{_pc['csa_fixed'] / 1e6:.2f}M/{_pc['full'] / 1e6:.2f}M ({_pd:+.1%})" if isinstance(_pd, (int, float)) else '—'
                 _conv = e.get('convergence') or {}
-                _pl = [f"{_v.get('n_plateaued', 0)}/{_v.get('n', 0)}" for _v in _conv.values()]
-                A(f"| {name} | {e.get('note', '')} | {_ntok} | {_ep.get('mean', float('nan')):+.2f} ± {_ep.get('std', 0):.2f} | {_ep.get('n', 0)} | {_ep.get('p_exact_signflip', float('nan')):.3f} | {'/'.join(_pl) or '—'} |")
+                _pl = []
+                for _vv in ('csa_fixed', 'full'):
+                    _cc = _conv.get(_vv) or {}
+                    _lbl = 'csa' if _vv == 'csa_fixed' else 'full'
+                    _pl.append((f'{_lbl} eval不足' if _cc.get('n_considered', 0) == 0
+                                else f"{_lbl} {_cc.get('n_plateaued', 0)}/{_cc.get('n_considered', 0)}"))
+                _steps = e.get('steps_run')
+                _stxt = str(int(_steps)) if isinstance(_steps, (int, float)) else '—'
+                A(f"| {name} | {e.get('note', '')} | {_budget.get(name, '')} | {_stxt} | {_ntok} | {_ptxt} | {_fnum(_ep.get('mean'), '+.2f')} ± {_fnum(_ep.get('std'), '.2f')} | {_ep.get('n', 0)} | {_fnum(_ep.get('p_exact_signflip'))} | {_fnum(_ep.get('p_floor'))} | {'; '.join(_pl) or '—'} |")
             A('')
-            _conv_warn = [name for name, e in _panels.items() if e.get('status') == 'ok' and any(((e.get('convergence') or {}).get(v) or {}).get('n_plateaued', 0) == 0 for v in ('csa_fixed', 'full'))]
-            if _conv_warn:
-                A(f'> **规模内平台期证据不足**：{_conv_warn} 面板在最后四分之一 eval 窗口的相对改进 ≥1%（未平台化）——「平台期后交叉」的主张在该面板上**不成立**，只有「窗口内交叉」的读数有效。')
+            _conv_insufficient = []
+            _conv_unplateaued = []
+            for _name, _e in _panels.items():
+                if _e.get('status') != 'ok':
+                    continue
+                for _vv in ('csa_fixed', 'full'):
+                    _cc = ((_e.get('convergence') or {}).get(_vv) or {})
+                    if _cc.get('n_considered', 0) == 0:
+                        _conv_insufficient.append(f'{_name}/{_vv}')
+                    elif _cc.get('n_plateaued', 0) == 0:
+                        _conv_unplateaued.append(f'{_name}/{_vv}')
+            if _conv_insufficient:
+                A(f'> **平台期不可诊断**：{_conv_insufficient} 的可用 eval 点少于 4 个（例如短预算臂），不能据此写「未平台化」或「已平台化」；该面板只给端点读数。')
+                A('')
+            if _conv_unplateaued:
+                A(f'> **规模内平台期证据不足**：{_conv_unplateaued} 在最后四分之一 eval 窗口的相对改进 ≥1%（未平台化）——「平台期后交叉」的主张在该面板上**不成立**，只有「窗口内交叉」的读数有效。')
                 A('')
             A('> 即使全部种子平台化，也只允许「规模内平台期后交叉」的读数；「渐近优势反转」「收敛后更差」需要更长训练、学习率续训与重复验证，本面板不提供。')
             A('')
+            _pd_rows = [(n, (_panels.get(n) or {}).get('param_rel_diff_csa_vs_full')) for n in ('P3SS', 'P3SL', 'P3SL_TOK', 'P3SL_FLOP')]
+            _pd_rows = [(n, x) for n, x in _pd_rows if isinstance(x, (int, float))]
+            if len(_pd_rows) >= 2:
+                A('> **容量混杂**：' + '；'.join(f'{n} 的 csa−full 参数差 {x:+.1%}' for n, x in _pd_rows) +
+                  '。跨规模 gap 的变化不能先归因于规模：CSA 相对 dense 的参数优势本身随宽度缩小，若没有参数匹配的 dense 臂，容量差就可以单独产生「gap 随规模变化」。')
+                A('')
+            A('> **学习率轨迹**：只有 `P3SL_TOK` 与 P3SS 同为 8000 总步（同一 warmup/cosine 形状）；`P3SL`（4000 步）与 `P3SL_FLOP`（659 步）在同一累计 token 处的 LR 不同，因此下面的切片分成「LR 对齐」与「仅 token 对齐」两组。')
+            A('')
+            A('> **评测口径**：末点 gap 来自 `eval_subset=64` 的曲线点，不是完整 validation 的最终 PPL；`tokens` 是训练**抽样** token 数（不等于去重后的唯一 token 数）。')
+            A('')
         _slices = sc.get('equal_token_slices') or {}
         if _slices:
-            A('**等 token 切片（gap_L − gap_S，同累计 token 处逐种子配对；>0 = 大模型在同 token 处 CSA−dense 差距更大）：**')
+            _aligned = {k: v for k, v in _slices.items() if v.get('lr_schedule_aligned')}
+            _misaligned = {k: v for k, v in _slices.items() if not v.get('lr_schedule_aligned')}
+            for _label, _grp, _why in (
+                    ('等 token 且同 LR 轨迹（唯一无 LR 混杂的切片）', _aligned,
+                     'P3SL_TOK 与 P3SS 同为 8000 步'),
+                    ('仅等 token（LR 轨迹不同，LR 仍是混杂）', _misaligned,
+                     'P3SL=4000 步 / P3SL_FLOP=659 步，与 P3SS=8000 步的 LR 形状不同')):
+                if not _grp:
+                    continue
+                A(f'**{_label}**（{_why}；gap_L − gap_S，逐种子配对；>0 = 大模型在同 token 处 CSA−dense 差距更大）：')
+                A('')
+                A('| 规模臂 | tokens | small step | large step | gap_S mean | gap_L mean | Δ mean±std | n | p (exact) | p 下限 |')
+                A('|---|---|---|---|---|---|---|---|---|---|')
+                for k, v in sorted(_grp.items(), key=lambda kv: (kv[1].get('tokens_small', 0.0), kv[0])):
+                    A(f"| {k.split(' - P3SS')[0]} | {v.get('tokens_small', 0.0) / 1e6:.2f}M | {v.get('small_step', '—')} | {v.get('large_step', '—')} | {_fnum(v.get('gap_S_mean'), '+.2f')} | {_fnum(v.get('gap_L_mean'), '+.2f')} | {_fnum(v.get('mean'), '+.2f')} ± {_fnum(v.get('std'), '.2f')} | {v.get('n', 0)} | {_fnum(v.get('p_exact_signflip'))} | {_fnum(v.get('p_floor'))} |")
+                A('')
+            _floors = [v.get('p_floor') for v in _slices.values() if isinstance(v.get('p_floor'), (int, float))]
+            if _floors and max(_floors) > 0.05:
+                A(f'> **分辨率警告**：这些切片的精确符号翻转 p 下限最高为 {max(_floors):.3f}（当前 scale 臂 n=2 时下限 0.500，v11 补到 n=4 仍为 0.125）——即使方向全部一致，也**不能**达到 p<0.05；表中的 p 只能读作描述性排序证据。')
+                A('')
+            A('> `P3SL_FLOP` 的步数按面板平均参数量比例确定性缩放（659 步 / 4.05M token），不是实测 FLOPs、GPU 时间或能耗；它的 gap 只能读作「该 6ND 代理近似相等时」的规模效应。')
             A('')
-            A('| 切片 | n | Δ mean±std | d_z | p (exact) |')
-            A('|---|---|---|---|---|')
-            for k, v in sorted(_slices.items()):
-                A(f'| {k} | {v.get('n', 0)} | {v.get('mean', float('nan')):+.2f} ± {v.get('std', 0):.2f} | {v.get('cohens_dz', float('nan')):+.2f} | {v.get('p_exact_signflip', float('nan')):.3f} |')
+        else:
+            A('> **等 token / 等计算控制未产出**：`P3SL_TOK` / `P3SL_FLOP` 没有可用曲线，`equal_token_slices` 为空。因此跨规模端点差异仍然同时混杂训练 token 数、LR 轨迹与容量差，**不能**单独归因于规模；本报告不提供「优势随规模反转」的证据。')
             A('')
-            A('> `P3SL_FLOP` 的步数按参数量比例确定性缩放（参数量按面板两臂平均，CPU 上计数），即**参数量与步数的 6ND 代理对齐**——它不是实测 FLOPs、GPU 时间或能耗；该臂的 gap 只能读作「该代理近似相等时」的规模效应。')
+        _ps = _panels.get('P3SS') or {}
+        _plf = _panels.get('P3SL_FLOP') or {}
+        _pcs, _pcl = (_ps.get('params') or {}), (_plf.get('params') or {})
+        _ss, _sl = _ps.get('steps_run'), _plf.get('steps_run')
+        if (_ps.get('endpoint') and _plf.get('endpoint') and _pcs and _pcl
+                and isinstance(_ss, (int, float)) and isinstance(_sl, (int, float)) and _sl > 0):
+            A('**等计算代理臂的逐臂 6ND 对齐（P3SS 8000 步 vs P3SL_FLOP 缩放步）**：')
+            A('')
+            A('| 臂 | P3SS 参数 | P3SL_FLOP 参数 | steps | 6ND 比值 (small/large) | 是否对齐 |')
+            A('|---|---|---|---|---|---|')
+            for _arm in ('csa_fixed', 'full'):
+                _a, _b = _pcs.get(_arm), _pcl.get(_arm)
+                if not _a or not _b:
+                    continue
+                _r = (float(_a) * float(_ss)) / (float(_b) * float(_sl))
+                A(f"| {_arm} | {_a / 1e6:.2f}M | {_b / 1e6:.2f}M | {int(_ss)}/{int(_sl)} | {_r:.3f}× | {'是（±5%）' if abs(_r - 1.0) <= 0.05 else '否'} |")
+            A('')
+            A('> 该臂用**面板平均参数**决定步数，逐臂 6ND 比值并不严格等于 1（见上表）；它既不是逐臂等计算，也不是实测 FLOPs。真正等计算的比较需要测得的 FLOPs 或同 kernel 墙钟时间，当前仓库没有这两个量。')
             A('')
     A('---')
     A('')

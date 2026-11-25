@@ -2979,12 +2979,18 @@ def t_evidence_metadata():
     # Every report header must print the evidence status.  Source-only repo =>
     # numbers are not independently auditable (review 10, issue 1).
     _ev = L.evidence_release_status()
-    assert _ev['status'] in ('no_release', 'missing_index') and _ev['complete_rows'] == 0, _ev
-    # The two independent implementations must agree on status/count.
+    # Do NOT hard-code the source-only state here: publishing a valid release
+    # must not make the test suite fail (that would block the very evidence
+    # release the project requires).  Assert internal consistency instead.
     _la, _ba = L.evidence_release_status(), BR.evidence_release_status()
     assert (_la['status'], _la['complete_rows']) == (_ba['status'], _ba['complete_rows']), (_la, _ba)
-    assert '不能独立审计' in L.evidence_status_banner()
-    assert '不能独立审计' in BR.evidence_status_banner()
+    _banner = L.evidence_status_banner()
+    _bbanner = BR.evidence_status_banner()
+    if _la['status'] == 'released':
+        assert 'released' in _banner and 'released' in _bbanner, (_banner, _bbanner)
+        assert _la['complete_rows'] >= 1, _la
+    else:
+        assert '不能独立审计' in _banner and '不能独立审计' in _bbanner, (_banner, _bbanner)
     assert '证据状态' in BR.sec_header(), 'report header must carry the evidence-status banner'
     assert BR._sig_gate({'n': 6, 'p_exact_signflip': 0.01, 'p_holm': 0.02, 'mean': 1.0, 'std': 0.5}) is True
     assert BR._sig_gate({'n': 3, 'p_exact_signflip': 0.01, 'p_holm': 0.02, 'mean': 1.0, 'std': 0.5}) is False
@@ -13070,6 +13076,28 @@ def t_archive_requires_run_evidence_and_packs_ledger():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def t_p3mtc_matches_p3mt_recipe():
+    """Review 13, issue 2: the from-scratch controls must share the mechanism
+    panel's data/seed/budget recipe, differing only in the variant list."""
+    a = dict(V10.P3MT_PAYLOAD)
+    b = dict(V10.P3MT_PAYLOAD_CONTROLS)
+    av, bv = a.pop('variants'), b.pop('variants')
+    assert b == a, (a, b)
+    assert set(bv) == set(V10.SCRATCH_CONTROLS), bv
+    assert len(av) == 2 and 'csa_fixed_rope' in av and 'full_rope' in av, av
+
+
+def t_archive_record_rejects_unverifiable_identity():
+    """Review 13, issue 6: the release index can only record a verified
+    archive with a machine-readable URL; the CI must not need to hard-code the
+    source-only state, but a junk row must still be refused."""
+    import archive_release as AR
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert AR.cmd_record('v1', '/no/such/release.tar.gz', 'ftp://example.org/x') == 1
+        assert AR.cmd_record('v1', '/no/such/release.tar.gz', 'https://example.org/x') == 1
+        assert AR.cmd_record('../v1', '/no/such/release.tar.gz', 'https://example.org/x') == 1
+
+
 def t_panel_synth_scan_sees_non_admitted_variant():
     """Review 12: the 'no reconstruction in this panel' sentence must scan the
     raw summary, not only the two admitted csa/full curves."""
@@ -13084,6 +13112,63 @@ def t_panel_synth_scan_sees_non_admitted_variant():
         assert V10._panel_synth_seeds(d) == []
         os.unlink(os.path.join(d, 'summary.json'))
         assert V10._panel_synth_seeds(d) is None
+
+
+def t_p3mp_probes_scratch_controls():
+    """Review 13, issue 2: P3MTC trains the from-scratch selector controls, and
+    P3MP must actually probe them; otherwise retrain-gap contrasts never exist
+    in a v10-only run.  Each scratch variant is evaluated only on its own
+    learned arm (test-time replacement would re-introduce the confound)."""
+    assert set(V10.SCRATCH_CONTROLS) <= set(V10.PROBE['variants']), V10.PROBE['variants']
+    for v in V10.SCRATCH_CONTROLS:
+        assert V10._arm_of(v, 'learned', V10.PROBE) is True, v
+        assert V10._arm_of(v, 'randidx', V10.PROBE) is False, v
+        assert V10._arm_of(v, 'allblocks', V10.PROBE) is False, v
+    # The main arms keep their full arm grid.
+    assert V10._arm_of('csa_fixed_rope', 'randidx', V10.PROBE) is True
+    assert V10._arm_of('full_rope', 'dense', V10.PROBE) is True
+
+
+def t_full_rope_cos_registered_not_misclaimed():
+    """Review 13, issue 5: a closer dense control exists, but it is explicitly
+    not advertised as an item-wise aligned dense twin."""
+    cfgs = V7.make_layer_cfgs_v7(1, 'full_rope_cos')
+    assert len(cfgs) == 1
+    c = cfgs[0]
+    assert c.kind == 'full' and bool(c.rope) and bool(c.full_cosine), c
+    assert 'full_rope_cos' in V7.ALIGNED_DENSE_VARIANTS
+    assert 'full_rope_cos' not in V7.ROPE_VARIANTS  # historical arm list unchanged
+    for name in ('v7_supp.py', 'v10_supp.py', 'README.md', 'docs/design_notes.md'):
+        txt = open(os.path.join(REPO, name), encoding='utf-8').read()
+        assert '逐项对齐的 dense' not in txt, name
+        assert 'item-by-item-aligned dense' not in txt, name
+
+
+def t_panel_convergence_reports_insufficient_evals():
+    """Review 13, issue 1: a 3-point curve has <4 eval points and must be
+    reported as 'insufficient', not as 'not plateaued'."""
+    hists = {'csa_fixed': {0: {250: 100.0, 500: 90.0, 659: 85.0}},
+             'full': {0: {250: 110.0, 500: 100.0, 659: 95.0}}}
+    out = V10._panel_convergence(hists)
+    for v in ('csa_fixed', 'full'):
+        assert out[v]['n_considered'] == 0, out[v]
+        assert out[v]['n_insufficient_evals'] == 1, out[v]
+        assert out[v]['n_plateaued'] == 0, out[v]
+
+
+def t_scale_param_counts_and_p_floor_fields():
+    """Review 13, issue 1/4: capacity confound and resolution floor are
+    machine-readable for the scale panels."""
+    spec = V10._SCALE_PANEL_SPECS['P3SS']
+    pc = V10._panel_param_counts(spec)
+    assert pc['csa_fixed'] > pc['full'] > 0, pc
+    assert abs(pc['csa_fixed'] - 3970192) < 8, pc
+    assert abs(pc['full'] - 2950272) < 8, pc
+    # p_floor is carried by every exact sign-flip result the scale code stores.
+    st = V7.exact_sign_permutation([1.0, 2.0, 4.0])
+    assert abs(st['p_floor'] - 0.25) < 1e-12, st
+    st2 = V7.exact_sign_permutation([1.0, 2.0])
+    assert abs(st2['p_floor'] - 0.5) < 1e-12, st2
 
 
 def t_report_input_manifest_binds_hashes():
@@ -13514,6 +13599,12 @@ def main():
     _check('N101 archive requires run evidence and packs the ledger', t_archive_requires_run_evidence_and_packs_ledger)
     _check('N102 panel reconstruction scan covers every variant', t_panel_synth_scan_sees_non_admitted_variant)
     _check('N103 report input manifest binds file hashes', t_report_input_manifest_binds_hashes)
+    _check('N104 P3MP probes from-scratch selector controls', t_p3mp_probes_scratch_controls)
+    _check('N105 full_rope_cos registered without aligned-dense claim', t_full_rope_cos_registered_not_misclaimed)
+    _check('N106 convergence distinguishes insufficient evals', t_panel_convergence_reports_insufficient_evals)
+    _check('N107 scale params + p-floor fields', t_scale_param_counts_and_p_floor_fields)
+    _check('N108 archive record refuses unverifiable identity', t_archive_record_rejects_unverifiable_identity)
+    _check('N109 P3MTC uses the same recipe as P3MT', t_p3mtc_matches_p3mt_recipe)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

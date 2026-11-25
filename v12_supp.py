@@ -3785,11 +3785,12 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         res['single_factor_contrast'] = False
         res['system_level_only'] = True
         res['claim_scope'] = ('SYSTEM-LEVEL comparison of frozen arms under one recipe; '
-                              'NOT an isolated-mechanism attribution (the manifest '
-                              'interpretation_caveat lists the rival differences: capacity '
-                              'allocation, training FLOPs, attention kernel, q/kv norm, sink, '
-                              'read fraction). Mechanism attribution additionally requires the '
-                              'selection-attribution artifact and same-backbone controls.')
+                              'NOT an isolated-mechanism attribution. Rival differences include '
+                              'capacity allocation, training FLOPs, attention kernel, q/kv '
+                              'normalization (CSA: L2-normalize then RMSNorm, scale 1.0; '
+                              'dense: RMSNorm only, scale 1/sqrt(d_head)), sink, sliding-window '
+                              'branch and read fraction. Mechanism attribution additionally '
+                              'requires the selection-attribution artifact and same-backbone controls.')
         res['interpretation_caveat'] = comp.get('interpretation_caveat')
         res['data_fp'] = unified_fp
         res['manifest_sha256'] = manifest.get('manifest_sha256')
@@ -4157,7 +4158,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
                 if _cbd_m.get(_ck):
                     A(f"- {_cl}：{_cbd_m[_ck]}")
             A('')
-            A('> 因此确认结果只能表述为「该冻结配方下的**系统级**臂间差异」；不能表述为「学习选择机制导致优势」的单因素结论，也不是「等计算预算下的稀疏 vs dense」。机制归因还需要选择归因工件（selection recall/mass）与同骨干、同投影、同归一化、同 kernel 的隔离对照。')
+            A('> 因此确认结果只能表述为「该冻结配方下的**系统级**臂间差异」；不能表述为「学习选择机制导致优势」的单因素结论，也不是「等计算预算下的稀疏 vs dense」。具体地：CSA 的 q/k 先 L2-normalize、再 RMSNorm，attention scale=1.0；dense 只做 RMSNorm，scale=1/sqrt(d_head)，且无 KV 压缩、sink 与滑窗分支——这些都与臂标签一起变化。机制归因还需要选择归因工件（selection recall/mass）与同骨干、同投影、同归一化、同 kernel 的隔离对照。')
             A('')
         _act_rows = [(k, v) for k, v in comps.items() if isinstance(v, dict)
                      and v.get('active_params_a') is not None
@@ -4281,7 +4282,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     A(f'| `{TEST_OUTDIR}/bylen.json` | P5T：冻结臂在 test split 的干净 by-length 评估 |')
     A(f'| `{TEST_OUTDIR}/distractor.json` | P5T：test split 上的 uniform 腐坏探针（描述性） |')
     A('| `analysis_v12/stats.json` | v10 扩展探针统计 + 冻结确认性统计 |')
-    A('| `analysis_v12/test_stats.json` | 冻结主比较 + Holm 校正（含准入记录、逐文档 doc_sampling 与功效注记） |')
+    A('| `analysis_v12/test_stats.json` | 冻结主比较 + Holm 校正（含准入记录、逐窗口/行 doc_sampling（**不是**逐文档聚类）与功效注记） |')
     A('| `confirmation_frozen.json` | 预注册冻结清单（含修订史、范围声明与机器可校验的绑定块） |')
     A('| `results_lm_test/.freeze_lock.json` | 首次测试访问锁（清单哈希 + test 切片指纹；gitignore 的结果目录内，不入库） |')
     A('| `v12_supp.py` | 本驱动（smoke/phase/analysis/report，可断点续跑） |')
