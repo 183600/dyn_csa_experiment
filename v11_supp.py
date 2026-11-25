@@ -646,7 +646,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     if contr:
         A(f'**系统级对比读数（区间实时算自上方配对检验，n={n_contr_max}，Δ = 对照臂 − 学习选择臂；不是单因素机制归因）：**dense−learned Δ {_fmt(dn)} PPL，allblocks−learned Δ {_fmt(ab)} PPL，randidx−learned Δ {_fmt(ri)} PPL——' + _ri_txt + (f'（统计分辨率：本段引用的对比中，最全的为 n={n_contr_max}、最弱的仅 n={n_tree_min}，精确符号翻转 p 值下限因此是 {_floor_txt}，**未**跨过 0.05——上述读法只作方向性表述。）' if not probe_ok else '') + (f'（统计分辨率：本段引用的是 n={n_tree_min}–{n_contr_max} 的对比，最弱者下限 {floor_p_tree:.3f}；最弱一格仅 n={n_tree_min}，其分辨率仍不足以支撑显著性主张。）' if probe_ok and _pair_ragged else ''))
         A('')
-        A('> **归因边界**：直接机制证据需要 `audit_gates.py selection` 的 selection-attribution 工件（recall/mass vs 依赖 oracle）；当前仓库没有该工件，因此本节只能读作系统级臂间差异。')
+        A('> **归因边界**：直接机制证据需要 `audit_gates.py selection` 的 selection-attribution 工件（recall/mass vs 依赖 oracle）；当前仓库没有该工件，因此本节只能读作系统级臂间差异。另注：本节的 `randidx` 对比是**测试时干预**（把已训练模型的选择器换成固定哈希）；从头训练的随机/全块选择器对照由 v10 P3MTC（`csa_fixed_rope_randidx` / `_allblocks`）提供，本节不把它当作「学习检索有独立贡献」的证据。')
         A('')
     else:
         A('**系统级对比读数**：`analysis_v11/stats.json` 的 `probe.contrasts` 为空，因此 dense/allblocks/randidx 相对 learned 的 Δ 区间**无数据**，本轮不给出读法。这不是「无差异」——是**未测量**。')
@@ -690,10 +690,15 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
             A(f'- d={v['d']}: ' + '；'.join(parts))
         A('')
     _xo256 = xo.get('d256_L6') or next((v for v in xo.values() if v.get('d') == 256), {})
-    if _xo256.get('excluded_reconstructed') or any(((_xo256.get('per_seed_synth') or {}).get(str(s)) for s in _xo256.get('seeds', []))):
-        A('**注意**：d=256 面板含 `synthesized` 重构记录；这些 seed 已从逐种子轨迹、seed 均值轨迹与交叉点拟合中一并剔除（拟合状态为 `reconstruction_only`），因此该规模没有可独立复核的交叉点，本节不引用重构数值。')
+    _xo256_recon = bool(_xo256.get('excluded_reconstructed')) or any(((_xo256.get('per_seed_synth') or {}).get(str(s)) for s in _xo256.get('seeds', [])))
+    _synth_all = V10._panel_synth_seeds('results_lm_v3_long')
+    if _xo256_recon or _synth_all:
+        _ss_txt = (f'（存在 reconstructed seed(s): {', '.join(_synth_all[:6])}{'…' if len(_synth_all) > 6 else ''}）' if _synth_all else '')
+        A('**注意**：d=256 面板含 `synthesized` 重构记录' + _ss_txt + '；凡依赖这些 seed 的逐种子轨迹、seed 均值轨迹与交叉点拟合均已剔除（拟合状态为 `reconstruction_only`），因此该规模没有可独立复核的交叉点，本节不引用重构数值。')
+    elif _synth_all is None:
+        A('**注意**：无法读取 d=256 面板的 `summary.json` 来确认是否存在重构记录——该面板的重构状态是「未知」，不得写成「不含重构记录」。')
     elif _xo256.get('status') == 'ok':
-        A('**注意**：d=256 面板（`results_lm_v3_long`）当前不含重构记录，逐种子交叉步与 seed 均值轨迹同为有效读数。')
+        A('**注意**：d=256 面板（`results_lm_v3_long`）的 summary.json 不含 `synthesized` 记录，逐种子交叉步与 seed 均值轨迹同为有效读数。')
     A('')
     if fit:
         if fit.get('status') != 'ok' or 'slope' not in fit:
@@ -711,18 +716,24 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     if scale384:
         A(f'**d=384 面板（P4F 后，实际 {_n384_txt}）：**')
         A('')
-        A('| variant | PPL (mean±std) | n |')
-        A('|---|---|---|')
+        A('| variant | PPL pooled (`exp(ΣNLL/Σtok)`) | PPL seed mean±std | median [IQR] | n |')
+        A('|---|---|---|---|---|')
         for v, p in scale384.items():
-            A(f'| `{v}` | {_fmt_pm(p)} | {p['n']} |')
+            _pool = p.get('ppl_pooled')
+            _pool_txt = f'{_pool:.2f}' if isinstance(_pool, (int, float)) and np.isfinite(_pool) else '—（缺 NLL/token）'
+            _med = p.get('ppl_median')
+            _iqr = p.get('ppl_iqr')
+            _med_txt = (f'{_med:.2f} [{_iqr[0]:.2f}, {_iqr[1]:.2f}]'
+                        if isinstance(_med, (int, float)) and isinstance(_iqr, (list, tuple)) and len(_iqr) == 2 else '—')
+            A(f'| `{v}` | {_pool_txt} | {_fmt_pm(p)} | {_med_txt} | {p['n']} |')
         A('')
-        A('| 比较 | n | Δ mean±std | p (exact) |')
-        A('|---|---|---|---|')
+        A('| 比较 | n | Δ mean±std | p (exact) | p_Holm |')
+        A('|---|---|---|---|---|')
         for k, v in comp.items():
             if 'omitted' in v:
-                A(f'| {k} | 0 | —（{v['omitted']}） | — |')
+                A(f'| {k} | 0 | —（{v['omitted']}） | — | — |')
                 continue
-            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} |')
+            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} | {v.get('p_holm') if v.get('p_holm') is not None else '—'} |')
         A('')
     A('---')
     A('')
@@ -751,6 +762,8 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     A('重建记录（`synthesized`）的 PPL 是从更早的表里抄来的，没有权重支撑，本报告的配对与聚合都已在读取时把它们剔出——它们不会进入任何Δ、n 或 p 值。上面把它们单独计一列，是为了让「这条记录存在」与「这条记录是一次测量」不再被混为一谈。')
     A('')
     A('---')
+    A('')
+    A('> **效率口径（review 12, issue 14）**：本报告不给出效率结论；解析 FLOPs 只含 attention 项，dense/CSA 的实现路径不同。端到端 prefill/prefix-prefill/峰值显存仅在 v7 报告的 `Measured efficiency` 节实测（真实 checkpoint、同实现），energy 未测；任何吞吐/延迟主张须另做同 kernel 测量。')
     A('')
     A('## 产物清单')
     A('')

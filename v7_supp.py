@@ -2015,6 +2015,7 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
             continue
         common = sorted(set(recs[a]) & set(recs[b]))
         dl, skipped, unstamped = ([], [], 0)
+        _a_vals, _b_vals = [], []
         mismatch_fields = set()
         for s in common:
             ra, rb = (recs[a][s], recs[b][s])
@@ -2033,6 +2034,8 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
                 skipped.append(s)
                 continue
             dl.append(ra['ppl'] - rb['ppl'])
+            _a_vals.append(ra['ppl'])
+            _b_vals.append(rb['ppl'])
         if skipped:
             why = '; '.join(sorted(mismatch_fields)) if mismatch_fields else 'different run_cfg'
             print(f'[stats] {name}: {len(skipped)} seed(s) NOT paired — the two sides have {why}; excluded from the test')
@@ -2041,6 +2044,17 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
             out_d['comparisons'][name] = {'omitted': 'no usable pair after the run_cfg/steps checks', 'n': 0, 'n_skipped_config_mismatch': len(skipped), 'n_unstamped': unstamped}
             continue
         res = exact_sign_permutation(dl)
+        # Review 12: the exact p is a seed-level sign test.  Carry the
+        # assumption boundary and the sensitivity readouts (sign split,
+        # paired/unpaired bootstrap, Wilcoxon) into the published artifact —
+        # paired_effect_stats computes them but v7 previously discarded them.
+        _rob = L.paired_effect_stats(dl, with_values=_a_vals, without_values=_b_vals)
+        res.update({_k: _rob.get(_k) for _k in (
+            'n_nonzero', 'p_floor', 'sign_counts', 'p_wilcoxon',
+            'p_wilcoxon_method', 'ci95_paired_bootstrap',
+            'ci95_unpaired_bootstrap', 'unit', 'assumption',
+            'effect_vs_noise', 'resolution_limited', 'underpowered',
+            'within_seed_noise', 'significant', 'cohens_dz')})
         res['n_skipped_config_mismatch'] = len(skipped)
         res['n_unstamped'] = unstamped
         out_d['comparisons'][name] = res

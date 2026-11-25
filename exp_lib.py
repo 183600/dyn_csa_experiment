@@ -10081,16 +10081,35 @@ def train_objective(m, *, comp_lambda=0.0, delta_lr_mult=1.0):
     # regularizer exists only for cosine_learnable gates, whose trunk computes
     # `last_gate_mean`; deriving this from `need_reg` falsely labels dense and
     # fixed-CSA arms as having a compression objective.
-    reg_layers = sum(1 for a in layers if str(getattr(a.cfg, 'chunking', '')) == 'cosine_learnable')
+    #
+    # Per-layer multiplier (review 12): the trunk sums
+    # `comp_lambda * comp_lambda_mult * (gate*Lb-1)^2`, so two arms with the
+    # same `comp_lambda` can still have different objectives (`csa_dyn_nocomp`
+    # sets mult=0; hybrid HCA layers use mult=4).  The descriptor must carry
+    # the ACTUAL per-layer weights, not just the global coefficient.
+    _reg_mults = [float(getattr(a.cfg, 'comp_lambda_mult', 1.0))
+                  for a in layers
+                  if str(getattr(a.cfg, 'chunking', '')) == 'cosine_learnable']
+    reg_layers = len(_reg_mults)
+    _eff_weights = [float(comp_lambda) * _m for _m in _reg_mults]
     _named = dict(m.named_parameters())
     delta_names = [n for n in _named if 'delta_logit' in n]
     delta_params = sum(int(_named[n].numel()) for n in delta_names)
-    applies = bool(comp_lambda) and reg_layers > 0
+    # A zero multiplier means the term is inert even though the architecture
+    # has a learnable gate: `csa_dyn_nocomp` is exactly that arm.
+    applies = bool(comp_lambda) and any(_w != 0.0 for _w in _eff_weights)
+    _homogeneous = len(set(_eff_weights)) <= 1
     return {
         'comp_lambda': float(comp_lambda),
         'comp_reg_layers': int(reg_layers),
         'comp_reg_applies': bool(applies),
+        # Base coefficient (kept for readers of older records); the exact
+        # objective is `comp_lambda_effective_per_layer` below.
         'comp_lambda_effective': float(comp_lambda) if applies else 0.0,
+        'comp_lambda_effective_per_layer': _eff_weights,
+        'comp_lambda_mults': _reg_mults,
+        'comp_lambda_effective_total': float(sum(_eff_weights)),
+        'comp_lambda_effective_homogeneous': bool(_homogeneous),
         'delta_param_count': int(delta_params),
         'delta_lr_mult': float(delta_lr_mult),
         'delta_lr_effective': float(delta_lr_mult) if delta_params else 1.0,
@@ -10274,6 +10293,23 @@ def objective_reason(ra, rb):
     for k in ('comp_reg_applies', 'delta_lr_effective', 'boundary_policy'):
         if oa.get(k) != ob.get(k):
             diffs.append(k)
+    # Review 12: `comp_reg_applies` is a coarse flag.  Two arms can both apply
+    # a regularizer yet carry different per-layer weights (`csa_dyn_nocomp`
+    # zeroes the multiplier; hybrid HCA layers use 4x), and the old descriptor
+    # could not tell them apart because run_cfg keeps `cl` identical by design.
+    _wa, _wb = (oa.get('comp_lambda_effective_per_layer'),
+                ob.get('comp_lambda_effective_per_layer'))
+    if (_wa is None) != (_wb is None):
+        return ('unverifiable objective weights (only one record carries '
+                'comp_lambda_effective_per_layer)')
+    if _wa is not None:
+        try:
+            _va = [float(_x) for _x in _wa]
+            _vb = [float(_x) for _x in _wb]
+        except (TypeError, ValueError, OverflowError):
+            return 'unverifiable objective weights (malformed comp_lambda_effective_per_layer)'
+        if _va != _vb:
+            diffs.append('comp_lambda_effective_per_layer')
     return ('objective differs: ' + ', '.join(diffs)) if diffs else None
 
 def ppl_is_usable(v):
@@ -11506,6 +11542,40 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     return lo
 
 
+_RELEASE_PLACEHOLDERS = ('—', '-', 'todo', 'tbd', 'pending', 'none', 'n/a', 'na',
+                         'null', 'unknown', '')
+
+
+def release_row_problems(cells):
+    """Schema problems in one RELEASES.md row (review 12).
+
+    A row is evidence only when every field is checkable machine-readable
+    provenance.  The previous parser accepted ANY seven non-placeholder cells,
+    so a typo/scratch row (`aaaa`/`bbbb`) flipped every report banner to
+    `released`.  The audit gate already demanded hex digests; the report
+    banner and the archiver must agree with it.
+    """
+    if not isinstance(cells, (list, tuple)) or len(cells) < 7:
+        return ['row has fewer than 7 columns']
+    tag, date, commit, url, asha, msha, verifier = [str(c).strip() for c in cells[:7]]
+    bad = []
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,63}', tag or ''):
+        bad.append('tag')
+    if not re.fullmatch(r'\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+\-Z]*)?', date or ''):
+        bad.append('date')
+    if not re.fullmatch(r'[0-9a-fA-F]{7,40}', commit or ''):
+        bad.append('Git commit')
+    if not re.fullmatch(r'(?:https?|s3|gs)://[^\s|]+', url or ''):
+        bad.append('archive URL')
+    if not re.fullmatch(r'[0-9a-fA-F]{64}', asha or ''):
+        bad.append('archive SHA-256')
+    if not re.fullmatch(r'[0-9a-fA-F]{64}', msha or ''):
+        bad.append('manifest SHA-256')
+    if (verifier or '').lower() in _RELEASE_PLACEHOLDERS:
+        bad.append('verifier')
+    return bad
+
+
 def evidence_release_status(path=None):
     """Read RELEASES.md and report whether any evidence release is published.
 
@@ -11515,6 +11585,11 @@ def evidence_release_status(path=None):
     claim may only be called auditable after a complete release row exists
     (tag + date + git commit + archive URL + archive SHA-256 + manifest
     SHA-256 + verifier) AND `archive_release.py verify` passes.
+
+    Review 12: "complete" is now schema-checked (hex commit, http(s)/s3/gs
+    URL, two 64-hex digests, ISO date, non-placeholder verifier), not just
+    "seven non-placeholder cells".  Malformed rows are reported, never
+    silently promoted to `released`.
 
     This helper is deliberately conservative: a row with a placeholder (`—`,
     `_none yet_`, `TODO`, `TBD`, `pending`) is NOT a release.  Missing index
@@ -11526,8 +11601,10 @@ def evidence_release_status(path=None):
             text = _f.read()
     except OSError:
         return {'status': 'missing_index', 'complete_rows': 0, 'rows': [],
+                'malformed_rows': 0, 'malformed': [],
                 'note': f'RELEASES.md not readable at {path!r}; no evidence release can be verified'}
     rows = []
+    malformed = []
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith('|'):
@@ -11539,19 +11616,28 @@ def evidence_release_status(path=None):
             continue
         if all(set(c) <= set('-: ') for c in cells[:1]):
             continue
-        placeholders = ('—', '-', 'todo', 'tbd', 'pending', 'none', 'n/a', '')
-        if any(c.lower() in placeholders for c in cells[:7]):
+        if all(c.lower() in _RELEASE_PLACEHOLDERS for c in cells[:7]):
+            continue
+        _bad = release_row_problems(cells)
+        if _bad:
+            malformed.append({'tag': cells[0][:64], 'problems': _bad})
             continue
         rows.append(cells[0])
     _n = len(rows)
     out = {'status': ('released' if _n else 'no_release'),
            'complete_rows': _n, 'rows': rows,
+           'malformed_rows': len(malformed),
+           'malformed': malformed[:5],
            'path': path}
+    if malformed:
+        out['malformed_note'] = (
+            f'{len(malformed)} RELEASES.md row(s) are present but not valid evidence '
+            '(bad tag/date/commit/URL/SHA-256/verifier) — they do NOT count as a release')
     if _n:
-        out['note'] = ('a complete release row exists; a number is independently auditable only '
+        out['note'] = ('a schema-complete release row exists; a number is independently auditable only '
                        'after the published archive passes `python archive_release.py verify`')
     else:
-        out['note'] = ('no complete release row: this repository is source-only and every number '
+        out['note'] = ('no schema-complete release row: this repository is source-only and every number '
                        'in any generated report is NOT independently auditable')
     return out
 
@@ -16621,6 +16707,27 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                                'signal_to_noise': _noise_ratio,
                                'ci95_low': st.get('ci95_low'),
                                'ci95_high': st.get('ci95_high'),
+                               # Robustness readouts from paired_effect_stats
+                               # (review 12): the sign-flip p is a seed-level
+                               # sign test; these make its assumptions and
+                               # sensitivity visible in the serialized
+                               # artifact instead of computing them and
+                               # discarding them.
+                               'p_floor': st.get('p_floor'),
+                               'n_nonzero': st.get('n_nonzero'),
+                               'resolution_limited': st.get('resolution_limited'),
+                               'underpowered': st.get('underpowered'),
+                               'within_seed_noise': st.get('within_seed_noise'),
+                               'sign_counts': st.get('sign_counts'),
+                               'p_wilcoxon': st.get('p_wilcoxon'),
+                               'p_wilcoxon_method': st.get('p_wilcoxon_method'),
+                               'ci95_paired_bootstrap': st.get('ci95_paired_bootstrap'),
+                               'ci95_unpaired_bootstrap': st.get('ci95_unpaired_bootstrap'),
+                               'unit': st.get('unit'),
+                               'assumption': st.get('assumption'),
+                               'effect_vs_noise': st.get('effect_vs_noise'),
+                               'objective_matched': st.get('objective_matched'),
+                               'objective_differences': st.get('objective_differences'),
                                'seed_driven': st.get('seed_driven'),
                                'seed_robust': st.get('seed_robust'),
                                'loo_means': st.get('loo_means'),
@@ -23582,7 +23689,7 @@ def _print_table(agg):
     print('              baseline = what compression adds beyond pure locality.')
     print('blklen = mean learned block length (dynamic layers); bndF1 = boundary alignment F1 mean±std over seeds (v4: n_sample=64);')
     print('        see summary.json for bnd_rand / bnd_excess: excess > 0 means the')
-    print('        learned boundaries are genuinely semantic).')
+    print('        boundaries align with the reference segmentation better than a random-cut baseline; this is a boundary-alignment diagnostic, NOT evidence that the cuts are task-learned or semantic).')
     print('================================================================')
 
 def _print_pairs(summary):

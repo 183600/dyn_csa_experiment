@@ -90,20 +90,49 @@ def _git_state():
 
 
 def _env_snapshot():
-    env = {'python': sys.version.split()[0], 'platform': platform.platform(), 'captured_at': time.strftime('%Y-%m-%dT%H:%M:%S')}
+    env = {'python': sys.version.split()[0], 'platform': platform.platform(),
+           'captured_at': time.strftime('%Y-%m-%dT%H:%M:%S')}
     try:
         import torch
         env['torch'] = torch.__version__
         env['cuda_available'] = torch.cuda.is_available()
         if torch.cuda.is_available():
             env['cuda'] = torch.version.cuda
-            env['gpu'] = torch.cuda.get_device_name(0)
+            env['cudnn'] = torch.backends.cudnn.version()
+            env['gpu_count'] = int(torch.cuda.device_count())
+            env['gpus'] = []
+            for _i in range(int(torch.cuda.device_count())):
+                try:
+                    _prop = torch.cuda.get_device_properties(_i)
+                    env['gpus'].append({'index': _i,
+                                        'name': _prop.name,
+                                        'uuid': str(getattr(_prop, 'uuid', '')),
+                                        'capability': f'{_prop.major}.{_prop.minor}',
+                                        'total_memory_mb': _prop.total_memory / (1 << 20)})
+                except Exception as _ge:
+                    env['gpus'].append({'index': _i, 'error': f'{type(_ge).__name__}: {_ge}'})
+            env['gpu'] = env['gpus'][0].get('name')
+            env['matmul_allow_tf32'] = bool(torch.backends.cuda.matmul.allow_tf32)
+            env['cudnn_allow_tf32'] = bool(torch.backends.cudnn.allow_tf32)
+            try:
+                _sm = subprocess.run(['nvidia-smi', '--query-gpu=driver_version',
+                                      '--format=csv,noheader'], capture_output=True,
+                                     text=True, timeout=30)
+                if _sm.returncode == 0:
+                    env['driver_version'] = _sm.stdout.strip().splitlines()
+            except Exception:
+                pass
     except Exception as e:
         env['torch'] = f'unavailable ({type(e).__name__})'
     try:
         _req = subprocess.run([sys.executable, '-m', 'pip', 'freeze'], capture_output=True, text=True, timeout=120)
         if _req.returncode == 0:
-            env['pip_freeze_head'] = _req.stdout.splitlines()[:400]
+            _lines = _req.stdout.splitlines()
+            # Truncation must be visible: a release that silently drops half
+            # the dependency lock cannot reproduce the environment.
+            env['pip_freeze_n'] = len(_lines)
+            env['pip_freeze_head'] = _lines[:400]
+            env['pip_freeze_truncated'] = len(_lines) > 400
     except Exception:
         pass
     return env
@@ -190,6 +219,20 @@ def _collect(dirs, include_ckpt=False):
                     files.append(_p)
                 else:
                     print(f'[archive] WARNING: skipping non-regular or out-of-repo root log {n} — only regular files are content-attested')
+    except OSError:
+        pass
+    # TimeGuard ledger / run-time accounting: the module docstring promises
+    # `run_time_state*.json`, but the collector previously packed only logs.
+    # A release without the ledger cannot show how much wall-clock each cell
+    # actually consumed.  `.k` is the checkpointed ledger state.
+    try:
+        for n in sorted(os.listdir(REPO)):
+            if (n.startswith('run_time_state') and (n.endswith('.json') or n.endswith('.json.k'))):
+                _p = os.path.join(REPO, n)
+                if _file_inside_repo(_p):
+                    files.append(_p)
+                else:
+                    print(f'[archive] WARNING: skipping non-regular or out-of-repo root ledger {n} — only regular files are content-attested')
     except OSError:
         pass
     # The freeze lock can already be reached by the directory walk above;
@@ -297,6 +340,16 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
     files = _collect(dirs, include_ckpt)
     if not files:
         print('[archive] REFUSE: nothing to archive — the named result dirs do not exist here; run this on the machine holding the artifacts')
+        return 1
+    # Provenance files + an analysis JSON are not a run evidence release: a
+    # release must contain at least one per-run manifest or summary.  Without
+    # it the archive can attest a report but not the measurements behind it.
+    _run_evidence = [p for p in files
+                     if os.path.basename(p) in ('summary.json', 'run_manifest.json')]
+    if not _run_evidence:
+        print('[archive] REFUSE: no per-run evidence found (expected at least one '
+              'summary.json or run_manifest.json under the requested dirs) — an '
+              'analysis-only bundle cannot be published as an evidence release')
         return 1
     base_name = f'release_{tag}'
     man_path_rel = f'{base_name}.MANIFEST.sha256'

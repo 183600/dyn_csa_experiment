@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import collections
+import hashlib
 import json
 import math
 import numbers
 import os
+import subprocess
 
 import numpy as np
 import random
@@ -21,6 +23,61 @@ for _stream in (sys.stdout, sys.stderr):
 REPO = os.path.dirname(os.path.abspath(__file__))
 PAIR_STEP_KEYS = ('steps', 'tokens_seen')
 _LOADED = {}
+_INPUTS = {}
+
+
+def _record_input(path):
+    """Record the content digest of every report input (review 12).
+
+    A report must be bound to the exact result/analysis batch that produced
+    it; otherwise two different runs can generate the same-looking REPORT.
+    Hashing happens once per path, after the file has been parsed.
+    """
+    try:
+        ap = os.path.abspath(path)
+        if ap in _INPUTS:
+            return
+        st = os.stat(ap)
+        h = hashlib.sha256()
+        with open(ap, 'rb') as f:
+            while True:
+                b = f.read(1 << 20)
+                if not b:
+                    break
+                h.update(b)
+        rel = os.path.relpath(ap, REPO)
+        _INPUTS[ap] = {'path': rel, 'sha256': h.hexdigest(),
+                       'size': int(st.st_size), 'mtime_ns': int(st.st_mtime_ns)}
+    except OSError:
+        return
+
+
+_RELEASE_PLACEHOLDERS = ('—', '-', 'todo', 'tbd', 'pending', 'none', 'n/a', 'na',
+                         'null', 'unknown', '')
+
+
+def release_row_problems(cells):
+    """Schema problems in one RELEASES.md row (review 12; twin of exp_lib)."""
+    if not isinstance(cells, (list, tuple)) or len(cells) < 7:
+        return ['row has fewer than 7 columns']
+    tag, date, commit, url, asha, msha, verifier = [str(c).strip() for c in cells[:7]]
+    bad = []
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+-]{0,63}', tag or ''):
+        bad.append('tag')
+    if not re.fullmatch(r'\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+\-Z]*)?', date or ''):
+        bad.append('date')
+    if not re.fullmatch(r'[0-9a-fA-F]{7,40}', commit or ''):
+        bad.append('Git commit')
+    if not re.fullmatch(r'(?:https?|s3|gs)://[^\s|]+', url or ''):
+        bad.append('archive URL')
+    if not re.fullmatch(r'[0-9a-fA-F]{64}', asha or ''):
+        bad.append('archive SHA-256')
+    if not re.fullmatch(r'[0-9a-fA-F]{64}', msha or ''):
+        bad.append('manifest SHA-256')
+    if (verifier or '').lower() in _RELEASE_PLACEHOLDERS:
+        bad.append('verifier')
+    return bad
+
 
 def evidence_release_status(path=None):
     """Local twin of `exp_lib.evidence_release_status` (this builder
@@ -30,15 +87,18 @@ def evidence_release_status(path=None):
     Review 10, issue 1: a source-only repository cannot make a generated
     number independently auditable.  A complete release row is required and
     the archive must pass `archive_release.py verify`; placeholders do not
-    count.
+    count.  Review 12 adds the same schema check as exp_lib: a junk seven-cell
+    row must not flip the banner to `released`.
     """
     path = path or os.path.join(REPO, 'RELEASES.md')
     try:
         with open(path, encoding='utf-8') as _f:
             text = _f.read()
     except OSError:
-        return {'status': 'missing_index', 'complete_rows': 0, 'rows': []}
+        return {'status': 'missing_index', 'complete_rows': 0, 'rows': [],
+                'malformed_rows': 0, 'malformed': []}
     rows = []
+    malformed = []
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith('|'):
@@ -50,12 +110,16 @@ def evidence_release_status(path=None):
             continue
         if all(set(c) <= set('-: ') for c in cells[:1]):
             continue
-        placeholders = ('—', '-', 'todo', 'tbd', 'pending', 'none', 'n/a', '')
-        if any(c.lower() in placeholders for c in cells[:7]):
+        if all(c.lower() in _RELEASE_PLACEHOLDERS for c in cells[:7]):
+            continue
+        _bad = release_row_problems(cells)
+        if _bad:
+            malformed.append({'tag': cells[0][:64], 'problems': _bad})
             continue
         rows.append(cells[0])
     return {'status': ('released' if rows else 'no_release'),
-            'complete_rows': len(rows), 'rows': rows}
+            'complete_rows': len(rows), 'rows': rows,
+            'malformed_rows': len(malformed), 'malformed': malformed[:5]}
 
 
 def evidence_status_banner(path=None):
@@ -112,6 +176,7 @@ def load(path, default=None):
         raise RuntimeError(f'{path} exists but cannot be parsed ({type(_e).__name__}: {_e}); refusing to build a report over corrupt data — repair or remove the file') from _e
     if data is None:
         return default
+    _record_input(path)
     if not isinstance(data, dict):
         raise RuntimeError(
             f'{path} is valid JSON but not an object ({type(data).__name__}); '
@@ -168,6 +233,7 @@ def _hydrate_curve_sidecars(outdir, obj):
                 f'{_path} exists but cannot be parsed '
                 f'({type(_e).__name__}: {_e}); refusing to build a report over '
                 'a corrupt curve sidecar — repair or remove the file') from _e
+        _record_input(_path)
         if not isinstance(_data, dict) or not isinstance(_data.get('ppl_history'), list):
             raise RuntimeError(
                 f'{_path} does not hold a {{"ppl_history": [...]}} object '
@@ -868,6 +934,34 @@ def _pair_condition_tail(r):
     )
 
 
+def _objective_reason(ra, rb):
+    """Non-blocking training-objective disclosure for a paired contrast.
+
+    Same `run_cfg` does not imply the same loss/optimizer objective (sparse
+    arms add `comp_lambda * comp_reg` and scale the delta params' LR).  Unlike
+    `_pair_reason`, a mismatch must NOT drop the pair: dense-vs-sparse is a
+    valid SYSTEM-level comparison.  It only forbids mechanism wording.
+    """
+    oa, ob = ra.get('train_objective'), rb.get('train_objective')
+    if oa is None or ob is None:
+        return 'unverifiable train_objective'
+    if not isinstance(oa, dict) or not isinstance(ob, dict):
+        return 'unverifiable train_objective (malformed)'
+    diffs = [k for k in ('comp_reg_applies', 'delta_lr_effective', 'boundary_policy')
+             if oa.get(k) != ob.get(k)]
+    _wa, _wb = (oa.get('comp_lambda_effective_per_layer'),
+                ob.get('comp_lambda_effective_per_layer'))
+    if (_wa is None) != (_wb is None):
+        return 'unverifiable train_objective (per-layer compression weights on one side only)'
+    if _wa is not None:
+        try:
+            if [float(x) for x in _wa] != [float(x) for x in _wb]:
+                diffs.append('comp_lambda_effective_per_layer')
+        except (TypeError, ValueError, OverflowError):
+            return 'unverifiable train_objective (malformed per-layer weights)'
+    return ('objective differs: ' + ', '.join(diffs)) if diffs else None
+
+
 def paired_row(a_records, b_records):
     common = sorted(set(a_records) & set(b_records))
     if not common:
@@ -919,6 +1013,14 @@ def paired_row(a_records, b_records):
         print('[report] no usable pair left after the run_cfg/steps checks — comparison omitted rather than quoting a cross-config delta')
         return None
     st = exact_signflip(dl)
+    # Non-blocking objective disclosure (review 12, issue 4): attach it to the
+    # statistic so every caller prints/uses the system-level boundary instead
+    # of silently treating the pair as mechanism-clean.
+    _objs = sorted({_objective_reason(a_records[s], b_records[s]) for s in kept})
+    _bad = [x for x in _objs if x and x.startswith('objective differs')]
+    _unk = [x for x in _objs if x and x.startswith('unverifiable')]
+    st['objective_matched'] = (False if _bad else (None if _unk else True))
+    st['objective_differences'] = _bad or _unk
     return (kept, dl, st)
 
 def sec_header():
@@ -988,7 +1090,7 @@ def sec_p0r():
         _gain_note = f'（注：{'；'.join(_gain_conf)}，对应对比同时含容量效应）' if _gain_conf else ''
         lines += [f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL（参数对齐 `full_matched` 时{_w_absm} **{abs(g_abs_m):.2f}**；两者相差 **{g_abs - g_abs_m:+.2f} PPL**，即容量差异贡献的部分）{unmatched_tag(_cf, _mt)}。' if _has_mt else f'- absPE 面板：`csa_fixed` {_w_abs} dense **{abs(g_abs):.2f}** PPL。⚠ **本面板没有参数对齐的 dense 臂**（`full_matched` 缺失），该差距因此**含未剥离的容量效应**，不能作为机制性结论的依据。', f'- RoPE 面板：`csa_fixed_rope` {_w_rope} `full_rope` **{abs(g_rope):.2f}** PPL{rope_unmatched}。', f'- RoPE 使 dense {_d_abs_t}、sparse {_d_sp_t}{_gain_note}。', '']
         if rope_unmatched and rope_is_defect and _has_mt:
-            lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线——落盘记录显示 `full_rope` 的 MLP 停在标准宽度（{_params_m(_fu_r)}），而 `csa_fixed_rope` 保持全宽（{_params_m(_cf_r)}），{f'相差 {100 * _pgap_r:.1f}%' if _pgap_r is not None else '参数差未知'}。对照 absPE 面板，同样的容量差异会贡献约 {g_abs - g_abs_m:.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。需**重跑 P0R 面板**（得到参数对齐的 dense 臂）才能给出该结论；在那之前，**P0-3 的证伪只由 absPE 面板的参数对齐数字支持**。', '']
+            lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线——落盘记录显示 `full_rope` 的 MLP 停在标准宽度（{_params_m(_fu_r)}），而 `csa_fixed_rope` 保持全宽（{_params_m(_cf_r)}），{f'相差 {100 * _pgap_r:.1f}%' if _pgap_r is not None else '参数差未知'}。对照 absPE 面板，同样的容量差异会贡献约 {g_abs - g_abs_m:.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。需**重跑 P0R 面板**（得到参数对齐的 dense 臂）才能给出该结论；在那之前，**P0-3 的混淆假设只能由 absPE 面板的参数对齐数字作探索性方向读数；本报告不给出「证伪」结论**。', '']
         _arms_gain = d_abs > 0 and d_sp > 0
         # These are cross-panel seed means, not paired contrasts.  A positive
         # mean difference is a directional readout only; calling it a "real
@@ -1017,13 +1119,13 @@ def sec_p0r():
                 _mt_gap = g_abs_m
             if _mt_gap > 0:
                 if _mt_sig:
-                    _p0r_concl = f'**结论**：在该受控面板上，PE 错配不足以解释 sparse 劣势（系统级证据，不是单因素机制归因）。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍落后且通过「n≥6 + Holm」统计门槛（|mean|>std 只作稳定性诊断）（{_mt_stat}），**不支持 PE 混淆解释**；但这是该受控面板上的证据，不外推为普遍机制。'
+                    _p0r_concl = f'**探索性读数（不是确认性证伪）**：在该受控面板上，PE 错配不足以解释 sparse 劣势；这是系统级方向性读数，不是单因素机制归因。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）仍落后且通过「n≥6 + Holm」统计门槛（|mean|>std 只作稳定性诊断）（{_mt_stat}），**未显示支持 PE 混淆解释的证据**；但这是该受控面板上的探索性证据，不外推为普遍机制。'
                 else:
                     _p0r_concl = f'**结论（方向性，未确认）**：PE 错配的证据方向与「sparse 劣势」一致。（1）{_gain_txt}；（2）参数对齐的 absPE 数字（`csa_fixed` 对 `full_matched`）方向仍为落后（{_mt_stat}），但未通过显著性/族校正门槛，因此只能说**不能据此排除** PE 混淆，不能写成「混淆假设被证伪」或「机制性落后」。'
             else:
-                _p0r_concl = f'**结论**：{_gain_txt}；但参数对齐的 absPE 数字中 `csa_fixed` 不再落后 `full_matched`（Δ={_mt_gap:+.2f} PPL，{_mt_stat}）——与原论断方向相反，**P0-3 的混淆假设在本轮未被证伪**，PE 错配不能排除在 sparse 的差距之外。'
+                _p0r_concl = f'**探索性读数**：{_gain_txt}；但参数对齐的 absPE 数字中 `csa_fixed` 不再落后 `full_matched`（Δ={_mt_gap:+.2f} PPL，{_mt_stat}）——与原论断方向相反，**本轮未获得排除 P0-3 混淆假设的证据**，PE 错配不能排除在 sparse 的差距之外。'
         else:
-            _p0r_concl = f'**结论（受限）**：`csa_fixed` 在 absPE 面板{_w_abs}未匹配的 `full`，{_gain_txt}。但**参数对齐的 absPE 臂（`full_matched`）在本面板缺失**，所以「容量差贡献了多少」无法剥离，**P0-3 的证伪在本轮没有证据支持**——本条只作方向性表述，须待 `full_matched` 产出后方可作结论。'
+            _p0r_concl = f'**方向性读数（受限）**：`csa_fixed` 在 absPE 面板{_w_abs}未匹配的 `full`，{_gain_txt}。但**参数对齐的 absPE 臂（`full_matched`）在本面板缺失**，所以「容量差贡献了多少」无法剥离，**不能得出 P0-3 混淆假设被排除的结论**——本条只作方向性表述，须待 `full_matched` 产出后方可再评估。'
         lines += [_p0r_concl, '']
     return '\n'.join(lines) + '\n'
 
@@ -1195,7 +1297,7 @@ def sec_p0w():
                 _conc.append('各 warm 档方向一致（预热更差），dense 预热在方向上**未能**拯救 sparse 臂，但没有一档达到配对检验的显著性（分辨率见上）——**P0-1 的质疑按方向不成立，按显著性则既不能证伪也不能确认**，须补更多 seeds 后再判。')
         elif _ds and all((x < 0 for x in _ds)):
             if any(_ds_sig):
-                _conc.append('即 dense 预热对 sparse 臂**有**真实帮助——**P0-1 的质疑成立**，from-scratch 对比不利于 sparse，相关负结果须按带 warmup 的设定重审。')
+                _conc.append('即在该探索性面板上，dense 预热对 sparse 臂有通过统计门槛的方向性帮助——**P0-1 的质疑在该面板上成立（方向性，非确认性）**；from-scratch 对比须按带 warmup 的设定重审，但不能把这条写成已确认的机制结论。')
             else:
                 _conc.append('各 warm 档方向一致（预热更好），dense 预热在方向上对 sparse 臂有帮助，但没有一档达到配对检验的显著性（分辨率见上）——**P0-1 质疑既不能证伪也不能确认**，须补更多 seeds 后再判。')
         elif _ds:
@@ -1622,6 +1724,38 @@ def sec_p1t():
         lines.append('3. 全部扫描点均已完成，「甜点位置」以本面板数据为准。')
     return '\n'.join(lines) + '\n'
 
+def _pooled_cells(cells):
+    """Token-pooled PPL over independent seed cells.
+
+    Each cell stores the total NLL and token count of its evaluation pass, so
+    exp(sum NLL / sum tokens) is the pooled estimator.  Returns
+    (ppl, nll_sum, n_tokens) or (None, None, None) when any cell lacks usable
+    totals — the caller must then label the arithmetic mean as a fallback.
+    """
+    _nll, _tok = [], []
+    for _c in cells if cells else []:
+        if not isinstance(_c, dict):
+            return (None, None, None)
+        _n = _c.get('nll_sum')
+        _t = _c.get('n_tokens') if _c.get('n_tokens') is not None else _c.get('n_tok')
+        _nf, _ti = _as_finite(_n), _int_or(_t, None)
+        if _nf is None or _ti is None or _ti <= 0 or _nf < 0.0:
+            return (None, None, None)
+        _nll.append(_nf)
+        _tok.append(_ti)
+    if not _nll or not any(_tok):
+        return (None, None, None)
+    _tot_t = sum(_tok)
+    if _tot_t <= 0:
+        return (None, None, None)
+    _ce = sum(_nll) / _tot_t
+    try:
+        _ppl = math.exp(_ce)
+    except OverflowError:
+        return (None, None, None)
+    return (float(_ppl), float(sum(_nll)), int(_tot_t))
+
+
 def sec_p1l():
     s = summary('results_len')
     if not s:
@@ -1758,9 +1892,11 @@ def sec_p1l():
         v: sorted({_sd for r in recs if r.get('variant') == v
                    for _sd in [_norm_seed(r.get('seed'))] if _sd is not None})
         for v in variants}
-    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**待检验论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训练（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、超出部分只取末尾 `max_pos` 个 token 截断评测——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；`?` = 该格缺少 `truncated` 标记，按不可验证处理（不参与 ratio）；未标注的格是完整 `Ln` 长度评测。', '', '> **长度口径（review 10, issue 10）**：PPL@Ln 评的是每行位置 1..Ln−1 的前缀目标（Ln=512 ⊂ 1024 ⊂ …，目标集合随长度嵌套），不是「同一组目标 token、不同上下文长度」的比较；训练长度固定 512、块数 = ceil(Ln/4)、top-k 固定，读取比例随长度下降。长长度 PPL 同时混合目标位置构成、未见远距位置暴露、局部性与无关信息暴露变化，**不能**单独归因为「更会利用长上下文」。局部窗口基线族（`full_sw128*`）与远端移除/距离分桶读数不在本表内；需另设探针（design_notes §22.6 / v10 P3M）。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
+    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**待检验论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训练（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、超出部分只取末尾 `max_pos` 个 token 截断评测——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；`?` = 该格缺少 `truncated` 标记，按不可验证处理（不参与 ratio）；`*` = 记录缺少 `nll_sum`/`n_tokens`，该格退回算术平均 PPL（不是 pooled 估计），不得与 pooled 格混读；未标注的格是完整 `Ln` 长度、跨 seed 的 **token-pooled** PPL（`exp(ΣNLL/Σtokens)`）。', '', '> **长度口径（review 10, issue 10；review 12 收紧）**：PPL@Ln 评的是每行位置 1..Ln−1 的前缀目标（Ln=512 ⊂ 1024 ⊂ …，目标集合随长度嵌套），不是「同一组目标 token、不同上下文长度」的比较；训练长度固定 512、块数 = ceil(Ln/4)、top-k 固定，读取比例随长度下降。长长度 PPL 同时混合目标位置构成、未见远距位置暴露、局部性与无关信息暴露变化，**不能**单独归因为「更会利用长上下文」。局部窗口基线族（`full_sw128*`）与远端移除/距离分桶读数不在本表内；需另设探针（design_notes §22.6 / v10 P3M）。**本节是 512 训练长度下的外推探针，不是长上下文训练，也不支持「稀疏注意力适合长上下文」的广泛结论；每格的 n 与是否 pooled 见上表/脚注。**', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
     per_v = {}
     trunc_v = {}
+    _ratio_basis_v = {}
+    _cell_meta = {}
     # Group by variant (preserving order).
     _recs_by_v = {}
     for _r in recs:
@@ -1768,6 +1904,7 @@ def sec_p1l():
     for v in variants:
         cells = []
         base_map, last_map = ({}, {})
+        base_pooled, last_pooled = ({}, {})
         trunc_flags = []
         for Ln in lens:
             recs_l = []
@@ -1806,18 +1943,46 @@ def sec_p1l():
             vals = [float(x['ppl']) for x in ok]
             trunc_flags.append(is_tr)
             mean = sum(vals) / len(vals) if vals else None
-            if mean is None:
+            # Primary readout: pooled token-level PPL over the seeds that
+            # share this non-truncated length.  Per-seed PPL is an
+            # exponentiated quantity; averaging it is not the population
+            # estimator when token counts/seed differ.  Fall back explicitly
+            # (marker `*`) when a record lacks nll_sum/n_tokens.
+            _pooled_val, _pnll, _ptok = _pooled_cells(ok)
+            _med_val = float(np.median(vals)) if vals else None
+            _disp = _pooled_val if _pooled_val is not None else mean
+            _mark = '' if _pooled_val is not None else ('*' if mean is not None else '')
+            if _disp is None:
                 cells.append('—' if not recs_l else '?')
             else:
-                cells.append(f'~{mean:.1f}' if is_tr else f'{mean:.1f}')
+                cells.append(f'~{_disp:.1f}' if is_tr else f'{_disp:.1f}{_mark}')
+            _cell_meta.setdefault(Ln, {})['n'] = len(ok)
+            _cell_meta[Ln]['nll'] = _pnll
+            _cell_meta[Ln]['tok'] = _ptok
+            _cell_meta[Ln]['median'] = _med_val
             if ok and not is_tr:
                 _tgt = base_map if Ln == lens[0] else last_map if Ln == lens[-1] else None
                 if _tgt is not None:
                     for _sd, x in recs_l:
                         _tgt[str(_sd)] = float(x['ppl'])
+                _ptgt = base_pooled if Ln == lens[0] else last_pooled if Ln == lens[-1] else None
+                if _ptgt is not None and _pooled_val is not None:
+                    _ptgt['ppl'] = _pooled_val
+                    _ptgt['tok'] = _ptok
         _matched = sorted(set(base_map) & set(last_map))
-        ratio = sum((last_map[sd] / base_map[sd] for sd in _matched)) / len(_matched) if _matched and len(lens) >= 2 else None
+        # Ratio of pooled PPLs when both endpoints are pooled; otherwise the
+        # per-seed ratio mean (never a ratio of two arithmetic means).
+        if base_pooled.get('ppl') is not None and last_pooled.get('ppl') is not None:
+            ratio = last_pooled['ppl'] / base_pooled['ppl']
+            _ratio_basis = 'pooled(PPL)'
+        elif _matched and len(lens) >= 2:
+            ratio = sum((last_map[sd] / base_map[sd] for sd in _matched)) / len(_matched)
+            _ratio_basis = f'mean of {len(_matched)} per-seed ratios'
+        else:
+            ratio = None
+            _ratio_basis = '—'
         per_v[v] = ratio
+        _ratio_basis_v[v] = _ratio_basis
         trunc_v[v] = trunc_flags
         rt_txt = f'×{ratio:.2f}' if _finite_or_none(ratio) is not None else '—'
         _vmark = '，⚠ 陈旧' if v in _stale_vars else ''
@@ -1851,17 +2016,24 @@ def sec_p1l():
             elif _rl:
                 _ptag = ' (⚠ params 各 seed 不一致，无法判定是否对齐)'
             _tail = f'（`csa_fixed_rope` ×{_ra:.2f} vs `full_rope` ×{_rb:.2f}，差值 {abs(dv):.2f} 个比值单位{_ptag}）'
+            _n_r = len(_seeds_by_v.get('csa_fixed_rope', []))
+            _n_f = len(_seeds_by_v.get('full_rope', []))
+            _basis = (f"ratio 口径：`csa_fixed_rope` = {_ratio_basis_v.get('csa_fixed_rope', '—')}，"
+                      f"`full_rope` = {_ratio_basis_v.get('full_rope', '—')}；n={_n_r}/{_n_f} seeds")
             if abs(dv) < 0.05:
-                note = 'sparse 与 dense 的长度外推退化**基本相同**——在该受控规模，块级稀疏未额外损害长度外推。' + _tail
+                note = ('两臂在该探针上的相对退化差值小于 0.05（描述性读数）——**不能**据此声称「块级稀疏未损害长度外推」；'
+                        '该差值没有 seed-level 区间，也未做配对检验。')
             elif dv > 0:
-                note = f'`csa_fixed_rope` 的长度外推退化比 `full_rope` 多 {abs(dv):.2f} 个比值单位——压缩 KV / 块级检索在超出训练长度后损失放大，这与「长距依赖检索是 CSA 软肋」的机制一致。' + _tail
+                note = (f'`csa_fixed_rope` 的相对退化比 `full_rope` 多 {abs(dv):.2f} 个比值单位（描述性系统级差异）。'
+                        '长度增加同时改变目标构成、块数、top-k 读取比例与位置编码暴露，**不能**把这个差值归因于「长距检索机制」或「CSA 软肋」。')
             else:
-                note = f'`csa_fixed_rope` 的长度外推退化低于 `full_rope` {abs(dv):.2f} 个比值单位——稀疏掩码滤掉了远距噪声，外推更稳。' + _tail
-            lines += ['', f'**结论**：{note}', '']
+                note = (f'`csa_fixed_rope` 的相对退化低于 `full_rope` {abs(dv):.2f} 个比值单位（描述性系统级差异）。'
+                        '这**不是**「稀疏掩码滤掉远距噪声」的机制证据：两臂同时改变表示、容量与读取范围，且没有 seed-level 区间。')
+            lines += ['', f'**描述性读数（非确认、非机制归因）**：{note}{_tail}。{_basis}。', '']
         elif 'csa_fixed_rope' in per_v and 'full_rope' in per_v:
             _ra_t = f"×{per_v['csa_fixed_rope']:.2f}" if _finite_or_none(per_v.get('csa_fixed_rope')) is not None else '—'
             _rb_t = f"×{per_v['full_rope']:.2f}" if _finite_or_none(per_v.get('full_rope')) is not None else '—'
-            lines += ['', f'**结论**：外推对比只看两个 RoPE 臂（`csa_fixed_rope` {_ra_t} vs `full_rope` {_rb_t}）——absPE 臂在 `max_pos` 之外没有可比的读数，**不参与**该对比。', '']
+            lines += ['', f'**读法**：外推对比只看两个 RoPE 臂（`csa_fixed_rope` {_ra_t} vs `full_rope` {_rb_t}）——absPE 臂在 `max_pos` 之外没有可比的读数，**不参与**该对比；该对比仍只是描述性探针。', '']
         lines.append('')
     lines.append('图：`results_len/length_gen.png`（PPL 与相对比值 vs 评测长度）。')
     lines.append('')
@@ -1972,7 +2144,7 @@ def sec_p2s():
             # The local holm_adjust returns {name: adjusted_float}; this is
             # deliberately not exp_lib's {name: {'p_holm': ...}} shape.
             st['p_holm'] = _p2s_holm.get(f'P2S {a} - {b}')
-        lines += ['', '**配对检验（同 seed 配对，符号翻转）**：', '', '| 比较 | n (配对 seeds) | Δ (a−b) mean±std | p | params |', '|---|---|---|---|---|']
+        lines += ['', '**配对检验（同 seed 配对，符号翻转）**：', '', '| 比较 | n (配对 seeds) | Δ (a−b) mean±std | p | p 下限 | p_Holm | params |', '|---|---|---|---|---|---|---|']
         for a, b, common, st in rows:
             # Every p-value printed in this table belongs to the report's
             # global multiplicity family, not only the one row later used by
@@ -1981,7 +2153,19 @@ def sec_p2s():
                              family='P2S', p_holm=st.get('p_holm'),
                              n=st.get('n'), mean=st.get('mean'))
             _pl = f'{st["p_exact_signflip"]:.3f}' + (' (saddlepoint)' if str(st.get('method', '')).startswith('saddlepoint') else ' (exact)')
-            lines.append(f'| `{a}` − `{b}` | {len(common)} | {st['mean']:+.2f} ± {st['std']:.2f} | {_pl} | {unmatched_tag(_agg_entry(_agg, a), _agg_entry(_agg, b)) or '✓'} |')
+            _nst = _int_or(st.get('n'), len(common))
+            _nn = _int_or(st.get('n_nonzero'), _nst)
+            _floor = (1.0 if _nn == 0 else
+                      (math.ldexp(2.0, -_nn) if _nn and 0 < _nn <= (_nst or _nn)
+                       else float('nan')))
+            lines.append(f'| `{a}` − `{b}` | {len(common)} | {st['mean']:+.2f} ± {st['std']:.2f} | {_pl} | {fm(_floor, 4)} | {fm(st.get('p_holm'), 4)} | {unmatched_tag(_agg_entry(_agg, a), _agg_entry(_agg, b)) or '✓'} |')
+        lines += ['', '> `p 下限` = 该配对 n 下精确符号翻转能达到的最小双侧 p（2/2^n_nonzero）；`p_Holm` 是 P2S 展示族的 step-down 校正值。任一为 — 时不得把该行写成显著。', '']
+        _objdiff = [f'`{a}` − `{b}`' for a, b, _c, st in rows
+                    if st.get('objective_matched') is False]
+        if _objdiff:
+            lines += [f'> **训练目标不匹配（系统级边界）**：{', '.join(_objdiff)} 的 `train_objective` 不同（压缩正则是否生效/权重或 delta 参数 LR 倍数不同；`run_cfg` 相同并不代表目标相同）。这些行只能读作**该冻结/探索配方下的系统级臂间差异**，不能写成「注意力结构本身」的机制归因。', '']
+        if any(st.get('objective_matched') is None for _a, _b, _c, st in rows):
+            lines += ['> 有比较的记录缺少 `train_objective` 描述符——目标是否一致**不可验证**，同样不得作机制归因。', '']
         main = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full'), None)
         _mt = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full_matched'), None) if _agg_entry(_agg, 'full_matched') is not None else None
         _base = _mt if _mt else main
@@ -2014,6 +2198,93 @@ def sec_p2s():
                          + (f'{_tag}' if _tag else '✓'))
             lines += ['', f'**结论**：{concl}', '']
     return '\n'.join(lines) + '\n'
+
+def _resource_rows():
+    """Per-arm resource accounting (review 12, issue 5).
+
+    Headline comparisons previously printed only one `params` number.  A
+    capacity/confound read needs the recorded breakdown (total / attention /
+    MLP / indexer / active), the structural KV footprint and the actual
+    training objective.  All values are structure-only counts read from the
+    run records; they are NOT measured FLOPs or throughput.
+    """
+    rows = []
+    for panel, summ in _result_summaries().items():
+        if not isinstance(summ, dict):
+            continue
+        for key, rec in summ.items():
+            if not isinstance(rec, dict) or rec.get('synthesized'):
+                continue
+            if not _CUR_CS or rec.get('_code') != _CUR_CS:
+                continue
+            pb = rec.get('param_breakdown')
+            if not isinstance(pb, dict) or not pb:
+                continue
+            v = _record_variant(rec, key)
+            if v is None:
+                continue
+            kv = rec.get('kv_cache_elements_per_token')
+            kvn = None
+            if isinstance(kv, dict):
+                kvn = _int_or(kv.get('elements_per_token_total'), None)
+            to = rec.get('train_objective') if isinstance(rec.get('train_objective'), dict) else {}
+            rows.append({
+                'panel': panel, 'key': key, 'variant': v,
+                'total': _int_or(pb.get('total'), None),
+                'attention': _int_or(pb.get('attention'), None),
+                'attention_indexer': _int_or(pb.get('attention_indexer'), None),
+                'mlp': _int_or(pb.get('mlp'), None),
+                'active': _int_or(pb.get('active'), None),
+                'dead': _int_or(pb.get('dead_params'), 0),
+                'n_layers': _int_or(pb.get('n_layers'), None),
+                'kv_per_token': kvn,
+                'comp_reg_applies': to.get('comp_reg_applies'),
+                'comp_weights': to.get('comp_lambda_effective_per_layer'),
+                'delta_lr_effective': to.get('delta_lr_effective'),
+                'params': _int_or(rec.get('params'), None),
+                'tokens_seen': _int_or(rec.get('tokens_seen'), None),
+            })
+    # One row per (panel, variant); if the same variant appears with two
+    # different breakdowns in one panel, keep each distinct fingerprint.
+    seen = {}
+    for r in rows:
+        key = (r['panel'], r['variant'], r['total'], r['active'], r['kv_per_token'])
+        if key in seen:
+            continue
+        seen[key] = r
+    return list(seen.values())
+
+
+def _mcount(x):
+    return f'{x / 1e6:.3f}' if isinstance(x, int) and x > 0 else '—'
+
+
+def sec_resources():
+    rows = _resource_rows()
+    if not rows:
+        return ''
+    lines = ['## 逐臂资源与训练目标披露（review 12, issue 5）', '',
+             '**目的**：headline 比较只印一个 `params` 数字会把「参数量匹配」读成「容量/目标/计算匹配」。下表从每条 run 记录读取结构计数，逐臂披露参数量分组、有效参数、KV 结构占用与**实际训练目标**。**这些不是实测 FLOPs/吞吐**；解析注意力 FLOPs 见下一节，端到端效率见 `## Measured efficiency`。', '',
+             '| 面板 | variant | total(M) | attention(M) | indexer(M) | MLP(M) | active(M) | dead | layers | KV elem/token | comp_reg | ΔLR mult | tokens seen |',
+             '|---|---|---|---|---|---|---|---|---|---|---|---|---|']
+    for r in rows[:60]:
+        _comp = ('yes' if r.get('comp_reg_applies') is True else
+                 'no' if r.get('comp_reg_applies') is False else '—')
+        _w = r.get('comp_weights')
+        if isinstance(_w, list) and _w:
+            _wu = sorted({round(float(x), 6) for x in _w if isinstance(x, (int, float))})
+            _comp += ' [' + (', '.join(f'{x:g}' for x in _wu[:4]) + ('…' if len(_wu) > 4 else '')) + ']'
+        _dlr = r.get('delta_lr_effective')
+        lines.append('| %s | `%s` | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
+            r['panel'], r['variant'], _mcount(r.get('total')), _mcount(r.get('attention')),
+            _mcount(r.get('attention_indexer')), _mcount(r.get('mlp')), _mcount(r.get('active')),
+            (r.get('dead') or 0), (r.get('n_layers') if r.get('n_layers') is not None else '—'),
+            (r.get('kv_per_token') if r.get('kv_per_token') is not None else '—'),
+            _comp, (f'{float(_dlr):g}' if isinstance(_dlr, (int, float)) else '—'),
+            (f'{r["tokens_seen"] / 1e6:.1f}M' if r.get('tokens_seen') else '—')))
+    lines += ['', '> **读法（务必先读）**：`total` 是全模型参数量；`active = total − dead`（random-indexer 层的 indexer 投影是死参数）；`attention` 含 q/o、KV 与 indexer，`MLP` 与 `indexer` 单独列出；`KV elem/token` 是结构元素数（不是字节，也不含索引器工作区）。**参数量匹配 ≠ 计算匹配 ≠ 有效容量匹配**：dense 臂的 FLOPs/读取比例/核实现与 sparse 臂不同（§computation disclosure），train/inference FLOPs 未逐臂实测。`comp_reg [w…]` 是每层实际 `comp_lambda × comp_lambda_mult` 权重；不同权重/不同 `ΔLR mult` 的臂是**不同训练目标**，只能作系统级比较。', '']
+    return '\n'.join(lines) + '\n'
+
 
 def sec_flops():
     d = load(os.path.join(REPO, 'analysis_v7', 'flops_analytic.json'))
@@ -2467,7 +2738,7 @@ def sec_stats():
                 f'> **陈旧分析已排除**：`analysis_v7/stats.json` 的代码语义戳为 `{_dcode}`，'
                 f'与当前 `{_CUR_CS}` 不一致（或缺失）。本节不引用其 p 值/Holm 值，也不给出显著性结论；'
                 '用当前代码重建该分析后再纳入。\n\n')
-    lines = ['## 配对符号翻转检验（sign-flip permutation）', '', '符号翻转检验：n≤20 枚举全部 2^n 种符号组合得精确双侧 p 值；20<n≤40 用 meet-in-the-middle 精确计数；n>40 用确定性的 Lugannani-Rice 鞍点尾近似（不是随机 Monte-Carlo）。n 很小时 p 的分辨率下限为 2/2^n，报告 Δ、方向同向性与该下限。', '', '> **证据等级：探索性（v7 面板）**。Holm 列在本报告展示的对比族内做 step-down 校正，防止把多格 p<0.05 读成多个发现；它不是预注册确认，也不能把 v7–v11 已看过的数据变成确认性证据（见 docs/design_notes.md §17）。', '', '| 比较 | Δ(mean) | p | p_Holm |', '|---|---|---|---|']
+    lines = ['## 配对符号翻转检验（sign-flip permutation）', '', '符号翻转检验：n≤20 枚举全部 2^n 种符号组合得精确双侧 p 值；20<n≤40 用 meet-in-the-middle 精确计数；n>40 用确定性的 Lugannani-Rice 鞍点尾近似（不是随机 Monte-Carlo）。n 很小时 p 的分辨率下限为 2/2^n，报告 Δ、方向同向性与该下限。', '', '> **证据等级：探索性（v7 面板）**。Holm 列在本报告展示的对比族内做 step-down 校正，防止把多格 p<0.05 读成多个发现；它不是预注册确认，也不能把 v7–v11 已看过的数据变成确认性证据（见 docs/design_notes.md §17）。', '', '> **假设边界（review 12）**：H0 = 每个 seed 的配对差符号关于 0 对称。同 seed / 同数据顺序 / 同初始化只是**控制**，不提供随机分配处理意义上的交换性；架构导致的 RNG 与优化轨迹差异属于「臂」的一部分。**p 是 seed-level，不是 token/window-level**；配对 bootstrap CI 与 Wilcoxon 只是敏感性读数，不改变这一点。', '', '| 比较 | n | Δ(mean) | 符号 (+/−/0) | p (seed-level) | p 下限 | p_Holm | 配对 bootstrap 95% CI | 非配对 bootstrap 95% CI | Wilcoxon p |', '|---|---|---|---|---|---|---|---|---|---|']
     items = d.get('comparisons', {}) if isinstance(d, dict) else {}
     if not isinstance(items, dict):
         # A malformed analysis file yields an ABSENT comparison table; a
@@ -2498,27 +2769,129 @@ def sec_stats():
         # The slot enters Holm, but the raw value stays absent for the global
         # audit: a failed measurement is "untestable", not a real p=1 result.
         _raw_p[k] = _pv if _valid else None
-    _holm = holm_adjust(_pairs, alpha=0.05) if _pairs else {}
+    # The analysis artifact declares its comparison family
+    # (`family.declared`).  If a declared comparison is absent from `items`
+    # (rather than stored as an explicit `omitted` row), the local Holm family
+    # must NOT silently shrink: missing declared slots enter as p=1.  They are
+    # not displayed (nothing was measured) and are not registered in the
+    # cross-panel audit (no number is shown for them).
+    _fam_meta = d.get('family') if isinstance(d, dict) else None
+    _declared = _int_or((_fam_meta or {}).get('declared'), None) if isinstance(_fam_meta, dict) else None
+    _declared = max(0, int(_declared or 0))
+    _m_declared = max(_declared, len(_pairs))
+    _holm_pairs = list(_pairs) + [(f'__declared_missing_{_i}__', 1.0)
+                                  for _i in range(_m_declared - len(_pairs))]
+    _holm = holm_adjust(_holm_pairs, alpha=0.05) if _holm_pairs else {}
     # The displayed family is itself part of the report's global selection:
     # register every displayed comparison (invalid/omitted ones included) so
     # the cross-panel audit counts them with a p=1 slot, never drops them.
     for _k, _pv in _pairs:
         _note_comparison(f'STATS {_k}', _raw_p[_k], family='v7 displayed comparisons',
                          p_holm=_holm.get(_k))
+
+    def _ci_txt(_ci):
+        if isinstance(_ci, (list, tuple)) and len(_ci) == 2:
+            _lo, _hi = _as_finite(_ci[0]), _as_finite(_ci[1])
+            if _lo is not None and _hi is not None and _lo <= _hi:
+                return f'[{_lo:.3f}, {_hi:.3f}]'
+        return '—'
+
+    def _sign_txt(_v):
+        _sc = _v.get('sign_counts')
+        if not isinstance(_sc, dict):
+            return '—'
+        _p, _n, _z = (_int_or(_sc.get(k), 0) for k in ('positive', 'negative', 'zero'))
+        return f'{_p}/−{_n}/{_z}'
+
+    def _floor_txt(_v):
+        _pf = _as_finite(_v.get('p_floor'))
+        if _pf is not None and 0.0 < _pf <= 1.0:
+            return f'{_pf:.4f}'
+        _n = _int_or(_v.get('n'), None)
+        if _n is None or _n <= 0:
+            return '—'
+        _nn = _int_or(_v.get('n_nonzero'), _n)
+        if _nn is None or _nn < 0 or _nn > _n:
+            _nn = _n
+        return f'{math.ldexp(2.0, -_nn):.4f}' if _nn else '1.0000'
+
     for k, v in items.items():
         if not isinstance(v, dict):
             continue
         if 'omitted' in v:
-            lines.append('| %s | —（%s） | — | — |' % (k, v.get('omitted')))
+            lines.append('| %s | 0 | —（%s） | — | — | — | — | — | — | — |' % (k, v.get('omitted')))
             continue
         _dv = v.get('mean') if v.get('mean') is not None else v.get('delta')
         _pv = v.get('p_exact_signflip') if v.get('p_exact_signflip') is not None else v.get('p')
         _ph = _holm.get(k)
         _method = str(v.get('method') or '')
         _pt = fm(_pv, 4) + (' (saddlepoint)' if _method.startswith('saddlepoint') else (' (MITM)' if _method == 'exact-mitm' else ''))
-        lines.append('| %s | %s | %s | %s |' % (k, fm(_dv), _pt, fm(_ph, 4)))
-    lines += ['', '> 若未校正 p<0.05 而 p_Holm≥0.05，只能写「名义上显著、族内未校正通过」，不能写成显著效应。', '']
+        lines.append('| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
+            k, _int_or(v.get('n'), '—'), fm(_dv), _sign_txt(v), _pt, _floor_txt(v),
+            fm(_ph, 4), _ci_txt(v.get('ci95_paired_bootstrap')),
+            _ci_txt(v.get('ci95_unpaired_bootstrap')), fm(v.get('p_wilcoxon'), 4)))
+    if _m_declared > len(_pairs):
+        lines += ['', f'> **校正族没有缩小**：`analysis_v7/stats.json` 声明 m={_m_declared} 个比较，但只有 {len(_pairs)} 行落盘；缺失的 {_m_declared - len(_pairs)} 个已声明比较按 p=1 槽位参与 Holm，因此上表 p_Holm 按完整声明族计算，而不是只按实际出现的行。', '']
+    lines += ['', '> 若未校正 p<0.05 而 p_Holm≥0.05，只能写「名义上显著、族内未校正通过」，不能写成显著效应。`p 下限` 是该 n 下精确检验能达到的最小 p；`p 下限 > 0.05` 时该行在构造上不可能显著，只能作方向性读数。', '']
     return '\n'.join(lines) + '\n'
+
+def sec_input_manifest():
+    """Bind the report to the exact input files (review 12, issue 15)."""
+    if not _INPUTS:
+        return ''
+    _items = sorted(_INPUTS.values(), key=lambda r: r['path'])
+    lines = ['## 报告输入清单（与具体 results/analysis 批次绑定）', '',
+             '**目的**：同一份报告文本可以由不同 batch 的结果生成；下表是本次构建实际读取的每个输入文件的 SHA-256，报告正文与这些字节绑定。归档时把本表与 `analysis_v7/report_inputs.json` 一起发布，才能证明「哪个 batch 生成了这份报告」。', '',
+             '| input | size (bytes) | SHA-256 |', '|---|---|---|']
+    for r in _items[:80]:
+        lines.append(f"| `{r['path']}` | {r['size']} | `{r['sha256']}` |")
+    if len(_items) > 80:
+        lines += ['', f'> 其余 {len(_items) - 80} 个输入见 `analysis_v7/report_inputs.json`（同一份清单，不截断）。']
+    try:
+        _head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=REPO, capture_output=True,
+                               text=True, timeout=30)
+        _head_txt = _head.stdout.strip() if _head.returncode == 0 else 'unavailable'
+    except Exception:
+        _head_txt = 'unavailable'
+    _all = hashlib.sha256()
+    for r in _items:
+        _all.update(f"{r['sha256']}  {r['path']}\n".encode('utf-8'))
+    lines += ['', f'**git HEAD**：`{_head_txt}`；**输入数**：{len(_items)}；**清单摘要**：`{_all.hexdigest()}`。', '']
+    return '\n'.join(lines) + '\n'
+
+
+def _write_input_sidecar(report_path):
+    if not _INPUTS:
+        return None
+    try:
+        _head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=REPO, capture_output=True,
+                               text=True, timeout=30)
+        _head_txt = _head.stdout.strip() if _head.returncode == 0 else None
+    except Exception:
+        _head_txt = None
+    payload = {'report': os.path.basename(report_path),
+               'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+               'git_head': _head_txt,
+               'inputs': sorted(_INPUTS.values(), key=lambda r: r['path'])}
+    outdir = os.path.join(REPO, 'analysis_v7')
+    os.makedirs(outdir, exist_ok=True)
+    out = os.path.join(outdir, 'report_inputs.json')
+    fd, tmp = tempfile.mkstemp(dir=outdir, prefix='report_inputs.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, out)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    print(f'[report] wrote input manifest {out} ({len(payload["inputs"])} files)')
+    return out
+
 
 def main(argv=None):
     if argv is None:
@@ -2532,7 +2905,7 @@ def main(argv=None):
     parts = [sec_header(), '---\n']
     failed = []
     _reset_claim_registry()
-    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_training_health, sec_efficiency, sec_stats, sec_global_multiplicity):
+    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_resources, sec_flops, sec_training_health, sec_efficiency, sec_stats, sec_global_multiplicity, sec_input_manifest):
         try:
             parts.append(sec())
         except Exception as e:
@@ -2560,6 +2933,7 @@ def main(argv=None):
             pass
         raise
     print(f'[report] wrote {out} ({len(txt)} bytes)')
+    _write_input_sidecar(out)
     return out
 if __name__ == '__main__':
     _rc = main()

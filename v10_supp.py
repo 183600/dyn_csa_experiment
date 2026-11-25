@@ -2062,12 +2062,44 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 return None
             return dict(_first) if _same else None
 
+        def _cell_pooled(by_seed):
+            """Token-pooled PPL + median/IQR over the cell's seeds.
+
+            The per-seed PPL is already exp(NLL/tokens) for that seed; the
+            cross-seed population estimate is exp(sum NLL / sum tokens), not
+            the arithmetic mean of PPLs.  Records store the per-sequence NLL
+            and token counts, so the pooled value is computable without a
+            re-run; return None when any record lacks them.
+            """
+            _nll, _tok = [], []
+            for _r in by_seed.values():
+                _ns, _ts = _r.get('nll_sum'), _r.get('n_tok')
+                if not isinstance(_ns, (list, tuple)) or not isinstance(_ts, (list, tuple)) or len(_ns) != len(_ts) or not _ns:
+                    return None
+                try:
+                    _nll.extend(float(x) for x in _ns)
+                    _tok.extend(int(t) for t in _ts)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+            if not _nll or sum(_tok) <= 0 or any(t <= 0 for t in _tok):
+                return None
+            _ce = sum(_nll) / sum(_tok)
+            try:
+                return float(np.exp(_ce))
+            except OverflowError:
+                return None
+
         probe_cells = []
         for (v, arm, Ln, rho, mode, _pp, _cd, _recipe, _vfp), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
             if not means:
                 raise RuntimeError(f'v10 probe aggregation: empty seed set for {(v, arm, Ln, rho, mode)}')
-            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'val_fp': _val_fp_value(_vfp), 'mean': float(np.mean(list(means.values()))), 'n': len(means), 'corruption_audit': _record_audit(by_seed)})
+            _vals = np.asarray(list(means.values()), dtype=float)
+            _pooled = _cell_pooled(by_seed)
+            _med = float(np.median(_vals)) if _vals.size else float('nan')
+            _q1 = float(np.percentile(_vals, 25)) if _vals.size >= 2 else _med
+            _q3 = float(np.percentile(_vals, 75)) if _vals.size >= 2 else _med
+            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'val_fp': _val_fp_value(_vfp), 'mean': float(np.mean(list(means.values()))), 'ppl_pooled': _pooled, 'ppl_median': _med, 'ppl_iqr': [_q1, _q3], 'n': len(means), 'corruption_audit': _record_audit(by_seed)})
         contrasts = {}
 
         # The grouped lists are exactly what a scan of probe_cells would have
@@ -2557,6 +2589,19 @@ def v10_analysis(out='analysis_v10/stats.json'):
         _gm_named.append((f'niah|{_k}', (_v or {}).get('p_exact_signflip'), 'v10 NIAH'))
     for _k, _v in comparisons.items():
         _gm_named.append((f'seq2k|{_k}', (_v or {}).get('p_exact_signflip'), 'v10 seq2k'))
+    # Review 12: the scale-endpoint and equal-token comparisons are DISPLAYED
+    # with p-values in this report, so they belong to the global family too.
+    # Omitting them made the printed BH/Bonferroni values anti-conservative
+    # whenever those panels had data.
+    for _name, _e in ((scale_conf.get('panels') or {}) if isinstance(scale_conf, dict) else {}).items():
+        _ep = (_e or {}).get('endpoint') or {}
+        _pv = _ep.get('p_exact_signflip')
+        if _pv is not None:
+            _gm_named.append((f'scale|{_name}: endpoint', _pv, 'v10 scale'))
+    for _k, _v in ((scale_conf.get('equal_token_slices') or {}) if isinstance(scale_conf, dict) else {}).items():
+        _pv = (_v or {}).get('p_exact_signflip')
+        if _pv is not None:
+            _gm_named.append((f'equal-token|{_k}', _pv, 'v10 equal-token'))
     _gm = L.global_multiplicity_audit(_gm_named) if _gm_named else {'m': 0, 'rows': [], 'n_raw_significant': 0, 'n_bh_rejected': 0, 'n_bonferroni_significant': 0, 'n_untestable': 0}
     out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'scale_confounds': scale_conf, 'seq2k_bs1_panel': panel(seq2k), 'comparisons': comparisons, 'holm': L.attach_holm(comparisons, family='v10 seq2k comparisons'), 'global_multiplicity': _gm}
     out_d = L.stamped_analysis('v10_analysis', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
@@ -2581,6 +2626,26 @@ def v10_analysis(out='analysis_v10/stats.json'):
             else:
                 print(f'  crossover {label:10s} mean-traj: step {v['mean_crossover_step']:g} (tokens/step unknown)')
     return out_d
+
+def _panel_synth_seeds(outdir):
+    """Seeds carrying `synthesized` records in one panel (review 12).
+
+    The earlier "this panel contains no reconstruction" sentence was derived
+    only from the two ADMITTED csa/full curves, so a synthesized record for
+    another variant (or one without a ppl_history) was invisible.  Scan the
+    raw summary instead; return None when it cannot be read (unknown, not
+    "clean").
+    """
+    try:
+        with open(os.path.join(outdir, 'summary.json'), encoding='utf-8') as _f:
+            _d = json.load(_f)
+    except Exception:
+        return None
+    if not isinstance(_d, dict):
+        return None
+    return sorted({str(_r.get('seed')) for _r in _d.values()
+                   if isinstance(_r, dict) and _r.get('synthesized')})
+
 
 def _one_record_per_seed(rows, label=''):
     """Canonicalise seeds, drop synthesized reconstructions, and exclude
@@ -2655,7 +2720,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
 
     A('---')
     A('')
-    A('## P3M 长度外推优势的机制验证（远距干扰注入）')
+    A('## P3M 长度外推的系统级对比（远距干扰注入；非机制归因）')
     A('')
     A('**背景**：v7 P1L 的外推对比只是附带观察（n=3 时精确符号翻转 p 值下限 0.250）。P1L 权重未持久化，P3MT 先按 v7 P1L 原配方（seq 512、AdamW lr 3e-4）重训两臂并保存权重——同时作为该外推对比的独立复现。')
     A('')
@@ -2688,7 +2753,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                     n_by_v = {v: {r['seed'] for r in _rv} for v, _rv in _rows_by_v.items() if _rv}
                 else:
                     print(f'[v10 report] WARNING: by-length arms share NO seed ({ {v: sorted(s) for v, s in n_by_v.items()} }) — the table below quotes per-arm means over DIFFERENT seed sets and is not a paired comparison')
-        A(f'**P3MT 复现对照**（train@512 → 同权重 eval；ratio = PPL@L / PPL@512，seed 平均，n={(min((len(s) for s in n_by_v.values())) if n_by_v else 0)}）：')
+        A(f'**P3MT 复现对照**（train@512 → 同权重 eval；PPL = 跨 seed 的 token-pooled 估计，记录缺 NLL 时退回算术平均并标 `*`；ratio = pooled PPL@L / pooled PPL@512；n={(min((len(s) for s in n_by_v.values())) if n_by_v else 0)}）：')
         A('')
         A('| variant | PPL@512 | PPL@2048 | PPL@4096 | ratio@4096 |')
         A('|---|---|---|---|---|')
@@ -2697,24 +2762,45 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             if not rows:
                 continue
 
+            def _pool_nll(cells):
+                """Token-pooled PPL over seed cells (review 12, issue 12)."""
+                _nll, _tok = [], []
+                for c in cells:
+                    _n = L._finite_scalar(c.get('nll_sum'))
+                    _t = L._as_seed_int(c.get('n_tokens') if c.get('n_tokens') is not None else c.get('n_tok'))
+                    if _n is None or _t is None or _t <= 0 or _n < 0.0:
+                        return None
+                    _nll.append(_n)
+                    _tok.append(_t)
+                if not _nll or sum(_tok) <= 0:
+                    return None
+                try:
+                    return float(np.exp(sum(_nll) / sum(_tok)))
+                except OverflowError:
+                    return None
+
             def _at(Ln, rows=rows, _v=v):
                 cells = L.by_len_cells(rows, Ln)
                 ok = [c for c in cells if isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated'))]
                 if (ok if ok else cells) and len(ok if ok else cells) < len(rows):
-                    print(f'[v10 report] {_v} L{Ln}: the column mean covers {len(ok if ok else cells)}/{len(rows)} seeds — the rest hold no usable cell at this length (error/truncated cell), so the column is a sub-seed mean')
-                if ok:
-                    # A mean over a strict subset is not a complete column:
-                    # mark it partial so the rendered cell carries `~` too.
-                    return (float(np.mean([c['ppl'] for c in ok])), len(ok) != len(rows))
-                return (float(np.mean([c['ppl'] for c in cells])), True) if cells else (float('nan'), False)
+                    print(f'[v10 report] {_v} L{Ln}: the column value covers {len(ok if ok else cells)}/{len(rows)} seeds — the rest hold no usable cell at this length (error/truncated cell), so the column is a sub-seed value')
+                use = ok if ok else cells
+                if not use:
+                    return (float('nan'), False, None)
+                _p = _pool_nll(use) if ok else None
+                _v_ = _p if _p is not None else float(np.mean([c['ppl'] for c in use]))
+                # A value over a strict subset is not a complete column: mark
+                # it partial so the rendered cell carries `~` too.
+                return (_v_, (len(use) != len(rows)) if ok else True, _p)
 
             def _paired_ratio(rows=rows, _v=v):
                 m512, m4096 = ({}, {})
+                c512, c4096 = ({}, {})
                 for r in rows:
                     bl = r.get('by_len')
                     if not isinstance(bl, dict):
                         continue
-                    for Ln, mp in ((512, m512), (4096, m4096)):
+                    for Ln, mp, cp in ((512, m512, c512), (4096, m4096, c4096)):
                         # by_len_cells refuses the ambiguous int/str twin of
                         # one length; a single ambiguous record cannot supply
                         # a defensible paired cell.
@@ -2725,26 +2811,35 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
                         c = _cells[0] if _cells else None
                         if isinstance(c, dict) and isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated')):
                             mp[r.get('seed')] = float(c['ppl'])
+                            cp[r.get('seed')] = c
                 both = sorted(set(m512) & set(m4096))
                 if both and len(both) < len(rows):
                     print(f'[v10 report] {_v} ratio@4096: computed over {len(both)}/{len(rows)} seeds — the rest lack a usable cell at 512 or 4096')
                 if not both:
-                    return None
-                return float(np.mean([m4096[s] / m512[s] for s in both]))
+                    return None, None
+                # Prefer the ratio of token-pooled PPLs; mixing an arithmetic
+                # seed mean into a ratio of exponentiated PPLs is exactly the
+                # aggregation error this review asks to remove.
+                _p512 = _pool_nll([c512[s] for s in both])
+                _p4096 = _pool_nll([c4096[s] for s in both])
+                if _p512 is not None and _p4096 is not None:
+                    return (float(_p4096 / _p512), 'pooled')
+                return (float(np.mean([m4096[s] / m512[s] for s in both])), 'per-seed-mean')
 
             def _fmt_cell(Ln):
-                val, tr = _at(Ln)
-                return f'{val:.1f}~' if tr else f'{val:.1f}'
-            p512, _512tr = _at(512)
-            p4096, _4096tr = _at(4096)
+                val, tr, pooled = _at(Ln)
+                _mark = '' if pooled is not None else ('*' if np.isfinite(val) else '')
+                return (f'{val:.1f}~' if tr else f'{val:.1f}{_mark}')
+            p512, _512tr, _p512p = _at(512)
+            p4096, _4096tr, _p4096p = _at(4096)
             if _512tr or _4096tr:
                 _ratio = '—（含截断 cell，不可比）'
             else:
-                _pr = _paired_ratio()
+                _pr, _pr_basis = _paired_ratio()
                 _ratio = f'×{_pr:.2f}' if _pr is not None and np.isfinite(_pr) else '—'
             A(f'| `{v}` | {_fmt_cell(512)} | {_fmt_cell(2048)} | {_fmt_cell(4096)} | {_ratio} |')
         A('')
-        A('> 后缀 `~` 表示该列**不是完整的非截断测量**：它可能只含位置受限（abs-PE）的截断 cell（在比列名更短的 span 上评出的分数），也可能只有部分 seed 在该长度有可用 cell；都**不是**完整的长上下文测量值。任何 `~` 行不可用于「外推是否稳健」的结论。')
+        A('> 后缀 `~` 表示该列**不是完整的非截断测量**：它可能只含位置受限（abs-PE）的截断 cell（在比列名更短的 span 上评出的分数），也可能只有部分 seed 在该长度有可用 cell；都**不是**完整的长上下文测量值。任何 `~` 行不可用于「外推是否稳健」的结论；`*` 表示该格记录缺少 `nll_sum`/`n_tokens`，退回算术平均而非 pooled。该表只是 512 训练长度下的**外推探针**，不是长上下文训练。')
         A('')
         if _stale_vars:
             A('> **⚠ 陈旧记录已排除**：' + '、'.join(f'`{x}`' for x in sorted(_stale_vars)) +
@@ -2767,17 +2862,23 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         arm_order = [('full_rope', 'dense'), ('csa_fixed_rope', 'learned'), ('csa_fixed_rope', 'randidx'), ('csa_fixed_rope', 'allblocks'), ('csa_fixed_rope_randidx', 'learned'), ('csa_fixed_rope_allblocks', 'learned')]
         for Ln in lens:
             _n_ln = max([c.get('n', 0) for c in cells if c['eval_len'] == Ln] or [0])
-            A(f'**目标区 PPL（eval_len={Ln}，至多 {_n_ln or "?"} seeds 平均；uniform 腐坏模式）**：')
+            A(f'**目标区 PPL（eval_len={Ln}，至多 {_n_ln or "?"} seeds；跨 seed token-pooled，uniform 腐坏模式）**：')
             A('')
             A('| 臂 | ' + ' | '.join((f'ρ={r:g}' for r in rhos)) + ' |')
             A('|---|' + '---|' * len(rhos))
             for v, arm in arm_order:
                 row = []
                 for rho in rhos:
-                    m = [c['mean'] for c in cells if (c['variant'], c['arm'], c['eval_len'], c['rho'], c.get('mode', 'uniform')) == (v, arm, Ln, rho, 'uniform')]
-                    row.append(f'{m[0]:.2f}' if len(m) == 1 else '—')
-                    if len(m) > 1:
-                        print(f'[report] {v}+{arm} L={Ln} rho={rho}: {len(m)} parameterisations of the cell exist — the table omits the cell (the paired test refuses it too)')
+                    _cc = [c for c in cells if (c['variant'], c['arm'], c['eval_len'], c['rho'], c.get('mode', 'uniform')) == (v, arm, Ln, rho, 'uniform')]
+                    _val = None
+                    if len(_cc) == 1:
+                        _c0 = _cc[0]
+                        _val = _c0.get('ppl_pooled')
+                        if _val is None:
+                            _val = _c0.get('mean')
+                    row.append(f'{_val:.2f}' if _val is not None else '—')
+                    if len(_cc) > 1:
+                        print(f'[report] {v}+{arm} L={Ln} rho={rho}: {len(_cc)} parameterisations of the cell exist — the table omits the cell (the paired test refuses it too)')
                 A(f'| `{v}`+{arm} | ' + ' | '.join(row) + ' |')
             A('')
     contr = probe.get('contrasts', {})
@@ -2999,7 +3100,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('')
     A('## P3S 反转交叉点的标度读数（4 个模型规模）')
     A('')
-    A('**判据（预注册）**：对每个规模的 `csa_fixed − full` 验证 PPL 差距轨迹（eval_every=250 或面板既有网格），取 ±1 点平滑后**首次转正且此后不再回穿**的 eval 步为交叉步；轨迹内未交叉记为删失（> 末步）。token 数 = 步数 × 每步 token。')
+    A('**判据（分析前声明的探索性判据，不是冻结预注册）**：对每个规模的 `csa_fixed − full` 验证 PPL 差距轨迹（eval_every=250 或面板既有网格），取 ±1 点平滑后**首次转正且此后不再回穿**的 eval 步为交叉步；轨迹内未交叉记为删失（> 末步）。token 数 = 步数 × 每步 token。')
     A('')
     A('| 规模 | 面板 | seeds | 交叉步（seed 均值轨迹） | 交叉 token | 状态 |')
     A('|---|---|---|---|---|---|')
@@ -3049,10 +3150,14 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     _xo256_step = _xo256.get('mean_crossover_step')
     _xo256_txt = f'~{_xo256_step:g} 步' if isinstance(_xo256_step, (int, float)) and math.isfinite(_xo256_step) else '步数未知（该规模无有效交叉读数）'
     _xo256_recon = bool(_xo256.get('excluded_reconstructed')) or any(((_xo256.get('per_seed_synth') or {}).get(str(s)) for s in _xo256.get('seeds', [])))
-    if _xo256_recon:
-        A('**注意**：d=256 面板含 `synthesized` 重构记录；这些 seed 已从逐种子轨迹、seed 均值轨迹与交叉点拟合中一并剔除（拟合状态为 `reconstruction_only`），因此该规模没有可独立复核的交叉点，本节不引用重构数值。')
+    _synth_all = _panel_synth_seeds('results_lm_v3_long')
+    if _xo256_recon or _synth_all:
+        _ss_txt = (f'（存在 reconstructed seed(s): {', '.join(_synth_all[:6])}{'…' if len(_synth_all) > 6 else ''}）' if _synth_all else '')
+        A('**注意**：d=256 面板含 `synthesized` 重构记录' + _ss_txt + '；凡依赖这些 seed 的逐种子轨迹、seed 均值轨迹与交叉点拟合均已剔除（拟合状态为 `reconstruction_only`），因此该规模没有可独立复核的交叉点，本节不引用重构数值。')
+    elif _synth_all is None:
+        A('**注意**：无法读取 d=256 面板的 `summary.json` 来确认是否存在重构记录——该面板的重构状态是「未知」，不得写成「不含重构记录」。')
     elif _xo256.get('status') == 'ok':
-        A(f'**注意**：d=256 面板（`results_lm_v3_long`）当前不含重构记录，逐种子交叉步（{_xo256_txt} 附近）与 seed 均值轨迹同为有效读数。')
+        A(f'**注意**：d=256 面板（`results_lm_v3_long`）的 summary.json 不含 `synthesized` 记录，逐种子交叉步（{_xo256_txt} 附近）与 seed 均值轨迹同为有效读数。')
     A('')
     if fit:
         if fit.get('status') != 'ok' or 'slope' not in fit:
@@ -3071,7 +3176,9 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             _vol = fit.get('volume_ratio')
             A(f'**趋势拟合（描述性，非幂律主张）**：{fit.get("n_points")} 个去重后的规模点，'
               f'log10(交叉 token) ~ log10(d) 斜率 {fit["slope"]:.2f}{_citxt}{_ptxt}{_r2txt}{_lootxt}；'
-              f'训练量比 {_vol:.2f}（要求 ≤1.25）。这是观测性回归，规模面板未随机化，不能写成 scaling law。')
+              f'训练量比 {_vol:.2f}（要求 ≤1.25）。这是观测性回归，规模面板未随机化，不能写成 scaling law。'
+              '**横轴不是单一规模变量**：d 与层数一一绑定（128/4L、256/6L、384/8L、512/10L），各面板的 batch/seq/eval 网格也不同，'
+              '因此斜率同时混入深度、优化动态与评测网格差异；它只能读作「这些配置的轨迹交叉点随 d 的描述性变化」。')
             A('')
     sc = st.get('scale_confounds') or {}
     if sc:
@@ -3118,31 +3225,43 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('')
     A('**背景**：v9 P2T 的完整 5 点扫描只有 2 seeds，精确符号翻转 p 值下限 0.500——v9 收官后唯一仍处该下限的面板。v10 按同一配方（seq 2048、bs 1）补 seeds 2/3（同一 outdir，resume 跳过 seed 0/1）。')
     A('')
-    A('| variant | PPL (mean±std) | n |')
-    A('|---|---|---|')
+    A('| variant | PPL pooled (`exp(ΣNLL/Σtok)`) | PPL seed mean±std | median [IQR] | n |')
+    A('|---|---|---|---|---|')
     _p3t_done = 0
     for v in ['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1']:
         if v in seq2k:
             p = seq2k[v]
-            A(f'| `{v}` | {_fmt_pm(p)} | {p['n']} |')
+            _pool = p.get('ppl_pooled')
+            _pool_txt = f'{_pool:.2f}' if isinstance(_pool, (int, float)) and np.isfinite(_pool) else '—（缺 NLL/token）'
+            _med = p.get('ppl_median')
+            _iqr = p.get('ppl_iqr')
+            _med_txt = (f'{_med:.2f} [{_iqr[0]:.2f}, {_iqr[1]:.2f}]'
+                        if isinstance(_med, (int, float)) and isinstance(_iqr, (list, tuple)) and len(_iqr) == 2 else '—')
+            A(f'| `{v}` | {_pool_txt} | {_fmt_pm(p)} | {_med_txt} | {p['n']} |')
             _p3t_done += 1
         else:
-            A(f'| `{v}` | —（未完成） | 0 |')
+            A(f'| `{v}` | —（未完成） | — | — | 0 |')
     A('')
     A(f'**完成 {_p3t_done}/5 点**。')
     A('')
-    A('| 比较 | n | Δ (a−b) mean±std | p (exact) |')
-    A('|---|---|---|---|')
+    A('| 比较 | n | Δ (a−b) mean±std | p (exact) | p 下限 | p_Holm |')
+    A('|---|---|---|---|---|---|')
     for k, v in comp.items():
         if k.startswith('seq2k'):
             if 'omitted' in v:
-                A(f'| {k} | 0 | —（{v['omitted']}） | — |')
+                A(f'| {k} | 0 | —（{v['omitted']}） | — | — | — |')
                 continue
-            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} |')
+            _nn = L._as_seed_int(v.get('n_nonzero'))
+            if _nn is None:
+                _nn = L._as_seed_int(v.get('n'))
+            _fl = L.signflip_p_floor(_nn) if _nn is not None and _nn > 0 else float('nan')
+            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} | {_fl:.4f} | {v.get('p_holm') if v.get('p_holm') is not None else '—'} |')
     A('')
     A('**注**：n=4 时精确符号翻转的 p 值分辨率为 0.125——仍跨不过 0.05（需 n=6 才有 0.031）；此行补齐的是与 scale 面板同级的统计分辨率，显著性主张仍以效应量 + 方向同向性表述。')
     A('')
     A('---')
+    A('')
+    A('> **效率口径（review 12, issue 14）**：本报告不给出 throughput/latency/显存结论。解析 FLOPs 只覆盖 attention 相关项（不含 MLP/QKV 投影/pooling/indexer/top-k/gather/padding/backward/内核启动），且 dense 与 CSA 使用不同实现路径；端到端 prefill/prefix-prefill/峰值显存测量只存在于 v7 报告的 `Measured efficiency` 节（真实 checkpoint、同实现），energy 未测。任何「更省算力」的读法必须换成端到端同 kernel 测量。')
     A('')
     A('## 产物清单')
     A('')

@@ -34,6 +34,19 @@
 缺 oracle/selection recall、动态分块逐样本几何不完整、无删失回归、source-only 无发布、
 CUDA 环境未锁定、未测 energy。
 
+## 评审十二硬化（review 12）
+
+对 16 条外部方法学意见做**核验优先**的处置：不新增训练面板、不读 test、不改冻结清单字节、不改测量语义（`CODE_SEMANTICS` 仍为 `v11.128`）。逐项判定（含在当前 HEAD 已不成立的事实）见 `docs/design_notes.md` §30。审查的设计边界意见（探索/确认混合、小 n、多因素、validation 复用、source-only）成立且保留为限制；本轮修的是仍可复现的代码/报告缺陷：
+
+- **训练目标描述符漏了每层压缩权重**：`train_objective` 原先只记 `comp_lambda`，`csa_dyn_nocomp`（mult=0）仍显示 `comp_reg_applies=True`、有效权重 0.05，hybrid HCA 的 4× 也不可见。现在记录每层有效权重，`objective_reason` 比较权重向量；v7/v9 对比携带 `objective_matched`/`objective_differences` 并打印系统级边界（dense-vs-sparse 仍配对，但不能再被静默读成机制归因）。
+- **符号翻转的稳健性字段落盘**：`aggregate`、v7 stats、v9 `add_paired` 现在保存符号计数、p 下限、配对/非配对 bootstrap CI、Wilcoxon 与显式零假设；v7 stats 表并排打印，且声明族不会因缺少某行而缩小（缺失槽位按 p=1 进入 Holm）。
+- **PPL 聚合**：v7 长度节与 v10 P3MT 改为跨 seed 的 **token-pooled PPL**（`exp(ΣNLL/Σtokens)`；缺 NLL 才标 `*` 回退），打印 n 与 ratio 口径；v9/v10/v11 面板表增加 pooled/median/IQR；长度结论改为描述性系统级读数，明确「512 训练长度外推探针，不是长上下文训练」，删除「机制一致/滤噪」措辞。
+- **多重性补全**：v10 的全局 BH/Bonferroni 族补入其展示的 scale 端点与等 token 切片 p 值（此前 m 偏小，打印的 q 值偏乐观）；P3T 补 `p_Holm` 与分辨率下限；v9 增加自己的全局 BH/Bonferroni 视图。
+- **逐臂资源披露**：新报告节打印每臂 total/attention/indexer/MLP/active/dead、层数、结构 KV elem/token、实际压缩权重与 ΔLR 倍数，并声明「参数量匹配 ≠ 计算/有效容量匹配，逐臂 FLOPs 未实测」。
+- **旧「证伪」措辞**：P0-3 不再写「P0-3 的证伪」；boundary-F1 不再称分块「genuinely semantic」；两者都降为探索性方向读数。
+- **证据可审计性**：`evidence_release_status` 对发布行做 schema 校验（ISO 日期、7–40 hex commit、http(s)/s3/gs URL、两个 64-hex 摘要、非占位 verifier），垃圾行不再把所有报告横幅翻成 `released`；`archive_release.py` 补打 TimeGuard `run_time_state*.json(.k)` 账本，拒绝只有 analysis 的归档（至少一个 `summary.json`/`run_manifest.json`），环境快照补 GPU 数量/名称/UUID/算力/驱动/TF32 与 pip freeze 截断标志；每份报告末尾新增输入清单（逐文件 SHA-256 + git HEAD）并写 `analysis_v7/report_inputs.json`，把报告绑定到具体 results/analysis 批次。
+- **crossover 范围**：v10 明确 d 与层数绑定（128/4L…512/10L）、batch/seq/eval 网格不同，斜率不是单一规模变量；「预注册」改为「分析前声明的探索性判据」。
+
 ## 仓库结构
 
 仓库只保留**源码、驱动脚本与设计文档**。所有实验结果目录（`results_*/`）、

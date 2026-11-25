@@ -3002,7 +3002,7 @@ def audit_release_readiness(path='RELEASES.md'):
         missing = []
         if not re.fullmatch(r'[0-9a-fA-F]{7,40}', commit or ''):
             missing.append('commit')
-        if not re.match(r'https?://', url or ''):
+        if not re.match(r'(?:https?|s3|gs)://', url or ''):
             missing.append('archive URL')
         if not re.fullmatch(r'[0-9a-fA-F]{64}', asha or ''):
             missing.append('archive SHA-256')

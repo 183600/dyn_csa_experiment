@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import gc
 import json
+import math
 import os
 import subprocess
 import sys
@@ -200,7 +201,32 @@ def _panel_block(panel):
             out[v] = {'ppls': ppl_map, 'n': 0, **({'_stale_cfg': True} if _stale_cfg else {})}
             continue
         _m, _sd = L._stable_mean_std(vals) if len(vals) > 1 else (vals[0], 0.0)
-        out[v] = {'ppls': ppl_map, 'mean': _m, 'std': _sd, 'n': len(vals), **({'_stale_cfg': True} if _stale_cfg else {})}
+        # Review 12: a per-seed PPL arithmetic mean is not the population
+        # estimator.  Pool the token-level NLL when the records carry it and
+        # publish median/IQR next to the seed mean.
+        _nll_tot, _tok_tot = 0.0, 0
+        _ok_pool = True
+        for _r in recs.values():
+            if not isinstance(_r, dict):
+                _ok_pool = False
+                break
+            _n = L._finite_scalar(_r.get('nll_sum'))
+            _t = L._as_seed_int(_r.get('n_tokens'))
+            if _n is None or _t is None or _t <= 0 or _n < 0.0:
+                _ok_pool = False
+                break
+            _nll_tot += _n
+            _tok_tot += _t
+        _pooled = (math.exp(_nll_tot / _tok_tot) if (_ok_pool and _tok_tot > 0) else None)
+        _sorted = sorted(vals)
+        _med = float(np.median(_sorted))
+        _q1 = float(np.percentile(_sorted, 25)) if len(_sorted) >= 2 else _med
+        _q3 = float(np.percentile(_sorted, 75)) if len(_sorted) >= 2 else _med
+        out[v] = {'ppls': ppl_map, 'mean': _m, 'std': _sd, 'n': len(vals),
+                  'ppl_pooled': _pooled, 'ppl_median': _med, 'ppl_iqr': [_q1, _q3],
+                  'nll_sum': (_nll_tot if _ok_pool else None),
+                  'n_tokens': (_tok_tot if _ok_pool else None),
+                  **({'_stale_cfg': True} if _stale_cfg else {})}
     return out
 
 def v8_analysis(out='analysis_v8/stats.json'):

@@ -175,6 +175,7 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None):
         common = _ranked[0][1]
         print(f'[stats] {who}{name}: paired seeds span {len(_cfg_groups)} run_cfg groups — keeping only the largest/current group ({len(common)} seed(s)) instead of pooling configurations')
     dl, skipped, unstamped, why = ([], [], 0, set())
+    _a_vals, _b_vals = [], []
     _cur_code = L.code_stamp()
     _n_stale = 0
     for s in common:
@@ -195,15 +196,38 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None):
             skipped.append(s)
             continue
         dl.append(ra['ppl'] - rb['ppl'])
+        _a_vals.append(ra['ppl'])
+        _b_vals.append(rb['ppl'])
     if skipped:
         print(f'[stats] {who}{name}: {len(skipped)}/{len(common)} seed(s) NOT paired — {sorted(why)}; excluded from the test')
     if not dl:
         return _omit(f'no seed survived the run_cfg/steps checks ({len(common)} shared, {len(skipped)} rejected: {sorted(why)})')
     res = V.exact_sign_permutation(dl)
+    # Review 12: carry the sign-test assumption boundary and the sensitivity
+    # readouts (sign split, paired/unpaired bootstrap, Wilcoxon) with the
+    # published contrast; they were computed by exp_lib but never serialized.
+    _rob = L.paired_effect_stats(dl, with_values=_a_vals, without_values=_b_vals)
+    res.update({_k: _rob.get(_k) for _k in (
+        'n_nonzero', 'p_floor', 'sign_counts', 'p_wilcoxon',
+        'p_wilcoxon_method', 'ci95_paired_bootstrap',
+        'ci95_unpaired_bootstrap', 'unit', 'assumption', 'effect_vs_noise',
+        'resolution_limited', 'underpowered', 'within_seed_noise',
+        'significant', 'cohens_dz', 'ci95_low', 'ci95_high')})
     res['seeds'] = [s for s in common if s not in set(skipped)]
     res['n_skipped_config_mismatch'] = len(skipped)
     res['n_unstamped'] = unstamped
     res['n_stale_code_excluded'] = _n_stale
+    # Training-objective disclosure (review 12, issue 4): same run_cfg does
+    # not imply same loss/optimizer objective.  This is a disclosure, not a
+    # pairing rejection: dense-vs-sparse remains a valid system-level
+    # comparison, just not an isolated-mechanism one.
+    _objs = sorted({L.objective_reason(panel[a][s], panel[b][s]) for s in res['seeds']})
+    _obj_bad = [x for x in _objs if x and x.startswith('objective differs')]
+    _obj_unknown = [x for x in _objs if x and x.startswith('unverifiable')]
+    res['objective_matched'] = (False if _obj_bad else (None if _obj_unknown else True))
+    res['objective_differences'] = _obj_bad or _obj_unknown
+    if _obj_bad:
+        print(f'[stats] {who}{name}: objective differs ({'; '.join(_obj_bad)}) — system-level contrast only, not an isolated mechanism claim')
     # Parameter-control disclosure (the same 1% gate `methodology_audit`
     # applies to the declared design tables): a paired contrast whose arms
     # differ in total parameter count is capacity-confounded and may only be
@@ -237,7 +261,15 @@ def v9_analysis(out='analysis_v9/stats.json'):
     add('rope20k: csa_fixed_rope - full_rope', rope20k, 'csa_fixed_rope', 'full_rope', 'results_lm_v8_rope20k')
     add('long20k(abs): csa_fixed - full', abs_long_f, 'csa_fixed', 'full', 'results_lm_v3_long')
     panel = V8._panel_block
-    out_d = {'seq2k_bs1_panel': panel(seq2k), 'seq2k_bs3_panel_historical': panel(seq2k_v7), 'rope20k_panel': panel(rope20k), 'comparisons': comparisons, 'holm': L.attach_holm(comparisons, family='v9 seq2k + rope20k + long20k')}
+    # Cross-panel multiplicity: v9 displays seq2k and rope20k p-values side
+    # by side.  Within-family Holm (below) does not cover quoting "significant
+    # in seq2k and in rope20k", so record the union view too (review 12).
+    _gm_named = [(f'v9|{_k}', (_v or {}).get('p_exact_signflip'), 'v9 displayed')
+                 for _k, _v in comparisons.items()]
+    _gm = L.global_multiplicity_audit(_gm_named) if _gm_named else {
+        'm': 0, 'rows': [], 'n_raw_significant': 0, 'n_bh_rejected': 0,
+        'n_bonferroni_significant': 0, 'n_untestable': 0}
+    out_d = {'seq2k_bs1_panel': panel(seq2k), 'seq2k_bs3_panel_historical': panel(seq2k_v7), 'rope20k_panel': panel(rope20k), 'comparisons': comparisons, 'holm': L.attach_holm(comparisons, family='v9 seq2k + rope20k + long20k'), 'global_multiplicity': _gm}
     out_d = L.stamped_analysis('v9_analysis', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[v9 stats] wrote {out}')
     for k, v in comparisons.items():
@@ -262,6 +294,16 @@ def _holm_txt(v):
     _p = v.get('p_holm') if isinstance(v, dict) else None
     return f'{_p:.3f}' if isinstance(_p, (int, float)) and math.isfinite(float(_p)) else 'n/a'
 
+def _panel_pooled_txt(p):
+    _v = p.get('ppl_pooled') if isinstance(p, dict) else None
+    _pt = f'{_v:.2f}' if isinstance(_v, (int, float)) and math.isfinite(float(_v)) else '—（缺 NLL/token）'
+    _med = p.get('ppl_median') if isinstance(p, dict) else None
+    _iqr = p.get('ppl_iqr') if isinstance(p, dict) else None
+    _mt = (f'{_med:.2f} [{_iqr[0]:.2f}, {_iqr[1]:.2f}]'
+           if isinstance(_med, (int, float)) and isinstance(_iqr, (list, tuple)) and len(_iqr) == 2 else '—')
+    return _pt, _mt
+
+
 def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     # v9_analysis returns exactly the object it writes to stats_p.
     st = v9_analysis(out=stats_p)
@@ -269,6 +311,7 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     seq2k_old = st.get('seq2k_bs3_panel_historical', {})
     rope = st['rope20k_panel']
     comp = st['comparisons']
+    _gm = st.get('global_multiplicity') or {}
     # Selection ratios are derived from the actual P2T configuration
     # (seq_len, per-variant block_size and index_topk) instead of being
     # hard-coded, so a change of P2T_CFG cannot silently desync the report.
@@ -296,6 +339,7 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     A = lines.append
     A('# CSA / HCA 受控机制研究 — v9 补实验报告（topk 扫描补齐 + RoPE 长跑第三种子）')
     A('> **证据等级：探索性（exploratory）**。本面板的比较/种子是观察 validation 结果后选择的；Holm 校正只限制过度宣称，不等于预注册确认。')
+    A('> **假设边界**：精确符号翻转的 H0 是「每个 seed 的配对差符号关于 0 对称」；同 seed/同数据/同初始化只是控制，不是随机分配处理。p 是 seed-level，不是 token/window-level；|mean|>std 只作稳定性诊断。')
     A(L.evidence_status_banner())
     A('')
     A('')
@@ -307,6 +351,9 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     _r_n_txt = (str(_r_n[0]) if len(_r_n) == 1 else f'{_r_n[0]}–{_r_n[-1]}') if _r_n else '0'
     A(f'v9 覆盖两个面板：(1) P2T 的 seq-2048 topk **完整 5 点扫描**（batch_size=1，新目录、面板内自洽）；(2) RoPE 20k 长跑补第三种子（精确符号翻转检验在 n=2 时 p 值下限 0.500，补种子以增加该面板的种子数）——**实际落盘 n={_r_n_txt}**。')
     A('')
+    if isinstance(_gm, dict) and _gm.get('m'):
+        A(f'**跨面板多重性**：本报告显示的全部 p 值 m={_gm.get("m")}；原始 p<0.05 {_gm.get("n_raw_significant", 0)} 个；BH-FDR q<0.05 {_gm.get("n_bh_rejected", 0)} 个；Bonferroni p<0.05 {_gm.get("n_bonferroni_significant", 0)} 个；无有效 p {_gm.get("n_untestable", 0)} 个（计入族大小，p 槽位=1）。跨面板引用必须按该全局视图措辞；族内 Holm 不能替代它。')
+        A('')
     A('---')
     A('')
     A('## P2T seq-2048 topk 完整扫描（batch_size=1）')
@@ -317,14 +364,15 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     _n_txt = (f'{_n_seen[0]} seeds' if len(_n_seen) == 1 else f'{_n_seen[0]}–{_n_seen[-1]} seeds') if _n_seen else '0 seeds'
     A(f'**做法**：seq 2048、bs 1；5 个变体全部重跑于 `results_lm_v9_seq2k`（面板内 batch/步数/token 数/训练配置完全一致）。**实际落盘 {_n_txt}**（下表每点自报 n）。')
     A('')
-    A('| variant | PPL (mean±std) | n | 等效选择率@2048 |')
-    A('|---|---|---|---|')
+    A('| variant | PPL pooled | PPL seed mean±std | median [IQR] | n | 等效选择率@2048 |')
+    A('|---|---|---|---|---|---|')
     for v in ['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1']:
         if v in seq2k:
             p = seq2k[v]
-            A(f'| `{v}` | {_fmt_pm(p)} | {p['n']} | {sel_ratio[v]} |')
+            _pt, _mt = _panel_pooled_txt(p)
+            A(f'| `{v}` | {_pt} | {_fmt_pm(p)} | {_mt} | {p['n']} | {sel_ratio[v]} |')
         else:
-            A(f'| `{v}` | —（未完成） | 0 | {sel_ratio[v]} |')
+            A(f'| `{v}` | —（未完成） | — | — | 0 | {sel_ratio[v]} |')
     A('')
     A('')
     if seq2k_old:
@@ -368,10 +416,11 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     A('')
     A('**背景**：`csa_fixed_rope` vs `full_rope` 的长跑对照（abs-PE 长跑的 RoPE 镜像）在此补齐第三个 seed（同一 outdir，resume 跳过已完成的 seed）。')
     A('')
-    A('| variant | PPL@20k (mean±std) | n |')
-    A('|---|---|---|')
+    A('| variant | PPL@20k pooled | PPL@20k seed mean±std | median [IQR] | n |')
+    A('|---|---|---|---|---|')
     for v, p in rope.items():
-        A(f'| `{v}` | {_fmt_pm(p)} | {p['n']} |')
+        _pt, _mt = _panel_pooled_txt(p)
+        A(f'| `{v}` | {_pt} | {_fmt_pm(p)} | {_mt} | {p['n']} |')
     A('')
     A('| 比较 | n | Δ mean±std | p (exact) | p_Holm |')
     A('|---|---|---|---|---|')

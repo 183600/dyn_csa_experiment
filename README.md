@@ -113,6 +113,67 @@ Real code fixes in this pass:
   banner; the "documents" mislabel on `eval_subset_rows` is fixed; the
   efficiency section states that energy is not measured.
 
+## Review-12 hardening (what changed)
+
+Verification-first pass over a 16-item external methodological review.  No new
+training panel, no test-split access, no frozen-manifest byte change, no
+measurement-semantics change (`CODE_SEMANTICS` stays `v11.128`).  The
+item-by-item disposition (including claims that are factually stale at HEAD)
+is `docs/design_notes.md` §30.  The review's design-boundary points are
+accepted and remain limitations; this pass fixes the code/report defects that
+were still reproducible:
+
+- **Training-objective descriptor was incomplete.** `train_objective` ignored
+  the per-layer `comp_lambda_mult`, so `csa_dyn_nocomp` (mult=0) was recorded
+  as `comp_reg_applies=True` with a 0.05 effective weight, and hybrid HCA
+  layers' 4x weight was invisible.  It now records the per-layer effective
+  weights, `objective_reason` compares the vector, and v7/v9 paired contrasts
+  carry `objective_matched` / `objective_differences` and print the
+  system-level boundary.  Dense-vs-sparse pairs are still paired (that is the
+  comparison), but they can no longer be silently read as mechanism-clean.
+- **Sign-test robustness reaches the artifacts.** `aggregate`, the v7 stats
+  artifact and v9's `add_paired` now serialize sign counts, the p-resolution
+  floor, paired and unpaired bootstrap CIs, Wilcoxon p and the explicit
+  sign-symmetry/seed-level assumption.  The v7 stats table prints them next to
+  `p` / `p_Holm`, and its Holm family cannot shrink when a declared comparison
+  is absent (missing slots enter as p=1).
+- **Length-extrapolation reporting.** The v7 length section and v10's P3MT now
+  use cross-seed **token-pooled PPL** (`exp(ΣNLL/Σtokens)`) whenever the
+  records carry NLL/token totals, fall back explicitly (`*`) otherwise, print
+  the seed count and ratio basis, and replace “mechanism-consistent”
+  conclusions with descriptive system-level readings.  The section is labelled
+  as a **512-training-length extrapolation probe**, not long-context training.
+  P3MP probe cells likewise publish pooled PPL/median/IQR.
+- **Multiplicity coverage completed.** v10's global BH/Bonferroni family now
+  includes the scale-endpoint and equal-token p-values it displays (previously
+  m excluded them, making the printed q-values anti-conservative); P3T gained
+  `p_Holm` and the resolution floor; v9 gained its own global BH/Bonferroni
+  view rather than only within-family Holm.
+- **Resource disclosure per arm.** A new report section prints, for each
+  recorded arm, total / attention / indexer / MLP / active / dead parameters,
+  layer count, structural KV elements per token, the actual compression
+  weights and the delta-LR multiplier, and states that these are structure-only
+  counts — parameter matching is not compute or active-capacity matching, and
+  per-arm FLOPs are not measured.
+- **Old “falsified” wording removed.** The P0-3 RoPE block no longer says
+  “P0-3 的证伪” and the boundary-F1 summary no longer calls the cuts
+  “genuinely semantic”; both are exploratory directional readings.
+- **Evidence auditability.** `evidence_release_status` now schema-checks a
+  release row (ISO date, 7–40 hex commit, http(s)/s3/gs URL, two 64-hex
+  digests, non-placeholder verifier) instead of accepting any seven
+  non-placeholder cells; a junk row can no longer flip every report banner to
+  `released`.  `archive_release.py` now packs the TimeGuard
+  `run_time_state*.json(.k)` ledger the docstring promises, refuses an
+  analysis-only bundle (at least one `summary.json`/`run_manifest.json` is
+  required), and records the full GPU/driver/TF32/pip-freeze environment.
+  Each report ends with an input manifest (per-file SHA-256 + git HEAD) and
+  writes `analysis_v7/report_inputs.json`, so a report is bound to the exact
+  results/analysis batch that produced it.
+- **Crossover scope.** The v10 fit text now states that d is bound to depth
+  (128/4L … 512/10L) and that batch/seq/eval grids differ, so the slope is not
+  a single-scale-variable estimate; “pre-registered” was corrected to an
+  exploratory pre-declared criterion.
+
 Still acknowledged as design limitations (not solved by code): small WikiText
 models only, parameter- but not FLOPs-matched dense controls, short training
 budgets, 2–6 seed exploratory panels, the 16-window frozen panel, hard top-k

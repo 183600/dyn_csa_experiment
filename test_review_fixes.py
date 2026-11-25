@@ -3008,7 +3008,7 @@ def t_evidence_metadata():
         txt = BR.sec_stats()
     finally:
         BR.load = old_load
-    assert '| flag | 1.00 | n/a | 1.0000 |' in txt, txt
+    assert '| flag | — | 1.00 | — | n/a | — | 1.0000 | — | — | n/a |' in txt, txt
 
 def t_pooled_aggregate():
     summary = {}
@@ -3297,14 +3297,32 @@ def t_evidence_release_status_parsing():
             f.write(header + '| v13 | pending | abc | — | — | — | — |\n')
         assert L.evidence_release_status(path)['status'] == 'no_release'
         assert BR.evidence_release_status(path)['status'] == 'no_release'
-        # A complete row is a release.
+        # A complete row is a release — but only when every field is valid
+        # machine-readable provenance (review 12).
         with open(path, 'w', encoding='utf-8') as f:
-            f.write(header + '| v13 | 2026-11-25 | abc123 | https://example.org/x.tar.gz '
-                            '| aaaa | bbbb | archive_release.py verify |\n')
+            f.write(header + '| v13 | 2026-11-25 | abc1234 | https://example.org/x.tar.gz '
+                            '| ' + 'a' * 64 + ' | ' + 'b' * 64 + ' | archive_release.py verify |\n')
         a, b = L.evidence_release_status(path), BR.evidence_release_status(path)
         assert a['status'] == 'released' and a['complete_rows'] == 1, a
         assert b['status'] == 'released' and b['complete_rows'] == 1, b
         assert 'released' in L.evidence_status_banner(path)
+        # A row with the right cell COUNT but fake/placeholder digests is not
+        # a release: the old parser accepted `aaaa`/`bbbb` and flipped every
+        # report banner to released.
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(header + '| v13 | 2026-11-25 | abc123 | https://example.org/x.tar.gz '
+                            '| aaaa | bbbb | archive_release.py verify |\n')
+        a, b = L.evidence_release_status(path), BR.evidence_release_status(path)
+        assert a['status'] == 'no_release' and a['malformed_rows'] == 1, a
+        assert b['status'] == 'no_release' and b['malformed_rows'] == 1, b
+        assert 'no_release' in L.evidence_status_banner(path)
+        # An s3/gs object key is a legitimate archive location (RELEASES.md
+        # allows "URL / object key"); the readiness audit must agree.
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(header + '| v13 | 2026-11-25 | abc1234 | s3://bucket/x.tar.gz '
+                            '| ' + 'a' * 64 + ' | ' + 'b' * 64 + ' | archive_release.py verify |\n')
+        assert L.evidence_release_status(path)['status'] == 'released'
+        assert BR.evidence_release_status(path)['status'] == 'released'
     # Missing index means no verifiable release either.
     assert L.evidence_release_status(os.path.join(tempfile.gettempdir(), 'no_such_releases.md'))['status'] == 'missing_index'
 
@@ -7498,6 +7516,8 @@ def t_archive_verify_uses_own_manifest():
         os.makedirs(d)
         with open(os.path.join(d, 'payload.txt'), 'w', encoding='utf-8') as f:
             f.write('hello')
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            f.write('{}')
         with open(os.path.join(d, 'aaa.MANIFEST.sha256'), 'w', encoding='utf-8') as f:
             json.dump({'files': {'payload.txt': {'sha256': 'deadbeef'}}}, f)
         AR.REPO = repo
@@ -12623,6 +12643,8 @@ def t_archive_manifest_case_collision_is_excluded():
         os.makedirs(results)
         with open(os.path.join(results, 'evidence.txt'), 'w', encoding='utf-8') as f:
             f.write('evidence')
+        with open(os.path.join(results, 'summary.json'), 'w', encoding='utf-8') as f:
+            f.write('{}')
         with open(os.path.join(repo, 'release_v1.manifest.sha256'), 'w',
                   encoding='utf-8') as f:
             f.write('stray lowercase manifest')
@@ -12936,6 +12958,154 @@ def t_v12_power_gate_floor():
                 assert 'power_gate' in str(e), (bad, e)
             else:
                 raise AssertionError(f'power_gate={bad!r} accepted')
+
+
+def t_train_objective_tracks_per_layer_multiplier():
+    """Review 12, issue 4: run_cfg keeps `cl` identical for the nocomp arm, so
+    the objective descriptor must expose the per-layer multiplier instead of
+    calling a zeroed term `comp_reg_applies=True, effective=0.05`."""
+    off = L.SmallGPT(64, 32, 2, 2, 16, 16, L.make_layer_cfgs(2, 'csa_dyn_nocomp'))
+    o = L.train_objective(off, comp_lambda=0.05, delta_lr_mult=10.0)
+    assert o['comp_reg_applies'] is False, o
+    assert o['comp_lambda_effective_per_layer'] == [0.0, 0.0], o
+    assert o['comp_lambda_effective_total'] == 0.0, o
+    on = L.SmallGPT(64, 32, 2, 2, 16, 16, L.make_layer_cfgs(2, 'csa_dynamic'))
+    o2 = L.train_objective(on, comp_lambda=0.05, delta_lr_mult=10.0)
+    assert o2['comp_reg_applies'] is True, o2
+    assert o2['comp_lambda_effective_per_layer'] == [0.05, 0.05], o2
+    # Same coarse flags, different weights => objective differs.
+    r = L.objective_reason({'train_objective': o2},
+                           {'train_objective': dict(o2, comp_lambda_effective_per_layer=[0.10, 0.10])})
+    assert isinstance(r, str) and r.startswith('objective differs'), r
+
+
+def t_v7_report_declared_family_does_not_shrink():
+    """Review 12, issue 2: a declared comparison that is absent from the
+    artifact must keep a p=1 slot in the v7 Holm family."""
+    orig_load, orig_cs = BR.load, BR._CUR_CS
+    BR._reset_claim_registry()
+    try:
+        BR._CUR_CS = 'vtest'
+        BR.load = lambda path, default=None: ({
+            'code': 'vtest',
+            'comparisons': {
+                'a': {'n': 6, 'mean': 1.0, 'p_exact_signflip': 0.01,
+                      'n_nonzero': 6, 'sign_counts': {'positive': 6, 'negative': 0, 'zero': 0},
+                      'p_floor': 2.0 ** -6, 'ci95_paired_bootstrap': [-0.1, 0.2]},
+                'b': {'n': 6, 'mean': 1.0, 'p_exact_signflip': 0.04,
+                      'n_nonzero': 6, 'sign_counts': {'positive': 6, 'negative': 0, 'zero': 0},
+                      'p_floor': 2.0 ** -6},
+            },
+            'family': {'declared': 3},
+        })
+        txt = BR.sec_stats()
+        # m=3: Holm for p=0.01 is 0.03; with a shrunk m=2 it would be 0.02.
+        assert '0.0300' in txt and '0.0800' in txt, txt
+        assert '校正族没有缩小' in txt, txt
+        assert 'H0' in txt and 'seed-level' in txt, txt
+    finally:
+        BR.load = orig_load
+        BR._CUR_CS = orig_cs
+        BR._reset_claim_registry()
+
+
+def t_report_pooled_cells_and_resource_table():
+    """Review 12, items 5/12: pooled PPL helper and per-arm resource section."""
+    assert BR._pooled_cells([{'nll_sum': 0.0, 'n_tokens': 10}])[0] == 1.0
+    import math as _m
+    got = BR._pooled_cells([{'nll_sum': 10 * _m.log(2.0), 'n_tokens': 10},
+                            {'nll_sum': 30 * _m.log(2.0), 'n_tokens': 30}])[0]
+    assert abs(got - 2.0) < 1e-12, got
+    assert BR._pooled_cells([{'ppl': 2.0}]) == (None, None, None)
+    rec = {'variant': 'csa_dyn_nocomp', 'params': 1000, '_code': BR._CUR_CS,
+           'param_breakdown': {'total': 1000, 'attention': 200, 'attention_indexer': 10,
+                               'mlp': 600, 'active': 1000, 'dead_params': 0,
+                               'n_layers': 2},
+           'kv_cache_elements_per_token': {'elements_per_token_total': 64},
+           'train_objective': {'comp_reg_applies': False,
+                               'comp_lambda_effective_per_layer': [0.0, 0.0],
+                               'delta_lr_effective': 10.0}}
+    orig = BR._result_summaries
+    try:
+        BR._result_summaries = lambda: {'results_x': {'csa_dyn_nocomp::seed0': rec}}
+        rows = BR._resource_rows()
+        assert rows and rows[0]['variant'] == 'csa_dyn_nocomp', rows
+        assert rows[0]['active'] == 1000 and rows[0]['kv_per_token'] == 64, rows
+        txt = BR.sec_resources()
+        assert '逐臂资源' in txt and 'comp_reg' in txt and 'no [' in txt, txt
+        assert '不是实测 FLOPs' in txt, txt
+    finally:
+        BR._result_summaries = orig
+
+
+def t_archive_requires_run_evidence_and_packs_ledger():
+    """Review 12, issue 15: an analysis-only bundle is not an evidence release,
+    and the TimeGuard ledger promised by the docstring must be packed."""
+    import archive_release as AR
+    root = tempfile.mkdtemp()
+    old_repo = AR.REPO
+    try:
+        repo = os.path.join(root, 'repo')
+        os.makedirs(os.path.join(repo, 'results_x'))
+        os.makedirs(os.path.join(repo, 'analysis_x'))
+        for n in ('DECISION_LOG.md', 'RELEASES.md', 'confirmation_frozen.json'):
+            with open(os.path.join(repo, n), 'w', encoding='utf-8') as f:
+                f.write('x')
+        with open(os.path.join(repo, 'analysis_x', 'stats.json'), 'w', encoding='utf-8') as f:
+            f.write('{}')
+        with open(os.path.join(repo, 'run_time_state.json'), 'w', encoding='utf-8') as f:
+            f.write('{}')
+        AR.REPO = repo
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert AR.cmd_make('v1', ['analysis_x'], outdir='arch') == 1
+            files = AR._collect(['analysis_x'])
+        assert any(p.endswith('run_time_state.json') for p in files), files
+        assert not os.path.exists(os.path.join(repo, 'arch', 'release_v1.tar.gz'))
+        with open(os.path.join(repo, 'results_x', 'summary.json'), 'w', encoding='utf-8') as f:
+            f.write('{}')
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert AR.cmd_make('v1', ['results_x'], outdir='arch') == 0
+    finally:
+        AR.REPO = old_repo
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_panel_synth_scan_sees_non_admitted_variant():
+    """Review 12: the 'no reconstruction in this panel' sentence must scan the
+    raw summary, not only the two admitted csa/full curves."""
+    import v10_supp as V10
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'other::seed3': {'seed': 3, 'synthesized': True},
+                       'csa_fixed::seed0': {'seed': 0}}, f)
+        assert V10._panel_synth_seeds(d) == ['3']
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'csa_fixed::seed0': {'seed': 0}}, f)
+        assert V10._panel_synth_seeds(d) == []
+        os.unlink(os.path.join(d, 'summary.json'))
+        assert V10._panel_synth_seeds(d) is None
+
+
+def t_report_input_manifest_binds_hashes():
+    """Review 12, issue 15: a report records the SHA-256 of every input it read."""
+    import hashlib as _h
+    old_inputs = dict(BR._INPUTS)
+    try:
+        BR._INPUTS.clear()
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'payload.json')
+            with open(p, 'w', encoding='utf-8') as f:
+                f.write('{"a": 1}')
+            BR._record_input(p)
+            BR._record_input(p)  # idempotent, hashed once
+            assert len(BR._INPUTS) == 1
+            want = _h.sha256(b'{"a": 1}').hexdigest()
+            assert list(BR._INPUTS.values())[0]['sha256'] == want
+            txt = BR.sec_input_manifest()
+            assert want in txt and 'git HEAD' in txt, txt
+    finally:
+        BR._INPUTS.clear()
+        BR._INPUTS.update(old_inputs)
 
 
 def main():
@@ -13338,6 +13508,12 @@ def main():
     _check('N95 kernel pool contract + open-block guard', t_kernel_pool_contract_and_open_block_guard)
     _check('N96 v12 minimum-power gate refuses a sub-floor panel', t_v12_power_gate_floor)
     _check('N97 follow-up plan declares a single-look stopping rule', t_followup_requires_stopping_rule)
+    _check('N98 train_objective exposes per-layer compression weights', t_train_objective_tracks_per_layer_multiplier)
+    _check('N99 v7 report keeps the declared Holm family', t_v7_report_declared_family_does_not_shrink)
+    _check('N100 report pooled PPL + resource table', t_report_pooled_cells_and_resource_table)
+    _check('N101 archive requires run evidence and packs the ledger', t_archive_requires_run_evidence_and_packs_ledger)
+    _check('N102 panel reconstruction scan covers every variant', t_panel_synth_scan_sees_non_admitted_variant)
+    _check('N103 report input manifest binds file hashes', t_report_input_manifest_binds_hashes)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

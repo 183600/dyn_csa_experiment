@@ -1659,3 +1659,58 @@ top-k 的选择梯度只覆盖被选块”“缺少 selection-attribution”“s
   `FOLLOWUP_CONFIRMATORY_PROTOCOL.md`：单次固定 n 的停止规则。
 - `test_review_fixes.py`：新增 per-seed init、stale-record、stopping-rule
   回归测试（N97 等）。
+
+## 30. review 12（外部方法学审查）的逐项核验与代码处置
+
+本轮仍是**核验优先**：先逐条对照当前 HEAD 的代码/产物，再决定改什么。没有新增
+训练面板，没有读取 test split，没有改 `confirmation_frozen.json`，也没有改任何
+测量语义（`CODE_SEMANTICS` 仍为 `v11.128`）。审查的 16 条意见中，设计边界类
+（探索/确认未分离、小 n、多因素混杂、validation 复用、source-only）**成立但
+不能用代码消除**；其余条目大多已在 v10/v11 硬化，本轮修掉的是**仍能在当前
+代码中复现的缺陷**。
+
+| # | 审查意见 | 对照 HEAD 的结论 | 本轮处置 |
+|---|---|---|---|
+| 1 | 探索/确认未严格分开；v6–v11 后验选择；旧报告「机制被证伪/负结果更稳固」应降级 | **成立（研究设计边界）**；报告头已标 exploratory，v12 是唯一冻结确认 | 修掉残余的**正向机制归因**（长度外推的「机制一致/滤掉远距噪声」、P0-3 的「证伪」、`learned boundaries … semantic`）；不能追溯预注册 |
+| 2 | 2–4 seeds 分辨率不足；v7–v11 无族级校正 | **部分成立/表述过时**：`reportable_claim` 的 n≥6 门、Holm 与全局 BH/Bonferroni 已存在；但 v7 `sec_stats` 不打印 n/下限，v10 全局族漏掉 scale/equal-token，v9 无全局视图 | `sec_stats` 增加 n/符号/p 下限/配对与非配对 bootstrap/Wilcoxon 与声明族；v10 全局族补全；v9 增加全局 BH/Bonferroni；P2S/P3T 补 `p_Holm` |
+| 3 | 符号翻转的适用前提未说明；配对只是同 seed | **部分成立/已披露**：`paired_effect_stats` 返回 `unit='seed'`、对称零假设、LOO/CI/Wilcoxon，v10/v11 已打印；v7/v9 未打印且字段被丢弃 | v7/v9 报告补固定假设边界句；`aggregate`、v7 stats、v9 `add_paired` 落盘符号计数、`p_floor`、配对/非配对 bootstrap、Wilcoxon、`assumption` |
+| 4 | 训练目标不同（comp_reg、delta LR 10×） | **成立（真实混杂）**：`train_objective` 已记录，但**漏掉每层 `comp_lambda_mult`**（`csa_dyn_nocomp` 的 mult=0 仍被记为 applied=True/0.05；hybrid HCA 的 4× 不可见），且 v7 配对与 v8–v10 `add_paired` 不消费目标描述符 | `train_objective` 记录每层有效权重；`objective_reason` 比较权重向量；v7/v9 对比携带 `objective_matched`/`objective_differences` 并在报告标注系统级边界（仍可配对，不做机制归因） |
+| 5 | 参数匹配不全局；RoPE 面板容量不匹配；缺 8 项资源表 | **部分成立**：`full_matched`/`full_sw128_matched` 存在；当前 P0R/P1L 的 `full_rope` 已按 `csa_fixed_rope` 宽度构建（CPU 复核 11,088,512 vs 11,089,904，<1%）；旧记录仍有容量差警告。没有任何报告逐臂打印 breakdown/KV/目标 | 新增 `sec_resources`：逐臂 total/attention/indexer/MLP/active/dead/layers/KV elem/token/comp_reg 权重/ΔLR/tokens；明确「参数量匹配 ≠ 计算/有效容量匹配」，FLOPs 未逐臂实测。v12 的 active 差继续披露且不改变冻结判定规则 |
+| 6 | 动态分块未端到端学习 | **成立（默认臂的定义），但已如实文档化**：`gate.detach()>0.5` + `comp_reg` 只训练标量偏移；`csa_dynamic_task` 是 opt-in 的 REINFORCE 边界臂，不在冻结范围 | 仅改残余措辞（boundary F1 不再是「genuinely semantic」）；默认臂继续描述为「余弦相似度 + 压缩率正则的阈值分块」 |
+| 7 | 许多比较同时改多个因素 | **成立（设计边界）**：现有消融不是正交因子设计；v12 主比较标 `single_factor_contrast=false`/`system_level_only=true` | 不伪造正交性；`sec_resources` 把容量/目标/读取差异逐臂列出；正交 2×2 设计仍是 follow-up 草案 |
+| 8 | 随机 indexer 只是评估时干预 | **不成立（当前 HEAD）**：P3MP 的 `ac.indexer_mode='random'` 是**测试时干预**，但 P3MTC 已从头训练 `csa_fixed_rope_randidx`/`_allblocks`，报告也明确区分两者并给出 retrain-gap。仍缺 oracle-block、同块数不同边界、冻结选择器 | 无代码改动（报告措辞已足够）；新增对照需要新训练面板 |
+| 9 | 长上下文混淆（训练 512、位置编码、截断、目标区） | **成立（设计边界）**：absPE 超表会 raise/截断并标 `truncated`，报告只用 RoPE 臂比外推，但结论段仍有机制措辞、算术平均、无 n | `sec_p1l`/v10 P3MT 改为跨 seed **token-pooled PPL**（缺 NLL 才标 `*` 回退），打印 n/ratio 口径，把「结论」改为描述性读数，明确「512 训练长度外推探针，不是长上下文训练」；删除「机制一致/滤噪」解释 |
+| 10 | crossover 证据弱、点少、判据后验 | **部分成立**：拟合已拒绝 <4 点/删失/训练量比>1.25，给斜率 CI/LOO/平滑敏感性，并声明描述性；但 d 与层数绑定、batch/seq 网格不同，v10 曾称判据「预注册」 | 报告明确横轴不是单一规模变量（128/4L…512/10L）、斜率混入深度/优化/评测网格；改「预注册」为「分析前声明的探索性判据」 |
+| 11 | validation 反复用于选择；无最终 test | **成立（设计边界）**：v6–v11 全为 exploratory，v12 一次性 test 流程存在但**尚未执行**（无 `results_lm_test/`、无冻结锁、RELEASES 无行） | 无代码可填补；报告/README 继续限制主张；不能把 v12 的保护回填给 v6–v11 |
+| 12 | PPL 用算术平均，未用 pooled NLL；缺 median/IQR/配对差 | **部分成立**：`aggregate` 主口径已是 pooled（含 median/IQR/CI），但 v7 长度/P2S、v9–v11 面板表仍用算术平均且不打印 pooled | v7/v10/v11 主表改为 pooled（或显式回退），v9 面板增加 pooled/median/IQR；`aggregate` 与 v7/v9 artifact 保留逐 seed 值与配对差 |
+| 13 | 评估集小、噪声低估 | **部分成立**：最终 PPL 用完整固定验证批（`eval_subset=128` 只控制训练曲线）；行/窗口 bootstrap 已实现，但 v10/v11 不打印；token-level CI 不存在 | 长度/P2S 表打印行/窗口 CI 或 n；明确「CI 单位是行/窗口，不是 token/文档」；v10 探针仍是 16 seq，限制不变 |
+| 14 | FLOPs 分析不能推出效率结论 | **部分成立**：解析 FLOPs 只含 attention；v7 报告有实测 prefill/prefix-prefill/峰值显存并声明 energy 未测；v10–v12 不展示 | `sec_resources` 增加结构资源与「非实测」声明；v10–v12 未新增效率测量（需要真实 checkpoint/GPU） |
+| 15 | 结果不可审计、无不可变证据包 | **成立（source-only）**：`archive_release.py` 存在，但无发布行/工件；release 解析过宽（任意 7 个非占位单元即 `released`），归档可只含 analysis，且漏掉 TimeGuard 账本 | 严格 release 行 schema（commit/URL/两个 64-hex/日期/verifier）；`cmd_make` 要求至少一个 `summary.json`/`run_manifest.json`；归档补 `run_time_state*.json(.k)`；报告新增输入清单（逐文件 SHA-256 + git HEAD + `analysis_v7/report_inputs.json`） |
+| 16 | 依赖/环境/数据可复现性风险 | **部分成立/表述过时**：import 时 pip install 与 HF mirror 已改 opt-in；tokenizer 仅 train 前缀拟合并 fail-closed 校验；CPU lock 精确，CUDA 环境未锁 | 归档环境快照补 GPU 数量/名称/UUID/算力/驱动/TF32 与 pip freeze 截断标志；CUDA lock 仍须在发布时生成 |
+
+**审查中与 HEAD 不符、应保留记录的事实**：`v11.125` 在当前 HEAD 不存在
+（`CODE_SEMANTICS='v11.128'`）；`eval_subset=128` 不是最终 PPL 的评估行数；
+「随机 indexer 只在评估时替换」不成立（已有从头训练对照）；`n=2 → R²=1`
+不成立（拟合至少 4 点）；「没有 Holm/FDR/窗口 bootstrap」不成立。审查对
+**探索/确认混合、小 n、目标/容量不匹配、动态边界非任务学习、source-only
+不可审计**的判断成立，这些是本轮保留的限制声明，不用代码伪装成已解决。
+
+本轮代码改动（全部零实验、零 test 访问）：
+
+- `exp_lib.py`：`train_objective` 每层压缩权重 + `objective_reason` 向量比较；
+  `aggregate` 透传符号检验的稳健性字段；`evidence_release_status` 严格 schema；
+  boundary-F1 措辞降级。
+- `build_report.py`：严格 release 解析；`sec_stats` 声明族/n/下限/符号/CI/
+  Wilcoxon + 假设边界；P2S `p_Holm`/下限/目标披露；P0-3 去「证伪」；长度节
+  pooled + 描述性措辞；新增 `sec_resources` 与输入清单；`_objective_reason`。
+- `v7_supp.py` / `v8_supp.py` / `v9_supp.py` / `v10_supp.py` / `v11_supp.py`：
+  v7 stats 稳健性字段；v8 面板 pooled/median/IQR；v9 稳健性+目标披露+
+  全局多重性+pooled 列；v10 全局族补全、P3T Holm/下限、P3MT/P3MP pooled、
+  机制标题/预注册/synthesized 措辞、crossover 混杂披露；v11 pooled 列+
+  Holm 列+合成记录措辞。
+- `archive_release.py`：TimeGuard 账本、run evidence 门槛、完整环境快照。
+- `audit_gates.py`：release URL 接受 `s3://`/`gs://` 对象键。
+- `test_review_fixes.py`：N98–N103 回归测试。
+
+`CODE_SEMANTICS` 保持 `v11.128`：所有改动都是统计/报告/归档层，没有改任何
+训练或评测路径上的数值语义，因此不会使已有记录失效。冻结清单字节未改。
