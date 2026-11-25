@@ -395,13 +395,36 @@ mode) 的腐坏在臂间**逐字节相同**，配对成立：
 
 **为什么必须有 mask/delete**：只看污染鲁棒性无法区分「滤噪」与「本来就
 少用远端」（关键替代解释）。mask/delete 给出干净远端上下文的收益幅度
-（NLL_干净 − NLL_屏蔽），是解读一切鲁棒性数字的参照系。**为什么必须有
-NIAH-natural**：检索任务（key→value 耦合埋在远端自然文本、查询在目标区、
-干扰只加在草料上）直接测「长距离信息利用」，与鲁棒性互补。
+（NLL_干净 − NLL_屏蔽），是解读一切鲁棒性数字的参照系。**为什么必须有 NIAH-natural**：检索任务（key→value 耦合埋在远端自然文本、
+查询在目标区、干扰只加在草料上）用于测「长距离信息利用」。但把随机 token
+的 key→value 对插入自然文本**不等于**模型具备该格式下的检索能力：小模型
+未在该格式上训练时，chance 水平可能只是任务不适配，而不是注意力失败。
+因此 NIAH 增加了机器判据（review 10 issue 13）：chance 基线（1/可用
+value token 数）、`nofar` 无远端信息对照（摧毁远端耦合后准确率应退回
+chance）、距离分桶准确率（short→long 梯度），并要求记录一个**能解任务
+的正对照**。三者缺一时 NIAH 只能作描述性读数，不得作为「长距离利用」的
+机制证据；当前面板没有正对照，故该门保持关闭。合成 NIAH 的格式训练/评测
+路径在 v7_supp 中已实现但未列入 phase（可显式作为探索性正对照运行，不
+触碰冻结确认）。
 
 **ΔNLL 口径**：ΔNLL = NLL_污染 − NLL_干净（nats/目标 token，逐种子配
 对；干净基线 = 同臂同参数化的 uniform ρ=0 cell）。报告必须同时给 ΔNLL
 与干净 NLL——某臂 ΔNLL 小 + 干净 NLL 差 = 「少用远端」，不是「更抗噪」。
+
+**ρ 是名义值，必须同时报告实现覆盖（review 10, issue 12）**：
+- `uniform`/`natural`/`topical` 选 k = max(1, round(ρ·n_far)) 个位置；
+  donor 模式写入的 token 可能与原文相同，因此**实际改变 token 数 ≤ k**；
+- `span` 的段**互不重叠**（远端按等宽 tile 切分、每 tile 抽一段），实现
+  覆盖槽位 = `n_seg × span_len`（通常 > k，是 span_len 的量化），
+  `自然/主题/文档` 供体撞车同样使 changed < covered；
+- `doc`/`mask` 恒 ρ=1、覆盖整个远端；`delete` 是**移除**，定义上
+  changed = n_far 且行变短。
+因此同一 ρ 在不同模式下**不是同强度腐坏**，跨模式比较只能以「实现
+覆盖/实际改变比例」列与 ΔNLL 一起读；`_corruption_audit` 把这些量
+（覆盖槽位/唯一位置/重叠/实际改变 token/空操作行/供体行）落盘并在报告
+中打印，禁止只报 nominal ρ。另：`uniform` 是强分布外扰动、`natural`
+只替换 token 不保持句法、`topical` 的 Jaccard 只是主题代理且不保证答案
+无关、donor 单位是**固定评测窗口**（可能跨文章）——这些都写进报告限制段。
 
 **向后兼容约定**：`_fp_norm` 归一化时剥掉 `mode` 字段（指纹本体不含
 mode），但分析分组的 key **显式**带 mode——uniform 与 natural 在同 ρ
@@ -435,6 +458,21 @@ token 相差一倍：跨规模**终点**差异混杂了训练进度，不能单�
   可能满足该条件。它只允许「**预算内平台期后交叉**」
   （crossing-after-plateau-under-budget）的读数；「渐近优势反转」「收敛
   后更差」需要更长训练、合理学习率续训及重复验证。
+
+**review 10（issue 14）补充的不可分离性（必须与上表并列写出）**：
+- 规模面板同时改变宽度、深度、seq/batch 与训练步数（P3SS 128/4L/8000 vs
+  P3SL 512/10L/4000；d=384 面板另用 seq=1024/bs=8）。**不存在只改宽度或
+  只改深度的对照**，因此「规模」效应无法在 2–3 个规模点内分离成宽度/
+  深度/预算三项。
+- 等 token 切片对齐的是**累计 token**；不同面板的学习率进度形状与数据
+  重复次数并不相同（8000 步面板在相同 token 处经历了不同的 LR 与重复
+  模式）。`P3SL_TOK` 对齐了步数/LR 形状，但**不**对齐参数分配。
+- 交叉点不是模型属性：它是**当前评测网格与观察窗内**的首次“转正且不再
+  回穿”，窗后行为未知、删失点不能进入拟合；log-log 拟合用的是**seed
+  均值轨迹**的交叉位置，不是逐种子交叉位置的平均。
+- 6ND 是**参数量代理**，不是实测 FLOPs；「最后四分之一 eval 改善 <1%」
+  不是收敛证明。规模结论只能写成**预算内描述性趋势**，不得写成
+  scaling law。
 
 ## 17. 探索 / 确认分离与冻结清单（v12 + 评审二轮·意见一/二/三/四）
 
@@ -649,19 +687,30 @@ z（n=6 时 90% t 区间比 z 区间宽约 20%，用 z 会把「未判等价」�
 本节把精确符号翻转检验的**有效性前提**与两类抽样不确定性显式化——
 「种子编号相同」本身不提供任何统计保证。
 
-- **交换性假设（意见九 a）**：精确符号翻转检验的 p 值正确性依赖配对内
-  交换性：同一种子下，两臂共享除臂本身之外的一切随机因素——同数据顺序
-  （P3MT 协议：同种子同数据顺序）、同评测行、同腐坏网格（腐坏只依赖
-  (eval_len, 行号, ρ, mode)，与臂无关）；初始化 RNG 按种子播种，臂间
-  架构差异对 RNG 流的扰动**属于臂的一部分**（这是合理的：被检验的就是
-  整个臂的差）。种子间方差主要反映训练随机性。若未来引入臂相关的数据
-  顺序或采样，本假设即被破坏，检验必须重新论证或更换。
-- **文档抽样不确定性（意见九 b）**：最终测试的干净 by-length 评估默认
-  16 条行。种子层方差 ≠ 文档层方差：`eval_length_gen` 现在落盘
-  `ppl_per_seq`（逐文档 PPL，池化 PPL 的归约不变），`finaltest_stats`
-  输出 `doc_sampling`（between-doc 与 within-doc-across-seed 两层分解）。
-  16 行**不足以覆盖语言数据总体分布**——面向总体的主张需要更大的行面板
-  与文档×种子的分层分析；在此之前，主张范围限于「该冻结 test 切片」。
+- **零假设与符号对称性（review 10 issue 6 修正）**：精确双侧符号翻转
+  检验的 p 值在**尖锐零假设**下精确：每个种子的配对差的符号分布关于 0
+  对称（配对差分布对称于 0，或随机分配处理使符号可交换）。它**不是**
+  「两套架构平均效果相同」这一弱零假设的检验——除非差值分布对称于其均
+  值，否则平均相等不能推出符号可交换。共享种子编号、数据顺序、评测行与
+  腐坏网格是**控制**（减少 nuisance 变异、让配对有意义），**不是**随机
+  分配意义上的交换性，不能使检验自动有效。机器可检的控制项：
+  `data_fp`/`train_fp`/`n_seq`/配方签名/`_code`/manifest sha/逐种子
+  `init_core_fp`；`rng_fp` 只报告不强制（架构导致的 RNG 消耗属于臂）。
+  `finaltest_stats` 现在把该零假设文本、逐比较符号计数、留一法均值符号
+  稳定性与 `|mean|≤std` 稳定性诊断一并写入 `validity`；这些只限定稳定性
+  读法，不改变预注册决策规则。若差值分布强烈偏斜/厚尾，精确符号翻转
+  检验与等幅投影功效表都可能偏离，p 值只对上述尖锐零假设成立。
+- **行/窗口抽样不确定性（意见九 b + review 10 issue 9）**：最终测试的干
+  净 by-length 评估默认 16 条**固定窗口**（不是 16 篇文档；一个 4096
+  token 窗口可跨文章，一篇文章也可贡献多行）。`ppl_per_seq` 是**逐行/
+  窗口** PPL，池化 PPL 的归约不变；`finaltest_stats` 的 `doc_sampling`
+  单位明确标为 `fixed evaluation windows (sequence rows), NOT documents`，
+  并给出 between-window 与 within-window-across-seed 两层分解。真正的
+  文档聚类需要 loader `doc_index` 路径（follow-up 研究的要求），冻结
+  v12 不提供。`MIN_DOCS_FOR_POPULATION_CLAIM=64` 是**仓库自设的最小
+  总体门槛**（无统计推导；64 不是总体推断突然有效的分界线），且它计数
+  的也是行/窗口；抽样代表性与区间精度比固定条数更关键。16 行**不足以
+  覆盖语言数据总体分布**——主张范围限于「该冻结 test 切片」。
 - **小种子面板一律描述性（意见九 c）**：双侧精确符号翻转的 p 下限 =
   2/2^n：n=4 → 0.125，n=3 → 0.25，n=2 → 0.5。S1×4 / S2×3 / hero×2
   （已退役算力规划的 S1/S2 阶梯）**全部不可能达到 0.05 显著性**，无论效应多大
@@ -790,7 +839,7 @@ statement / mechanism / `predicted_sign` / `primary_metric` / falsifier；
   `ppl_mean_arithmetic`、`ppl_median`、IQR、seed-level t 区间与文档
   bootstrap 区间。旧记录缺 NLL 时明确回退为 `arithmetic_seed_mean_fallback`，
   不伪装成 pooled。
-- 报告仍打印 seed 标准差，但必须标成 **seed-level**；文档 bootstrap 才是
+- 报告仍打印 seed 标准差，但必须标成 **seed-level**；行/窗口 bootstrap（非文档）才是
   评测文档抽样不确定性。`eval_subset` 只控制训练过程中的曲线评估；最终
   PPL 仍用完整固定验证批（历史口径），该区别在记录中由 `eval_rows` /
   `eval_fp` 显式化。
@@ -815,10 +864,16 @@ statement / mechanism / `predicted_sign` / `primary_metric` / falsifier；
 - v7/v8/v9/v10/v11 的 analysis 与 `build_report.py` 都对**展示出来的**
   比较族做 Holm step-down；被省略/无效的比较保留 dummy p=1 槽位，不能靠
   少报比较来缩小 m。
-- 报告正文的「显著」必须同时满足：n≥6（否则精确检验下限 >0.05 或
-  族校正不可达）、原始 p<0.05、Holm p<0.05、|mean|>std、且通过
-  `run_cfg`/`train_knobs` 配对门禁。任一不满足只能写「方向性 / 名义显著 /
-  未过校正」，不得写「证伪」「机制性」「更稳固」。
+- 报告正文的「显著」只由**统计证据**门决定：n≥6（否则精确检验下限
+  >0.05 或族校正不可达）、原始 p<0.05、Holm p<0.05、族级分辨率可达、
+  且通过 `run_cfg`/`train_knobs` 配对门禁。`|mean|>std` 与留一法符号
+  稳定性是**稳定性**诊断（报告为 `stable`/`stability`），**不是**显著性
+  判据：低于一个种子标准差的效应可能是真实且可估计的小效应，不得据此
+  说它「不真实」「只是噪声」或「不显著」。**实际价值**需要**预先声明**
+  的最小有意义改善（`min_effect`）；v12 未预注册该阈值，因此 v12 报告
+  不得作「实际价值」声明，只能同时给出估计、CI、校正 p、稳定性与主张
+  范围。任一门槛不满足只能写「方向性 / 名义显著 / 未过校正」，不得写
+  「证伪」「机制性」「更稳固」。
 
 ### 22.4 训练目标、参数与 KV 的公平性字段
 
@@ -879,7 +934,7 @@ statement / mechanism / `predicted_sign` / `primary_metric` / falsifier；
   `CSA_HF_MIRROR=1` 才使用镜像。`pyproject.toml` 声明 Python ≥3.12，
   `requirements.txt` 给兼容范围，发布时用 `pip freeze > requirements.lock`。
 - 仍存在的边界：WikiText-103 官方 split 之间有近重复文档，审计只量化、
-  不删除；16 条 test 文档不覆盖语言总体；实际推理延迟/吞吐/峰值显存必须
+  不删除；16 条 test **窗口/行（非文档）**不覆盖语言总体；实际推理延迟/吞吐/峰值显存必须
   在真实 checkpoint 上测量，解析 FLOPs/KV 只作结构性读数。
 
 ## 23. 训练健康、NaN 排查与坏案例分析（结果分析层）
@@ -1122,16 +1177,24 @@ blocks: the main result measures "is a prefix useful under a fixed K", not
 
 ### 25.1 统一的显著性措辞闸门
 
-`exp_lib.reportable_claim` 是报告正文「significant / confirmed」的唯一
-判据：n≥6、原始 p<α、Holm p<α、|mean|>std、族级最小可达 Holm p≤α 全部
-满足才返回 `allowed=True`；否则返回 `underpowered` /
-`resolution_limited` / `not_significant` 与逐条原因。v10/v11 的
-「强版本成立」判定、`build_report._sig_gate` 与 v12 的确认规则都走同一
-口径。`attach_holm` 现在同时输出 `family_min_attainable_p_holm` 与
-`family_resolution_limited`：当 m 个比较 × n 个种子的最小可达 Holm p
-已经 >α 时，p_holm=1.0 是分辨率上限，不是零结果，报告必须这样写。
-v10 的 NIAH-natural 对照此前在 Holm 之后才构造，已改为并入同一族重新
-校正，不再出现「标题写 Holm、表里是原始 p」的路径。
+`exp_lib.reportable_claim` 是报告正文「statistically significant」的
+共享闸门（review 10 issue 8 起拆成三个独立判决）：
+- `allowed` / `statistical_significance`：n≥6、原始 p<α、Holm p<α、
+  族级最小可达 Holm p≤α 且测量值格式合法——**只**回答统计显著性；
+- `stable` / `stability`：`|mean|>std` 与留一法符号稳定性——**稳定性**
+  诊断，不参与统计显著性判定，也不得反过来写「无效应」；
+- `practical`：只有调用方传入**预先声明**的 `min_effect` 才给出是否达到
+  最小有意义改善；否则记为未测量（`None`），不得由 p 值推断。
+`build_report._sig_gate` 同步改为只要求统计显著性，并把 mean/std/稳定性
+交给表格与报告文字单独呈现。**v12 的 CONFIRMED 规则不使用
+`|mean|>std`**：它严格按冻结清单的 decision_rule（p_holm<α、方向符合、
+`param_matched is True`、逐种子 `init_core_fp` 相等、n≥8），由
+`v12_supp._frozen_rule_confirms` 单一实现；`reportable_claim` 与
+`build_report._sig_gate` 只服务探索性面板的措辞。`attach_holm` 同时输出
+`family_min_attainable_p_holm` 与 `family_resolution_limited`：当 m 个
+比较 × n 个种子的最小可达 Holm p 已 >α 时，p_holm=1.0 是分辨率上限，
+不是零结果，报告必须这样写。v10 的 NIAH-natural 对照此前在 Holm 之后才
+构造，已改为并入同一族重新校正。
 
 ### 25.2 交叉点标度拟合的拒绝规则
 
@@ -1430,3 +1493,113 @@ Dense 仍是 TODO——因为协议要求**实测** FLOPs，不能用一个未�
   执行 `git add -A` + commit + pull --rebase + push：零 GPU 预检失败绝不
   应把开发树发布到 main（本次审计中真实发生过一次）。长训练模式要推送
   部分结果需显式 `V12_AUTO_PUSH=1`。
+
+## 28. review 10（外部方法学审查）的逐项处置与事实更正
+
+本轮不新增训练面板、不改冻结清单字节、不改任何测量语义。逐项处置：
+
+1. **证据缺口（issue 1）**：仓库仍为 source-only。新增 `exp_lib.evidence_
+   release_status` / `evidence_status_banner` 与 `build_report` 的本地
+   孪生：所有报告头必须打印「无完整证据发布 ⇒ 数字不能独立审计」；完整
+   发布行的判据是 tag/date/commit/URL/archive sha/manifest sha/verifier
+   均非占位，且 `archive_release.py verify` 通过。审计函数不能替代真实
+   工件，本仓库未声称数字可审计。
+2. **主对照非单因素（issue 2）**：冻结清单已有 `interpretation_caveat`
+   与 `compute_budget_disclosure`；本轮把它们**原样打印在 v12 报告主表
+   旁**，并给每个主比较写入 `single_factor_contrast=false` /
+   `system_level_only=true` / `claim_scope`。CONFIRMED 只能读作「该冻结
+   配方下的系统级臂间差异」；机制归因需要 selection-attribution 工件与
+   同骨干/同投影/同归一化/同 kernel 的隔离对照。
+3. **随机选择对照（issue 3）**：审查声称「新版已改为按 (seed, layer)
+   变化的伪随机模式」——**在当前 HEAD 与所有 ref 中不存在**；实现仍是
+   固定确定性哈希 `(row*12.9898 + col*78.233)`，对每 seed/layer/step
+   完全相同（冻结清单 caveat 已如实写明），不是每次前向重随机。随机臂
+   的 `W_DQ/W_DK/W_w` 是**死参数**（202,752，≈1.83%）：本轮让
+   `param_breakdown` 计入 `dead_params` 并令 `active=total−dead`，
+   `finaltest_stats` 逐臂报告 active/相对差/`active_param_matched`，报告
+   打印「total 匹配 ≠ 有效容量匹配」。因此该对照最多支持「学习选择优于
+   该固定伪随机连接模式」；不支持「选择器找到语义相关信息」，也不代表
+   所有随机稀疏基线。
+4. **动态分块语义（issue 4）**：默认 `csa_dynamic` 不是任务学习边界——
+   §22.5 已写明 `gate.detach()>0.5` + `comp_reg` 训练偏移；冻结范围不含
+   动态/HCA；follow-up 仍是 draft（`--require-ready` 拒绝）。本轮仅在
+   README_zh 补齐与英文 README 相同的「非任务学习」负向声明。
+5. **score-function 符号（issue 5）**：当前文档与代码均为
+   `+(CE − baseline)·logπ / n_decisions`（CE 是最小化成本，detached），
+   **不是**审查所称的负号；`exp_lib.boundary_policy_term` 把该式抽成
+   可测试函数，训练循环原样调用。新增两动作玩具测试
+   `t_score_function_term_sign_two_action_toy`：低损失动作概率在正确符号
+   下上升、在反号反事实下下降——把「文档疑点」变成可执行核验。
+6. **符号翻转假设（issue 6）**：§20 已改写为「尖锐零假设 = 配对差符号
+   关于 0 对称」；明确指出共享 seed/数据顺序/评测行/初始化只是控制，
+   不提供随机分配意义上的交换性。`finaltest_stats.validity` 新增
+   `null_hypothesis` / `assumption_boundary` / `machine_checked_controls`
+   与逐比较 `positive/negative/zero` 符号计数、留一法均值符号稳定性、
+   `within_seed_noise`（稳定性诊断，非显著性判定）。
+7. **功效设计（issue 7）**：审查称门槛用 q=0.95——**事实错误**：冻结
+   门槛是 `statistics.power_gate {q:0.80, min_power:0.80}`，q=0.95 只是
+   四列设计辅助表之一。真实缺口是：验证集挑选的效应可能高估 test 效应、
+   固定 |Δ| 的符号枚举不建模训练随机性、低功效 override 的报告呈现。
+   本轮给 `p5c_power.json` 增加 `power_sensitivity`（观测同向率 q_hat 与
+   Wilson 下界处的功效、留一 seed 功效范围、去掉最大 |Δ|/替换为中位幅
+   度的功效、均匀缩放的说明），`V12_SKIP_POWER=1` 在清单声明
+   `power_gate` 时必须同时 `V12_ACCEPT_LOW_POWER=1` 并写
+   `power_gate.json(status=skipped)`；v12 报告打印 `accepted_low_power`。
+   另更正 `signflip_power`/`signflip_min_consistency` 文档中「等幅投影
+   是精确功效上界/下界」的错误断言（8×(+100)+4×(−1) 反例：精确 p=0.0078
+   vs 等幅投影 0.388，方向可反转）。
+8. **`|mean|>std` 混用（issue 8）**：`reportable_claim` 拆成
+   statistical/stability/practical 三个独立判决（见 §25.1）；
+   `_sig_gate` 只要求统计显著性；v12 CONFIRMED **从不**使用该稳定性
+   阈值（§25.1 已更正原先「同一口径」的错误表述）。v12 未预注册
+   `min_effect`，因此 v12 报告不得作「实际价值」声明。
+9. **单位（issue 9）**：冻结 v12 的 16 个评测单位是**固定窗口/行**，
+   不是文档；`doc_sampling` 明确 `unit=fixed evaluation windows`。
+   `48` 是 arms×seeds=4×12 的记录数，**不是 48 篇文档**；冻结清单无
+   「48 documents」字段。`MIN_DOCS_FOR_POPULATION_CLAIM=64` 是仓库自设
+   最小总体门槛（无统计推导，且计数单位是行/窗口）。DECISION_LOG 与
+   build_report 中的「文档」措辞已改为「行/窗口（非文档）」；冻结清单
+   `eval.per_document` 的字段名属预注册字节，不改，按 §27.2 与本
+   errata 解释为逐行/窗口。
+10. **长度外推（issue 10）**：PPL@Ln 是**前缀嵌套目标**（512 ⊂ 1024 ⊂
+    …），不是同目标跨长度比较；读取比例随长度下降（512 25% → 4096
+    3.1%）。报告已并列写出目标定义、块数/top-k/读取比例与替代解释；
+    局部窗口基线（`full_sw128*` 已注册）、逐长度远端移除 ΔNLL、固定目标
+    位置跨长度探针与距离分桶选择读数**尚未在冻结面板提供**，因此长长度
+    优势只能作为「该配方下的描述性外推读数」，不能归因为「更会利用长
+    上下文」。
+11. **干扰探针（issue 11）**：验证集 P3MP 早已以 ΔNLL/ΔΔNLL + 干净基线
+    为核心，非绝对 PPL；但 v12 test probe 原先只有绝对 PPL。本轮在
+    `_test_probe_stats` 用已存储的 `nll_sum/n_tok` 重建同臂干净 NLL 与
+    `delta_nll`（描述性、不进 Holm），报告并列打印。§15 补充 uniform 的
+    OOD 性质、donor 单位=固定窗口、topical 只是主题代理且不保证答案无关、
+    mask/delete 改变长度/分布、跨模式同 ρ 不同强度等限制。
+12. **span 覆盖（issue 12）**：审查描述的「允许重叠」在 HEAD 已不存在
+    （`6646c91` 起按 tile 切分、段不重叠）；真实缺口是**未记录**实现覆盖
+    /实际改变 token 数。本轮 `_corrupt_row(return_audit=True)` +
+    `_corruption_audit` 落盘覆盖槽位/唯一位置/重叠/实际改变/空操作行/
+    供体行，报告打印「实际腐坏几何」表；§15 同步说明 ρ 是名义值。
+13. **NIAH（issue 13）**：新增 chance 基线（1/可用 value token 数）、
+    `nofar` 无远端信息对照（摧毁远端耦合，准确率应退回 chance）、距离
+    分桶准确率（short→long 梯度）与任务有效性机器门：clean 显著高于
+    chance + nofar 与 chance 一致 + 记录了解题正对照，三者缺一则 NIAH
+    只能作描述性读数、不得作为「长距离利用」的机制证据。当前面板没有
+    正对照，因此门必然为 false——这是诚实收紧，不是新结果。
+14. **规模/收敛（issue 14）**：§16 补充宽度/深度/预算不可分离、等 token
+    切片不控制 LR 形状与数据重复、交叉点依赖评测窗、拟合是均值轨迹而非
+    逐 seed 交叉均值等不可分离性；README 的「compute-matched」措辞改为
+    「6ND 参数量代理预算（非实测 FLOPs）」。
+15. **冻结/调参/健康门（issue 15）**：新增 `round_is_confirmatory`：
+    冻结锁含 `superseded`（post-test `V12_REFREEZE=1`）时，**当前轮**
+    也强制 `confirmatory_round=false`、`confirmed=[]`，报告显著警告
+    「重冻结不恢复 test 独立性」；只保留 `would_confirm_under_decision_
+    rule` 作探索性记录。`BASELINE_TUNING_PROTOCOL` 的「固定配方确认 ≠
+    两侧调参后的最佳方法比较」限制补入 README/本笔记；health-gate 的
+    override 已持久化，v7 P1L 的「为取得 health 证据而重训」补写实验事件。
+    另修正若干处指向不存在的 `REVIEW_4_RESPONSE.md` 的引用与
+    `confirmation_frozen.json` 的「plan v2」陈旧措辞。
+
+**审查中与当前 HEAD 不符的事实**（保留记录，避免下一轮重复）：`Holm 六比较`
+（实为 m=4）、`48 documents`（实为 4×12 条 arm-seed 记录）、`-(CE-baseline)`
+（实为 `+`）、默认 `csa_dynamic` 被称作 task-learned（文档明确否认）、
+随机模式按 (seed, layer) 变化（实为固定哈希，所有 ref 一致）。

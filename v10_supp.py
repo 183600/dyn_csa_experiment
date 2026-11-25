@@ -96,7 +96,7 @@ P3MT_PAYLOAD_CONTROLS = dict(P3MT_PAYLOAD, variants=SCRATCH_CONTROLS)
 #   种子无关，同一 (行, ρ, mode) 在臂间逐字节相同，严格配对成立。
 PROBE_MODES = {'uniform': [0.0, 0.125, 0.25, 0.5], 'natural': [0.125, 0.25, 0.5], 'mask': [1.0], 'delete': [1.0], 'span': [0.125, 0.25, 0.5], 'doc': [1.0], 'topical': [0.25, 0.5]}
 PROBE_SPAN_LEN = 32
-NIAH_NATURAL = dict(summary='results_v10_mech/niah_natural.json', n_pairs=8, n_seq=16, conditions=['clean', 'distract'], rho=0.5)
+NIAH_NATURAL = dict(summary='results_v10_mech/niah_natural.json', n_pairs=8, n_seq=16, conditions=['clean', 'distract', 'nofar'], rho=0.5)
 PROBE = dict(outdir='results_v10_mech', ckpt_dir='results_v10_mech/ckpt', summary='results_v10_mech/distractor.json', variants=['csa_fixed_rope', 'full_rope'], seeds=[0, 1, 2], eval_lens=[2048, 4096], rhos=[0.0, 0.125, 0.25, 0.5], modes=dict(PROBE_MODES), target=512, n_seq=16, chunk=4, arms=['dense', 'learned', 'randidx', 'allblocks'], arm_overrides={}, niah=dict(NIAH_NATURAL))
 
 def _arm_of(variant, arm, cfg=None):
@@ -208,7 +208,8 @@ def _topical_donor(val_ids, jj, n_far, exclude):
     return best
 
 
-def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE_SPAN_LEN):
+def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE_SPAN_LEN,
+                  return_audit=False):
     """Build ONE corrupted evaluation row (pure, arm/model-seed independent).
 
     输入 val_ids 为 (n_rows, >=eval_len+1) 的 token 面板；返回长度
@@ -277,12 +278,48 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
         raise ValueError(f'_corrupt_row: rho={rho!r} must be a finite fraction in [0,1]')
     if mode in ('mask', 'delete', 'doc') and abs(_rho - 1.0) > 1e-9:
         raise ValueError(f"mode {mode!r} is an all-or-nothing condition and only admits rho=1.0 (got {rho!r}); partial masking is a different question and is not this probe")
+    # ---- Disclosure-only audit of what the corruption ACTUALLY did ----
+    # (review 10 issue 12).  `rho` is a nominal fraction: for `span` the
+    # realised coverage is quantised by segment geometry, for natural /
+    # topical / doc replacements a donor token can equal the original token
+    # (no change), and `overlap_token_slots` measures repeated coverage.  The
+    # audit is a deterministic function of the same arguments and consumes no
+    # RNG draws, so it never changes the measured ids.
+    ids = np.asarray(val_ids[jj, :eval_len + 1], dtype=np.int64).copy()
+    _clean = ids.copy()
+    _audit = {'mode': mode, 'rho_nominal': float(_rho),
+              'far_positions': int(n_far), 'span_len': None,
+              'n_span_segments': None, 'donor_row': None,
+              'covered_token_slots': 0, 'covered_unique_positions': 0,
+              'overlap_token_slots': 0, 'changed_tokens': 0,
+              'changed_definition': 'replaced'}
+
+    def _finish(_ids, _covered, *, changed=None, donor=None, span_len=None,
+                n_seg=None, changed_definition='replaced'):
+        _cov = np.asarray(_covered, dtype=np.int64)
+        _uniq = np.unique(_cov) if _cov.size else _cov
+        if changed is None:
+            changed = int((_ids[_uniq] != _clean[_uniq]).sum()) if _uniq.size else 0
+        _audit.update({
+            'covered_token_slots': int(_cov.size),
+            'covered_unique_positions': int(_uniq.size),
+            'overlap_token_slots': int(max(0, _cov.size - _uniq.size)),
+            'changed_tokens': int(changed),
+            'changed_definition': changed_definition,
+            'realised_coverage_fraction': (float(_uniq.size) / n_far) if n_far else 0.0,
+            'realised_changed_fraction': (float(changed) / n_far) if n_far else 0.0,
+            'changed_fraction_of_covered': (float(changed) / _cov.size) if _cov.size else None,
+            'no_op': bool(_cov.size > 0 and changed == 0),
+            'donor_row': donor, 'span_len': span_len,
+            'n_span_segments': n_seg})
+        return (_ids, _audit) if return_audit else _ids
     if mode == 'delete':
         # the far context is REMOVED, not filled: the model sees only
         # the final target+1 tokens (RoPE is relative, so the kept
         # tokens' pairwise structure is unchanged)
-        return np.asarray(val_ids[jj, eval_len - target:eval_len + 1], dtype=np.int64).copy()
-    ids = np.asarray(val_ids[jj, :eval_len + 1], dtype=np.int64).copy()
+        _short = np.asarray(val_ids[jj, eval_len - target:eval_len + 1], dtype=np.int64).copy()
+        return _finish(_short, np.arange(n_far, dtype=np.int64),
+                       changed=n_far, changed_definition='removed')
     k = int(round(_rho * n_far))
     if _rho > 0.0:
         # Any positive corruption fraction must replace at least one far token.
@@ -290,7 +327,7 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
     k = min(k, n_far)
     if mode == 'mask':
         ids[:n_far] = MASK_TOKEN_ID
-        return ids
+        return _finish(ids, np.arange(n_far, dtype=np.int64))
     if mode == 'doc':
         # whole far context replaced by ONE contiguous slice of another row
         # (length- and position-controlled "unrelated document" context)
@@ -300,9 +337,9 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
         _max_off = _row_len - n_far
         _off = int(rng.integers(0, max(1, _max_off))) if _max_off > 0 else 0
         ids[:n_far] = np.asarray(val_ids[_src, _off:_off + n_far], dtype=np.int64)
-        return ids
+        return _finish(ids, np.arange(n_far, dtype=np.int64), donor=int(_src))
     if k <= 0:
-        return ids
+        return _finish(ids, np.empty(0, dtype=np.int64))
     if mode == 'uniform':
         # With vocab < 2 there is no alternative token, so the resample loop
         # below could never make progress (an infinite loop rather than a
@@ -318,7 +355,7 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
             _draw[_same] = rng.integers(0, _vb, size=int(_same.sum()))
             _same = _draw == ids[pos]
         ids[pos] = _draw
-        return ids
+        return _finish(ids, pos)
     if mode in ('natural', 'topical'):
         # natural: paired other-row realistic tokens at the same seeded
         # position grid; collisions with the original token are KEPT (they
@@ -342,7 +379,7 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
         else:
             _src = (jj + max(1, val_ids.shape[0] // 2)) % val_ids.shape[0]
         ids[pos] = np.asarray(val_ids[_src, pos], dtype=np.int64)
-        return ids
+        return _finish(ids, pos, donor=int(_src))
     if mode == 'span':
         # contiguous sentence-like segments from the donor row: local syntax
         # inside each span survives, cross-span coherence is destroyed.
@@ -363,15 +400,73 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
         _row_len = min(val_ids.shape[1], eval_len + 1)
         _src = (jj + max(1, val_ids.shape[0] // 2)) % val_ids.shape[0]
         _off_hi = _row_len - seg + 1
+        _covered = []
         for i in range(n_seg):
             s = int(i * tile + rng.integers(0, tile - seg + 1))
             o = int(rng.integers(0, _off_hi)) if _off_hi > 1 else 0
             ids[s:s + seg] = np.asarray(val_ids[_src, o:o + seg], dtype=np.int64)
-        return ids
+            _covered.append(np.arange(s, s + seg, dtype=np.int64))
+        _cov = (np.concatenate(_covered) if _covered
+                else np.empty(0, dtype=np.int64))
+        return _finish(ids, _cov, donor=int(_src), span_len=int(seg),
+                       n_seg=int(n_seg))
     raise ValueError(f'_corrupt_row: unknown corruption mode {mode!r} (expected one of {_CORRUPT_MODES})')
 
 
 @torch.inference_mode()
+def _corruption_audit(val_ids, eval_len, rho, mode, n_seq, vocab, target,
+                      span_len=PROBE_SPAN_LEN):
+    """Aggregate what a corruption mode ACTUALLY changed over the scored panel.
+
+    Review 10 issue 12: `rho` is a NOMINAL fraction.  For `span` the realised
+    coverage is quantised by the segment geometry (`n_seg * span_len` replaced
+    slots, capped by the far zone), different modes carry different geometry at
+    the same rho, donor tokens can equal the original token (so a covered
+    position is not necessarily a changed one), and the same position can in
+    principle be covered more than once.  This audit records the realised
+    counts so reports can state, per (mode, rho), how much of the far context
+    was actually covered/changed and whether the corruption was a no-op.
+
+    The audit is an arm/model independent deterministic function of the same
+    arguments as `_corrupt_row`; it consumes no RNG state and does not change
+    any measured id.
+    """
+    _ns = L._as_seed_int(n_seq)
+    if _ns is None or _ns < 1:
+        raise ValueError(f'_corruption_audit: n_seq={n_seq!r} must be a positive exact integer')
+    _rows = np.asarray(val_ids)
+    if _rows.ndim != 2:
+        raise ValueError(f'_corruption_audit: val_ids must be a 2-D token matrix, got shape {_rows.shape}')
+    if _ns > _rows.shape[0]:
+        raise ValueError(f'_corruption_audit: n_seq={_ns} exceeds the {_rows.shape[0]}-row panel')
+    audits = []
+    for jj in range(_ns):
+        _, _a = _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target,
+                             span_len=span_len, return_audit=True)
+        audits.append(_a)
+    far = audits[0]['far_positions']
+    denom = far * len(audits)
+    cov_slots = sum(a['covered_token_slots'] for a in audits)
+    cov_uniq = sum(a['covered_unique_positions'] for a in audits)
+    changed = sum(a['changed_tokens'] for a in audits)
+    overlap = sum(a['overlap_token_slots'] for a in audits)
+    _donor = sorted({a['donor_row'] for a in audits if a['donor_row'] is not None})
+    return {'mode': mode, 'rho_nominal': float(audits[0]['rho_nominal']),
+            'n_rows': len(audits), 'far_positions_per_row': int(far),
+            'covered_token_slots_total': int(cov_slots),
+            'covered_unique_positions_total': int(cov_uniq),
+            'overlap_token_slots_total': int(overlap),
+            'changed_tokens_total': int(changed),
+            'changed_definition': audits[0]['changed_definition'],
+            'realised_coverage_fraction': (float(cov_uniq) / denom) if denom else 0.0,
+            'realised_changed_fraction': (float(changed) / denom) if denom else 0.0,
+            'changed_fraction_of_covered': (float(changed) / cov_slots) if cov_slots else None,
+            'no_op_rows': int(sum(1 for a in audits if a['no_op'])),
+            'span_len': audits[0]['span_len'],
+            'n_span_segments': audits[0]['n_span_segments'],
+            'distinct_donor_rows': len(_donor)}
+
+
 def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, chunk_mem=None, mode='uniform'):
     """Score the clean 512-token target zone under a corrupted far context.
 
@@ -453,6 +548,34 @@ def _cell_ppl(nll_sum, n_tok):
     # Use the shared exp-for-PPL helper for the binary64 exp boundary.
     _ppl = L._safe_exp_ppl(ce)
     return float('inf') if _ppl is None else _ppl
+
+def _binom_sf_exact(n, k, q):
+    """P(Bin(n, q) >= k) in log space (exact, overflow-free for small n)."""
+    n_i = L._as_seed_int(n)
+    k_i = L._as_seed_int(k)
+    if n_i is None or k_i is None or n_i < 1:
+        return float('nan')
+    try:
+        q_f = float(q)
+    except (TypeError, ValueError, OverflowError):
+        return float('nan')
+    if not (math.isfinite(q_f) and 0.0 <= q_f <= 1.0):
+        return float('nan')
+    if k_i <= 0:
+        return 1.0
+    if k_i > n_i:
+        return 0.0
+    if q_f <= 0.0:
+        return 0.0
+    if q_f >= 1.0:
+        return 1.0
+    _lq, _l1q = math.log(q_f), math.log1p(-q_f)
+    _logs = [math.lgamma(n_i + 1) - math.lgamma(i + 1) - math.lgamma(n_i - i + 1)
+             + i * _lq + (n_i - i) * _l1q for i in range(k_i, n_i + 1)]
+    _mx = max(_logs)
+    _p = math.exp(_mx) * math.fsum(math.exp(x - _mx) for x in _logs)
+    return float(min(1.0, max(0.0, _p)))
+
 
 def _probe_span_len(cfg):
     """Exact positive span geometry for the `span` corruption mode.
@@ -707,9 +830,17 @@ def _niah_fingerprint(cfg, condition=None):
         if _iv is None or _iv < 1:
             raise ValueError(
                 f'_niah_fingerprint: {_name}={_iv!r} must be a positive exact integer')
-    if condition not in (None, 'clean', 'distract'):
+    if condition not in (None, 'clean', 'distract', 'nofar'):
         raise ValueError(
-            f"_niah_fingerprint: condition={condition!r} must be None, 'clean' or 'distract'")
+            f"_niah_fingerprint: condition={condition!r} must be None, 'clean', "
+            "'distract' or 'nofar'")
+    if condition == 'nofar':
+        # nofar is a different task construction (couples destroyed): keep its
+        # geometry visibly distinct from clean/distract in probe_params.
+        _fp_nf = {'n_seq': int(_n_seq), 'target': int(_target), 'vocab': int(_vocab),
+                  'n_pairs': int(_n_pairs), 'val_seq_len': max(_tl, _need),
+                  'stat': 'niah_nofar_v1'}
+        return _fp_nf
     fp = {'n_seq': int(_n_seq), 'target': int(_target), 'vocab': int(_vocab),
           'n_pairs': int(_n_pairs), 'val_seq_len': max(_tl, _need),
           'stat': 'niah_natural_v1'}
@@ -762,9 +893,12 @@ def _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed, 
     _seed = L._as_seed_int(seed)
     if _seed is None:
         raise ValueError(f'NIAH-natural: seed must be an exact integer, got {seed!r}')
-    if condition not in ('clean', 'distract'):
+    if condition not in ('clean', 'distract', 'nofar'):
         raise ValueError(
-            f"NIAH-natural: condition={condition!r} must be 'clean' or 'distract'")
+            "NIAH-natural: condition must be 'clean', 'distract' or 'nofar' "
+            f'(got {condition!r}); `nofar` deletes the far key->value couples so '
+            'the answer is not recoverable from the far context (a no-far-info '
+            'control: accuracy there must collapse to chance)')
     if isinstance(rho, (bool, np.bool_, np.datetime64, np.timedelta64,
                         complex, np.complexfloating)):
         raise ValueError(f'NIAH-natural: rho={rho!r} is a boolean/temporal/complex value, not a density')
@@ -830,6 +964,18 @@ def _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed, 
             rows[i, kp] = keys[jp]
             rows[i, vp] = vals[jp]
             couple_pos.update((kp, vp))
+        if condition == 'nofar':
+            # No-far-information control: overwrite BOTH far couple tokens with
+            # donor-row natural tokens, so the query key's answer is nowhere in
+            # the far context.  The query keys in the target zone are kept.  A
+            # model scoring above chance here means the answer leaks from the
+            # local target context and the task is invalid as a far-necessity
+            # probe.
+            for _jp in range(n_pairs):
+                _kp = _jp * band + (band // 2 if band > 2 else 1)
+                _kp = min(_kp, n_far - 2)
+                rows[i, _kp] = np.asarray(val_ids[_src_rows[i], _kp], dtype=np.int64)
+                rows[i, _kp + 1] = np.asarray(val_ids[_src_rows[i], _kp + 1], dtype=np.int64)
         if condition == 'distract':
             k = int(round(rho * n_far))
             if rho > 0.0:
@@ -856,7 +1002,23 @@ def _build_niah_natural(val_ids, eval_len, target, n_pairs, vocab, n_seq, seed, 
             _far_kp = pj * band + (band // 2 if band > 2 else 1)
             _far_kp = min(_far_kp, n_far - 2)
             dists[i, j] = kp - (_far_kp + 1)
-    stats = {'n_pairs': int(n_pairs), 'eval_len': int(eval_len), 'target': int(target), 'condition': str(condition), 'rho': float(rho) if condition == 'distract' else 0.0, 'dist_mean': float(dists.mean()), 'dist_min': int(dists.min()), 'dist_max': int(dists.max()), 'couple_positions_excluded_from_distract': True}
+    _n_value_tokens = int(vocab - val_lo)
+    stats = {'n_pairs': int(n_pairs), 'eval_len': int(eval_len), 'target': int(target),
+             'condition': str(condition),
+             'rho': float(rho) if condition == 'distract' else 0.0,
+             'dist_mean': float(dists.mean()), 'dist_min': int(dists.min()),
+             'dist_max': int(dists.max()),
+             # Review 10, issue 13: publish the chance level of the task (the
+             # answer is one of `_n_value_tokens` value tokens, sampled
+             # uniformly) so "chance-level accuracy" can be judged against the
+             # actual task, not assumed.  Positive-control solvers are NOT part
+             # of the task construction; without one the analysis refuses to
+             # treat NIAH as mechanism evidence.
+             'chance_acc': (1.0 / _n_value_tokens) if _n_value_tokens > 0 else None,
+             'n_value_tokens': _n_value_tokens,
+             'dist_per_query': [int(x) for x in dists.reshape(-1).tolist()],
+             'couple_positions_excluded_from_distract': True,
+             'nofar_control': bool(condition == 'nofar')}
     return (rows, q_cols, q_vals, stats)
 
 @torch.inference_mode()
@@ -875,6 +1037,7 @@ def _niah_ppls(model, val_ids, eval_len, n_seq, cfg, condition, row_cache=None, 
     n_correct = 0
     n_q = 0
     nll_parts = []
+    _correct_parts = []
     i = 0
     while i < n_seq:
         j = min(i + n_ch, n_seq)
@@ -896,8 +1059,10 @@ def _niah_ppls(model, val_ids, eval_len, n_seq, cfg, condition, row_cache=None, 
         _lv = L._h2d_async(q_vals[i:j], torch.int64, DEVICE)
         _lg = torch.gather(logits, 1, _lc.unsqueeze(-1).expand(-1, -1, logits.size(-1)))
         _nll = F.cross_entropy(_lg.reshape(-1, vocab), _lv.reshape(-1), reduction='none').view(j - i, n_pairs)
-        n_correct += int((_lg.argmax(-1) == _lv).sum())
+        _correct = (_lg.argmax(-1) == _lv)
+        n_correct += int(_correct.sum())
         n_q += int(_lv.numel())
+        _correct_parts.append(_correct.detach().cpu().reshape(-1).to(torch.bool))
         nll_parts.append(_nll)
         del ids, logits, _lg, _lv, _nll
         if chunk_mem is not None:
@@ -906,7 +1071,37 @@ def _niah_ppls(model, val_ids, eval_len, n_seq, cfg, condition, row_cache=None, 
     if not nll_parts:
         return {'acc': float('nan'), 'nll': float('nan'), 'n': 0, **stats}
     _nll_all = torch.cat(nll_parts)
-    return {'acc': float(n_correct) / max(n_q, 1), 'nll': float(_nll_all.mean()), 'n': int(n_q), **stats}
+    out = {'acc': float(n_correct) / max(n_q, 1), 'nll': float(_nll_all.mean()),
+           'n': int(n_q), **stats}
+    # Distance-bucket accuracy (review 10, issue 13): a far-necessity task must
+    # show a short-to-long distance gradient; a flat/chance profile means the
+    # task does not exercise distance in this model/format.  Buckets are
+    # equal-count quantiles of the ACTUAL query distances in this cell.
+    try:
+        _corr = torch.cat(_correct_parts).numpy()
+        _dists = np.asarray(stats.get('dist_per_query') or [], dtype=np.int64)
+        if _corr.size == _dists.size and _corr.size:
+            _order = np.argsort(_dists, kind='stable')
+            _buckets = []
+            _nb = 4
+            for _bi in range(_nb):
+                _lo = (_bi * _corr.size) // _nb
+                _hi = ((_bi + 1) * _corr.size) // _nb
+                if _hi <= _lo:
+                    continue
+                _idx = _order[_lo:_hi]
+                _buckets.append({'bucket': _bi,
+                                 'dist_min': int(_dists[_idx].min()),
+                                 'dist_max': int(_dists[_idx].max()),
+                                 'n': int(_idx.size),
+                                 'acc': float(_corr[_idx].mean())})
+            out['acc_by_distance_bucket'] = _buckets
+            out['distance_gradient'] = ('unavailable' if len(_buckets) < 2 else
+                                        ('positive' if _buckets[0]['acc'] <= _buckets[-1]['acc']
+                                         else 'negative'))
+    except (TypeError, ValueError, RuntimeError):
+        pass
+    return out
 
 def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     """Run exactly ONE (variant, seed) probe cell: load the trained checkpoint
@@ -1114,7 +1309,8 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
                        for _ppl in (L._safe_exp_ppl(s / t) for s, t in zip(nll_sum, n_tok))]
             _fp_base = _probe_fp_for_mode(_fp, _pcfg, mode)
             _fp_rec = dict(_fp_base, mode=mode) if mode != 'uniform' else _fp_base
-            _pending[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], 'val_fp': _val_fp, '_code': V.CKPT_CODE, 'probe_params': _fp_rec, 'recipe': _ck_recipe, 'train_knobs': _tr.get('train_knobs'), 'train_objective': _tr.get('train_objective'), 'param_breakdown': _tr.get('param_breakdown'), 'rng_fp': _tr.get('rng_fp'), 'train_fp': _tr.get('data_fp'), 'manifest_sha256': cfg.get('manifest_sha256')}
+            _corr_audit = _corruption_audit(val_ids, Ln, rho, mode, _pcfg['n_seq'], _pcfg['vocab'], _pcfg['target'], span_len=_probe_span_len(_pcfg))
+            _pending[key] = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'corruption_audit': _corr_audit, 'ppl_mean': float(cell_ppl), 'ppl_std_per_seq': float(np.std(per_seq, ddof=1)) if len(per_seq) > 1 else 0.0, 'ppls': [float(p) for p in per_seq], 'nll_sum': [float(x) for x in nll_sum], 'n_tok': [int(x) for x in n_tok], 'n_seq': len(per_seq), 'target': cfg['target'], 'val_fp': _val_fp, '_code': V.CKPT_CODE, 'probe_params': _fp_rec, 'recipe': _ck_recipe, 'train_knobs': _tr.get('train_knobs'), 'train_objective': _tr.get('train_objective'), 'param_breakdown': _tr.get('param_breakdown'), 'rng_fp': _tr.get('rng_fp'), 'train_fp': _tr.get('data_fp'), 'manifest_sha256': cfg.get('manifest_sha256')}
             _log_metrics[key] = {'ppl_mean': float(cell_ppl), 'n_seq': len(per_seq)}
             print(f'  [p3mp] {key:44s} PPL={cell_ppl:8.2f}', flush=True)
             if _ci % 8 == 0:
@@ -1125,7 +1321,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
         for Ln, cond in _niah_cells:
             res = _niah_ppls(model, val_ids, Ln, _pcfg['n_seq'], _pcfg, cond, row_cache=_row_cache, chunk_mem=_chunk_mem)
             key = _niah_cell_key(v, seed, arm, Ln, cond)
-            rec = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': int(Ln), 'task': 'niah_natural', 'condition': cond, 'acc': float(res['acc']), 'nll': float(res['nll']), 'n_queries': int(res['n']), 'n_pairs': int(res.get('n_pairs', (_niah_cfg or {}).get('n_pairs', 8))), 'dist_mean': float(res.get('dist_mean', float('nan'))), 'dist_min': int(res.get('dist_min', -1)), 'dist_max': int(res.get('dist_max', -1)), 'rho': float(res.get('rho', 0.0)), 'val_fp': _val_fp, '_code': V.CKPT_CODE, 'probe_params': _niah_fp_of(cond), 'recipe': _ck_recipe, 'manifest_sha256': cfg.get('manifest_sha256')}
+            rec = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': int(Ln), 'task': 'niah_natural', 'condition': cond, 'acc': float(res['acc']), 'nll': float(res['nll']), 'n_queries': int(res['n']), 'n_pairs': int(res.get('n_pairs', (_niah_cfg or {}).get('n_pairs', 8))), 'dist_mean': float(res.get('dist_mean', float('nan'))), 'dist_min': int(res.get('dist_min', -1)), 'dist_max': int(res.get('dist_max', -1)), 'rho': float(res.get('rho', 0.0)), 'chance_acc': res.get('chance_acc'), 'n_value_tokens': res.get('n_value_tokens'), 'acc_by_distance_bucket': res.get('acc_by_distance_bucket'), 'distance_gradient': res.get('distance_gradient'), 'val_fp': _val_fp, '_code': V.CKPT_CODE, 'probe_params': _niah_fp_of(cond), 'recipe': _ck_recipe, 'manifest_sha256': cfg.get('manifest_sha256')}
             L.locked_json_update(_nspath, (lambda s, _p=dict({key: rec}): (s.update(_p), s)[1]), indent=1)
             _log_metrics[key] = {'acc': float(rec['acc']), 'nll': float(rec['nll']), 'n_queries': int(rec['n_queries'])}
             print(f"  [niah] {key:48s} acc={rec['acc']:.3f} nll={rec['nll']:.3f}", flush=True)
@@ -1605,7 +1801,7 @@ def _scale_crossovers():
         out[label] = entry
     return out
 
-_SCALE_PANEL_SPECS = {'P3SS': dict(outdir='results_lm_v10_scale_s', d=128, n_layers=4, batch=12, seq=512, steps=8000, note='small arm'), 'P3SL': dict(outdir='results_lm_v10_scale_l', d=512, n_layers=10, batch=12, seq=512, steps=4000, note='large arm'), 'P3SL_TOK': dict(outdir='results_lm_v10_scale_l8k', d=512, n_layers=10, batch=12, seq=512, steps=8000, note='token-matched large arm'), 'P3SL_FLOP': dict(outdir='results_lm_v10_scale_lflop', d=512, n_layers=10, batch=12, seq=512, steps=None, note='compute-matched large arm')}
+_SCALE_PANEL_SPECS = {'P3SS': dict(outdir='results_lm_v10_scale_s', d=128, n_layers=4, batch=12, seq=512, steps=8000, note='small arm'), 'P3SL': dict(outdir='results_lm_v10_scale_l', d=512, n_layers=10, batch=12, seq=512, steps=4000, note='large arm'), 'P3SL_TOK': dict(outdir='results_lm_v10_scale_l8k', d=512, n_layers=10, batch=12, seq=512, steps=8000, note='token-matched large arm'), 'P3SL_FLOP': dict(outdir='results_lm_v10_scale_lflop', d=512, n_layers=10, batch=12, seq=512, steps=None, note='6ND-param-proxy-budget large arm (NOT measured FLOPs)')}
 
 def _panel_endpoint(hists, tps):
     """Final-eval gap + token count of a panel: csa_fixed vs full, seed-paired."""
@@ -1845,12 +2041,26 @@ def v10_analysis(out='analysis_v10/stats.json'):
         _new_bad = _bad_cells[_n_bad_pre:]
         if _new_bad:
             print(f'[v10 stats] {len(_new_bad)} record(s) in {sp} lack `probe_params` and are dropped from every mean/paired statistic: ' + ', '.join((f'{k}({why})' for k, why in _new_bad[:4])))
+        def _record_audit(by_seed):
+            """The corruption audit is arm/model/seed independent; keep it only
+            when every seed record of the cell agrees, otherwise mark unknown."""
+            _vals = [r.get('corruption_audit') for r in by_seed.values()]
+            if not _vals or any(not isinstance(x, dict) for x in _vals):
+                return None
+            _first = _vals[0]
+            try:
+                _same = all(json.dumps(x, sort_keys=True) == json.dumps(_first, sort_keys=True)
+                            for x in _vals[1:])
+            except (TypeError, ValueError):
+                return None
+            return dict(_first) if _same else None
+
         probe_cells = []
         for (v, arm, Ln, rho, mode, _pp, _cd, _recipe, _vfp), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
             if not means:
                 raise RuntimeError(f'v10 probe aggregation: empty seed set for {(v, arm, Ln, rho, mode)}')
-            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'val_fp': _val_fp_value(_vfp), 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
+            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'val_fp': _val_fp_value(_vfp), 'mean': float(np.mean(list(means.values()))), 'n': len(means), 'corruption_audit': _record_audit(by_seed)})
         contrasts = {}
 
         # The grouped lists are exactly what a scan of probe_cells would have
@@ -2016,7 +2226,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if len(per_seed) >= 1:
                 means = {s: per_seed[s] for s in sorted(per_seed)}
                 _dl = list(means.values())
-                entry = {'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'n': len(_dl), 'mean': float(np.mean(_dl)), 'std': float(np.std(_dl, ddof=1)) if len(_dl) > 1 else 0.0, 'per_seed': means, 'clean_nll_by_seed': {s: _nll_tok(r) for s, r in clean_grp.items() if math.isfinite(_nll_tok(r))}, 'note': 'delta = NLL_corrupted - NLL_clean, nats per target token'}
+                entry = {'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'n': len(_dl), 'corruption_audit': _record_audit(by_seed), 'mean': float(np.mean(_dl)), 'std': float(np.std(_dl, ddof=1)) if len(_dl) > 1 else 0.0, 'per_seed': means, 'clean_nll_by_seed': {s: _nll_tok(r) for s, r in clean_grp.items() if math.isfinite(_nll_tok(r))}, 'note': 'delta = NLL_corrupted - NLL_clean, nats per target token'}
                 _dnk = f'{v}::{arm}::L{Ln}::{mode}::r{rho}'
                 _dnident = (v, arm, Ln, rho, mode, _pp, _cd, _recipe, _vfp)
                 if _dnk in _dn_ambiguous:
@@ -2132,7 +2342,8 @@ def v10_analysis(out='analysis_v10/stats.json'):
             for (v, arm, Ln, cond, _pp, _cd, _recipe, _vfp), by_seed in sorted(ncells.items(), key=lambda kv: kv[0]):
                 accs = {s: r['acc'] for s, r in by_seed.items()}
                 nlls = {s: r['nll'] for s, r in by_seed.items()}
-                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'acc_mean': float(np.mean(list(accs.values()))), 'nll_mean': float(np.mean(list(nlls.values()))), 'n': len(accs), 'n_pairs': next(iter(by_seed.values())).get('n_pairs'), 'dist_mean': next(iter(by_seed.values())).get('dist_mean'), '_pp': _pp, '_code': _cd, '_recipe': _recipe, 'val_fp': _val_fp_value(_vfp)})
+                _first = next(iter(by_seed.values()))
+                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'acc_mean': float(np.mean(list(accs.values()))), 'nll_mean': float(np.mean(list(nlls.values()))), 'n': len(accs), 'n_pairs': _first.get('n_pairs'), 'n_queries': _first.get('n_queries'), 'chance_acc': _first.get('chance_acc'), 'n_value_tokens': _first.get('n_value_tokens'), 'acc_by_distance_bucket': _first.get('acc_by_distance_bucket'), 'distance_gradient': _first.get('distance_gradient'), 'dist_mean': _first.get('dist_mean'), '_pp': _pp, '_code': _cd, '_recipe': _recipe, 'val_fp': _val_fp_value(_vfp)})
             niah_contrasts = {}
             _nidx = {}
             for c in niah_cells:
@@ -2188,6 +2399,85 @@ def v10_analysis(out='analysis_v10/stats.json'):
                             res['seeds'] = _keep
                             niah_contrasts[_cname] = res
             probe['niah_natural'] = {'cells': niah_cells, 'contrasts': niah_contrasts}
+            # Review 10, issue 13: NIAH task-validity gate.  A random-token
+            # key->value task pasted into natural text is not automatically a
+            # valid far-necessity probe for a small model that was never
+            # trained on the format: chance-level accuracy can mean "task
+            # format unsupported", not "attention failed".  The gate therefore
+            # requires ALL of:
+            #   (1) clean accuracy significantly above the published chance
+            #       level (exact binomial lower-tail p < alpha);
+            #   (2) the no-far-info control (couples destroyed) at chance —
+            #       above-chance accuracy there would mean the answer leaks
+            #       from the local target context;
+            #   (3) a POSITIVE CONTROL solver that demonstrably solves the
+            #       task.  No positive control is part of the probe config, so
+            #       this condition is false for every current panel and NIAH
+            #       cannot support a "long-distance utilization" mechanism
+            #       claim until one is added and recorded.
+            _alpha_n = 0.05
+            _pc = (PROBE.get('niah') or {}).get('positive_control')
+            _pc_ok = bool(isinstance(_pc, dict) and L._finite_scalar(_pc.get('acc')) is not None
+                          and L._finite_scalar(_pc.get('chance_acc')) is not None
+                          and L._finite_scalar(_pc.get('acc')) > L._finite_scalar(_pc.get('chance_acc')))
+            _nvl = {}
+            for _bv, _barm, _bL in sorted({(c['variant'], c['arm'], c['eval_len']) for c in niah_cells}):
+                def _ncellv(_cond):
+                    hits = [c for c in niah_cells
+                            if c['variant'] == _bv and c['arm'] == _barm
+                            and c['eval_len'] == _bL and c['condition'] == _cond]
+                    return hits[0] if len(hits) == 1 else None
+                _cl = _ncellv('clean')
+                if _cl is None:
+                    continue
+                _chance = L._finite_scalar(_cl.get('chance_acc'))
+                _nq = L._as_seed_int(_cl.get('n_queries'))
+                _acc = _cl.get('acc_mean')
+                _p_bin = None
+                _correct = None
+                if (_chance is not None and _nq is not None and _nq > 0
+                        and L._finite_scalar(_acc) is not None):
+                    _correct = int(round(float(_acc) * _nq * len(_cl.get('acc_by_seed') or {})))
+                    _p_bin = _binom_sf_exact(_nq * len(_cl.get('acc_by_seed') or {}), _correct, _chance)
+                _nof = _ncellv('nofar')
+                _nofar_ok = None
+                _nofar_p = None
+                _nofar_acc = None
+                if _nof is not None and _chance is not None and _nq is not None and _nq > 0:
+                    _nofar_acc = _nof.get('acc_mean')
+                    _nof_n = _nq * len(_nof.get('acc_by_seed') or {})
+                    _nof_k = int(round(float(_nofar_acc) * _nof_n)) if L._finite_scalar(_nofar_acc) is not None else 0
+                    _nofar_p = _binom_sf_exact(_nof_n, _nof_k, _chance)
+                    _nofar_ok = not (L._finite_scalar(_nofar_acc) is not None
+                                     and _nofar_p is not None and _nofar_p < _alpha_n
+                                     and float(_nofar_acc) > float(_chance))
+                _above = bool(_p_bin is not None and _p_bin < _alpha_n
+                              and float(_acc) > float(_chance))
+                _valid = bool(_above and (_nofar_ok is not False) and _pc_ok)
+                _nvl[f'{_bv}::{_barm}::L{_bL}'] = {
+                    'chance_acc': _chance, 'clean_acc': _acc,
+                    'n_queries': _nq,
+                    'binomial_p_above_chance': _p_bin,
+                    'above_chance': _above,
+                    'nofar_available': _nof is not None,
+                    'nofar_acc': _nofar_acc,
+                    'nofar_p_above_chance': _nofar_p,
+                    'nofar_consistent_with_chance': _nofar_ok,
+                    'positive_control_recorded': _pc_ok,
+                    'task_valid_for_mechanism_claim': _valid,
+                }
+            probe['niah_task_validity'] = _nvl
+            probe['niah_mechanism_usable'] = bool(_nvl) and all(
+                v['task_valid_for_mechanism_claim'] for v in _nvl.values())
+            probe['niah_validity_note'] = (
+                'NIAH-natural cannot be used as mechanism evidence unless (1) clean accuracy is '
+                'above the published chance level, (2) the no-far-info control is at chance, and '
+                '(3) a positive-control solver is recorded. Current panels lack a positive control, '
+                'so mechanism claims based on NIAH remain unsupported (descriptive only).')
+            if not probe['niah_mechanism_usable']:
+                print('[v10 stats] NIAH task-validity gate: mechanism claims NOT supported '
+                      '(missing/!pass positive control, or chance/nofar checks failed) — '
+                      'NIAH stays descriptive only')
             # NIAH contrasts are built AFTER the corruption family was
             # corrected.  Leaving them out of the Holm family would report
             # uncorrected p-values under a "Holm" heading, so re-run the
@@ -2326,6 +2616,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A = lines.append
     A('# CSA / HCA 受控机制研究 — v10 补实验报告（外推机制 + 反转点标度 + topk 补种子）')
     A('> **证据等级：探索性（exploratory）**。本面板的比较/种子是观察 validation 结果后选择的；Holm 校正只限制过度宣称，不等于预注册确认。')
+    A(L.evidence_status_banner())
     A('')
     A('')
     A(f'> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}')
@@ -2485,7 +2776,9 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             vs = [(k, v) for k, v in _legacy.items() if tag in k]
             if not vs:
                 return False
-            # Direction, raw p, Holm p, n floor and |mean|>std must ALL hold:
+            # Direction, raw p, Holm p and n floor must hold for the word
+          # "significant"; |mean|>std is a STABILITY diagnostic reported
+          # separately (review 10 issue 8), never a significance verdict:
             # the raw-p version could call a resolution-limited or noise-level
             # contrast "strong evidence" while the table printed p_holm=1.0.
             return all((v.get('mean', 0) > 0 and
@@ -2510,7 +2803,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         learned_helps = ri_sig
         _dpos = bool(dn) and dn[0] > 0 and bool(ab) and ab[0] > 0
         _dtxt = '正值表示「看得见远距噪声就会受害」，支持限制远距注意力暴露带来抗噪性' if _dpos else '区间并非全正，「远距暴露致害」的方向在本轮产物上不成立，以配对数字为准'
-        A(f'**结论（区间实时算自上方配对检验，Δ = 对照臂 − 学习选择臂）：**(1) dense−learned Δ 区间 {_fmt(dn)} PPL，allblocks−learned Δ 区间 {_fmt(ab)} PPL——{_dtxt}；(2) randidx−learned Δ 区间 {_fmt(ri)} PPL——' + ('全为正值且全部对照达到 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立）。' if learned_helps else f'未能在 p<0.05 上成立（randidx 对照的最小 n={n_min_ri}，全表最小 n={n_min}[{', '.join(sorted(_bind)[:2])}{('…' if len(_bind) > 2 else '')}]，精确符号翻转的 p 下限为 {p_floor:.3f}，' + ('该种子数下无法达到 0.05 显著性' if not (p_floor <= 0.05) else '分辨率已足以达到 0.05，未显著是数据结论而非分辨率上限') + '），「抗噪性来自学习到的检索质量」的强版本**不成立**；现有数据只支持「抗噪性主要来自稀疏归纳偏置本身」这一较弱表述。') + '）')
+        A(f'**结论（区间实时算自上方配对检验，Δ = 对照臂 − 学习选择臂）：**(1) dense−learned Δ 区间 {_fmt(dn)} PPL，allblocks−learned Δ 区间 {_fmt(ab)} PPL——{_dtxt}；(2) randidx−learned Δ 区间 {_fmt(ri)} PPL——' + ('全为正值且全部对照达到 p<0.05：学习到的检索对抗噪性有**独立贡献**（统计显著性成立；稳定性见 mean/std 列，|mean|>std 只作稳定性诊断）。' if learned_helps else f'未能在 p<0.05 上成立（randidx 对照的最小 n={n_min_ri}，全表最小 n={n_min}[{', '.join(sorted(_bind)[:2])}{('…' if len(_bind) > 2 else '')}]，精确符号翻转的 p 下限为 {p_floor:.3f}，' + ('该种子数下无法达到 0.05 显著性' if not (p_floor <= 0.05) else '分辨率已足以达到 0.05，未显著是数据结论而非分辨率上限') + '），「抗噪性来自学习到的检索质量」的强版本**不成立**；现有数据只支持「抗噪性主要来自稀疏归纳偏置本身」这一较弱表述。') + '）')
         A('')
     # ---- P3M-2：从头训练的选择器对照 ----
     _new_c = {k: v for k, v in contr.items() if k not in _legacy and not k.startswith('ΔNLL')}
@@ -2533,6 +2826,28 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         A('')
         A('**口径**：ΔNLL = NLL_污染 − NLL_干净（nats/目标 token，逐种子配对）。腐坏模式：`uniform`（均匀随机 token，既有协议）、`natural`（其他真实序列同位置 token）、`mask`（远端整体屏蔽为 `<pad>`）、`delete`（远端整体删除，仅剩目标区）。`mask`/`delete` 回答「干净远端上下文到底带来多少收益」；`natural` 与 `uniform` 之差只回答「真实语料同位置 token 替换是否比均匀随机替换更难过滤」；它不是主题干扰、语义相近干扰、重复文本或对抗干扰，不能据此声称普遍抗噪性。')
         A('')
+        # Review 10 issue 12: rho is NOMINAL.  Publish what each mode actually
+        # covered/changed so modes are not compared as if the same rho meant
+        # the same realised corruption.  The audit is arm-independent; when a
+        # legacy record predates it the cell is marked n/a rather than guessed.
+        _audit_rows = {}
+        for _c in (probe.get('cells') or []):
+            _a = _c.get('corruption_audit')
+            _akey = (_c['eval_len'], _c['mode'], _c['rho'])
+            if isinstance(_a, dict):
+                _audit_rows.setdefault(_akey, _a)
+        if _audit_rows:
+            A('**实际腐坏几何**（ρ 是名义比例；`span` 的实际覆盖受段长量化，供体 token 可能与原文相同，故覆盖 ≠ 改变）：')
+            A('')
+            A('| L | 模式 | ρ 名义 | 覆盖槽位 | 唯一覆盖位置 | 重叠槽位 | 实际改变 token | 实现覆盖率 | 改变率 | 空操作行 |')
+            A('|---|---|---|---|---|---|---|---|---|---|')
+            for (_L, _mode, _rho) in sorted(_audit_rows):
+                _a = _audit_rows[(_L, _mode, _rho)]
+                _cf = _a.get('changed_fraction_of_covered')
+                A(f"| {_L} | {_mode} | {_rho:g} | {_a.get('covered_token_slots_total', 0)} | {_a.get('covered_unique_positions_total', 0)} | {_a.get('overlap_token_slots_total', 0)} | {_a.get('changed_tokens_total', 0)} | {_a.get('realised_coverage_fraction', 0.0):.3f} | {_a.get('realised_changed_fraction', 0.0):.3f} | {_a.get('no_op_rows', 0)} |")
+            A('')
+            A('> 读法：同一 ρ 下不同模式的**实际改变比例**不同，不能把「ρ 相同」当作「腐坏强度相同」；跨模式比较一律以本表的实现覆盖/改变列为准，ΔNLL 只回答腐坏增量。若某行显示「空操作行 > 0」（自然/主题/文档模式的供体 token 与原 token 相同），该行是内容未变的假腐坏，必须单独说明。')
+            A('')
         A('| 臂 | L | 模式 | ρ | ΔNLL mean±std | n | 干净 NLL |')
         A('|---|---|---|---|---|---|---|')
         _clean_nll_cache = {}
@@ -2567,20 +2882,60 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     if niah.get('cells'):
         A('### P3M-4 远端必要信息任务（NIAH-natural，自然文本 + 自然干扰）')
         A('')
-        A('**设计**：序列 = 远端自然文本（内嵌 8 个 key→value 耦合）+ 目标区（自然文本收尾 + 8 个查询 key）。查询 key 的下一个 token 的正确答案只在远端出现——正确预测**必须**利用远距信息；`distract` 条件把 ρ=0.5 的远端草料换成其他真实序列的 token（realistic-token 替换；不是主题/语义干扰），但**绝不腐坏耦合位置**。报告 answer top-1 准确率与 answer NLL（已按各臂 clean/distract 成对）。')
+        A('**设计**：序列 = 远端自然文本（内嵌 8 个 key→value 耦合）+ 目标区（自然文本收尾 + 8 个查询 key）。查询 key 的下一个 token 的正确答案只在远端出现。`distract` 条件把 ρ=0.5 的远端草料换成其他真实序列的 token（realistic-token 替换；不是主题/语义干扰），但**绝不腐坏耦合位置**；`nofar` 条件**删除远端耦合**（无远端信息对照，准确率应退回 chance）。报告 answer top-1 准确率与 answer NLL。**注意**：把随机 token 的 key→value 对插入自然文本，不等于模型具备该格式下的远距检索能力；chance 水平也可能只是任务格式不适配。因此本报告还给出任务有效性的机器判据（见下），不满足时该任务只能作描述性读数。')
         A('')
-        A('| 臂 | L | 条件 | acc | answer NLL | n |')
-        A('|---|---|---|---|---|---|')
+        A('| 臂 | L | 条件 | acc | chance | 高于 chance? | answer NLL | n |')
+        A('|---|---|---|---|---|---|---|---|')
+        _nval = probe.get('niah_task_validity') or {}
         for c in sorted(niah['cells'], key=lambda c: (c['eval_len'], c['condition'], c['variant'], c['arm'])):
-            A(f"| `{c['variant']}::{c['arm']}` | {c['eval_len']} | {c['condition']} | {c['acc_mean']:.3f} | {c['nll_mean']:.3f} | {c['n']} |")
+            _ch = c.get('chance_acc')
+            _chtxt = '—' if _ch is None else f'{float(_ch):.5f}'
+            _v = _nval.get(f"{c['variant']}::{c['arm']}::L{c['eval_len']}")
+            _ab = '—'
+            if _v is not None and c['condition'] == 'clean':
+                _ab = '是' if _v.get('above_chance') else '否'
+            A(f"| `{c['variant']}::{c['arm']}` | {c['eval_len']} | {c['condition']} | {c['acc_mean']:.3f} | {_chtxt} | {_ab} | {c['nll_mean']:.3f} | {c['n']} |")
         A('')
+        if _nval:
+            A('**任务有效性判据（机器门；不满足则 NIAH 不能作为机制证据）**：')
+            A('')
+            A('| 臂 | L | clean acc | chance | 二项 p(>chance) | nofar acc | nofar 与 chance 一致 | 正对照已记录 | 可用于机制主张 |')
+            A('|---|---|---|---|---|---|---|---|---|')
+            for _k, _v in sorted(_nval.items()):
+                _pp = _v.get('binomial_p_above_chance')
+                _ptxt = '—' if _pp is None else f'{float(_pp):.3g}'
+                _nfa = _v.get('nofar_acc')
+                _nftxt = '—' if _nfa is None else f'{float(_nfa):.3f}'
+                A(f"| `{_k}` | — | {_v.get('clean_acc', float('nan')):.3f} | {(_v.get('chance_acc') or 0.0):.5f} | {_ptxt} | {_nftxt} | {_v.get('nofar_consistent_with_chance')} | {_v.get('positive_control_recorded')} | {_v.get('task_valid_for_mechanism_claim')} |")
+            A('')
+            A('> ' + str(probe.get('niah_validity_note') or '') + (' **结论：当前面板的 NIAH 只能作为描述性读数，不支持「长距离信息利用」的机制主张（缺少可解任务的正对照）。**' if not probe.get('niah_mechanism_usable') else ' 结论：三个条件均满足，NIAH 可作为远距利用的机制证据。'))
+            A('')
+        # distance buckets (short-to-long gradient) per arm/length/condition
+        _nb = {}
+        for c in niah['cells']:
+            if c.get('acc_by_distance_bucket'):
+                _nb.setdefault((c['variant'], c['arm'], c['eval_len'], c['condition']), c)
+        if _nb:
+            A('**距离分桶准确率（short→long 梯度；平坦或反向说明该任务没有区分度）**：')
+            A('')
+            A('| 臂 | L | 条件 | 桶0 (dist) | 桶1 | 桶2 | 桶3 (dist) | 梯度 |')
+            A('|---|---|---|---|---|---|---|---|')
+            for _k, c in sorted(_nb.items()):
+                _bs = c['acc_by_distance_bucket']
+                def _btxt(i):
+                    if i >= len(_bs):
+                        return '—'
+                    b = _bs[i]
+                    return f"acc={b['acc']:.3f} (d={b['dist_min']}-{b['dist_max']})"
+                A(f"| `{_k[0]}::{_k[1]}` | {_k[2]} | {_k[3]} | {_btxt(0)} | {_btxt(1)} | {_btxt(2)} | {_btxt(3)} | {c.get('distance_gradient')} |")
+            A('')
         if niah.get('contrasts'):
             A('| NIAH 配对比较（Δ = 对照臂 − 学习选择，answer NLL，>0 = 学习选择更好） | n | Δ mean±std | p (exact) |')
             A('|---|---|---|---|')
             for k, v in sorted(niah['contrasts'].items()):
                 A(f'| {k} | {v['n']} | {v['mean']:+.3f} ± {v.get('std', 0):.3f} | {v['p_exact_signflip']:.3f} |')
             A('')
-        A('> 该任务直接检验「长距离信息**利用**能力」，与上面的干扰鲁棒性互补：鲁棒性高 + 检索利用不差，才支持「稀疏选择在滤噪的同时保留了有用远距信息」；若只有鲁棒性而检索差，则更符合「本来就少用远端」的替代解释。')
+        A('> 该任务**在通过上表任务有效性判据后**才可用于「长距离信息利用」的机制读法：鲁棒性高 + 检索利用不差，才支持「稀疏选择在滤噪的同时保留了有用远距信息」；若只有鲁棒性而检索差，则更符合「本来就少用远端」的替代解释。正对照、无远端信息对照、chance 与距离梯度缺一不可；任一缺失时 NIAH 读数只能描述成败，不能解释机制。')
         A('')
     A('### 统计口径')
     A('')
@@ -2761,7 +3116,7 @@ def run_full():
     guard = make_guard()
     guard.report()
     print(f'[v10] headroom {max(guard.headroom_hours(), 0.0):.2f} h left (booked {guard.state['booked_seconds'] / 3600:.2f} h)')
-    git_push('v10: supplementary driver (P3M distractor-injection mechanism + P3S crossover scaling + P3T topk seeds 2/3 + scratch selector controls, corruption modes/NIAH, token/compute-matched scale arms)')
+    git_push('v10: supplementary driver (P3M distractor-injection mechanism + P3S crossover scaling + P3T topk seeds 2/3 + scratch selector controls, corruption modes/NIAH, token-matched and 6ND-param-proxy-budget scale arms)')
     import par
     _ctx = par.resolve_ctx(label='v10')
     all_ok = True

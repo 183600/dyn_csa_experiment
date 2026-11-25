@@ -57,6 +57,38 @@ For all primary sparse factorial cells:
   measured total training-FLOPs ratio to be within 1% of the target;
 - do not use wall-clock time as a substitute for FLOPs matching.
 
+## Mechanism-isolation controls (review 10, issues 2/3)
+
+The factorial sparse cells above answer *system-level* questions: a significant
+dynamic-vs-fixed or HCA-vs-CSA difference does not by itself attribute the
+effect to the segmentation or attention mechanism. Run these controls before
+any mechanism wording:
+
+- **Same-backbone isolation.** A selector-only contrast must hold backbone,
+  width/depth, output head, KV projection, normalization (q/kv norm width and
+  placement), position encoding, sink policy, attention kernel (manual eager vs
+  SDPA), and dtype identical. A single-factor version of the current frozen
+  dense comparison is required; the v12 dense arm differs in MLP width, FLOPs,
+  kernel, q/kv normalization and sink, so it is a system-level reference only.
+- **Random-selection variants.** The current random-indexer control is a FIXED
+  deterministic hash pattern (identical for every seed/layer/step) and its
+  indexer projections are dead parameters (~1.8% capacity), so it supports only
+  "learned selection beats this fixed pattern". Add at least: a per-forward
+  re-randomized selector, a distance-matched random selector, a nearest-block
+  selector, and a uniform-stride selector; repeat with connection-pattern seeds
+  independent of the training seed so training noise and pattern noise can be
+  separated.
+- **Reading-scope controls.** A learned-top-k vs all-block contrast changes
+  reading scope and the STE soft prior, not only selection; pair it with a
+  same-scope learned-vs-random contrast, and report block/read counts.
+- **Three budget questions, answered separately.** (i) equal trainable
+  parameters (active, after dead parameters), (ii) equal training tokens
+  (same optimizer/LR-schedule shape and data order), (iii) equal profiler-
+  measured training FLOPs (within 1%). Never describe one answer as another.
+- **Kernel/dtype parity** is an acceptance gate (below); a performance
+  difference measured across two different kernels is a system property and
+  must be labelled as such.
+
 Record both analytical FLOPs estimates and profiler-measured FLOPs. The measured
 value is the primary compute-matching gate; analytical estimates are a
 cross-check. If the profiler cannot reliably count an operator (e.g. custom

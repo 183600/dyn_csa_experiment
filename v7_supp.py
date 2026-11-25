@@ -2888,6 +2888,24 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
                                            or str((_meta.get('curve_health') or {}).get('status')) in ('unmonitored', 'insufficient_data')):
                 stale = True
                 print(f'[p1l] {v} s{seed}: checkpoint has no usable training-curve health record (status={((_meta.get("curve_health") or {}).get("status") if isinstance(_meta.get("curve_health"), dict) else None)!r}) — RETRAINING so the pre-test health gate has evidence (this does not change the frozen recipe)')
+                # Review 10, issue 15: a retrain that exists only to produce
+                # health evidence is a design decision; persist it instead of
+                # leaving it in stdout only.  This does not change any frozen
+                # arm/seed/endpoint (P1L is exploratory).
+                try:
+                    os.makedirs('analysis_v7', exist_ok=True)
+                    with open('analysis_v7/p1l_health_retrain_events.jsonl', 'a',
+                              encoding='utf-8') as _evf:
+                        _evf.write(json.dumps({
+                            'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                            'variant': v, 'seed': int(seed),
+                            'reason': 'health_evidence_missing',
+                            'previous_code': (_meta.get('code') if isinstance(_meta, dict) else None),
+                            'previous_curve_health': (_meta.get('curve_health') if isinstance(_meta, dict) else None),
+                            'note': 'pre-test health gate needs a curve-health record; retrain under the unchanged recipe',
+                        }, ensure_ascii=False) + '\n')
+                except (OSError, TypeError, ValueError) as _eve:
+                    print(f'[p1l] WARNING: could not persist the health-evidence retrain event ({type(_eve).__name__}: {_eve})')
             else:
                 _ckp_pre = _meta
             del _meta

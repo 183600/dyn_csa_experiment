@@ -439,6 +439,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     _head_n = f'n={n_contr_max}' if n_tree_min == n_contr_max else f'n={n_tree_min}–{n_contr_max}'
     A(f'# CSA / HCA 受控机制研究 — v11 补实验报告（统计分辨率收尾：主结果 {_head_n}、规模面板 {_xo_txt}）')
     A('> **证据等级：探索性（exploratory）**。本面板的比较/种子是观察 validation 结果后选择的；Holm 校正只限制过度宣称，不等于预注册确认。')
+    A(L.evidence_status_banner())
     A('')
     A('')
     A(f'> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}')
@@ -617,7 +618,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     ri_sig = _all_sig('randidx')
     ri_all_pos = bool(ri) and ri[0] > 0.0
     if ri_sig:
-        _ri_txt = 'randidx 全线更差且各对照格均达 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立：n≥6、原始 p、Holm、|mean|>std 全部通过）。'
+        _ri_txt = 'randidx 全线更差且各对照格均达 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立：统计显著——n≥6、原始 p、Holm 通过；稳定性见 mean/std 列，|mean|>std 只作稳定性诊断，不是显著性判据）。'
     elif ri_all_pos:
         _ri_txt = 'randidx 全线更差但并非各对照格都达 p<0.05：方向一致地支持「学习检索有独立贡献」，按当前分辨率只作方向性表述；「抗噪性主要来自稀疏归纳偏置本身」的较弱读法仍然成立。'
     else:

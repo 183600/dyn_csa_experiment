@@ -22,6 +22,54 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 PAIR_STEP_KEYS = ('steps', 'tokens_seen')
 _LOADED = {}
 
+def evidence_release_status(path=None):
+    """Local twin of `exp_lib.evidence_release_status` (this builder
+    intentionally does not import torch/exp_lib; `test_review_fixes.py`
+    cross-checks the two implementations so they cannot silently differ).
+
+    Review 10, issue 1: a source-only repository cannot make a generated
+    number independently auditable.  A complete release row is required and
+    the archive must pass `archive_release.py verify`; placeholders do not
+    count.
+    """
+    path = path or os.path.join(REPO, 'RELEASES.md')
+    try:
+        with open(path, encoding='utf-8') as _f:
+            text = _f.read()
+    except OSError:
+        return {'status': 'missing_index', 'complete_rows': 0, 'rows': []}
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith('|'):
+            continue
+        cells = [c.strip() for c in line.strip('|').split('|')]
+        if len(cells) < 7:
+            continue
+        if not cells[0] or cells[0].lower() in ('tag', '_none yet_', 'none'):
+            continue
+        if all(set(c) <= set('-: ') for c in cells[:1]):
+            continue
+        placeholders = ('—', '-', 'todo', 'tbd', 'pending', 'none', 'n/a', '')
+        if any(c.lower() in placeholders for c in cells[:7]):
+            continue
+        rows.append(cells[0])
+    return {'status': ('released' if rows else 'no_release'),
+            'complete_rows': len(rows), 'rows': rows}
+
+
+def evidence_status_banner(path=None):
+    st = evidence_release_status(path)
+    if st.get('status') == 'released':
+        return (f"> 证据状态：**released**（{st['complete_rows']} 条完整发布行）——发布归档仍须以 "
+                "`archive_release.py verify` 的输出为准；本报告未内置该输出时不得称为可独立审计。")
+    return ("> 证据状态：**" + str(st.get('status', 'unknown')) +
+            "**（无完整证据发布）——本报告全部数字**不能独立审计**。源码只能证明实验将如何准备；"
+            "只有在发布 `release_<tag>.tar.gz` + SHA-256 清单、并让 `archive_release.py verify` "
+            "通过之后，相应数字才可审计。")
+
+
+
 def _as_finite(v):
     """Finite float for any real numeric scalar (NumPy scalars included).
 
@@ -857,6 +905,7 @@ def paired_row(a_records, b_records):
 def sec_header():
     return ('# CSA / HCA 受控机制研究 — 补充实验报告 (v7)\n\n'
             f'> 生成时间：{time.strftime("%Y-%m-%d %H:%M:%S")}\n'
+            + evidence_status_banner() + '\n'
             '> 参考论文：arXiv:2606.19348。**范围声明**：本仓库是小规模、从头训练、WikiText-103、固定训练量下的受控研究，不是 DeepSeek-V4 的全量复现；结论不外推到该模型的规模、语料、长上下文训练或生产系统。\n'
             '> 定位：**受控机制研究**（controlled mechanism study），非论文全量复现。\n'
             '> **证据等级：探索性（exploratory）**。本报告的面板/种子/比较是在同一 validation split 上选择后观察的；'
@@ -1541,7 +1590,7 @@ def sec_p1t():
             # This is the single pre-specified contrast in P1T: Holm over a
             # one-element family is the raw p, so attach it before the gate.
             _st['p_holm'] = _st.get('p_exact_signflip')
-            _sig_txt = '显示该差距**达到 p≤0.05 且通过族校正/噪声门槛**，按显著性读法处理。' if _sig_gate(_st, label='P1T csa_fixed_topk8 vs topk32 (seq2048)', family='P1T') else '显示该差距未通过「n≥6 + 原始 p<0.05 + Holm + 效应大于 seed 噪声」门槛，**不构成显著性主张**，只作方向性参考。'
+            _sig_txt = '显示该差距**达到 p≤0.05 且通过族校正**，按统计显著性读法处理（mean/std 分布与稳定性另见表格）。' if _sig_gate(_st, label='P1T csa_fixed_topk8 vs topk32 (seq2048)', family='P1T') else '显示该差距未通过「n≥6 + 原始 p<0.05 + Holm」统计门槛，**不构成显著性主张**，只作方向性参考（效应是否大于种子噪声是稳定性诊断，不在此判定）。'
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；配对的精确符号翻转检验（n={_st['n']}，p={_st['p_exact_signflip']:.3f}，Δ(topk8−topk32) mean={_st['mean']:+.2f} PPL）{_sig_txt}')
         else:
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；面板上没有可通过 pairing 门禁的同配置种子对，topk8 与 topk32 之差（{_gap:.2f} PPL）无法配对检验，只作方向性参考。')
@@ -1690,7 +1739,7 @@ def sec_p1l():
         v: sorted({_sd for r in recs if r.get('variant') == v
                    for _sd in [_norm_seed(r.get('seed'))] if _sd is not None})
         for v in variants}
-    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**待检验论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训练（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、超出部分只取末尾 `max_pos` 个 token 截断评测——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；`?` = 该格缺少 `truncated` 标记，按不可验证处理（不参与 ratio）；未标注的格是完整 `Ln` 长度评测。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
+    lines = ['## P1 长上下文长度外推（train@512 → 同一权重 eval 512/1024/2048/4096）', '', '**待检验论断**：仓库所有评测都在训练长度（512）上，没有任何长上下文证据。', '', '**做法**：4 变体（`full` / `csa_fixed` / `full_rope` / `csa_fixed_rope`）在 seq 512 训练（同一代码路径，各臂 seed 数见表），保存权重后用**同一份权重**在 512/1024/2048/4096 上评 wikitext PPL。absPE 变体 `max_seq=512`、超出部分只取末尾 `max_pos` 个 token 截断评测——**这正是 P0-3 的对照点**；RoPE 变体可原生外推。', '', '> **`~` = 位置受限（abs-PE）：该格只评了最后 `max_pos` 个 token，不是该长度的真实长上下文分数**；`?` = 该格缺少 `truncated` 标记，按不可验证处理（不参与 ratio）；未标注的格是完整 `Ln` 长度评测。', '', '> **长度口径（review 10, issue 10）**：PPL@Ln 评的是每行位置 1..Ln−1 的前缀目标（Ln=512 ⊂ 1024 ⊂ …，目标集合随长度嵌套），不是「同一组目标 token、不同上下文长度」的比较；训练长度固定 512、块数 = ceil(Ln/4)、top-k 固定，读取比例随长度下降。长长度 PPL 同时混合目标位置构成、未见远距位置暴露、局部性与无关信息暴露变化，**不能**单独归因为「更会利用长上下文」。局部窗口基线族（`full_sw128*`）与远端移除/距离分桶读数不在本表内；需另设探针（design_notes §22.6 / v10 P3M）。', '', '| variant | ' + ' | '.join((f'PPL@{Ln}' for Ln in lens)) + ' | 相对退化 ratio@{0}/@{1} |'.format(lens[-1], lens[0]), '|' + '---|' * (len(lens) + 2)]
     per_v = {}
     trunc_v = {}
     # Group by variant (preserving order).
@@ -1857,7 +1906,7 @@ def sec_p2s():
     d = agg('results_lm_v5_scale')
     if not d:
         return ''
-    lines = ['## P2 v5 scale 面板补种子（至 4 seeds）+ 配对显著性', '', '**待检验论断**：v5 scale 的种子数不足，需 4 seeds + `full_matched`。', '', '| variant | PPL (pooled/mean; ±seed sd) | 文档 bootstrap 95% CI | n | params |', '|---|---|---|---|---|']
+    lines = ['## P2 v5 scale 面板补种子（至 4 seeds）+ 配对显著性', '', '**待检验论断**：v5 scale 的种子数不足，需 4 seeds + `full_matched`。', '', '| variant | PPL (pooled/mean; ±seed sd) | 行/窗口 bootstrap 95% CI（非文档） | n | params |', '|---|---|---|---|---|']
     _variants = sorted({_v for _v in
                         (_record_variant(r, _k) for _k, r in d.items())
                         if _v is not None})
@@ -1878,7 +1927,7 @@ def sec_p2s():
                 _dci_ok = False
         _dcitxt = f'[{_dlo:.2f}, {_dhi:.2f}]' if _dci_ok else '—（缺失/无效的逐文档 NLL CI）'
         lines.append(f'| `{v}` | {fm(_ppl_value(r))} {sp(r.get('ppl_std'))} | {_dcitxt} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
-    lines += ['', '> 注：`±seed sd` 是**种子层**训练随机性；`文档 bootstrap 95% CI` 重采样固定的评测文档，只量化**文档抽样**不确定性，二者不是同一个估计量。评测文档少于 64 条时该 CI 不覆盖语言数据总体（design_notes §20）。', '']
+    lines += ['', '> 注：`±seed sd` 是**种子层**训练随机性；`行/窗口 bootstrap 95% CI` 重采样固定的**评测行/窗口**（不是文档：一个 4096-token 窗口可跨文章），只量化行/窗口抽样不确定性，二者不是同一个估计量。单位是窗口而非文档；少于 64 个窗口时该 CI 不覆盖语言数据总体（`MIN_DOCS_FOR_POPULATION_CLAIM=64` 是仓库自设门槛，见 design_notes §20）。', '']
     ps = per_seed_records('results_lm_v5_scale')
     pairs = [('csa_fixed', 'full'), ('csa_fixed', 'full_sw128_matched'), ('csa_fixed', 'full_matched'), ('csa_dynamic', 'full'), ('hybrid_dynamic', 'full')]
     _agg = d
@@ -2008,13 +2057,20 @@ def sec_flops():
     return '\n'.join(lines) + '\n'
 
 def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):
-    """Conservative significance gate for report prose.
+    """Statistical-significance gate for report prose.
 
     Requires n>=6 (the exact sign-flip floor at n<6 is >alpha, so no n<6 panel
     can support a significance claim), raw p<alpha, Holm p<alpha when present,
-    and |mean|>std (effect bigger than seed noise).  A missing Holm value is
+    and well-formed finite mean/std measurements.  A missing Holm value is
     treated as NOT corrected — the report may say "nominal" but never
     "significant" until a family correction has actually been attached.
+
+    |mean| > std is deliberately NOT required here (review 10, issue 8): that
+    is a STABILITY diagnostic, not a significance test.  A small but precisely
+    estimated effect can be statistically real; report builders must print the
+    mean/std distribution and the stability verdict next to the p-value rather
+    than folding them into the word "significant".  See
+    `exp_lib.reportable_claim` for the three separate verdicts.
 
     `label` (with optional `family`) registers the decision in the report's
     cross-panel multiplicity audit (`sec_global_multiplicity`): every
@@ -2067,8 +2123,6 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):
         if mf is None or sf is None:
             return False
         if not (math.isfinite(mf) and math.isfinite(sf) and sf >= 0.0):
-            return False
-        if abs(mf) <= sf:
             return False
     except (TypeError, ValueError, OverflowError):
         return False

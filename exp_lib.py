@@ -9973,7 +9973,33 @@ def param_breakdown(m):
         out['d_head'] = int(getattr(first, 'hd', 0) or 0)
     except Exception:
         pass
-    out['active'] = out['total']
+    # Review 10, issue 3: an indexer_mode='random' layer bypasses W_DQ/W_DK/W_w
+    # entirely (lightning_indexer never uses the learned projections on that
+    # path), so those parameters are allocated but DEAD.  Total-parameter
+    # matching alone therefore overstates the random control's effective
+    # capacity by ~1.8%.  Count them explicitly so a report cannot hide the
+    # active-parameter mismatch.
+    _dead = 0
+    for name, p in m.named_parameters():
+        if not name.startswith('blocks.') or '.attn.' not in name:
+            continue
+        if not any(k in name for k in ('W_DQ', 'W_DK', 'W_w')):
+            continue
+        try:
+            _blk_i = int(name.split('.')[1])
+            _blk = m.blocks[_blk_i]
+        except (IndexError, ValueError, AttributeError, TypeError):
+            continue
+        try:
+            if getattr(_blk.attn.cfg, 'indexer_mode', 'learned') == 'random':
+                _dead += int(p.numel())
+        except Exception:
+            continue
+    out['dead_params'] = int(_dead)
+    out['dead_indexer_params'] = int(_dead)
+    out['active'] = int(out['total'] - _dead)
+    out['active_note'] = ('active excludes parameters allocated but bypassed by indexer_mode=random '
+                          '(W_DQ/W_DK/W_w); total-parameter matching does not match active capacity')
     out['attention_share'] = (out['attention'] / out['total']) if out['total'] else 0.0
     return out
 
@@ -10465,27 +10491,50 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
 
 # Minimum number of evaluation documents below which a claim about the
 # language population (rather than about the frozen evaluation slice) is
-# refused.  The confirmatory panel scores n_seqs=16; that is enough for a
-# fixed-slice mechanism claim and not enough for a population claim.
+# refused.  The confirmatory panel scores n_seqs=16 FIXED WINDOWS (rows), not
+# 16 documents: a 4096-token window can span article boundaries and an article
+# can contribute several windows, so these units are correlated.  The floor is
+# a house convention (no statistical derivation; 64 is not a boundary at which
+# population inference suddenly becomes valid), and it counts rows/windows.
+# It is enough for a fixed-slice mechanism claim and not for a population one.
 MIN_DOCS_FOR_POPULATION_CLAIM = 64
 
 def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
-                     require_holm=True, evidence_level=None):
+                     require_holm=True, evidence_level=None, min_effect=None):
     """One machine-checkable answer to: may this contrast be called significant?
 
-    This is the shared gate behind report prose.  A contrast is reportable only
-    when ALL of the following hold:
+    This is the shared gate behind report prose.  It separates THREE questions
+    that must never be conflated (review 10, issue 8):
 
-      * n >= min_n            (otherwise the exact sign-flip p floor is > alpha)
-      * p_floor <= alpha      (resolution ceiling)
-      * p_raw < alpha
-      * p_holm < alpha        (when `require_holm`; an uncorrected p is exploratory)
-      * |mean| > std          (effect larger than seed noise)
-      * family_size is None or the family's minimum attainable Holm p <= alpha
+      1. **Statistical evidence** -- may the contrast be called statistically
+         significant at ``alpha`` after the pre-registered correction?
+         ``allowed`` / ``statistical_significance`` answer only this.  It
+         requires:
+           * n >= min_n            (otherwise the exact sign-flip p floor > alpha)
+           * p_floor <= alpha      (resolution ceiling)
+           * p_raw < alpha
+           * p_holm < alpha        (when `require_holm`; an uncorrected p is
+                                    exploratory)
+           * family_size is None or the family's minimum attainable Holm p <= alpha
+           * mean/std are finite, well-formed measurements (a malformed
+             artifact cannot support any claim)
+         |mean| > std is NOT part of this gate: a small but precisely estimated
+         mean effect can be statistically real.  The mean/std relation is a
+         *stability* diagnostic, reported separately in ``stable`` /
+         ``stability``.
+      2. **Stability across seeds** -- ``stable`` is true when the effect is
+         larger than seed-to-seed noise (|mean| > std) and dropping one seed
+         does not flip the mean sign.  It qualifies wording such as "stable
+         across seeds"; it is not a significance test and a false value must
+         not be reported as "no effect" or "just noise".
+      3. **Practical value** -- when the caller supplies ``min_effect`` (the
+         pre-declared minimum meaningful improvement), ``practical`` reports
+         whether the estimated effect reaches it.  Without a pre-declared
+         threshold this is ``None`` (not measured), never assumed.
 
-    `evidence_level='confirmatory'` is only honoured when the caller passes it
-    explicitly (a pre-registered family); otherwise a passing contrast is
-    labelled `exploratory_significant`.  The function never turns a failure
+    ``evidence_level='confirmatory'`` is only honoured when the caller passes
+    it explicitly (a pre-registered family); otherwise a passing contrast is
+    labelled ``exploratory_significant``.  The function never turns a failure
     into a prohibition on *reporting* the number -- it only forbids the words
     "significant"/"confirmed" and records exactly why.
     """
@@ -10520,7 +10569,16 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     out = {'allowed': False, 'level': 'unverifiable', 'reasons': [],
            'n': None, 'p_raw': None, 'p_holm': None, 'p_floor': None,
            'min_attainable_p_holm_family': None, 'min_n': _min_n,
-           'alpha': _alpha}
+           'alpha': _alpha,
+           # Three separate verdicts (review 10, issue 8): statistical
+           # significance, seed stability, and practical value.
+           'statistical_significance': False,
+           'stable': None,
+           'stability': {'within_seed_noise': None,
+                         'leave_one_seed_out_stable': None,
+                         'mean_abs': None, 'std': None},
+           'stability_reasons': [],
+           'practical': {'min_effect': None, 'meets_min_effect': None}}
     if _alpha_bad is not None:
         out['reasons'].append(_alpha_bad)
     if _min_n_bad is not None:
@@ -10623,6 +10681,8 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             out['reasons'].append(f'Holm p {_ph:.3g} is not < alpha={_alpha}')
     if (isinstance(mean, (bool, np.bool_)) or _is_nonmeasurement_scalar(mean)
             or isinstance(std, (bool, np.bool_)) or _is_nonmeasurement_scalar(std)):
+        # A malformed effect artifact cannot support any claim, but this is an
+        # evidence-integrity failure, not a statement about effect size.
         out['reasons'].append('mean/std are boolean/temporal/complex values, not measurements')
     elif _finite_scalar(mean) is None or _finite_scalar(std) is None:
         out['reasons'].append('mean/std are not finite numeric measurements')
@@ -10635,15 +10695,58 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
         else:
             if not (math.isfinite(_mean_f) and math.isfinite(_std_f) and _std_f >= 0.0):
                 out['reasons'].append('mean/std are not finite non-negative measurements')
-            elif not (abs(_mean_f) > _std_f):
-                out['reasons'].append('|mean| <= std: effect is within seed noise')
+            else:
+                # Stability diagnostics are reported SEPARATELY from the
+                # statistical-significance gate (review 10, issue 8):
+                # |mean| > std is an in-house stability criterion, not a
+                # significance test, and failing it does not mean the effect
+                # is "just noise" or unreal.
+                _within = not (abs(_mean_f) > _std_f)
+                out['stability']['mean_abs'] = abs(_mean_f)
+                out['stability']['std'] = _std_f
+                out['stability']['within_seed_noise'] = bool(_within)
+                if _within:
+                    out['stability_reasons'].append(
+                        '|mean| <= std: effect is not larger than seed-to-seed noise (stability diagnostic; this is not a significance verdict)')
     # Leave-one-seed-out instability is a direct contradiction of a stable
-    # directional effect: dropping one seed must not flip the sign.  Only
-    # enforced when the caller supplied the diagnostic (stats without the field
-    # do not carry it); the verdict is never silently assumed robust.
+    # directional effect: dropping one seed must not flip the sign.  Reported
+    # as a stability diagnostic, never as a significance verdict.
     _seed_driven = stats.get('seed_driven')
-    if isinstance(_seed_driven, (bool, np.bool_)) and bool(_seed_driven):
-        out['reasons'].append('leave-one-seed-out stability fails: dropping one seed flips the mean sign')
+    _loo_ok = None
+    if isinstance(_seed_driven, (bool, np.bool_)):
+        _loo_ok = not bool(_seed_driven)
+        if bool(_seed_driven):
+            out['stability_reasons'].append('leave-one-seed-out stability fails: dropping one seed flips the mean sign')
+    out['stability']['leave_one_seed_out_stable'] = _loo_ok
+    _within = out['stability']['within_seed_noise']
+    # A failure of the |mean|>std stability diagnostic is already decisive even
+    # when the leave-one-out diagnostic is absent; only a *passing* stability
+    # verdict requires both diagnostics to be known.
+    if _within is True:
+        out['stable'] = False
+    elif _within is False and _loo_ok is not None:
+        out['stable'] = bool(_loo_ok)
+    else:
+        out['stable'] = None
+    # Practical value needs a PRE-DECLARED minimum meaningful effect.  Without
+    # one it is unmeasured (None), never inferred from the p-value.
+    _min_eff = None
+    if min_effect is not None:
+        if isinstance(min_effect, (bool, np.bool_)) or _is_nonmeasurement_scalar(min_effect):
+            out['practical']['min_effect'] = None
+            out['practical']['meets_min_effect'] = None
+            out['reasons'].append('min_effect is a boolean/temporal/complex value, not a meaningful-effect threshold')
+        else:
+            _me = _finite_scalar(min_effect)
+            if _me is None or _me < 0.0:
+                out['practical']['min_effect'] = None
+                out['practical']['meets_min_effect'] = None
+                out['reasons'].append(f'min_effect {min_effect!r} is not a finite non-negative threshold')
+            else:
+                _min_eff = _me
+                out['practical']['min_effect'] = _min_eff
+                if out['stability']['mean_abs'] is not None:
+                    out['practical']['meets_min_effect'] = bool(out['stability']['mean_abs'] >= _min_eff)
     if family_size is not None:
         # A boolean flag or a non-integral number is not a declared family
         # size.  int() would turn True into m=1 (the smallest possible family)
@@ -10683,6 +10786,7 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
         if _fl is not None and math.isfinite(_fl) and _fl > _alpha:
             out['reasons'].append(f'family of m={_fs} at n_nonzero={_n_eff} has minimum attainable Holm p {_fl:.4g} > alpha={_alpha}')
     out['allowed'] = not out['reasons']
+    out['statistical_significance'] = bool(out['allowed'])
     if out['allowed']:
         out['level'] = 'confirmatory' if str(evidence_level).lower() == 'confirmatory' else 'exploratory_significant'
     elif n < _min_n:
@@ -11402,6 +11506,67 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     return lo
 
 
+def evidence_release_status(path=None):
+    """Read RELEASES.md and report whether any evidence release is published.
+
+    Review 10, issue 1: source code can show *how* the experiment would be
+    prepared; it cannot make a number independently auditable.  A generated
+    report must therefore carry the release status next to its numbers, and a
+    claim may only be called auditable after a complete release row exists
+    (tag + date + git commit + archive URL + archive SHA-256 + manifest
+    SHA-256 + verifier) AND `archive_release.py verify` passes.
+
+    This helper is deliberately conservative: a row with a placeholder (`—`,
+    `_none yet_`, `TODO`, `TBD`, `pending`) is NOT a release.  Missing index
+    also means no release.  Pure text parsing, no I/O beyond the index file.
+    """
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'RELEASES.md')
+    try:
+        with open(path, encoding='utf-8') as _f:
+            text = _f.read()
+    except OSError:
+        return {'status': 'missing_index', 'complete_rows': 0, 'rows': [],
+                'note': f'RELEASES.md not readable at {path!r}; no evidence release can be verified'}
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith('|'):
+            continue
+        cells = [c.strip() for c in line.strip('|').split('|')]
+        if len(cells) < 7:
+            continue
+        if not cells[0] or cells[0].lower() in ('tag', '_none yet_', 'none'):
+            continue
+        if all(set(c) <= set('-: ') for c in cells[:1]):
+            continue
+        placeholders = ('—', '-', 'todo', 'tbd', 'pending', 'none', 'n/a', '')
+        if any(c.lower() in placeholders for c in cells[:7]):
+            continue
+        rows.append(cells[0])
+    _n = len(rows)
+    out = {'status': ('released' if _n else 'no_release'),
+           'complete_rows': _n, 'rows': rows,
+           'path': path}
+    if _n:
+        out['note'] = ('a complete release row exists; a number is independently auditable only '
+                       'after the published archive passes `python archive_release.py verify`')
+    else:
+        out['note'] = ('no complete release row: this repository is source-only and every number '
+                       'in any generated report is NOT independently auditable')
+    return out
+
+
+def evidence_status_banner(path=None):
+    """One-line Markdown banner for report headers (see evidence_release_status)."""
+    st = evidence_release_status(path)
+    if st.get('status') == 'released':
+        return (f"> 证据状态：**released**（{st['complete_rows']} 条完整发布行：{', '.join(st['rows'][:3])}）"
+                "——发布归档仍须以 `archive_release.py verify` 的输出为准；本报告未内置该输出时不得称为可独立审计。")
+    return (f"> 证据状态：**{st.get('status', 'unknown')}**（无完整证据发布）——本报告全部数字**不能独立审计**："
+            "源码只能证明实验将如何准备；只有在发布 `release_<tag>.tar.gz` + SHA-256 清单、"
+            "并让 `archive_release.py verify` 通过之后，相应数字才可审计。")
+
+
 def global_multiplicity_audit(named_pvals, *, alpha=0.05,
                               families=None, family_holm=None):
     """Cross-PANEL multiplicity view over every comparison a report displays.
@@ -11673,11 +11838,15 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
 
     若 k 个种子同向（n−k 反向），符号检验投影的 p 为
     2·P(Bin(n, 1/2) ≤ n−k)，第一道门要求 m·p < alpha。对**绝对值相等**
-    的配对差，这个投影就等于精确双侧符号翻转 p；绝对值不等时，精确
-    sign-flip p 只会更大（更不显著），所以本函数给出的是所需同向数的
-    下界，真实数据可能仍需更多同向种子。返回使 m·p(k) < alpha 的最小
-    k；若全部 n 个同向仍不够，返回 None（方案不可能确认）。二项尾概率
-    在 log 空间计算，因此大 n（规模扩展后的补种子计划）也不会整数溢出。"""
+    的配对差，这个投影才等于精确双侧符号翻转 p。绝对值不等时，精确检验
+    与这个投影**没有固定方向**：例如 8×(+100) 与 4×(−1) 的 8/12 同向，
+    精确 sign-flip p = 0.0078（m=4 时 Holm 通过），而等幅投影 p ≈ 0.388
+    ——精确检验可能更容易拒绝；反过来，幅度分布不利时也可能需要更多同向
+    种子。因此本函数只回答「在等幅/符号检验投影下，计划是否数学上可能
+    确认」，是**规划用的投影**，不是真实数据所需同向数的界（上界或下界
+    都不成立）。返回使 m·p(k) < alpha 的最小 k；若全部 n 个同向仍不够，
+    返回 None（该投影下方案不可能确认）。二项尾概率在 log 空间计算，因此
+    大 n（规模扩展后的补种子计划）也不会整数溢出。"""
     # Exact integer counts only: truncating 12.9 to 12 would report a plan as
     # feasible one seed before it actually is.
     n = _as_seed_int(n_seeds)
@@ -11725,12 +11894,17 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
     """每种子同向概率为 q 时，通过 Holm 第一道门的功效。
 
     P(Bin(n, q) ≥ k_min)。q 的含义：在真效应方向上，单个种子的配对 Δ
-    落在预注册方向的概率（含种子间噪声）。k_min 来自等幅/符号检验投影，
-    因此这里的功效是对真实 sign-flip 功效的上界（绝对值不等时实际功效
-    更低）。功效对 q 敏感——预注册时必须报告 q 的假设来源（如 validation
-    面板的同向率），不得只报「数学上可能」。n<=0 或方案不可能确认时返回
-    0.0。尾部概率用正则化不完全贝塔函数计算（P(X<=k-1)=I_{1-q}(n-k+1,k)），
-    大 n 下不会因 `comb(n,k)*q**k` 的整数/浮点溢出而失败。"""
+    落在预注册方向的概率（含种子间噪声）。k_min 来自等幅/符号检验投影；
+    因为精确 sign-flip 功效与等幅投影**没有固定的大小关系**（幅度不等时
+    精确检验可能更易拒绝，也可能更难拒绝；8×(+100)+4×(−1) 即前者），
+    这里给出的是「q 模型下的符号检验投影功效」，**不是**真实精确检验功效
+    的上界或下界，只能作为设计参考。q=0.95 也只是四个报告列之一；冻结
+    清单 v6 的实际最低功效门槛是 q=0.80（`statistics.power_gate`）。
+    功效对 q 敏感——预注册时必须报告 q 的假设来源（如 validation 面板的
+    同向率与其置信下界），不得只报「数学上可能」。n<=0 或方案不可能确认
+    时返回 0.0。尾部概率用正则化不完全贝塔函数计算
+    （P(X<=k-1)=I_{1-q}(n-k+1,k)），大 n 下不会因 `comb(n,k)*q**k` 的
+    整数/浮点溢出而失败。"""
     kmin = signflip_min_consistency(n_seeds, m_comparisons, alpha)
     if kmin is None or kmin <= 0:
         return 0.0 if kmin is None else 1.0
@@ -19380,6 +19554,37 @@ LR_FLOOR_MULT = 0.1
 BOUNDARY_PG_COEF = 1.0
 LR_COSINE_AMP = 0.45
 
+
+def boundary_policy_term(ce_value, baseline, boundary_logp, n_decisions):
+    """Score-function (REINFORCE) term appended with a PLUS sign to the
+    minimised LM loss of the opt-in ``csa_dynamic_task`` arm.
+
+    The arm's total loss is ``CE + comp_lambda * comp_reg + coef * T`` with
+    ``T = (CE - baseline) * logprob_sum / n_decisions``, where:
+
+      * ``CE`` is the cross-entropy that is being *minimised* (a cost, not a
+        reward), and is detached for this term;
+      * ``baseline`` is the EMA of CE, so ``CE - baseline`` is a cost
+        advantage: positive means the sampled cut pattern was worse than the
+        running average;
+      * ``boundary_logp`` is the sum of the log-probabilities of the sampled
+        cut actions; the attention module returns it as
+        ``-binary_cross_entropy_with_logits(..., reduction='sum')``, which is
+        exactly ``sum(log pi(a))`` for the sampled Bernoulli actions;
+      * ``n_decisions`` is the number of sampled decisions, so the term is a
+        per-decision mean.
+
+    Descent on ``+(CE - baseline) * log pi`` therefore *decreases* the
+    sampling probability of above-baseline (worse) cut patterns and
+    *increases* it for below-baseline (better) ones.  Spelling the advantage
+    as ``baseline - CE``, or negating the whole term, would be gradient ascent
+    on expected CE.  The sign is locked by
+    ``test_review_fixes.py::t_score_function_term_sign_two_action_toy``.
+    """
+    _bdec = max(int(n_decisions), 1)
+    return (float(ce_value) - float(baseline)) * boundary_logp / _bdec
+
+
 def training_knobs(*, amp_dtype='auto', eager_batch='auto'):
     """Canonical, JSON-safe descriptor of the training / schedule /
     gradient-clipping / augmentation / precision settings shared by every arm
@@ -20296,13 +20501,14 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                     # step.
                     _ce_item = float(ce.detach().item())
                     _comp_item = float(_comp.detach().item()) if _comp is not None else 0.0
-                    # Reinforce term: `_adv` is an advantage (CE above an
-                    # EMA baseline). Descent on `+adv * logp` decreases the
-                    # probability of above-baseline patterns; the opposite
-                    # sign would be gradient ascent on expected CE.
-                    _adv = _ce_item - float(_ce_baseline)
+                    # Reinforce term: `boundary_policy_term` forms
+                    # (CE - EMA baseline) * logp / n_decisions with the
+                    # documented sign; descent on it decreases the
+                    # probability of above-baseline (worse) cut patterns and
+                    # increases it for below-baseline (better) ones.  The
+                    # opposite sign would be gradient ascent on expected CE.
                     _bdec = max(int(getattr(_inner_model, 'boundary_decisions', 0) or 0), 1)
-                    _pg = _adv * _blp / _bdec
+                    _pg = boundary_policy_term(_ce_item, _ce_baseline, _blp, _bdec)
                     _pg_item = float(_pg.detach().item())
                     loss = ce + comp_lambda * _inner_model.comp_reg + BOUNDARY_PG_COEF * _pg
                     _ce_baseline = 0.99 * float(_ce_baseline) + 0.01 * _ce_item

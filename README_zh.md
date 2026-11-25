@@ -31,7 +31,7 @@
 | `v9_supp.py` | **v9 驱动**：P2T（seq-2048 的 topk 扫描，`batch_size=1`）与 P2S3（RoPE 20k 长跑的第三个 seed） |
 | `v10_supp.py` | **v10 驱动**：P3M 长度外推机制 + 干扰项注入探针、P3S 交叉面板扩规模、P3T topk 扫描补至 4 seeds |
 | `v11_supp.py` | **v11 驱动**：统计收尾——干扰探针扩到 n=6（P4MT/P4MP）、交叉面板扩到 n=4（P4S）、d=384 配对臂扩到 n=4（P4F） |
-| `v12_supp.py` | **v12 确认驱动（评审响应 + 评审二轮加固）**：P5C 按清单种子列表训练全部四个冻结臂，P5MP 跑扩展腐坏模式探针（uniform/realistic-token/mask/delete + 评审二轮新增 span/doc/topical + NIAH-natural），P5S2/P5S3 补等 token 与 6ND 参数量代理预算的大规模臂，P5T 按 `confirmation_frozen.json` 在 held-out 的 WikiText-103 test split 上做**冻结后一次性确认评估**——含加载期功效硬门槛（数学上不可能确认的清单直接拒绝）、严格记录准入（种子白名单/唯一记录/单一冻结切片/配方签名/manifest 哈希）、首次访问冻结锁与逐文档 PPL 落盘 |
+| `v12_supp.py` | **v12 确认驱动（评审响应 + 评审二轮加固）**：P5C 按清单种子列表训练全部四个冻结臂，P5MP 跑扩展腐坏模式探针（uniform/realistic-token/mask/delete + 评审二轮新增 span/doc/topical + NIAH-natural），P5S2/P5S3 补等 token 与 6ND 参数量代理预算的大规模臂，P5T 按 `confirmation_frozen.json` 在 held-out 的 WikiText-103 test split 上做**冻结后一次性确认评估**——含加载期功效硬门槛（数学上不可能确认的清单直接拒绝）、严格记录准入（种子白名单/唯一记录/单一冻结切片/配方签名/manifest 哈希）、首次访问冻结锁与**逐行/窗口** PPL 落盘（不是逐文档：单位见 design_notes §20/§27.2） |
 | `open_block_supp.py` | **未结束块读取面板驱动**：最大块长（32/64/128/无强制上限）× 当前未结束块读取方式（`closed` / `prefix_summary` / `prefix_singletons`）；共享 top-k 预算、因果前缀构造、窗口外辅助面板、逐种子配对差与交互统计——见 `docs/design_notes.md` §24 |
 | `test_open_block.py` | **未结束块 CPU 门禁**：配置/分段器、优化前缀池化与逐查询参考的前向/梯度一致、前缀不变性、未来扰动/未来梯度、候选掩码、边界情形、closed 回归、单 token 语义与 HCA 预算声明 |
 | `confirmation_frozen.json` | **预注册冻结清单 v2**（入库）：冻结臂、种子 0-11（在任何 test-split 访问**之前**由 6 修订为 12，含功效表）、终点、精确符号翻转 + Holm、决策规则、机器可校验的绑定块与范围声明——见 `docs/design_notes.md` §17 与 `DECISION_LOG.md` |
@@ -276,6 +276,13 @@ phase 只读 train/valid。首次 test split 评估之后禁止追加冻结比�
 
 **范围声明**：本确认只覆盖**固定分块 CSA 机制**的主张；动态分块优于固定分块、动态边界的语义价值、HCA 的优劣与动态分块的规模规律**不在本确认内**，需要各自的预注册冻结。
 
+**默认 `csa_dynamic` 不是任务学习边界**（design_notes §22.5）：硬切分来自
+`gate.detach() > 0.5`，LM 交叉熵不能通过离散切分反传；`delta_logit` /
+`fuse_conv` 只从压缩率正则 `comp_reg` 得到梯度。它是「余弦阈值 + 由压缩率
+正则训练的标量偏移」。可选 `csa_dynamic_task` 才是按 score-function
+`+(CE − baseline)·logπ / n_decisions` 训练边界的臂（CE 为最小化成本），且
+**不在**本次固化确认内。
+
 **可执行审计入口（零实验）**：
 
 ```bash
@@ -328,13 +335,42 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
 > 构建器从 `results_*/`、`analysis_*/` 落盘产物现算出的表格为准，仓库正文
 > 不写死任何量值。
 
+## 评审十硬化（review 10，本轮）
+
+详见 `docs/design_notes.md` §28 与英文 README 的 Review-10 hardening 节；
+要点（只改实现/报告/文档，不改冻结清单字节与测量语义）：
+- 所有报告头打印证据状态：无完整 `RELEASES.md` 发布行时，数字**不能独立审计**。
+- v12 主表旁原样打印冻结清单的 `interpretation_caveat` / 计算预算披露；每个
+  主比较标 `single_factor_contrast=false` / `system_level_only=true`——CONFIRMED
+  只能读作「该冻结配方下的系统级臂间差异」。
+- 随机选择对照是**固定确定性哈希**（非按 seed/layer 变化、非每次前向重随机），
+  其 indexer 投影是死参数（202,752，≈1.83%）；`param_breakdown` 现报告
+  `dead_params`/`active`，报告逐臂打印有效参数。
+- 冻结锁含 `superseded` 时当前轮强制 `confirmatory_round=false`、`confirmed=[]`：
+  test 看过之后重冻结不恢复独立性。
+- 固定配方确认 ≠ 两侧同搜索预算调参后的最佳方法比较。
+- NIAH 增加 chance、`nofar` 无远端信息对照、距离分桶与任务有效性门；缺少
+  正对照时 NIAH 只能作描述性读数。
+- 腐坏探针报告**实际覆盖/实际改变 token/空操作行**：ρ 是名义值，span 段
+  互不重叠但受段长量化，donor 撞车使 changed < covered，跨模式同 ρ 不是
+  同强度。
+- 精确符号翻转检验的零假设是**符号关于 0 对称**；共享 seed/数据顺序/初始化
+  是控制而非随机化。功率产物增加 q_hat/Wilson 下界/留一与异常种子敏感性；
+  `V12_SKIP_POWER=1` 在清单声明功效门时必须同时 `V12_ACCEPT_LOW_POWER=1`。
+- 单位：冻结 v12 的 16 个评测单位是固定窗口/行，不是 16 篇文档；`48` 是
+  arms×seeds=4×12 的记录数，不是 48 篇文档。PPL@L 是嵌套前缀目标，不是
+  同目标跨长度比较。
+
 ## 评审四硬化（本轮）
 
-逐条核对见 `REVIEW_4_RESPONSE.md`。核心变化是把原先的软约束变成机器闸门：
+逐条核对见 `DECISION_LOG.md` 的评审 4/5 行（本快照没有 `REVIEW_4_RESPONSE.md`）。核心变化是把原先的软约束变成机器闸门：
 
-- 报告措辞统一走 `exp_lib.reportable_claim`（n≥6、原始 p、Holm p、
-  `mean>std`、族级最小可达 p）；`attach_holm` 输出族级分辨率上限，
-  v10 的 NIAH 对照并入同一 Holm 族。
+- 报告措辞统一走 `exp_lib.reportable_claim`：review-10 起拆成**统计显著性**
+  （n≥6、原始 p、Holm p、族级最小可达 p）、**稳定性**（|mean|>std、
+  留一法符号稳定）与**实际价值**（仅当预先声明 `min_effect`；v12 未预注册，
+  故不作实际价值声明）三个独立判决；|mean|>std 是稳定性诊断、不是显著
+  性判据。v12 的 CONFIRMED 规则不使用该阈值。`attach_holm` 输出族级
+  分辨率上限，v10 的 NIAH 对照并入同一 Holm 族。
 - 交叉点标度改用 `crossover_scaling_fit`：≥4 个去重宽度、任一点删失即
   拒绝、训练量差 >25% 拒绝、斜率带 95% CI；否则不报告斜率。
 - 每条训练记录新增 `init_core_fp`，`pair_reason` 拒绝共享 trunk 初始化
@@ -342,8 +378,10 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
   赢家的混杂结果标为 `system_level_only` 而非 `verified`。
 - 陈旧记录 fail-closed：无当前代码戳的按长度臂整臂排除，不列表、不算
   ratio；缺失 `truncated` 标记按不可验证处理。
-- P2 表显示文档 bootstrap CI；v12 主比较表新增文档 Δ CI，文档数 <64 时
-  禁止总体主张。
+- P2 表显示 row/window bootstrap CI（非文档）；v12 主比较表的行/窗口 Δ CI
+  单位是固定评测窗口，不是文档。`MIN_DOCS_FOR_POPULATION_CLAIM=64` 是仓库
+  自设最小总体门槛（无统计推导，且计数单位是行/窗口）；16 个窗口不覆盖
+  语言总体，总体主张一律拒绝。
 - 长度阶段记录实测效率；新增 `measure_efficiency_sweep` 与
   `audit_gates.py efficiency_pairs`，只有同形状/同设备/同 KV 语义且
   比值超出 ±5% 才允许说「更快」。

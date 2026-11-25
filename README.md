@@ -32,6 +32,59 @@ split). Only the frozen v12 fixed-chunk comparisons are confirmatory. See
 > auditable. A claim becomes auditable only when its `release_<tag>.tar.gz`
 > plus manifest is published and `archive_release.py verify` passes.
 
+## Review-10 hardening (what changed)
+
+The review-10 response is implementation/reporting only: no new training panel,
+no frozen-manifest byte change, no measurement-semantics change.  The
+item-by-item disposition is in `docs/design_notes.md` §28.  Highlights:
+
+- **Evidence status is printed, not implied.** Every report builder now starts
+  with an `evidence_status_banner()` line from the `RELEASES.md` index: while no
+  complete release row exists (the current state), the banner says the numbers
+  are **not independently auditable**.  A release row must contain tag / date /
+  commit / archive URL / archive SHA-256 / manifest SHA-256 / verifier; audit
+  functions and freeze locks are not a substitute for published artifacts.
+- **System-level scope, not mechanism attribution.** `REPORT_v12` prints the
+  frozen manifest's `interpretation_caveat` and `compute_budget_disclosure`
+  next to the primary table; every frozen comparison carries
+  `single_factor_contrast: false` / `system_level_only: true`.  CONFIRMED means
+  "system-level arm difference under this frozen recipe", never "the learned
+  selector causes the advantage".
+- **Random control is a fixed deterministic hash** (`(row*12.9898 + col*78.233)`,
+  identical for every seed/layer/step) — not a per-forward random draw, and not
+  a general random-sparse baseline.  Its indexer projections are dead
+  parameters (202,752, ≈1.83%); `param_breakdown` now reports
+  `dead_params`/`active = total − dead`, and the report prints per-arm active
+  parameters.
+- **Re-freeze cannot create a new confirmation.** If the freeze lock shows a
+  post-test `V12_REFREEZE=1` (`superseded`), the current round is forced to
+  `confirmatory_round=false`, `confirmed=[]`, with a report warning: the same
+  test slice has already been observed.
+- **Fix-recipe boundary.** The frozen confirmation is a frozen-default-
+  hyperparameter comparison; it is **not** a both-sides-tuned best-method
+  comparison (`BASELINE_TUNING_PROTOCOL.note`).
+- **NIAH task-validity gate.** NIAH-natural now records the chance level, runs a
+  `nofar` no-far-information control, stores distance-bucketed accuracy, and
+  requires a recorded positive-control solver before it can support mechanism
+  wording.  No such positive control exists in the current panels, so NIAH stays
+  descriptive-only.
+- **Corruption audit.** `rho` is nominal: reports print realised coverage /
+  unique positions / overlap / actually-changed tokens / no-op rows per mode
+  (spans are disjoint by construction; donor collisions can make changed <
+  covered), so modes are not compared as equal-strength corruption.
+- **Statistics.** Exact sign-flip is a test of a SHARP sign-symmetry null;
+  sharing seed/data order/init is a control, not randomization.  Sign counts,
+  leave-one-seed-out stability and within-seed-noise are reported separately
+  from significance, and the power artifact now includes q_hat, a Wilson lower
+  bound, leave-one-seed-out and outlier sensitivity.  A `V12_SKIP_POWER=1`
+  access additionally requires `V12_ACCEPT_LOW_POWER=1` when the manifest
+  declares a power gate.
+- **Units and length scope.** The frozen 16 evaluation units are fixed
+  windows/rows, not documents; `48` is the arm×seed record count (4×12), not 48
+  documents; the 64-document floor is a house population gate with no
+  statistical derivation.  PPL@4096 scores nested-prefix targets, so it is not
+  a same-target context-length comparison.
+
 ## Repository layout
 
 The repository keeps only **source code, driver scripts and design
@@ -57,11 +110,10 @@ already keeps those path families out of the repository (`docs/` retains only
 | `v12_supp.py` | **the v12 confirmation driver (reviewer-response + review-2 hardening)**: P5C trains all four frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms, P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-row PPL records (the window is the unit; `load_wikitest(with_doc_ids=True)` + `eval_ppl(doc_index=...)` give true document clusters) |
 | `open_block_supp.py` | **open-block panel driver**: maximum block length (32/64/128/no cap) × current-block reading rule (`closed` / `prefix_summary` / `prefix_singletons`), with a shared top-k budget, causal prefix construction, outside-window auxiliary panel, paired per-seed deltas and interaction statistics — see `docs/design_notes.md` §24 |
 | `test_open_block.py` | **open-block CPU gates**: config/segmenter, optimized-vs-reference prefix pooling (forward + gradients), prefix invariance, future perturbation/gradient, candidate masks, edge cases, closed regression, singleton semantics and HCA budget declaration |
-| `confirmation_frozen.json` | **pre-registered confirmation plan v2** (tracked): frozen arms, seeds 0-11 (revised 6->12 BEFORE any test-split access; power table recorded), endpoints, exact sign-flip + Holm, decision rule, machine-checkable binding block and a scope declaration — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
+| `confirmation_frozen.json` | **pre-registered confirmation plan, manifest v5 (revision history v1–v6)** (tracked): frozen arms, seeds 0-11 (revised 6->12 BEFORE any test-split access; power table recorded), endpoints, exact sign-flip + Holm, decision rule, machine-checkable binding block and a scope declaration — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
 | `RELEASES.md` | **evidence release index**: where each immutable `release_<tag>.tar.gz` + SHA-256 manifest is published; the Git repo itself stays source-only |
 | `pyproject.toml` / `requirements.txt` | Python ≥3.12 and dependency declarations; install explicitly (no import-time pip install) |
 | `DECISION_LOG.md` | **decision log** (tracked; reconstructed 2026-10-18 from the README/design notes/manifest because the snapshot has one squashed commit): why each version ran what it ran, what was seen, and what was decided next — the exploration/confirmation paper trail; formal releases additionally archive per-seed results via `archive_release.py` |
-| `REVIEW_4_RESPONSE.md` | **review-4 per-issue audit** (tracked): the 21 methodological issues, what this repository already enforced, what this revision changed, and what still cannot be answered without new experiments/artifacts |
 | `audit_gates.py` | **review-2/4 verification entry points** (zero-experiment): data-leakage audits (tokenizer provenance, vocab identity, train/test overlap), CPU causality unit checks (prefix invariance, label shift, decode consistency), block-attribution / boundary-vs-random / length-consistency / baseline-fairness / failure-concentration / budget-reconciliation audits and prefill-decode-kv-growth measurement utilities |
 | `archive_release.py` | **immutable evidence archiver**: packs per-release artifacts (results, analyses, reports, freeze lock, decision log, environment, checkpoint hashes) into a tar.gz with a per-file SHA-256 manifest and an independent `verify` subcommand — the git repo stays source-only (design_notes §8) while every formal release gets an auditable fixed archive |
 | `m0_supp.py` | **the M0/S1 driver (adopted B tier)**: entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention throughput benchmark), `full` (the S1 panel); see "B-tier M0/S1" below |
@@ -296,8 +348,9 @@ realistic-token (natural) / mask / delete + review-2 span / doc / topical
 corruption modes** + the NIAH-natural far-necessity task), P3T
 (topk sweep seeds 2/3 → n=4), P3SS/P3SL (d=128/4L 8000-step and d=512/10L
 4000-step crossover panels), P3SL2/P3SL3 (**token-matched and
-compute-matched large arms** — the scale-confound fix; see
-docs/design_notes.md §16).
+6ND-parameter-proxy-budget large arms** — a scale-confound *probe*: 6ND is a
+proxy, not measured FLOPs, and only a token-matched slice is actually
+matched; see docs/design_notes.md §16).
 See `docs/design_notes.md` for the design rationale behind the
 paired-corruption protocol, the pre-registered crossover criterion, the
 corruption-mode/ΔNLL semantics (§15) and the intervention-vs-trained-control
@@ -311,7 +364,7 @@ python v12_supp.py plan            # zero-GPU pre-flight: stamps + implementatio
 python v12_supp.py phase P5C       # train all four frozen arms at the manifest seed list (resumable; 0-5 main arms covered by P3MT/P4MT)
 python v12_supp.py phase P5MP      # extended probe (all modes + NIAH + controls) at the manifest seed list
 python v12_supp.py phase P5S2      # token-matched large scale arm (8000 steps)
-python v12_supp.py phase P5S3      # compute-matched large scale arm (param-ratio steps)
+python v12_supp.py phase P5S3      # 6ND-param-proxy-budget large arm (param-ratio steps; NOT measured FLOPs)
 python v12_supp.py phase P5T       # FROZEN final test on wiki.test.raw (requires the freeze manifest)
 python v12_supp.py analysis        # zero-GPU: shared v10 stats + frozen final-test stats
 python v12_supp.py report          # rebuild REPORT_v12.md from disk (zero GPU)
@@ -423,11 +476,17 @@ script pushes and shuts the instance down (cancel with
 
 ## Review-4 hardening (what changed)
 
-See `REVIEW_4_RESPONSE.md` for the item-by-item table.  The main additions are
+See the review-4/review-5 rows in `DECISION_LOG.md` for the item-by-item list
+(there is no `REVIEW_4_RESPONSE.md` in this source snapshot).  The main additions are
 machine gates rather than new prose:
 
-- **Claim wording** now goes through `exp_lib.reportable_claim` (n>=6, raw p,
-  Holm p, |mean|>std, family resolution floor).  `attach_holm` reports
+- **Claim wording** now goes through `exp_lib.reportable_claim`, which since the
+  review-10 split reports **three separate verdicts**: statistical significance
+  (n>=6, raw p, Holm p, family resolution floor), seed **stability**
+  (|mean|>std, leave-one-seed-out), and **practical value** (only when a
+  pre-declared `min_effect` is supplied; v12 pre-registers none, so v12 makes no
+  practical-value claim). |mean|>std is a stability diagnostic, not a
+  significance test.  `attach_holm` reports
   `family_min_attainable_p_holm`, so `p_holm=1.0` from an oversized family is
   printed as a resolution ceiling, not as a null result.  v10's NIAH contrasts
   are now inside the Holm family.
@@ -473,8 +532,10 @@ machine gates rather than new prose:
   `eval_subset` only controls the in-training curve.
 - **Statistics**: v7–v11 analysis and `build_report.py` attach Holm
   step-down over the displayed family (omitted comparisons keep a dummy p=1
-  slot). Report prose may say “significant” only when n≥6, raw p<0.05, Holm
-  p<0.05 and |mean|>std.
+  slot). Report prose may say “statistically significant” only when n≥6, raw
+  p<0.05, Holm p<0.05 and the family resolution floor is reachable;
+  |mean|>std and leave-one-seed-out stability are reported separately as
+  **stability**, never as the significance criterion.
 - **Sign-flip assumptions**: `paired_effect_stats` now also reports the sign
   split, a paired bootstrap interval, an exact Wilcoxon sensitivity p, and an
   unpaired bootstrap interval when both arms are supplied. The primary p

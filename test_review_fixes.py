@@ -1116,6 +1116,70 @@ def t_new_modes_do_something():
     assert not np.array_equal(top, nat), 'topical (most-similar donor) should differ from natural (fixed-offset donor)'
 
 
+def t_corruption_audit_reports_realised_geometry():
+    """Review 10 issue 12: `rho` is nominal; the audit must expose the realised
+    coverage / change counts so modes are not compared as if equal rho meant
+    equal corruption, and span coverage must be disjoint by construction."""
+    # Backwards-compatible call signature: without return_audit the helper
+    # returns the row array exactly as before.
+    row = V10._corrupt_row(_PANEL, 128, 0.5, 'uniform', 0, _VOCAB, 32)
+    assert isinstance(row, np.ndarray) and row.shape == (129,)
+    _row2, _aud = V10._corrupt_row(_PANEL, 128, 0.5, 'uniform', 0, _VOCAB, 32,
+                                   return_audit=True)
+    assert np.array_equal(row, _row2), 'return_audit must not change the sampled ids'
+    assert _aud['mode'] == 'uniform' and _aud['far_positions'] == 96
+    assert _aud['covered_token_slots'] == 48 and _aud['covered_unique_positions'] == 48
+    assert _aud['overlap_token_slots'] == 0 and _aud['changed_tokens'] == 48
+    assert abs(_aud['realised_coverage_fraction'] - 0.5) < 1e-12
+    # Span: disjoint tiles by construction.  Cover is quantised by segment
+    # geometry, so the realised fraction is NOT the nominal rho.
+    _srow, _sa = V10._corrupt_row(_PANEL, 128, 0.125, 'span', 1, _VOCAB, 32,
+                                  span_len=8, return_audit=True)
+    assert _sa['overlap_token_slots'] == 0, 'span spans must be disjoint by construction'
+    assert _sa['covered_token_slots'] == _sa['n_span_segments'] * _sa['span_len']
+    assert _sa['covered_unique_positions'] == _sa['covered_token_slots']
+    assert abs(_sa['realised_coverage_fraction'] - 0.125) > 1e-9, (
+        'span coverage is quantised, so rho is nominal -- the audit must show the difference')
+    # delete removes (does not replace) the whole far zone.
+    _drow, _da = V10._corrupt_row(_PANEL, 128, 1.0, 'delete', 0, _VOCAB, 32,
+                                  return_audit=True)
+    assert _drow.shape == (33,) and _da['changed_definition'] == 'removed'
+    assert _da['changed_tokens'] == 96 and _da['covered_token_slots'] == 96
+    # Natural replacement can be a content no-op when the donor row is
+    # identical: a "corruption" that changes nothing must be disclosed, not
+    # measured as if it were corruption.
+    _same = np.stack([np.asarray(_PANEL[0], dtype=np.int64)] * 2)
+    _, _na = V10._corrupt_row(_same, 128, 0.5, 'natural', 0, _VOCAB, 32,
+                              return_audit=True)
+    assert _na['covered_token_slots'] > 0 and _na['changed_tokens'] == 0
+    assert _na['no_op'] is True and _na['changed_fraction_of_covered'] == 0.0
+    # The aggregate audit is deterministic, arm-independent and does not touch
+    # the global NumPy RNG state.
+    _st_before = np.random.get_state()[1][:3].copy()
+    _agg1 = V10._corruption_audit(_PANEL, 128, 0.25, 'span', 4, _VOCAB, 32)
+    _agg2 = V10._corruption_audit(_PANEL, 128, 0.25, 'span', 4, _VOCAB, 32)
+    assert _agg1 == _agg2, 'the corruption audit must be deterministic'
+    assert np.array_equal(_st_before, np.random.get_state()[1][:3]), (
+        'the corruption audit must not consume the global NumPy RNG state')
+    assert _agg1['n_rows'] == 4 and _agg1['far_positions_per_row'] == 96
+    assert (_agg1['covered_unique_positions_total']
+            == _agg1['covered_token_slots_total']), 'disjoint span audit must not double-count slots'
+    assert _agg1['overlap_token_slots_total'] == 0
+    assert 0.0 < _agg1['realised_coverage_fraction'] <= 1.0
+    assert _agg1['realised_changed_fraction'] <= _agg1['realised_coverage_fraction'] + 1e-12
+    # A malformed panel/geometry is refused rather than silently reported.
+    for _bad in ({'n_seq': True}, {'n_seq': 1.5}, {'n_seq': 0}):
+        _kw = dict(val_ids=_PANEL, eval_len=128, rho=0.25, mode='span',
+                   n_seq=4, vocab=_VOCAB, target=32)
+        _kw.update(_bad)
+        try:
+            V10._corruption_audit(**_kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'_corruption_audit accepted {_bad!r}')
+
+
 def t_mode_validation():
     for bad in ('naturaln', '', 'DOC'):
         try:
@@ -2824,6 +2888,8 @@ def t_doc_level_analysis():
     recs_b = {s: {'by_len': {'4096': {'ppl': 1.0, 'ppl_per_seq': base_b[s]}}} for s in range(n_seed)}
     d = V12._doc_level_analysis(recs_a, recs_b, list(range(n_seed)), 4096)
     assert d is not None and d['n_docs'] == n_doc
+    assert d['n_windows'] == n_doc and d['n_units'] == n_doc, d
+    assert d['unit'] == 'fixed evaluation windows (sequence rows), NOT documents', d
     assert abs(d['per_doc_delta_mean'] - (-1.0)) < 1e-9, 'per-doc delta must be a - b = -1.0'
     assert abs(d['between_doc_sd']) < 1e-9, 'constant -1.0 shift across docs -> zero between-doc spread'
     _shape_rec = {'by_len': {'8': {'n_tok': 16 * 7, 'n_seq': 16, 'truncated': False,
@@ -2910,6 +2976,16 @@ def t_evidence_metadata():
     assert 'requirements.txt' in open(os.path.join(REPO, 'archive_release.py'), encoding='utf-8').read(), 'archive must pack the dependency declaration'
     assert 'DECISION_LOG.md' in open(os.path.join(REPO, 'archive_release.py'), encoding='utf-8').read()
     import build_report as BR
+    # Every report header must print the evidence status.  Source-only repo =>
+    # numbers are not independently auditable (review 10, issue 1).
+    _ev = L.evidence_release_status()
+    assert _ev['status'] in ('no_release', 'missing_index') and _ev['complete_rows'] == 0, _ev
+    # The two independent implementations must agree on status/count.
+    _la, _ba = L.evidence_release_status(), BR.evidence_release_status()
+    assert (_la['status'], _la['complete_rows']) == (_ba['status'], _ba['complete_rows']), (_la, _ba)
+    assert '不能独立审计' in L.evidence_status_banner()
+    assert '不能独立审计' in BR.evidence_status_banner()
+    assert '证据状态' in BR.sec_header(), 'report header must carry the evidence-status banner'
     assert BR._sig_gate({'n': 6, 'p_exact_signflip': 0.01, 'p_holm': 0.02, 'mean': 1.0, 'std': 0.5}) is True
     assert BR._sig_gate({'n': 3, 'p_exact_signflip': 0.01, 'p_holm': 0.02, 'mean': 1.0, 'std': 0.5}) is False
     assert BR._sig_gate({'n': 6, 'p_exact_signflip': 0.01, 'p_holm': None, 'mean': 1.0, 'std': 0.5}) is False
@@ -3124,6 +3200,199 @@ def t_boundary_arm_and_objective():
     loss.backward()
     grads = [p.grad.abs().sum().item() for n, p in m.named_parameters() if 'delta_logit' in n and p.grad is not None]
     assert grads and all(g > 0 for g in grads), f'delta_logit received no task-loss gradient: {grads}'
+
+
+def t_score_function_term_sign_two_action_toy():
+    """Review 10 issue 5: lock the score-function SIGN along the actual loss
+    construction, with a two-action toy.
+
+    The training loop constructs (in this order):
+
+        ce   = LM cross-entropy        (a COST that is being minimised)
+        adv  = ce - baseline           (positive = sampled cut pattern worse)
+        logp = sum log pi(a)           (attention returns -BCE-with-logits)
+        loss = ce + comp + coef * (adv * logp / n_decisions)
+
+    Correct sign: gradient descent increases the probability of the LOWER-cost
+    action.  A sign error (writing ``baseline - ce`` or subtracting the term)
+    reverses that, so the counterfactual is asserted too -- this test cannot
+    pass vacuously.  The real module's ``boundary_logp`` is checked to be the
+    same ``-BCE`` log-probability sum the toy consumes.
+    """
+    import torch.nn.functional as _F
+
+    def _fit(sign, steps=250, batch=256, seed=7):
+        torch.manual_seed(seed)
+        theta = torch.tensor(0.0, requires_grad=True)  # logit for action 1
+        opt = torch.optim.SGD([theta], lr=0.5)
+        # Action 0 is the low-cost ("good") cut pattern; baseline 0, so the
+        # cost advantage equals the cost itself.
+        costs = torch.tensor([-0.5, 0.5])
+        for _ in range(steps):
+            opt.zero_grad()
+            p1 = torch.sigmoid(theta)
+            acts = torch.bernoulli(p1.expand(batch)).long()
+            logits = theta.expand(batch)
+            logp = -_F.binary_cross_entropy_with_logits(
+                logits, acts.to(logits.dtype), reduction='none')
+            adv = costs[acts]
+            loss = (costs[acts] + sign * adv * logp).mean()
+            loss.backward()
+            opt.step()
+        # theta is the logit of action 1 (the high-cost action); the toy's
+        # reported quantity is the probability of the LOW-cost action 0.
+        return float(1.0 - torch.sigmoid(theta).detach())
+
+    # The helper is the exact additive term: (ce - baseline) * logp / n.
+    logp0 = -_F.binary_cross_entropy_with_logits(
+        torch.tensor([0.0]), torch.tensor([1.0]), reduction='sum')
+    assert abs(L.boundary_policy_term(0.5, 0.0, logp0, 1).item()
+               - (0.5 * logp0).item()) < 1e-7
+    # n_decisions divides (per-decision mean), it does not multiply.
+    assert abs(L.boundary_policy_term(0.5, 0.0, logp0, 2).item()
+               - (0.25 * logp0).item()) < 1e-7
+    # Correct sign: the low-cost action's probability rises.
+    p_good = _fit(sign=+1.0)
+    assert p_good > 0.95, (
+        'two-action toy: the correct score-function sign must favour the '
+        f'lower-cost action; got p(good)={p_good:.3f}')
+    # Wrong sign (the reviewer's suspected `-(CE - baseline) * logp` form) must
+    # fail the same expectation, proving the toy detects a flipped sign.
+    p_wrong = _fit(sign=-1.0)
+    assert p_wrong < 0.05, (
+        'two-action toy: a flipped score-function sign must drive the '
+        f'low-cost probability down; got p(good)={p_wrong:.3f}')
+    # The real module's boundary_logp is the same -BCE log-probability sum, and
+    # the real model's term is finite and reachable.
+    cfg = L.make_layer_cfgs(1, 'csa_dynamic_task')[0]
+    m = L.SmallGPT(64, 32, 1, 2, 16, 16, [cfg])
+    x = torch.randint(0, 64, (1, 16), generator=torch.Generator().manual_seed(0))
+    y = torch.randint(0, 64, (1, 16), generator=torch.Generator().manual_seed(1))
+    ce = m.ce_loss(x, y, 64)
+    assert m.boundary_logp is not None and m.boundary_decisions > 0, (
+        'boundary policy must emit log-probabilities')
+    term = L.boundary_policy_term(float(ce.detach().item()), 0.0,
+                                  m.boundary_logp, m.boundary_decisions)
+    assert torch.isfinite(term).all() and abs(term.detach().item()) > 0, (
+        'the real model loss must contain a finite REINFORCE term')
+
+
+def t_evidence_release_status_parsing():
+    """Review 10, issue 1: evidence release status is parsed conservatively and
+    the two independent implementations (exp_lib / build_report) agree."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'RELEASES.md')
+        header = ('| tag | date | Git commit | archive URL / object key | archive SHA-256 '
+                  '| manifest SHA-256 | verifier |\n|---|---|---|---|---|---|---|\n')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(header + '| _none yet_ | — | — | — | — | — | — |\n')
+        a, b = L.evidence_release_status(path), BR.evidence_release_status(path)
+        assert a['status'] == 'no_release' and a['complete_rows'] == 0, a
+        assert b['status'] == 'no_release' and b['complete_rows'] == 0, b
+        assert '不能独立审计' in L.evidence_status_banner(path)
+        assert '不能独立审计' in BR.evidence_status_banner(path)
+        # A row with placeholders is still not a release.
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(header + '| v13 | pending | abc | — | — | — | — |\n')
+        assert L.evidence_release_status(path)['status'] == 'no_release'
+        assert BR.evidence_release_status(path)['status'] == 'no_release'
+        # A complete row is a release.
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(header + '| v13 | 2026-11-25 | abc123 | https://example.org/x.tar.gz '
+                            '| aaaa | bbbb | archive_release.py verify |\n')
+        a, b = L.evidence_release_status(path), BR.evidence_release_status(path)
+        assert a['status'] == 'released' and a['complete_rows'] == 1, a
+        assert b['status'] == 'released' and b['complete_rows'] == 1, b
+        assert 'released' in L.evidence_status_banner(path)
+    # Missing index means no verifiable release either.
+    assert L.evidence_release_status(os.path.join(tempfile.gettempdir(), 'no_such_releases.md'))['status'] == 'missing_index'
+
+
+def t_param_breakdown_reports_dead_indexer_params():
+    """Review 10, issue 3: random-indexer layers allocate but never use their
+    indexer projections; active capacity must exclude them."""
+    learned = L.SmallGPT(64, 32, 2, 2, 16, 16, L.make_layer_cfgs(2, 'csa_fixed'))
+    pb = L.param_breakdown(learned)
+    assert pb['dead_params'] == 0 and pb['active'] == pb['total'], pb
+    rnd = L.SmallGPT(64, 32, 2, 2, 16, 16, L.make_layer_cfgs(2, 'csa_fix_randidx'))
+    pb2 = L.param_breakdown(rnd)
+    # Every indexer projection of a random-mode layer is dead; derive the
+    # expected count from the model itself instead of hard-coding d=256 shapes.
+    expected_dead = pb2['attention_indexer']
+    assert expected_dead > 0 and pb2['dead_params'] == expected_dead, (pb2['dead_params'], expected_dead)
+    assert pb2['dead_indexer_params'] == expected_dead
+    assert pb2['active'] == pb2['total'] - expected_dead
+    assert pb2['active'] < pb2['total']
+    assert 'random' in pb2['active_note']
+
+
+def t_refreeze_round_cannot_confirm():
+    """Review 10, issue 15: a post-test re-freeze cannot issue CONFIRMED
+    labels (the same held-out slice was already observed)."""
+    assert V12.round_is_confirmatory({'stage': 'accessed', 'test_ids_fp': 'aa',
+                                      'superseded': []}) is True
+    assert V12.round_is_confirmatory({'stage': 'accessed', 'test_ids_fp': 'aa'}) is True
+    assert V12.round_is_confirmatory({'stage': 'accessed', 'test_ids_fp': 'aa',
+                                      'superseded': [{'manifest_sha256': 'old'}]}) is False
+    assert V12.round_is_confirmatory({'stage': 'preaccess', 'test_ids_fp': None}) is False
+    for bad in (None, [], 'x', 3):
+        assert V12.round_is_confirmatory(bad) is False
+
+
+def t_power_sensitivity_reports_validation_optimism():
+    """Review 10, issue 7: the pre-access power artifact must expose the
+    observed direction fraction, its Wilson lower bound and outlier/LOO
+    sensitivity, not only the q-design table."""
+    deltas = [-1.0] * 8 + [2.0]
+    s = V12._power_sensitivity(deltas, 'negative', 0.05, 4)
+    assert abs(s['q_hat_validation'] - 8.0 / 9.0) < 1e-6, s
+    assert 0.0 <= s['q_wilson95_lower'] <= s['q_hat_validation'], s
+    loo = s['leave_one_seed_out_power_q080']
+    assert loo['min'] <= loo['max'], s
+    assert 'drop_largest_abs_delta_power_q080' in s
+    assert 'replace_largest_with_median_power_q080' in s
+    assert 'uniform_shrinkage_note' in s and 'validation_selection_note' in s
+    # Extra q levels requested by the sensitivity pass are emitted.
+    r = V12._power_enumeration([1.0] * 10, 'negative', 0.05, 4, extra_q=[0.55])
+    assert any(k.startswith('q=0.55') for k in r['power_holm_conservative']), r['power_holm_conservative']
+    # Wilson bound is a valid conservative proportion.
+    assert 0.0 <= V12._wilson_lower(8, 9) < 8.0 / 9.0
+    assert V12._wilson_lower(9, 9) <= 1.0
+    assert V12._wilson_lower(1, 0) is None
+
+
+def t_niah_task_validity_controls():
+    """Review 10, issue 13: NIAH must publish chance, provide a no-far-info
+    control, and expose a distance gradient instead of assuming the task is
+    valid for the model."""
+    rng = np.random.default_rng(0)
+    val = rng.integers(0, 64, size=(4, 80)).astype(np.int64)
+    rows, qc, qv, st = V10._build_niah_natural(val, 64, 16, 4, 64, 2, seed=1,
+                                                condition='clean')
+    # vocab 64 -> value tokens [48,64): 16 equiprobable answers.
+    assert abs(st['chance_acc'] - 1.0 / 16.0) < 1e-12, st
+    assert len(st['dist_per_query']) == 2 * 4, st
+    assert st['condition'] == 'clean'
+    rows_n, qc_n, qv_n, st_n = V10._build_niah_natural(val, 64, 16, 4, 64, 2,
+                                                        seed=1, condition='nofar')
+    assert st_n['nofar_control'] is True and st_n['condition'] == 'nofar'
+    assert np.array_equal(qc, qc_n) and np.array_equal(qv, qv_n), (
+        'the nofar control must keep the same queries/answers in the target zone')
+    assert np.array_equal(rows[:, -16:], rows_n[:, -16:]), (
+        'nofar must only destroy the FAR couples, not the target zone')
+    assert not np.array_equal(rows[:, :48], rows_n[:, :48]), (
+        'nofar must actually replace the far couple tokens')
+    # A nofar control is a different task construction: its probe_params differ.
+    assert V10._niah_fingerprint(dict(V10.PROBE), condition='nofar') != V10._niah_fingerprint(dict(V10.PROBE), condition='clean')
+    # Exact binomial tail sanity for the chance-level gate.
+    assert abs(V10._binom_sf_exact(100, 0, 0.5) - 1.0) < 1e-12
+    assert V10._binom_sf_exact(100, 100, 0.5) < 1e-25
+    assert 0.4 < V10._binom_sf_exact(10, 5, 0.5) < 0.7
+    # The shipped probe config includes the no-far condition and no positive
+    # control (so the validity gate must stay closed).
+    assert 'nofar' in V10.NIAH_NATURAL['conditions']
+    assert 'positive_control' not in V10.PROBE['niah']
+
 
 def t_seed_reproducible():
     def draw():
@@ -6354,15 +6623,45 @@ def t_reportable_claim_gate():
     base = {'n': 6, 'mean': -1.0, 'std': 0.2, 'p_exact_signflip': 0.01, 'p_holm': 0.02}
     r = L.reportable_claim(base)
     assert r['allowed'] is True and r['level'] == 'exploratory_significant', r
+    assert r['statistical_significance'] is True, r
+    # Without the leave-one-seed-out diagnostic, stability is UNKNOWN (None),
+    # never silently assumed robust.
+    assert r['stable'] is None and r['stability']['within_seed_noise'] is False, r
+    # Review 10 issue 8: a mean effect smaller than the seed std is a STABILITY
+    # diagnostic, not evidence that the effect is unreal.  Statistical
+    # significance and stability must be reported as separate verdicts.
+    r = L.reportable_claim(dict(base, mean=-0.1, std=0.2))
+    assert r['allowed'] is True and r['statistical_significance'] is True, r
+    assert r['stable'] is False and r['stability']['within_seed_noise'] is True, r
+    assert any('seed-to-seed noise' in x for x in r['stability_reasons']), r
+    assert not any('seed noise' in x for x in r['reasons']), r
+    # The stability verdict is needed to qualify the "stable across seeds"
+    # wording; it must never be silently assumed robust.
+    r = L.reportable_claim(base)
+    assert r['stability']['leave_one_seed_out_stable'] is None, r
+    # A missing seed_driven diagnostic leaves `stable` unknown (None), not True.
+    r = L.reportable_claim({'n': 12, 'mean': -1.0, 'std': 0.1,
+                            'p_exact_signflip': 0.01, 'p_holm': 0.02,
+                            'seed_driven': False})
+    assert r['stable'] is True and r['stability']['leave_one_seed_out_stable'] is True, r
+    # Practical value needs a PRE-DECLARED minimum meaningful effect; without
+    # one it is unmeasured, never inferred from the p-value.
+    r = L.reportable_claim(base)
+    assert r['practical'] == {'min_effect': None, 'meets_min_effect': None}, r
+    r = L.reportable_claim(base, min_effect=0.5)
+    assert r['practical']['meets_min_effect'] is True, r
+    r = L.reportable_claim(base, min_effect=2.0)
+    assert r['practical']['meets_min_effect'] is False, r
     # n<6 is underpowered even with a tiny raw p.
     r = L.reportable_claim(dict(base, n=3, p_holm=0.02))
     assert r['allowed'] is False and r['level'] == 'underpowered', r
     # Missing Holm is uncorrected -> not reportable.
     r = L.reportable_claim({k: v for k, v in base.items() if k != 'p_holm'})
     assert r['allowed'] is False and any('Holm' in x for x in r['reasons']), r
-    # Effect inside seed noise is not reportable.
-    r = L.reportable_claim(dict(base, mean=-0.1, std=0.2))
-    assert r['allowed'] is False and any('seed noise' in x for x in r['reasons']), r
+    # A malformed effect artifact is an evidence-integrity failure and still
+    # blocks every claim; it is not an effect-size judgement.
+    r = L.reportable_claim(dict(base, mean=float('nan')))
+    assert r['allowed'] is False and any('mean/std' in x for x in r['reasons']), r
     # A family too large for n=6 cannot reach significance at all.
     r = L.reportable_claim(base, family_size=100)
     assert r['allowed'] is False and r['min_attainable_p_holm_family'] > 0.05, r
@@ -6370,9 +6669,12 @@ def t_reportable_claim_gate():
     r = L.reportable_claim(base, evidence_level='confirmatory')
     assert r['level'] == 'confirmatory', r
     # A mean whose sign flips when one seed is dropped is not a stable
-    # directional claim, even if the aggregate p happens to clear Holm.
+    # directional claim, but that is a stability verdict, not a redefinition
+    # of the p-value's statistical meaning.
     r = L.reportable_claim(dict(base, seed_driven=True))
-    assert r['allowed'] is False and any('leave-one-seed-out' in x for x in r['reasons']), r
+    assert r['allowed'] is True and r['statistical_significance'] is True, r
+    assert r['stable'] is False, r
+    assert any('leave-one-seed-out' in x for x in r['stability_reasons']), r
     # n_nonzero is an exact nonzero-pair count; a fractional spelling is
     # rejected.
     r = L.reportable_claim(dict(base, n_nonzero=4.9))
@@ -12594,6 +12896,7 @@ def main():
     _check('B2 determinism + target-zone safety', t_corruption_deterministic_and_paired)
     _check('B3 new modes span/doc/topical', t_new_modes_do_something)
     _check('B4 mode validation', t_mode_validation)
+    _check('B5 corruption realised-geometry audit', t_corruption_audit_reports_realised_geometry)
     _check('C1 load-time power gate', t_power_gate)
     _check('C2 admission gate exclusions', t_admission_gate)
     _check('C3 admission gate refusals', t_admission_refuses)
@@ -12652,6 +12955,11 @@ def main():
     _check('J2c document CI token counts are exact integers', t_nll_doc_ci_exact_token_counts)
     _check('J3 Holm declared-family slots', t_holm_family_size)
     _check('J4 task-boundary arm + objective descriptor', t_boundary_arm_and_objective)
+    _check('J4b score-function sign two-action toy', t_score_function_term_sign_two_action_toy)
+    _check('J4c evidence release status + banner', t_evidence_release_status_parsing)
+    _check('J4d NIAH chance/nofar/distance validity', t_niah_task_validity_controls)
+    _check('J4e power sensitivity (q_hat/LOO/outlier)', t_power_sensitivity_reports_validation_optimism)
+    _check('J4f refreeze round cannot confirm', t_refreeze_round_cannot_confirm)
     _check('J5 span clean-baseline key', t_span_clean_key)
     _check('E1 seed reproducibility', t_seed_reproducible)
     _check('E1a seed/variant axis normalisation', t_seed_axis_normalization)
@@ -12785,6 +13093,7 @@ def main():
     _check('L3h v12 probe contrasts require matching probe_params', t_v12_probe_contrasts_require_matching_params)
     _check('L4 matched-init fingerprint + pair gate', t_init_core_fingerprint_and_pair_gate)
     _check('L5 param breakdown + measured compute control', t_param_and_compute_control_detail)
+    _check('L5b param breakdown dead random-indexer params', t_param_breakdown_reports_dead_indexer_params)
     _check('L6 stale aggregate refused', t_stale_aggregate_refused)
     _check('L7 stale length panel excluded from report', t_sec_p1l_excludes_stale_records)
     _check('L7b report length table rejects malformed length keys', t_sec_p1l_rejects_malformed_length_keys)

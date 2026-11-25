@@ -1795,7 +1795,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     del d
     return out
 
-def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
+def _power_enumeration(deltas, expected_sign, alpha, m_comparisons, extra_q=None):
     """Exact sign-flip power enumeration on FIXED magnitudes (zero GPU).
 
     Implements the manifest's statistics.power_note obligation: treat the
@@ -1879,7 +1879,25 @@ def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
         exp_dir = 1.0
     elif expected_sign == 'negative':
         exp_dir = -1.0
-    powers = {f'q={q:.2f}': 0.0 for q in (0.8, 0.85, 0.9, 0.95)}
+    # The four protocol levels are always reported.  `extra_q` lets the power
+    # phase add the OBSERVED validation direction fraction q_hat and its lower
+    # confidence bound, so the artifact shows power at the q the data actually
+    # supports instead of only the four design-aid columns (review 10, issue 7).
+    _q_levels = [0.8, 0.85, 0.9, 0.95]
+    _q_seen = {round(float(q), 6) for q in _q_levels}
+    if extra_q is not None:
+        for _q in extra_q:
+            try:
+                _qv = float(_q)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not (math.isfinite(_qv) and 0.0 < _qv < 1.0):
+                continue
+            _qr = round(_qv, 6)
+            if _qr not in _q_seen:
+                _q_seen.add(_qr)
+                _q_levels.append(_qv)
+    powers = {f'q={q:.2f}': 0.0 for q in _q_levels}
     _min_same = None
     _n_reject_holm = 0
     _n_reject_marginal = 0
@@ -1920,7 +1938,7 @@ def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
         if _rej_h:
             for q in powers:
                 _qv = float(q.split('=')[1])
-                powers[q] += (_qv ** _same) * ((1.0 - _qv) ** (n - _same))
+                powers[q] += (math.exp(_same * math.log(_qv)) * math.exp((n - _same) * math.log1p(-_qv)))
     return {
         'n': n,
         'status': 'ok',
@@ -1940,6 +1958,139 @@ def _power_enumeration(deltas, expected_sign, alpha, m_comparisons):
                  'arms/seeds is not modelled; the Holm threshold used is the conservative '
                  'smallest-p slot alpha/m. Design aid, not a guarantee or a bound.'),
     }
+
+
+def _wilson_lower(k, n, z=1.959963984540054):
+    """One-sided-ish Wilson score lower bound for a binomial proportion.
+
+    Pure-Python (no scipy): used to report the power at a *conservative*
+    direction probability instead of only the observed validation fraction.
+    """
+    try:
+        _k, _n = int(k), int(n)
+        _zf = float(z)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if _n <= 0 or _k < 0 or _k > _n or not math.isfinite(_zf) or _zf <= 0.0:
+        return None
+    p = _k / _n
+    den = 1.0 + _zf * _zf / _n
+    center = (p + _zf * _zf / (2.0 * _n)) / den
+    half = _zf * math.sqrt(max(0.0, p * (1.0 - p) / _n + _zf * _zf / (4.0 * _n * _n))) / den
+    return max(0.0, center - half)
+
+
+def _q_direction_fraction(deltas, expected_sign):
+    """Observed fraction of validation deltas that fall in the expected
+    direction (the empirical q behind the power model), plus the count."""
+    if expected_sign not in ('positive', 'negative'):
+        return None
+    vals = []
+    for x in (deltas or []):
+        try:
+            f = float(x)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(f):
+            vals.append(f)
+    if not vals:
+        return None
+    k = sum(1 for f in vals if (f > 0 if expected_sign == 'positive' else f < 0))
+    return (k, len(vals))
+
+
+def _power_sensitivity(deltas, expected_sign, alpha, m_comparisons):
+    """Magnitude / outlier sensitivity of the pre-access power read.
+
+    Review 10, issue 7: the validation panel was selected on the same split
+    that produced these deltas, so its direction fraction q_hat is optimistic
+    for the test split, and the fixed-|d_i| sign enumeration does not model
+    training randomness.  This block reports:
+
+      * q_hat and its Wilson lower bound (the conservative q to read);
+      * leave-one-seed-out power range at the protocol q=0.80 level;
+      * dropping the largest-|d| seed and replacing it with the median magnitude
+        (outlier influence on the power read);
+      * an explicit note that a uniform positive rescaling of |d_i| leaves the
+        exact sign-flip test and the q-model power unchanged, so a smaller TEST
+        effect appears as a smaller true q — not as a scaled |d| column.
+
+    All values are additive diagnostics; the v6 gate still reads only
+    ``power_holm_conservative['q=0.80']`` from `_power_enumeration`.
+    """
+    out = {'note': ('Sensitivity diagnostics for the pre-access power read; they do NOT '
+                    'change the frozen v6 gate (q=0.80, power_holm_conservative) and are '
+                    'not a substitute for the one-shot test.')}
+    vals = []
+    for x in (deltas or []):
+        try:
+            f = float(x)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(f):
+            vals.append(f)
+    if not vals:
+        out['status'] = 'no_data'
+        return out
+    q = _q_direction_fraction(vals, expected_sign)
+    if q is not None:
+        k, n = q
+        out['q_hat_validation'] = round(k / n, 6)
+        _ql = _wilson_lower(k, n)
+        out['q_wilson95_lower'] = (round(_ql, 6) if _ql is not None else None)
+        out['direction_counts'] = {'expected': k, 'total': n}
+        # Power at the observed and conservative q, using the same exact
+        # enumeration distribution (extra q levels in `_power_enumeration`).
+        _r = _power_enumeration(vals, expected_sign, alpha, m_comparisons,
+                                extra_q=[k / n] + ([] if _ql is None else [_ql]))
+        _pw = _r.get('power_holm_conservative') or {}
+        out['power_at_q_hat'] = _pw.get(f'q={k / n:.2f}') if k / n in [0.8, 0.85, 0.9, 0.95] else None
+        if out['power_at_q_hat'] is None:
+            # formatting in _power_enumeration is 2-dp, so read the closest key
+            _cand = [(abs(float(key.split('=')[1]) - k / n), val) for key, val in _pw.items()]
+            out['power_at_q_hat'] = min(_cand)[1] if _cand else None
+        if _ql is not None:
+            _cand = [(abs(float(key.split('=')[1]) - _ql), val) for key, val in _pw.items()]
+            out['power_at_q_wilson_lower'] = min(_cand)[1] if _cand else None
+    if len(vals) >= 3:
+        _name = 'q=0.80'
+        _loo = []
+        for i in range(len(vals)):
+            rest = vals[:i] + vals[i + 1:]
+            _r = _power_enumeration(rest, expected_sign, alpha, m_comparisons)
+            _p = (_r.get('power_holm_conservative') or {}).get(_name)
+            if _p is not None:
+                _loo.append((float(_p), i))
+        if _loo:
+            _mn, _imin = min(_loo)
+            _mx, _imax = max(_loo)
+            out['leave_one_seed_out_power_q080'] = {
+                'min': round(_mn, 6), 'max': round(_mx, 6),
+                'drop_index_at_min': int(_imin),
+                'drop_index_at_max': int(_imax),
+                'note': 'range of the q=0.80 power read over panels with ONE seed dropped; '
+                        'a large spread means the power read is driven by one seed',
+            }
+        _imax_abs = max(range(len(vals)), key=lambda i: abs(vals[i]))
+        _rest = [v for i, v in enumerate(vals) if i != _imax_abs]
+        _r = _power_enumeration(_rest, expected_sign, alpha, m_comparisons)
+        out['drop_largest_abs_delta_power_q080'] = (_r.get('power_holm_conservative') or {}).get(_name)
+        _mags = sorted(abs(v) for v in vals)
+        _med = _mags[len(_mags) // 2]
+        _vals2 = list(vals)
+        _vals2[_imax_abs] = math.copysign(_med, vals[_imax_abs]) if vals[_imax_abs] != 0 else 0.0
+        _r2 = _power_enumeration(_vals2, expected_sign, alpha, m_comparisons)
+        out['replace_largest_with_median_power_q080'] = (_r2.get('power_holm_conservative') or {}).get(_name)
+    out['uniform_shrinkage_note'] = (
+        'A uniform positive rescaling of |d_i| leaves both the exact sign-flip p and the '
+        'q-model power unchanged. A smaller TEST effect therefore shows up as a smaller '
+        'true direction probability q, which is why the power artifact now also reports '
+        'q_hat and its Wilson lower bound; scaling the |d_i| column would be cosmetic.')
+    out['validation_selection_note'] = (
+        'The validation panel selected the arms and the favourable direction, so q_hat is '
+        'an optimistic estimate of the test-split direction probability. Read the power at '
+        'q_wilson95_lower, not only at q=0.95; the frozen gate decision itself is unchanged.')
+    return out
 
 
 def run_power_check(cfg=None):
@@ -2014,7 +2165,19 @@ def run_power_check(cfg=None):
                  'n_paired_seeds': len(ordered),
                  'seeds': sorted(deltas),
                  'deltas': ordered}
-        entry.update(_power_enumeration(ordered, comp.get('expected_sign'), _alpha, _m))
+        _qinfo = _q_direction_fraction(ordered, comp.get('expected_sign'))
+        _extra_q = []
+        if _qinfo is not None:
+            _k_q, _n_q = _qinfo
+            _extra_q.append(_k_q / _n_q)
+            _ql = _wilson_lower(_k_q, _n_q)
+            if _ql is not None:
+                _extra_q.append(_ql)
+        entry.update(_power_enumeration(ordered, comp.get('expected_sign'), _alpha, _m,
+                                        extra_q=_extra_q))
+        if ordered:
+            entry['power_sensitivity'] = _power_sensitivity(
+                ordered, comp.get('expected_sign'), _alpha, _m)
         if entry.get('status') == 'no_data':
             entry['note'] = ('no paired validation by-length records for this comparison yet — '
                              'run the frozen-arm training phases (P3MT/P4MT/P3MTC/P5C) first')
@@ -2302,6 +2465,38 @@ def run_finaltest(cfg=None, guard=None):
                                                   'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
                                                   'manifest': manifest.get('manifest_sha256'),
                                                   'note': 'V12_SKIP_POWER=1: the pre-access power simulation was consciously skipped before the one-shot test access'})
+                # Review 10, issue 7: skipping the power artifact must not
+                # silently bypass the manifest's v6 minimum-power gate.  When
+                # the manifest declares statistics.power_gate, an explicit
+                # V12_ACCEPT_LOW_POWER=1 is required as well, and the gate
+                # decision is written to power_gate.json (so test_stats.json
+                # carries a recorded "skipped" decision instead of "missing").
+                _pgate_skip = (manifest.get('statistics') or {}).get('power_gate')
+                if _pgate_skip is not None:
+                    _pg_ack_skip = os.environ.get('V12_ACCEPT_LOW_POWER', '').strip().lower() in ('1', 'true', 'yes', 'on')
+                    if not _pg_ack_skip:
+                        raise SystemExit(
+                            '[v12] REFUSE: V12_SKIP_POWER=1 is not sufficient when the frozen '
+                            'manifest declares statistics.power_gate: either run '
+                            '`python v12_supp.py power` (the honest pre-access read) or set '
+                            'V12_ACCEPT_LOW_POWER=1 as well, which records an explicit '
+                            'resolution-limited acceptance in power_gate.json.')
+                    L.atomic_write_json(os.path.join(outdir, 'power_gate.json'), {
+                        'kind': 'v12_power_gate',
+                        'checked_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                        'manifest': manifest.get('manifest_sha256'),
+                        'status': 'skipped',
+                        'gate': _pgate_skip,
+                        'comparisons': {},
+                        'problem': 'pre-access power artifact skipped (V12_SKIP_POWER=1); no panel-specific power was computed',
+                        'accepted_low_power': True,
+                        'note': ('V12_SKIP_POWER=1 + V12_ACCEPT_LOW_POWER=1: the one-shot '
+                                 'test access proceeds WITHOUT the pre-access power simulation '
+                                 'the frozen manifest asks for. This does NOT make the design '
+                                 'adequately powered; it only makes the resolution-limited '
+                                 'decision explicit and auditable.'),
+                    })
+                    print('[v12] WARNING: power gate recorded as SKIPPED (V12_SKIP_POWER=1 + V12_ACCEPT_LOW_POWER=1) — the access is explicitly resolution-limited, not adequately powered')
             else:
                 raise SystemExit(
                     f'[v12] REFUSE: no pre-access power artifact at {_power_path} — the frozen '
@@ -2845,6 +3040,7 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     _ci_ppl = L.bootstrap_mean_ci(arr, seed=20261018)
     _ci_log = L.bootstrap_mean_ci(lr, seed=20261018)
     return {'n_docs': int(len(doc_deltas)), 'n_units': int(len(doc_deltas)),
+            'n_windows': int(len(doc_deltas)),
             'unit': 'fixed evaluation windows (sequence rows), NOT documents',
             'unit_note': ('the frozen v12 panel is 16 fixed 4096-token windows from the '
                           'first stream slice; a window can span document boundaries, so '
@@ -2863,6 +3059,22 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
             'ci_method': 'percentile bootstrap over the fixed evaluation rows/windows (chunked, deterministic), NOT over documents; conditions on the trained seeds',
             'note': 'row/window-sampling uncertainty only (the unit is the fixed evaluation window, not a document); seed-level exact sign-flip remains the confirmatory test, and n_seqs<64 does not cover the language-population distribution — enlarge the row panel for population-level claims and use the loader doc_index path for true document clustering (design_notes section 20)'}
 
+
+def round_is_confirmatory(lock):
+    """Whether the CURRENT frozen round may issue CONFIRMED labels.
+
+    Review 10, issue 15: re-freezing after a test-split access (V12_REFREEZE=1)
+    does not restore independence — the same test slice has already been
+    observed, so the new round is exploratory by construction.  Only the
+    EARLIER round used to be downgraded; the lock's `superseded` list now also
+    downgrades the current round.  A missing/invalid lock fails closed
+    (not confirmatory).
+    """
+    if not isinstance(lock, dict):
+        return False
+    if lock.get('superseded'):
+        return False
+    return bool(lock.get('stage') in ('accessed', 'reading') or lock.get('test_ids_fp') is not None)
 
 def _test_probe_stats(probe_path, manifest, slice_fp):
     """Descriptive summary of the P5T test-split distractor probe.
@@ -2911,6 +3123,7 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
         isinstance(_r, dict) and _r.get('train_fp') is not None
         for _r in raw.values())
     groups = {}
+    _recs_by_ident = {}
     excluded = []
     _probe_train_fps = set()
     _ambiguous_idents = set()
@@ -2975,6 +3188,7 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             _ambiguous_idents.add(ident)
             continue
         grp[_seed_i] = float(r['ppl_mean'])
+        _recs_by_ident.setdefault(ident, {})[_seed_i] = r
         if _tfp_text is not None:
             _probe_train_fps.add(_tfp_text)
     for _ident in _ambiguous_idents:
@@ -3017,6 +3231,58 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
                              'mode': mode, 'n': len(by_seed),
                              'mean': float(np.mean(list(by_seed.values()))),
                              'ppl_by_seed': {str(sd): p for sd, p in sorted(by_seed.items())}})
+    # Review 10, issue 11: the test-split probe must not report absolute PPL
+    # alone.  Each arm's corrupted-context cost must be read against its own
+    # clean (rho=0) cost on the SAME slice, so clean-quality differences do not
+    # masquerade as corruption sensitivity.  These are descriptive only.
+    def _nll_tok(rec):
+        ns, nt = rec.get('nll_sum'), rec.get('n_tok')
+        if (not isinstance(ns, (list, tuple)) or not isinstance(nt, (list, tuple))
+                or not ns or len(ns) != len(nt)):
+            return None
+        try:
+            vals = [float(x) for x in ns]
+            toks = [int(x) for x in nt]
+        except (TypeError, ValueError, OverflowError):
+            return None
+        tot = sum(toks)
+        if tot <= 0 or any(t < 0 for t in toks):
+            return None
+        v = math.fsum(vals) / tot
+        return v if math.isfinite(v) else None
+    _clean_by_key = {}
+    for _ident, _by_seed in _recs_by_ident.items():
+        _v, _arm, _Ln, _rho, _mode = _ident[:5]
+        if _rho == 0.0 and _mode == 'uniform':
+            _clean_by_key[(_v, _arm, _Ln, _ident[5:])] = _by_seed
+    _delta_nll = {}
+    for _ident, _by_seed in _recs_by_ident.items():
+        _v, _arm, _Ln, _rho, _mode = _ident[:5]
+        if _rho == 0.0:
+            continue
+        _clean = _clean_by_key.get((_v, _arm, _Ln, _ident[5:]))
+        if not _clean:
+            continue
+        _per = {}
+        for _sd, _r in _by_seed.items():
+            _cr = _clean.get(_sd)
+            if _cr is None:
+                continue
+            _a, _b = _nll_tok(_r), _nll_tok(_cr)
+            if _a is not None and _b is not None:
+                _per[_sd] = _a - _b
+        if _per:
+            _vals = list(_per.values())
+            _delta_nll[f'{_v}::{_arm}::L{_Ln}::{_mode}::r{_rho}'] = {
+                'nll_clean_mean': float(np.mean([_nll_tok(_clean[_sd]) for _sd in _per if _sd in _clean and _nll_tok(_clean[_sd]) is not None])) if any(_nll_tok(_clean[_sd]) is not None for _sd in _per if _sd in _clean) else None,
+                'delta_nll_mean': float(np.mean(_vals)),
+                'delta_nll_std': (float(np.std(_vals, ddof=1)) if len(_vals) > 1 else 0.0),
+                'n_seeds': len(_per),
+                'per_seed': {str(_sd): float(_v2) for _sd, _v2 in sorted(_per.items())},
+                'note': 'delta = NLL_corrupted - NLL_clean (nats/target token), same arm, same slice; descriptive, not in the Holm family',
+            }
+    if _delta_nll:
+        out['delta_nll'] = _delta_nll
     # Descriptive paired contrasts against the learned arm on the same slice.
     # The full cell identity (including probe_params, recipe and code stamp)
     # must match on both sides: same length/rho/mode is not enough when the
@@ -3204,8 +3470,18 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                 or _lock_proves_test_access(_freeze_lock_mirror_path())):
             raise SystemExit(f'[v12] REFUSE: {bylen_path} has admissible confirmation records but no freeze lock in {_lock_dir} that proves the first test-split access (a pre-access attestation is not an access) — refuse to analyse a copied result that cannot be tied to the first test-split access')
         _adm_train_fps = {r.get('train_fp') for r in admitted.values() if isinstance(r.get('train_fp'), str) and r.get('train_fp')}
-        _check_or_write_freeze_lock(_lock_dir, manifest, unified_fp, stage='accessed',
-                                    train_fp=(next(iter(_adm_train_fps)) if len(_adm_train_fps) == 1 else None))
+        _access_lock = _check_or_write_freeze_lock(
+            _lock_dir, manifest, unified_fp, stage='accessed',
+            train_fp=(next(iter(_adm_train_fps)) if len(_adm_train_fps) == 1 else None))
+    else:
+        _access_lock = None
+    # A synthetic/descriptive analysis path (in-memory manifest, records with
+    # no slice fingerprint at all) has no freeze lock to consult; it also has
+    # no evidence of a prior access.  Real confirmation records always carry a
+    # non-null frozen slice fingerprint (admission requires it), so this
+    # fallback cannot be used to bypass the post-access downgrade.
+    _round_confirmatory = bool(round_is_confirmatory(_access_lock)
+                               or (unified_fp is None and _access_lock is None))
     _alpha_raw = (manifest.get('statistics') or {}).get('alpha', 0.05)
     if isinstance(_alpha_raw, (bool, np.bool_, np.datetime64, np.timedelta64,
                                complex, np.complexfloating)):
@@ -3217,6 +3493,19 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     if not (math.isfinite(_alpha) and 0.0 < _alpha < 1.0):
         raise SystemExit(f'[p5t stats] REFUSE: statistics.alpha={_alpha!r} must be in (0,1)')
     stats = {'manifest': {'frozen_at': manifest.get('frozen_at'), 'manifest_sha256': manifest.get('manifest_sha256'), 'arms': manifest['arms'], 'seeds': manifest['seeds'], 'code_semantics_expected': manifest.get('code_semantics_expected'), 'statistics': manifest.get('statistics'), 'scope': manifest.get('scope'), 'revision': manifest.get('revision')}, 'admission': {'n_admitted': len(admitted), 'test_slice_fp': unified_fp, 'n_effective_seeds': len({int(s) for (_v, s) in admitted}), 'n_declared_seeds': len(manifest['seeds'])}, 'comparisons': {}, 'holm': {}, 'by_length': {}, 'probe': _test_probe_stats(probe_path, manifest, unified_fp)}
+    # Review 10, issue 15: a re-frozen round evaluated on an already-observed
+    # test slice cannot issue CONFIRMED labels.  This is metadata/gating only;
+    # the pre-registered decision rule is unchanged for a FIRST access.
+    stats['confirmatory_round'] = bool(_round_confirmatory)
+    if not _round_confirmatory:
+        stats['round_status'] = ('exploratory_post_access_refreeze' if admitted
+                                 else 'no_admissible_records_or_no_access_lock')
+        stats['round_status_note'] = (
+            'This round is NOT a fresh confirmation: either the freeze lock shows a '
+            'post-test re-freeze (V12_REFREEZE=1; the same held-out slice was already '
+            'observed), or no first-access lock could be proven.  Re-freezing after access '
+            'does not restore independence, so every result here is exploratory regardless '
+            'of p-values; use an unobserved test slice for a new confirmation.')
     # The exact sign-flip p is valid only under within-seed exchangeability.
     # admission binds the corpus/slice/row count/recipe/code, but the RNG stream
     # and batch order are not independently re-derivable from a record; report
@@ -3247,6 +3536,37 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         'same_init_core_fp': bool(_n_admitted_seeds) and len(_init_by_seed) == _n_admitted_seeds and not _init_conflict_seeds,
         'n_seq_values': sorted({n for n in (_record_int(r.get('n_seq')) for r in admitted.values()) if n is not None}),
         'note': 'exact sign-flip requires within-seed exchangeability (same data order / eval rows / corruption grid). data_fp, train_fp, n_seq and recipe are machine-checked; the shared-trunk initialization digest (init_core_fp) is machine-checked PER SEED (each seed must have exactly one digest across its admitted arms) and is a CONFIRMED gate in manifest v6; rng_fp is reported but NOT enforced (architecture-induced RNG consumption is part of the arm).',
+        # Review 10, issue 6: state the null hypothesis and the scope of what
+        # sharing seeds/data/initialization actually buys.  Paired sharing is
+        # a CONTROL (it removes known nuisance variation); it is NOT the
+        # randomization-based exchangeability that would make the exact test
+        # valid by design.  The sharp null is what the p-value is computed
+        # under; if that null is false in a way that breaks sign symmetry the
+        # p-value is not a valid test of the weaker "same average effect" null.
+        'null_hypothesis': ('H0 (sharp null): for every seed the paired delta is a draw whose '
+                            'sign distribution is symmetric about 0, i.e. the two arms are '
+                            'exchangeable in sign within a seed under the frozen recipe. The '
+                            'two-sided exact sign-flip p is exact for this H0. It is NOT a test '
+                            'of "the two architectures have equal mean performance" unless the '
+                            'delta distribution is symmetric about its mean; that symmetry is an '
+                            'assumption, not a consequence of sharing seeds, data order, eval rows '
+                            'or initialization. Those controls reduce nuisance variation and make '
+                            'the pairing meaningful, but they do not create randomization-based '
+                            'exchangeability (the arms are not randomly assigned runs).'),
+        'assumption_boundary': ('If the arms differ in any stochastic input (data order, dropout '
+                                'schedule, eval rows, corruption grid) the sign-flip null is '
+                                'invalid, not conservative. If deltas are strongly skewed or '
+                                'heterogeneous in magnitude, the exact sign-flip test can be less '
+                                'powerful than its plug-in power table and the reported p refers '
+                                'only to the sharp null above. Equal means under a non-symmetric '
+                                'delta distribution do not imply the sharp null.'),
+        'machine_checked_controls': ['data_fp', 'train_fp', 'n_seq', 'training recipe signature',
+                                     'code semantic stamp', 'manifest sha256',
+                                     'per-seed init_core_fp equality (CONFIRMED gate)'],
+        'reported_not_enforced': ['rng_fp'],
+        'sensitivity_reported': ['per-seed deltas in every comparison', 'sign counts',
+                                 'leave-one-seed-out mean-sign stability',
+                                 'within-seed-noise ratio (mean/std, stability diagnostic)'],
     }
     # The frozen comparison is parameter-matched, not compute-matched.
     # Refuse a non-descriptive plan that does not disclose
@@ -3259,6 +3579,9 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         if _missing:
             raise SystemExit(f'[p5t stats] REFUSE: the frozen plan lacks compute-allocation disclosure {_missing}. Parameter matching is not compute matching; the report must state the FLOPs/read-allocation mismatch next to every primary comparison .')
     stats['compute_budget_disclosure'] = _cbd
+    # Review 10, issue 1: machine-readable evidence status next to every
+    # confirmation artifact.  Source-only until a complete release row exists.
+    stats['evidence_release'] = L.evidence_release_status()
     for v in manifest['arms']:
         rows = [r for (rv, s), r in admitted.items() if rv == v]
         _lens = sorted({n for n in (_record_int(k) for r in rows for k in (r.get('by_len') or {}))
@@ -3414,15 +3737,60 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         res['init_core_fp_mismatch_seeds'] = sorted(_init_mismatch)
         res['init_core_fp_missing_seeds'] = sorted(_init_missing)
         res['same_init_core_fp'] = bool(_init_complete and not _init_mismatch)
-        _act = []
-        for _recs in (recs_a, recs_b):
+        # Review 10, issue 3: report ACTIVE parameter counts per arm, not one
+        # pooled mean across both arms.  The random-indexer control allocates
+        # but never uses its indexer projections (~1.8% at this scale), so a
+        # total-parameter match is not an active-capacity match.
+        def _active_by_arm(_recs):
+            vals = []
+            dead = []
             for s in usable:
                 _pbd = _recs[s].get('param_breakdown')
-                if isinstance(_pbd, dict):
-                    _act_i = L._as_seed_int(_pbd.get('active'))
-                    if _act_i is not None and _act_i > 0:
-                        _act.append(_act_i)
-        res['active_params_mean'] = (_exact_mean(_act) if _act else None)
+                if not isinstance(_pbd, dict):
+                    continue
+                _a = L._as_seed_int(_pbd.get('active'))
+                _t = L._as_seed_int(_pbd.get('total'))
+                _d = L._as_seed_int(_pbd.get('dead_params'))
+                if _d is None and _a is not None and _t is not None:
+                    _d = _t - _a
+                if _a is not None and _a > 0:
+                    vals.append(_a)
+                if _d is not None and _d >= 0:
+                    dead.append(_d)
+            return (vals, dead)
+        _act_a, _dead_a = _active_by_arm(recs_a)
+        _act_b, _dead_b = _active_by_arm(recs_b)
+        res['active_params_a'] = (_exact_mean(_act_a) if _act_a else None)
+        res['active_params_b'] = (_exact_mean(_act_b) if _act_b else None)
+        res['dead_params_a'] = (_exact_mean(_dead_a) if _dead_a else None)
+        res['dead_params_b'] = (_exact_mean(_dead_b) if _dead_b else None)
+        _act_all = _act_a + _act_b
+        res['active_params_mean'] = (_exact_mean(_act_all) if _act_all else None)
+        if res['active_params_a'] is not None and res['active_params_b'] is not None:
+            _a_am, _a_bm = res['active_params_a'], res['active_params_b']
+            _a_rel = abs(_a_am - _a_bm) / max(_a_am, _a_bm, 1)
+            res['active_param_rel_diff'] = float(_a_rel)
+            res['active_param_matched'] = bool(_a_rel <= 0.01)
+        else:
+            res['active_param_rel_diff'] = None
+            res['active_param_matched'] = None
+        res['active_param_note'] = ('active excludes parameters allocated but bypassed by '
+                                    'indexer_mode=random; a total-parameter match does not imply '
+                                    'an active-capacity match')
+        # Review 10, issue 2: the frozen manifest itself declares these
+        # comparisons NOT single-factor.  Carry that scope into every record so
+        # a CONFIRMED label can never be reported as isolated-mechanism
+        # evidence: the contrast is a SYSTEM-LEVEL arm comparison under one
+        # frozen recipe.
+        res['single_factor_contrast'] = False
+        res['system_level_only'] = True
+        res['claim_scope'] = ('SYSTEM-LEVEL comparison of frozen arms under one recipe; '
+                              'NOT an isolated-mechanism attribution (the manifest '
+                              'interpretation_caveat lists the rival differences: capacity '
+                              'allocation, training FLOPs, attention kernel, q/kv norm, sink, '
+                              'read fraction). Mechanism attribution additionally requires the '
+                              'selection-attribution artifact and same-backbone controls.')
+        res['interpretation_caveat'] = comp.get('interpretation_caveat')
         res['data_fp'] = unified_fp
         res['manifest_sha256'] = manifest.get('manifest_sha256')
         res['delta_definition'] = f'{a} - {b} (paired per seed, test split)'
@@ -3441,6 +3809,56 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         if _doc is not None:
             res['doc_sampling'] = _doc
         stats['comparisons'][name] = res
+    # Review 10, issues 6/8: per-comparison distribution diagnostics.  The
+    # exact p is a statement about the sharp sign-symmetry null; the report
+    # must also show what the paired difference distribution actually looks
+    # like (sign counts, leave-one-seed-out sign stability, within-seed-noise
+    # ratio) so a skew/outlier-driven p cannot be read as a robust effect.
+    _diag = {}
+    for _name, _res in stats['comparisons'].items():
+        if not isinstance(_res, dict) or 'omitted' in _res:
+            continue
+        _ps = _res.get('per_seed')
+        _seeds = _res.get('seeds') or []
+        if not isinstance(_ps, (list, tuple)) or not _ps:
+            continue
+        _d = np.asarray([float(x) for x in _ps], dtype=float)
+        _d = _d[np.isfinite(_d)]
+        if _d.size == 0:
+            continue
+        _pos = int(np.sum(_d > 0)); _neg = int(np.sum(_d < 0))
+        _zero = int(np.sum(_d == 0))
+        _mean = float(np.mean(_d))
+        _sd = float(np.std(_d, ddof=1)) if _d.size > 1 else 0.0
+        _flips = []
+        if _d.size > 2 and _mean != 0.0:
+            _m_sign = _mean > 0
+            for _i, _seed in enumerate(_seeds[:len(_d)]):
+                _rest = np.delete(_d, _i)
+                _rm = float(np.mean(_rest))
+                if (_rm > 0) != _m_sign:
+                    _flips.append(int(_seed))
+        _diag[_name] = {
+            'n': int(_d.size), 'positive': _pos, 'negative': _neg, 'zero': _zero,
+            'mean': _mean, 'std': _sd,
+            'within_seed_noise': bool(not (abs(_mean) > _sd)),
+            'within_seed_noise_note': ('|mean| <= std is a stability diagnostic, NOT a '
+                                       'significance verdict and NOT evidence of no effect'),
+            'leave_one_out_mean_sign_flip_seeds': _flips,
+            'leave_one_out_stable': bool(not _flips),
+        }
+    stats['validity']['per_comparison_diagnostics'] = _diag
+    _any_flip = any(v['leave_one_out_mean_sign_flip_seeds'] for v in _diag.values())
+    _any_noisy = any(v['within_seed_noise'] for v in _diag.values())
+    stats['validity']['sensitivity_summary'] = {
+        'any_leave_one_out_sign_flip': bool(_any_flip),
+        'any_within_seed_noise': bool(_any_noisy),
+        'note': ('These diagnostics qualify the STABILITY of each comparison; they do not '
+                 'change the pre-registered significance decision rule, and a noisy/unstable '
+                 'delta distribution must be reported as such rather than converted into a '
+                 'significance or "no effect" claim.'),
+    }
+
     # Holm is corrected over the DECLARED frozen family, not over whichever
     # comparisons happened to produce a finite p: an omitted comparison enters
     # with p=1.0 so a missing arm can never shrink m and relax the correction.
@@ -3476,6 +3894,11 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                                        stats['comparisons'].get(k, {}),
                                                        _alpha,
                                                        len(manifest['seeds']))]
+    if not stats.get('confirmatory_round'):
+        # Pre-registered rule otherwise applies, but a re-frozen/post-access
+        # round can never be CONFIRMED (the same test slice was observed).
+        stats['would_confirm_under_decision_rule'] = list(_conf)
+        _conf = []
     stats['confirmed'] = _conf
     stats['significant_nondirectional'] = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is None]
     stats['not_confirmed_reasons'] = {k: {'param_matched': stats['comparisons'].get(k, {}).get('param_matched'),
@@ -3523,7 +3946,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         if _n_doc:
             stats['population_claim_allowed'] = bool(_n_doc >= L.MIN_DOCS_FOR_POPULATION_CLAIM)
             if _n_doc < L.MIN_DOCS_FOR_POPULATION_CLAIM:
-                stats['doc_sampling_note'] = (f'per-document rows recorded (n_docs={_n_doc}); between-doc variance is reported per comparison in doc_sampling — '
+                stats['doc_sampling_note'] = (f'{_n_doc} fixed evaluation windows/rows recorded (windows, NOT documents); between-window variance is reported per comparison in doc_sampling — '
                                               f'n_docs<{L.MIN_DOCS_FOR_POPULATION_CLAIM} does not cover the language-population distribution, so population-level claims are refused; '
                                               'the confirmed claims are about the frozen evaluation slice (design_notes section 20)')
     # v6: carry the pre-access power decision into the confirmation stats so a
@@ -3594,6 +4017,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     A(f'> 生成时间：{time.strftime("%Y-%m-%d %H:%M:%S")}')
     A('> 参考论文：arXiv:2606.19348。**范围声明**：小规模 WikiText-103 上的受控研究，不是 DeepSeek-V4 的全量复现；结论不外推到其规模、语料、长上下文训练或生产系统。')
     A('> 说明：本报告全部数字由 `v12_supp.py report` 从 `results_lm_test/`、`results_v10_mech/`、`analysis_v12/` 的落盘产物计算得到，无手填数值。')
+    A(L.evidence_status_banner())
     A('')
     A('本驱动的确认性协议：v7→v11 的全部面板与 v10/v12 的机制扩展属于**探索性**证据；本报告只报告**冻结后**在 held-out test split（wiki.test.raw，其它 phase 不读）上的一次性确认评估。')
     A('')
@@ -3624,6 +4048,16 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         _pw = ft.get('power_first_holm_gate') or {}
         if _pw:
             A(f"- 功效注记（第一道 Holm 门，逐种子同向概率 q）：{'；'.join((f"{k}→{v:.2f}" for k, v in _pw.items()))}——功效对 q 敏感，q 假设来源见清单 statistics.power_note；数学上可拒绝 ≠ 已足功效。")
+        _pgate = ft.get('power_gate') or {}
+        if isinstance(_pgate, dict) and _pgate:
+            _pg_status = _pgate.get('status', 'recorded')
+            _pg_ack = _pgate.get('accepted_low_power')
+            _pg_prob = _pgate.get('problem')
+            A(f"- 功效门槛决定（清单 v6）：status=`{_pg_status}`；accepted_low_power=`{_pg_ack}`" + (f"；problem={_pg_prob}" if _pg_prob else '') + '。')
+            if _pg_ack:
+                A('  > ⚠ 本次确认访问是在**未达最低功效门槛**（或跳过访问前功效模拟）的显式接受下进行的：结论只能是分辨率受限的确认，不能表述为「设计功效充分」。')
+            if _pg_status in ('missing', 'unreadable'):
+                A(f'  > ⚠ 功效门槛决定不可用（status={_pg_status}）：本次访问没有可审计的功效门槛记录。')
         _scope = m.get('scope') or {}
         if isinstance(_scope, dict) and _scope:
             A(f"- 范围声明：{_scope.get('confirmatory_claims', '')} {_scope.get('not_covered', '')} {_scope.get('required_for', '')}")
@@ -3667,6 +4101,8 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
                 row.append(f'{e["mean"]:.2f} (n={e["n"]})' if e else '—')
             A('| `%s` | %s | %s | ' % (v, _p0 if _p0 is not None else '—', _n0 if _n0 is not None else '—') + ' | '.join(row) + ' |')
         A('')
+        A('> **长度口径（review 10, issue 10）**：PPL@Ln 评的是每行位置 1..Ln−1 的前缀目标（Ln=512 ⊂ 1024 ⊂ …，目标集合随长度嵌套），不是「同一组目标 token、不同上下文长度」的比较；训练长度固定 512，块数 = ceil(Ln/4)、top-k=32 固定，故读取比例随长度下降（L512 25% → L4096 3.1%）。长长度 PPL 同时受目标位置构成、未见远距位置暴露、局部性与无关信息暴露变化影响；仅凭本表不能把「外推更稳」归因为「更会利用长上下文」。局部窗口基线、远端移除 ΔNLL、远端必要任务与距离分桶/选择归因读数见 `docs/design_notes.md` §22.6 与 v10 P3M/P3M-4 探针（后者未通过任务有效性门时只作描述）。')
+        A('')
     else:
         A(f'**尚未运行 P5T**：`{TEST_OUTDIR}/bylen.json` 不存在（或为空）。前置：`python v12_supp.py phase P5C`（现覆盖全部四个冻结臂、种子数取自清单；主臂 0-5 已由 P3MT/P4MT 训练，resume 自动跳过），然后 `python v12_supp.py phase P5T`。冻结清单已入库（见上），随时可以执行；执行前请勿据任何 validation 读数调整冻结内容。')
         A('')
@@ -3676,7 +4112,10 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             _alpha = float(((ft.get('manifest') or {}).get('statistics') or {}).get('alpha', 0.05))
         except (TypeError, ValueError, OverflowError):
             _alpha = 0.05
-        A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | Δ mean±std | 文档 Δ 95% CI | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
+        if ft.get('confirmatory_round') is False:
+            A('> ⚠ **本轮不是一次新的确认**：冻结锁显示该 held-out test slice 在此前已被观察后重冻结，或无法证明首次访问锁（`confirmatory_round=false`）。重冻结不会恢复 test 的独立性——下列 p 值与任何“确认”标签一律只能作**探索性**读数；新的确认需要未观察过的 test 切片。')
+            A('')
+        A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | Δ mean±std | 行/窗口 Δ 95% CI（非文档） | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
         A('|---|---|---|---|---|---|---|---|---|---|---|---|')
         holm = ft.get('holm') or {}
         for k, v in comps.items():
@@ -3693,6 +4132,73 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             _dcitxt = f'[{_dci[0]:+.2f}, {_dci[1]:+.2f}]' if isinstance(_dci, (list, tuple)) and len(_dci) == 2 else '—'
             A(f'| {k} | {v["n"]} | {v.get("coverage_ok")} | {v.get("param_matched")} | {v["mean"]:+.2f} ± {v.get("std", 0):.2f} | {_dcitxt} | {v.get("cohens_dz", float("nan")):+.2f} | {v["p_exact_signflip"]:.3f} | {v.get("p_floor", float("nan")):.3f} | {_hp} | {_hr} | {_ds} |')
         A('')
+        # Review 10, issue 2: the manifest declares every frozen comparison
+        # NOT single-factor.  Print the caveats/disclosure next to the table so
+        # a CONFIRMED label cannot be read as isolated-mechanism evidence.
+        try:
+            with open(FREEZE_MANIFEST, encoding='utf-8') as _jf:
+                _mcf = json.load(_jf)
+            if not isinstance(_mcf, dict):
+                _mcf = {}
+        except Exception:
+            _mcf = {}
+        _caveats = [c for c in (_mcf.get('primary_comparisons') or []) if isinstance(c, dict)]
+        _cbd_m = ft.get('compute_budget_disclosure') or (_mcf.get('compute_budget_disclosure') or {})
+        if _caveats or _cbd_m:
+            A('**口径与归因边界（冻结清单原文；是否 CONFIRMED 都不改变这些）**：')
+            A('')
+            for _c in _caveats:
+                if _c.get('interpretation_caveat'):
+                    A(f"- **{_c.get('name')}**：{_c['interpretation_caveat']}")
+            _cbl = (('parameter_matching', '参数匹配'), ('flops', '训练 FLOPs'),
+                    ('read_fraction', '读取比例'), ('kernel', 'attention kernel'),
+                    ('reporting_rule', '报告规则'))
+            for _ck, _cl in _cbl:
+                if _cbd_m.get(_ck):
+                    A(f"- {_cl}：{_cbd_m[_ck]}")
+            A('')
+            A('> 因此确认结果只能表述为「该冻结配方下的**系统级**臂间差异」；不能表述为「学习选择机制导致优势」的单因素结论，也不是「等计算预算下的稀疏 vs dense」。机制归因还需要选择归因工件（selection recall/mass）与同骨干、同投影、同归一化、同 kernel 的隔离对照。')
+            A('')
+        _act_rows = [(k, v) for k, v in comps.items() if isinstance(v, dict)
+                     and v.get('active_params_a') is not None
+                     and v.get('active_params_b') is not None]
+        if _act_rows:
+            A('**有效参数（active；扣除 random indexer 不使用的投影参数）**：')
+            A('')
+            A('| 比较 | active A | active B | active 相对差 | ≤1%? | dead A | dead B |')
+            A('|---|---|---|---|---|---|---|')
+            for _k, _v in _act_rows:
+                _rd = _v.get('active_param_rel_diff')
+                A(f"| {_k} | {_v['active_params_a']:.0f} | {_v['active_params_b']:.0f} | {'—' if _rd is None else f'{_rd:.4%}'} | {_v.get('active_param_matched')} | {_v.get('dead_params_a') if _v.get('dead_params_a') is not None else 0:.0f} | {_v.get('dead_params_b') if _v.get('dead_params_b') is not None else 0:.0f} |")
+            A('')
+            A('> `random` 选择器臂的 indexer 投影参数（W_DQ/W_DK/W_w）被分配但从不使用：total-parameter 匹配不等于有效容量匹配；随机臂的解读必须带上这一限制（见冻结清单 interpretation_caveat 的固定哈希/死参数说明）。')
+            A('')
+        # Review 10 issues 6/8: the p-value is computed under a SHARP sign
+        # symmetry null, and the paired-delta distribution is a separate
+        # stability readout.  Print both next to the confirmatory table so the
+        # report cannot present "p<alpha" as a general statement about the
+        # architecture difference.
+        _val = ft.get('validity') or {}
+        if isinstance(_val.get('null_hypothesis'), str) and _val['null_hypothesis']:
+            A('**检验的零假设与边界**（p 值只对下列零假设成立；共享种子/数据顺序/初始化是控制，不是随机分配）：')
+            A('')
+            A('> ' + _val['null_hypothesis'])
+            A('')
+            if isinstance(_val.get('assumption_boundary'), str) and _val['assumption_boundary']:
+                A('> ' + _val['assumption_boundary'])
+                A('')
+        _pcd = _val.get('per_comparison_diagnostics') or {}
+        if _pcd:
+            A('**逐比较分布诊断（稳定性读法，不是显著性判定；|mean|≤std 不等于「无效应」）**：')
+            A('')
+            A('| 比较 | n | 正/负/零 | mean±std | 均值≤种子噪声 | 留一符号翻转种子 |')
+            A('|---|---|---|---|---|---|')
+            for _k, _v in _pcd.items():
+                _fl = ','.join(str(x) for x in _v.get('leave_one_out_mean_sign_flip_seeds') or []) or '—'
+                A(f"| {_k} | {_v['n']} | {_v['positive']}/{_v['negative']}/{_v['zero']} | {_v['mean']:+.4f} ± {_v['std']:.4f} | {'是（不稳定）' if _v.get('within_seed_noise') else '否'} | {_fl} |")
+            A('')
+            A('> 说明：留一符号翻转 = 去掉一个种子后剩余均值符号翻转（稳定性诊断）；「均值≤种子噪声」是 |mean|≤std 的稳定性口径，**不是**「效应不存在」或「不显著」的证据。统计证据（估计、区间、Holm p）与稳定性、实际价值必须分开陈述。')
+            A('')
         _conf = ft.get('confirmed')
         if _conf is None:
             # Stats files without a `confirmed` key: re-derive the
@@ -3715,9 +4221,12 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             _conf = [k for k, v in holm.items()
                      if _frozen_rule_confirms(v, comps.get(k, {}), _alpha, *_floor_args)]
         if _conf:
-            A(f'**确认结果**：{len(_conf)}/{len(comps)} 个冻结主比较在 Holm 校正后成立**且方向符合预注册**（{sorted(_conf)}）——这是预注册规则下的确认性证据。')
+            A(f'**确认结果**：{len(_conf)}/{len(comps)} 个冻结主比较在 Holm 校正后成立**且方向符合预注册**（{sorted(_conf)}）——这是预注册规则下的确认性证据，**但只在该冻结配方的系统级口径内成立**（各比较并非单因素对照；见上「口径与归因边界」）。它不支持「学习选择机制导致优势」的机制性结论。')
         else:
             A(f'**确认结果**：没有冻结主比较同时满足「Holm 校正后 p < {_alpha:g}」与「方向符合预注册」。按预注册的决策规则，相应主张**不获确认**；探索性面板的正向读数保持「探索性」标签，不得写成结论。')
+            if ft.get('confirmatory_round') is False:
+                A('')
+                A('（补充：本轮 `confirmatory_round=false`，因此即使决策规则的 p/方向条件满足也不能标记为确认；`would_confirm_under_decision_rule` 仅作为探索性记录。）')
         _nd = ft.get('significant_nondirectional') or []
         if _nd:
             A('')
@@ -3742,6 +4251,16 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             _amb = '（歧义：多个探针参数化，未合并）' if _c.get('ambiguous_cell') else ''
             A(f"| `{_c['variant']}` | {_c['arm']} | {_c['eval_len']} | {_c['rho']} | {_c['mode']} | {_c['n']} | {_c['mean']:.2f}{_amb} |")
         A('')
+        _dnll = _pr.get('delta_nll') or {}
+        if _dnll:
+            A('| ΔNLL（污染 − 同臂干净；nats/目标 token，描述性） | n | ΔNLL mean±std | 干净 NLL |')
+            A('|---|---|---|---|')
+            for _k, _v in sorted(_dnll.items()):
+                _cn = _v.get('nll_clean_mean')
+                A(f"| {_k} | {_v.get('n_seeds')} | {_v.get('delta_nll_mean', float('nan')):+.4f} ± {_v.get('delta_nll_std', float('nan')):.4f} | {'—' if _cn is None else f'{_cn:.4f}'} |")
+            A('')
+            A('> 该表以**同臂干净条件**为基线（而非跨臂绝对 PPL），避免把「干净质量差异」读成「污染敏感度差异」；仍只作描述性二次证据，不进入确认性检验。')
+            A('')
         _pctr = _pr.get('contrasts') or {}
         if _pctr:
             A('| 描述性配对差（test split） | n | Δ mean | p (exact) |')
