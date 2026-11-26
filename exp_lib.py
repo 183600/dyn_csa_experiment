@@ -948,6 +948,70 @@ def cosine_similarity_consecutive(H, eps=1e-08):
         out[_lead_sl + (slice(s, e - 1),)] = (h[..., 1:, :] * h[..., :-1, :]).sum(dim=-1)
     return out
 
+
+# ---- random-boundary segmentation control (review-18) ------------------------
+# The review's dynamic-block attribution table asks for a Random Boundary
+# control: same compression-rate target, same min/max block clamping, but the
+# cut positions carry no information about the content beyond a deterministic
+# content-keyed hash.  This mirrors `lightning_indexer`'s 'random_each'
+# selection control at the SEGMENTER level: the row key is a float64 reduction
+# of the hidden state, hashed with the same GLSL-style formula
+# (12.9898 / 78.233 / 43758.5453), so the pattern is a fixed function of the
+# saved inputs — recompute-stable, resume-stable, no RNG stream consumed —
+# while still varying across rows, steps, layers and seeds as the hidden state
+# evolves.  `pattern_seed` mixes an independent integer into the row key
+# (0 = unseeded behaviour) so one training seed can be rerun under many random
+# boundary patterns, separating pattern noise from training noise.
+def random_boundary_cut_table(x, target_block_tokens, *, pattern_seed=0):
+    """Per-position random cut decisions for the segmentation control.
+
+    ``x`` is the attention layer's input hidden states, either ``[T, d]``
+    (single row) or ``[B, T, d]`` (batch).  Returns a bool ``numpy`` array of
+    shape ``[T-1]`` / ``[B, T-1]``: position ``i`` is a cut (token ``i`` ends a
+    block) iff the content-keyed hash at that position falls below
+    ``1 / max(target_block_tokens, 1)``.  The raw table is NOT clamped to
+    ``[min_block, max_block]`` — that is `blocks_from_cuts`'s job, exactly as
+    for the cosine-gate cut tables, so the control shares the segmenter's
+    geometry contract.  The expected block length before clamping equals
+    ``target_block_tokens`` (the same rate knob the cosine arm's compression
+    regularizer targets), which is what makes this a rate-matched control.
+
+    Pure function of its inputs (detached, float64 reduction, elementwise op
+    chain with in-place tails): the same ``x`` yields bit-identical cuts on the
+    same device.  A prefix of the input yields the same cuts on its own
+    positions (each decision is a per-position hash), so the control satisfies
+    the protocol's prefix-invariance gate the same way the cosine gate does.
+    """
+    _tgt = int(target_block_tokens)
+    if _tgt < 1:
+        raise ValueError(f'random_boundary_cut_table: target_block_tokens must be >= 1, got {target_block_tokens!r}')
+    _ps = int(pattern_seed)
+    if _ps < 0:
+        raise ValueError(f'random_boundary_cut_table: pattern_seed must be >= 0, got {pattern_seed!r}')
+    single = (x.dim() == 2)
+    xx = x.unsqueeze(0) if single else x
+    T = int(xx.shape[1])
+    if T <= 1:
+        return np.zeros((0,) if single else (int(xx.shape[0]), 0), dtype=bool)
+    with torch.inference_mode(False), torch.no_grad():
+        # Content key: per-position float64 reduction of the detached hidden
+        # state (the same digest family random_each uses for its row key).
+        _hk = xx.detach().to(torch.float64).sum(-1)[:, :T - 1]
+        if _ps:
+            _hk = _hk + (_ps * 0.6180339887498949)
+        _jc = torch.arange(T - 1, device=xx.device, dtype=torch.float64)[None, :] * 78.233
+        z = _hk * 12.9898 + _jc
+        z.sin_()
+        z.mul_(43758.5453)
+        z.sub_(torch.floor(z))
+        # cut iff the hash falls below the per-position cut probability.  The
+        # out-of-place comparison yields a NEW bool tensor (`lt_` would keep
+        # the float64 dtype and silently return 0.0/1.0 floats instead).
+        cuts = z < (1.0 / _tgt)
+        out = cuts.cpu().numpy()
+    return out[0] if single else out
+
+
 # LRU memo of exact segmenter outputs (OrderedDict).
 # — a pure cache: hits return the identical (bids, honoured, counts) triple
 # either policy would return, so no value downstream can change.
@@ -4947,8 +5011,28 @@ class AttnCfg:
         # mechanism.
         if self.kind not in ('full', 'csa', 'hca'):
             raise ValueError(f'unknown attention kind {self.kind!r}; expected full/csa/hca')
-        if self.chunking not in ('fixed', 'cosine_learnable', 'cosine_abs', 'cosine_adaptive'):
-            raise ValueError(f'unknown chunking {self.chunking!r}; expected fixed/cosine_learnable/cosine_abs/cosine_adaptive')
+        if self.chunking not in ('fixed', 'cosine_learnable', 'cosine_abs', 'cosine_adaptive',
+                                 'random', 'oracle'):
+            raise ValueError(f'unknown chunking {self.chunking!r}; expected fixed/cosine_learnable/cosine_abs/cosine_adaptive/random/oracle')
+        # Segmentation controls (review-18): 'random' (content-keyed random
+        # boundary) and 'oracle' (reference boundary from token ids) are
+        # dynamic-segmentation controls.  They are meaningless on a dense layer
+        # (nothing is segmented) and on a non-dynamic layer (the fixed grid IS
+        # the segmentation), so both spellings fail closed instead of silently
+        # falling through to another branch.
+        if self.chunking in ('random', 'oracle') and (
+                self.kind == 'full' or not self.dynamic):
+            raise ValueError(
+                f"chunking={self.chunking!r} is a dynamic-segmentation control and requires "
+                f"kind in ('csa', 'hca') with dynamic=True (got kind={self.kind!r}, "
+                f"dynamic={self.dynamic!r}); use chunking='fixed' or 'cosine_learnable' instead")
+        # The sampled-cut score-function path only exists on the
+        # cosine_learnable gate; a reinforce arm on any other chunking would
+        # silently train nothing through the boundary term.
+        if self.boundary_policy == 'reinforce' and self.chunking != 'cosine_learnable':
+            raise ValueError(
+                f"boundary_policy='reinforce' requires chunking='cosine_learnable' (the "
+                f"sampled Bernoulli gate); got chunking={self.chunking!r}")
         if self.indexer_mode not in ('learned', 'random', 'random_each', 'random_dist', 'stride', 'nearest'):
             raise ValueError(f'unknown indexer_mode {self.indexer_mode!r}; expected learned/random/random_each/random_dist/stride/nearest')
         if self.content_mode not in ('pooled', 'zero'):
@@ -5017,14 +5101,19 @@ class AttnCfg:
             return f
 
         # pattern_seed normalisation + fail-closed mode check (see the field
-        # comment: only the two hash-based re-randomized controls consume it).
+        # comment: only the two hash-based re-randomized controls consume it —
+        # and, since review-18, the hash-based random-boundary segmentation
+        # control, whose cut table mixes the same seed into its row key).
         # Runs after the _cfg_int helper is defined.
         self.pattern_seed = _cfg_int('pattern_seed', self.pattern_seed, 0)
-        if self.pattern_seed != 0 and self.indexer_mode not in ('random_each', 'random_dist'):
+        _pattern_seeded = (self.indexer_mode in ('random_each', 'random_dist')
+                           or self.chunking == 'random')
+        if self.pattern_seed != 0 and not _pattern_seeded:
             raise ValueError(
                 f'pattern_seed={self.pattern_seed} is only defined for the hash-based '
-                f're-randomized controls (indexer_mode random_each/random_dist); '
-                f'indexer_mode={self.indexer_mode!r} has no connection-pattern seed to mix '
+                f're-randomized controls (indexer_mode random_each/random_dist, or '
+                f'chunking=random boundary control); indexer_mode={self.indexer_mode!r} '
+                f'with chunking={self.chunking!r} has no connection-pattern seed to mix '
                 f'(the frozen fixed-hash arm must stay bit-identical, nearest/stride are '
                 f'deterministic geometry, and the learned indexer is trained, not seeded)')
 
@@ -5765,6 +5854,18 @@ class HybridAttention(nn.Module):
         if self.cfg.kind == 'full':
             self.last_gate_mean = None
             return self._full_batched(x)
+        # Segmentation controls (review-18) are implemented on the RoPE
+        # per-row path (HybridAttentionRoPE.forward / _single_rope).  A
+        # non-rope layer carrying chunking='random'/'oracle' would otherwise
+        # silently fall through to the cosine-branch dispatch below and
+        # segment by the cosine threshold instead of the declared control.
+        if self.cfg.chunking in ('random', 'oracle') and not bool(getattr(self.cfg, 'rope', False)):
+            raise RuntimeError(
+                f"chunking={self.cfg.chunking!r} (segmentation control) is implemented on "
+                f"the RoPE per-row path only; this layer is not a rope layer.  Use the "
+                f"registered *_rope control arms (e.g. csa_dynamic_randbnd_rope / "
+                f"csa_dynamic_oraclebnd_rope) or chunking='cosine_learnable' for the "
+                f"non-rope dynamic arms")
         flat = x.reshape(B * T, d)
         pre_flat = self._pre(flat, fuse_x=x)
         _open_mode = getattr(self.cfg, 'open_block_mode', 'closed')
@@ -6038,6 +6139,70 @@ class SmallGPT(nn.Module):
     def _make_block(self, d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=None):
         return Block(d, n_heads, d_head, cfg, mlp_ratio, mlp_gen=mlp_gen)
 
+    def set_boundary_token_ids(self, bnd_ids):
+        """Register the oracle-boundary token id set (review-18).
+
+        Arms with ``chunking='oracle'`` segment at a REFERENCE boundary (the
+        punctuation/eos token set `boundary_token_ids` extracts from the
+        tokenizer) instead of a learned or hashed gate.  The attention layers
+        only see hidden states, so the reference cut table must be derived
+        from the token ids at the model level: every ``trunk(ids)`` call
+        recomputes ``_oracle_cuts`` (a bool ``[B, T-1]`` table: cut after
+        position i iff ``ids[b, i]`` is a boundary token) and pushes it onto
+        the oracle-chunking layers.  This setter registers the id set; it is
+        NOT a parameter (never in the state dict), so a checkpoint reload
+        must re-register it before evaluation — the layers fail closed with
+        a pointer to this method otherwise.
+        """
+        try:
+            vals = sorted({int(v) for v in bnd_ids})
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f'set_boundary_token_ids: expected an iterable of integer token ids, '
+                f'got {type(bnd_ids).__name__}: {exc}') from exc
+        if any(v < 0 for v in vals):
+            raise ValueError('set_boundary_token_ids: token ids must be non-negative')
+        self._bnd_token_ids = vals
+
+    def _oracle_boundary_refresh(self, ids):
+        """Recompute and push the oracle cut table for the current batch.
+
+        Called at the top of every ``trunk``; a no-op unless some layer
+        declared ``chunking='oracle'``.  The table is pushed only when it
+        actually changed (shape or bytes), so repeated forwards of the same
+        batch do not churn the layer attributes.
+        """
+        wants = []
+        for blk in self.blocks:
+            _attn = getattr(blk, 'attn', None)
+            if _attn is not None and str(getattr(getattr(_attn, 'cfg', None), 'chunking', '')) == 'oracle':
+                wants.append(_attn)
+        if not wants:
+            return
+        bnd = getattr(self, '_bnd_token_ids', None)
+        if not bnd:
+            raise RuntimeError(
+                'oracle-boundary segmentation is configured but no boundary token ids '
+                'are registered on the model: call model.set_boundary_token_ids(' 
+                'sorted(exp_lib.boundary_token_ids(tok, eos_id))) (the punctuation/eos '
+                'reference set the boundary-F1 analysis already uses) before the '
+                'forward/evaluation')
+        _ids = torch.as_tensor(ids)
+        T = int(_ids.shape[1])
+        if T <= 1:
+            arr = np.zeros((int(_ids.shape[0]), 0), dtype=bool)
+        else:
+            with torch.no_grad():
+                _bnd_t = torch.as_tensor(bnd, dtype=_ids.dtype, device=_ids.device)
+                # cut after position i iff ids[b, i] is a boundary token
+                _mask = torch.isin(_ids[:, :T - 1], _bnd_t)
+            arr = _mask.cpu().numpy()
+        for a in wants:
+            cur = getattr(a, '_oracle_cuts', None)
+            if (cur is None or cur.shape != arr.shape
+                    or not np.array_equal(cur, arr)):
+                a._oracle_cuts = arr
+
     def forward(self, ids, logits_tail=None, targets=None, vocab=None):
         # When `targets` is supplied this returns the training CE loss instead
         # of logits.  The DDP wrapper only proxies `forward`, so routing the
@@ -6057,6 +6222,7 @@ class SmallGPT(nn.Module):
         # Full forward minus the LM head; sets self.comp_reg exactly as forward
         # did (the reg terms are accumulated inside the single block loop — the
         # same addition order as the full forward).
+        self._oracle_boundary_refresh(ids)
         T = ids.shape[1]
         _max_pos = int(self.pos.weight.shape[0])
         if T > _max_pos:
@@ -20548,7 +20714,7 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
     return out
 
 
-def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False, distributed=False, save_ckpt=None, ckpt_dir=None, diag_every=None, measure_eff=False, amp_dtype='auto', eager_batch='auto'):
+def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False, distributed=False, save_ckpt=None, ckpt_dir=None, diag_every=None, measure_eff=False, amp_dtype='auto', eager_batch='auto', boundary_token_ids=None):
     if steps < 1:
         raise ValueError(f'train_variant needs steps >= 1, got steps={steps}')
     set_seed(seed)
@@ -20584,7 +20750,24 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         {'amp_dtype': amp_dtype, 'eager_batch': eager_batch,
          'batch_size': batch_size}, device=device)
     _eager_batch_used = _uses_batched_eager(cfgs, device, batch_size, forced=_impl_eb)
+    # Oracle-boundary segmentation control (review-18): the reference cut
+    # table is derived from the batch token ids at the model level, so the
+    # trainer must register the boundary token id set on the model before the
+    # first forward.  Fail closed when the arm needs it and nothing was
+    # passed — the alternative (silently running without the reference
+    # boundary) cannot happen because the layers refuse anyway, but failing
+    # HERE names the caller's fix in one message.
+    _needs_oracle = any(str(getattr(c, 'chunking', '')) == 'oracle' for c in cfgs)
+    if _needs_oracle:
+        if boundary_token_ids is None:
+            raise ValueError(
+                f'{variant} uses chunking=\'oracle\' (reference-boundary segmentation) and '
+                f'requires the boundary token id set: pass '
+                f'boundary_token_ids=sorted(exp_lib.boundary_token_ids(tok, eos_id)) '
+                f'(the same punctuation/eos set the boundary-F1 analysis uses)')
     model = SmallGPT(vocab, d, n_layers, n_heads, d_head, seq_len, cfgs, mlp_ratio=mlp_ratio).to(device)
+    if _needs_oracle:
+        model.set_boundary_token_ids(boundary_token_ids)
     for _blk in getattr(model, 'blocks', ()):
         _attn = getattr(_blk, 'attn', None)
         if _attn is not None:

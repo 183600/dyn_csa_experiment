@@ -783,3 +783,63 @@ the follow-up manifest is frozen), does not run the power simulation, the
 FLOPs measurement or the algorithmic gates, and does not touch the test split.
 Tooling existence is still not evidence; the follow-up protocol's
 `--require-ready` blockers are unchanged.
+
+---
+
+## 2026-11-26 (later) — review 18: segmentation (boundary-generation) controls + a rope REINFORCE aggregation fix
+
+Context: an eleven-part external methodological review whose section 2 asks
+for a boundary-generation ablation family (fixed / cosine-threshold /
+cosine+comp-reg / task-learned / random / oracle boundaries) so a
+dynamic-vs-fixed factorial gain can be attributed to something. Baseline
+before this round: the follow-up registry carried selection controls but no
+boundary controls — `csa_dyn_nocomp` and `csa_dynamic_task` existed only in
+non-rope space, and no random-boundary or oracle-boundary arm existed at
+any level.
+
+1. **All quantitative claims re-verified exactly** (signflip_power 0.2749,
+   p floor 2/2^12, Holm floor 0.001953125, randidx dead params 202,752 =
+   1.83%, analytic FLOPs 1,229,824 vs 2,297,296 = 1.87x, FLOPs-matched mr
+   689/256): the review's numbers are the disclosed numbers; design_notes
+   §35.1 records the tools used.
+2. **Five registry-only rope arms land** (`v7_supp.SEGMENT_CONTROL_VARIANTS`):
+   `csa_dynamic_nocomp_rope` (ablation B), `csa_dynamic_task_rope` /
+   `hca_dynamic_task_rope` (ablation D), `csa_dynamic_randbnd_rope`
+   (ablation E, content-keyed hash cuts via
+   `exp_lib.random_boundary_cut_table`, rate-matched, pattern-seeded) and
+   `csa_dynamic_oraclebnd_rope` (ablation F, punctuation/eos reference cuts
+   via `SmallGPT.set_boundary_token_ids` + trunk refresh, fail-closed).
+   `AttnCfg` fails closed on random/oracle chunking for dense/non-dynamic
+   layers and on reinforce outside the cosine gate; the non-rope forward
+   refuses those chunking values instead of falling into the cosine branch.
+   The random/oracle controls carry no trainable segmentation parameters
+   (dead delta_logit disclosed like the randidx dead projections) and no
+   compression regularizer (rate matched by construction).
+3. **A real rope-path bug found and fixed by the round:**
+   `SmallGPTRoPE.trunk` never aggregated `last_boundary_logp` /
+   `boundary_decisions` into the model-level fields
+   `train_variant`'s REINFORCE term consumes — a rope REINFORCE arm would
+   have silently trained its boundary policy with the score-function term
+   dropped. No rope arm used `boundary_policy='reinforce'` before, which is
+   why no earlier test caught it; the aggregation now mirrors the base
+   trunk (N124 locks it).
+4. **The design record binds the controls:** the follow-up template declares
+   `design.segmentation_controls` (five arms, mechanism labels, disclosure
+   notes); `validate_followup_design.py` cross-checks each control against
+   the resolved registry cfgs (a threshold arm cannot wear the
+   `task_learned_boundary` label; an oracle control must document its
+   reference source; unknown mechanisms are rejected) and now REQUIRES a
+   `random_boundary` and a `task_learned_boundary` control, because without
+   them the registered 2x2 factorial cannot attribute a dynamic gain to
+   boundary placement, compression-rate change or the task signal.
+5. **Frozen surfaces untouched:** v12 manifest byte-identical, no arm list
+   of any historical panel changed, `CODE_SEMANTICS` stays `v11.128`,
+   `v12_supp.py plan` still admits 48/48 records.
+
+**What this does NOT do.** It trains nothing (registry-only until the
+follow-up manifest is frozen), runs no power simulation, no measured-FLOPs
+gate and no algorithmic gates, and never touches the test split. Tooling
+existence is not evidence; the follow-up `--require-ready` blockers are
+unchanged, and the review's remaining items (single dataset, length-
+extrapolation semantics, evidence archiving) stay documented scope
+limitations until the GPU work runs.

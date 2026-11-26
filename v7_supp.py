@@ -305,6 +305,29 @@ class HybridAttentionRoPE(L.HybridAttention):
                     _soft_hon = gate * _hon
                     _shs = _soft_hon.sum()
                     gate_mean = (float(nblk - 1) + _shs - _shs.detach()) / T
+        elif cfg.chunking in ('random', 'oracle'):
+            # Segmentation controls (review-18), per-row form.  The batched
+            # forward passes pre_blocks (the _segment_control_blocks hoist);
+            # a direct per-row caller gets its own random table (a pure
+            # function of this row's hidden states), while the oracle control
+            # refuses to guess: its reference table is batch-derived, so
+            # without pre_blocks there is no honest per-row fallback.
+            if pre_blocks is not None:
+                bid, nblk, _hon = pre_blocks
+            elif cfg.chunking == 'random':
+                _row_cuts = L.random_boundary_cut_table(
+                    x, cfg.target_block_tokens,
+                    pattern_seed=int(getattr(cfg, 'pattern_seed', 0) or 0))
+                bid, nblk = L.blocks_from_cuts(T, _row_cuts, cfg.min_block,
+                                               cfg.max_block, x.device,
+                                               return_count=True)
+            else:
+                raise RuntimeError(
+                    "chunking='oracle' reached the per-row path without batch geometry: "
+                    "the reference cut table is derived from the batch token ids by the "
+                    "model trunk and passed down as pre_blocks — call the layer through "
+                    "HybridAttentionRoPE.forward (or the model forward), not "
+                    "_single_rope directly")
         elif cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (cfg.dynamic and cfg.kind != 'hca'):
             if pre_blocks is not None:
                 # geometry pre-computed once for the whole batch by the
@@ -610,6 +633,47 @@ class HybridAttentionRoPE(L.HybridAttention):
             out[:, s:e] = torch.einsum('bths,bshd->bthd', attn.view(B, e - s, nh, T), v)
         return out
 
+    def _segment_control_blocks(self, x):
+        """Batched block geometry for the segmentation controls (review-18).
+
+        'random' derives the [B, T-1] cut table from the content-keyed hash
+        (``exp_lib.random_boundary_cut_table``; pattern_seed from the layer cfg
+        mixes an independent seed into the row key).  'oracle' reads the
+        token-id reference table the model trunk pushed onto
+        ``self._oracle_cuts`` and fails closed when it is absent or misaligned
+        (an oracle arm without its reference is not runnable, and guessing a
+        default would silently turn it into another arm).  Both feed the same
+        ``_hoist_blocks_from_cuts`` hoist the cosine-gate path uses, with
+        ``want_honoured=False``: there is no gate tensor, so there is no
+        compression-rate term to build (the rate is matched by construction).
+        """
+        B, T, _d = x.shape
+        cfg = self.cfg
+        if cfg.chunking == 'random':
+            _table = L.random_boundary_cut_table(
+                x, cfg.target_block_tokens,
+                pattern_seed=int(getattr(cfg, 'pattern_seed', 0) or 0))
+        else:
+            _oc = getattr(self, '_oracle_cuts', None)
+            if _oc is None:
+                raise RuntimeError(
+                    "chunking='oracle' (reference-boundary control) but no oracle cut "
+                    "table is present on the layer: the model trunk pushes it from the "
+                    "batch token ids — register the boundary token id set with "
+                    "model.set_boundary_token_ids(sorted(exp_lib.boundary_token_ids(tok, "
+                    "eos_id))) before the forward (re-register after a checkpoint load; "
+                    "the id set is not part of the state dict)")
+            _table = np.asarray(_oc)
+            if _table.shape != (B, T - 1):
+                raise RuntimeError(
+                    f"chunking='oracle': the layer's oracle cut table has shape "
+                    f"{_table.shape} but the input batch is ({B}, {T}); the table is "
+                    f"derived from the current batch's token ids by the model trunk — "
+                    f"a stale table means the forward bypassed trunk(ids)")
+        _gl = [_table[b] for b in range(_table.shape[0])] if _table.ndim == 2 else [_table]
+        return L._hoist_blocks_from_cuts(T, _gl, cfg.min_block, cfg.max_block, x.device,
+                                         want_honoured=False, hon_dtype=x.dtype)
+
     def forward(self, x):
         B, T, d = x.shape
         if B == 0 or T == 0:
@@ -689,6 +753,15 @@ class HybridAttentionRoPE(L.HybridAttention):
                         # same batched block geometry as exp_lib.HybridAttention.forward;
                         # every value identical to the per-row form
                         pre_blocks = L._hoist_blocks_from_cuts(T, _gl, self.cfg.min_block, self.cfg.max_block, x.device, want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
+            elif self.cfg.chunking in ('random', 'oracle'):
+                # Segmentation controls (review-18): the cut table comes from
+                # the content-keyed hash ('random') or the model-level
+                # token-id reference table ('oracle'), never from a gate, so
+                # the geometry hoist reuses the plain blocks-from-cuts path
+                # with want_honoured=False (no gate -> no compression-rate
+                # term; the rate is matched by construction — see the arm
+                # comments in make_layer_cfgs_v7).
+                pre_blocks = self._segment_control_blocks(x)
             elif self.cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (self.cfg.dynamic and self.cfg.kind != 'hca'):
                 # same batch-level geometry hoist as exp_lib.HybridAttention.forward:
                 # values identical.
@@ -789,6 +862,10 @@ class SmallGPTRoPE(L.__dict__.get('_v7_orig_smallgpt', L.SmallGPT)):
         # RoPE embedding form of exp_lib.SmallGPT.trunk — trunk is dispatched
         # here by the inherited ce_loss; comp_reg terms accumulate in the same
         # order as the full forward (zeros init + per-block adds).
+        # Oracle-boundary controls (review-18): refresh the token-id-derived
+        # reference cut table BEFORE the block loop, exactly as the base
+        # trunk does, so every oracle-chunking layer sees this batch's table.
+        self._oracle_boundary_refresh(ids)
         T = ids.shape[1]
         x = self.tok(ids)
         if getattr(self, 'use_abs_pe', True):
@@ -799,6 +876,15 @@ class SmallGPTRoPE(L.__dict__.get('_v7_orig_smallgpt', L.SmallGPT)):
                     'use a RoPE arm or pass an explicit max_pos (recorded as truncated=True)')
             x = x + self.pos(L._arange_cache(T, ids.device))
         reg = torch.zeros((), device=ids.device)
+        # Boundary score-function log-prob aggregation, mirroring the base
+        # SmallGPT.trunk (review-18): the rope REINFORCE arms
+        # (csa/hca_dynamic_task_rope) set last_boundary_logp per layer, and the
+        # trainer's boundary_policy_term reads the MODEL-level aggregate.  No
+        # rope arm used boundary_policy='reinforce' before, so this override
+        # silently dropped the term — the non-rope csa_dynamic_task twin never
+        # noticed because it runs the base trunk.
+        blp = None
+        bdec = 0
         for blk in self.blocks:
             x = blk(x)
             gm = blk.attn.last_gate_mean
@@ -811,7 +897,13 @@ class SmallGPTRoPE(L.__dict__.get('_v7_orig_smallgpt', L.SmallGPT)):
                         tot = tot + _g
                     gm = tot / len(gm)
                 reg = reg + mult * (gm * Lb - 1.0) ** 2
+            _lp = getattr(blk.attn, 'last_boundary_logp', None)
+            if _lp is not None:
+                blp = _lp if blp is None else blp + _lp
+                bdec += int(getattr(blk.attn, 'last_boundary_decisions', 0) or 0)
         self.comp_reg = reg
+        self.boundary_logp = blp
+        self.boundary_decisions = int(bdec)
         return self.norm(x)
 
 def make_layer_cfgs_v7(n_layers, variant):
@@ -912,6 +1004,75 @@ def make_layer_cfgs_v7(n_layers, variant):
                             target_block_tokens=64, temperature=0.1,
                             comp_lambda_mult=4.0, rope=True, rope_dim=16,
                             qk_norm=True)
+                for _ in range(n_layers)]
+    # ---- segmentation (boundary-generation) controls (review-18) ------------
+    # The external review's dynamic-block attribution table asks for boundary
+    # controls the registry did not carry: the follow-up factorial can say
+    # "dynamic beats fixed" but not WHERE the gain lives (boundary placement vs
+    # compression-rate change vs the task signal itself).  These five arms are
+    # the segmentation-level analog of the review-14/15 selection controls;
+    # registry-only, like them: no default panel trains anything here, and
+    # registering an arm creates no claim.
+    if variant == 'csa_dynamic_nocomp_rope':
+        # Ablation B (review table): cosine-threshold dynamic boundaries with
+        # the compression-rate regularizer REMOVED (comp_lambda_mult=0.0).
+        # Identical architecture/optimizer/data to csa_dynamic_rope; only the
+        # reg term is zeroed, so C-vs-B isolates what the comp_reg-trained
+        # delta_logit offset contributes (the non-rope csa_dyn_nocomp twin has
+        # existed since v4; this is its rope-space twin for the follow-up).
+        return [AttnCfgRope(kind='csa', dynamic=True, chunking='cosine_learnable',
+                            target_block_tokens=4, overlap=OVERLAP, index_topk=32,
+                            temperature=0.1, comp_lambda_mult=0.0,
+                            rope=True, rope_dim=16, qk_norm=True)
+                for _ in range(n_layers)]
+    if variant == 'csa_dynamic_task_rope':
+        # Ablation D: the sampled-cut REINFORCE arm (boundary_policy='reinforce')
+        # — the ONLY dynamic arm whose discrete boundaries receive a task-loss
+        # gradient (score-function term; exp_lib.boundary_policy_term).  The
+        # non-rope csa_dynamic_task twin exists; this is the rope-space twin.
+        # csa_dynamic_rope (threshold policy) must keep being described as
+        # cosine-threshold + comp-reg, never as task-learned.
+        return [AttnCfgRope(kind='csa', dynamic=True, chunking='cosine_learnable',
+                            target_block_tokens=4, overlap=OVERLAP, index_topk=32,
+                            temperature=0.1, boundary_policy='reinforce',
+                            rope=True, rope_dim=16, qk_norm=True)
+                for _ in range(n_layers)]
+    if variant == 'hca_dynamic_task_rope':
+        # Ablation D twin for the HCA family (same comp_lambda_mult=4.0 as
+        # hca_dynamic_rope, plus the sampled-cut REINFORCE policy).
+        return [AttnCfgRope(kind='hca', dynamic=True, chunking='cosine_learnable',
+                            target_block_tokens=64, temperature=0.1,
+                            comp_lambda_mult=4.0, boundary_policy='reinforce',
+                            rope=True, rope_dim=16, qk_norm=True)
+                for _ in range(n_layers)]
+    if variant == 'csa_dynamic_randbnd_rope':
+        # Ablation E: random boundary control.  chunking='random' cuts at
+        # content-keyed hash positions (exp_lib.random_boundary_cut_table,
+        # recompute-stable, no RNG stream) with the SAME target block rate
+        # (target_block_tokens=4) and the same min/max clamping as the cosine
+        # arm — a rate-matched arbitrary-placement control.  No trainable
+        # segmentation parameters (delta_logit is dead weight, like the
+        # randidx indexer projections) and no compression regularizer (the
+        # rate is matched by construction, and there is no gate to regularize).
+        # A nonzero AttnCfg.pattern_seed reruns the SAME training seed under a
+        # different random boundary pattern (pattern noise vs training noise).
+        return [AttnCfgRope(kind='csa', dynamic=True, chunking='random',
+                            target_block_tokens=4, overlap=OVERLAP, index_topk=32,
+                            rope=True, rope_dim=16, qk_norm=True)
+                for _ in range(n_layers)]
+    if variant == 'csa_dynamic_oraclebnd_rope':
+        # Ablation F: reference ("oracle") boundary control.  chunking='oracle'
+        # cuts at the punctuation/eos token positions the boundary-F1 analysis
+        # already uses as its reference (exp_lib.boundary_token_ids) — a
+        # non-learned, linguistically-motivated segmentation upper-reference,
+        # NOT a claimed-optimal boundary.  The cut table is derived from the
+        # batch token ids at the model level (SmallGPT.set_boundary_token_ids
+        # + trunk -> layer._oracle_cuts) and fails closed if the id set is not
+        # registered.  Same capacity/rate knobs as the random control; no
+        # trainable segmentation parameters and no compression regularizer.
+        return [AttnCfgRope(kind='csa', dynamic=True, chunking='oracle',
+                            target_block_tokens=4, overlap=OVERLAP, index_topk=32,
+                            rope=True, rope_dim=16, qk_norm=True)
                 for _ in range(n_layers)]
     if variant == 'full_rope':
         return [AttnCfgRope(kind='full', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
@@ -1033,6 +1194,17 @@ ALIGNED_DENSE_VARIANTS = ['full_rope_cos', 'full_rope_cos_sink']
 PURE_HCA_VARIANTS = ['hca_fixed_rope', 'hca_dynamic_rope']
 FACTORIAL_VARIANTS = ['csa_fixed_rope', 'csa_dynamic_rope',
                       'hca_fixed_rope', 'hca_dynamic_rope']
+# Segmentation (boundary-generation) controls (review-18): the dynamic-block
+# attribution family the external review asked for — cosine-without-comp-reg,
+# task-learned (REINFORCE) boundaries, random boundaries and the
+# punctuation-reference boundary.  Registry-only, like the selection controls:
+# no default panel trains any of them; the follow-up design declares them in
+# design.segmentation_controls and the validator cross-checks the resolution.
+# None of these arms may be described as the default dynamic arm: the default
+# csa_dynamic_rope stays "cosine threshold + comp-reg-trained offset".
+SEGMENT_CONTROL_VARIANTS = ['csa_dynamic_nocomp_rope', 'csa_dynamic_task_rope',
+                            'hca_dynamic_task_rope', 'csa_dynamic_randbnd_rope',
+                            'csa_dynamic_oraclebnd_rope']
 PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
 
 def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=20000, warm_steps=0, lr=0.0003, weight_decay=0.1, warmup=200, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=1000, eval_subset=128, val_bnd=None, device=DEVICE, log_every=1000, mlp_ratio=4, deadline_ts=None, save_ckpt=None, ckpt_dir=None, measure_eff=True, diag_every=None):

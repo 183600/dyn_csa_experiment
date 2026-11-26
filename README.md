@@ -356,6 +356,67 @@ rope arms, `validate_followup_design.py --verify-registry` accepts the
 template (its remaining blockers are the intentional pre-freeze ones), and
 `v12_supp.py plan` is untouched by the round.
 
+## Review-18 hardening (what changed)
+
+Verification-first pass over the eleven-part external methodological review
+(the dynamic-block attribution table in its section 2).  All quantitative
+claims in the review were re-verified against HEAD and hold exactly as
+disclosed: sign-flip power q=0.80 at 12 seeds/Holm-4 is 0.2749, the exact
+p floor is 2/2^12 = 0.000488, the randidx arm carries 202,752 dead indexer
+parameters (1.83%), the analytic per-token FLOPs are 1,229,824 (csa) vs
+2,297,296 (dense, 1.87x) and the FLOPs-matched dense ratio is exactly
+689/256 = 2.69140625.  The design-boundary findings are the retired-v12
+limitations the follow-up protocol exists to remove; the item-by-item
+disposition is `docs/design_notes.md` §35.  No new training panel, no
+test-split access, no frozen-manifest byte change, no measurement-semantics
+change (`CODE_SEMANTICS` stays `v11.128`), `v12_supp.py plan` still admits
+48/48 records.  The one structural gap that was still fixable is closed:
+
+- **The segmentation (boundary-generation) controls exist now.**  The
+  review's ablation table asks WHERE a dynamic-vs-fixed gain lives
+  (boundary placement vs compression-rate change vs the task signal), and
+  until now the follow-up registry had selection controls but NO
+  boundary-generation controls: the factorial's `csa_dynamic_rope` is
+  cosine-threshold + comp-reg by definition, `csa_dynamic_task` existed only
+  in non-rope space, and there was no random-boundary or reference-boundary
+  arm at any level.  Five registry-only rope arms land
+  (`v7_supp.SEGMENT_CONTROL_VARIANTS`):
+  `csa_dynamic_nocomp_rope` (ablation B: comp_lambda_mult=0),
+  `csa_dynamic_task_rope` / `hca_dynamic_task_rope` (ablation D: the
+  REINFORCE arms, now resolvable in the follow-up's rope space),
+  `csa_dynamic_randbnd_rope` (ablation E: content-keyed random cuts via
+  `exp_lib.random_boundary_cut_table` — recompute-stable, no RNG stream,
+  rate-matched by construction, `AttnCfg.pattern_seed` separates pattern
+  noise from training noise) and `csa_dynamic_oraclebnd_rope` (ablation F:
+  cuts at the punctuation/eos reference boundary the boundary-F1 analysis
+  already uses, derived from the batch token ids by
+  `SmallGPT.set_boundary_token_ids` + a trunk-level refresh, fail-closed
+  when the id set is unregistered).  None of them trains in any default
+  panel; `AttnCfg` fails closed on `random`/`oracle` chunking for dense or
+  non-dynamic layers and on `reinforce` outside the cosine gate.
+- **A real rope-path bug fixed.**  `SmallGPTRoPE.trunk` never aggregated the
+  per-layer `last_boundary_logp` into the model-level `boundary_logp` the
+  trainer's `boundary_policy_term` consumes, so a rope REINFORCE arm would
+  have trained its boundary policy with the term silently dropped (no rope
+  arm used `boundary_policy='reinforce'` before, which is why no earlier
+  test caught it).  The rope trunk now aggregates `boundary_logp` /
+  `boundary_decisions` exactly like the base trunk; N124 locks it.
+- **The design record binds the controls.**  `followup_design.template.json`
+  declares `design.segmentation_controls` (all five arms with mechanism
+  labels and disclosure notes); `validate_followup_design.py` cross-checks
+  each declared control against the resolved registry cfgs (a threshold arm
+  cannot wear the `task_learned_boundary` label, an oracle control must
+  document its reference source) and now REQUIRES a `random_boundary` and a
+  `task_learned_boundary` control, because without them the registered
+  factorial cannot attribute a dynamic gain to anything.
+
+Verification after the change: `test_review_fixes.py` 427/427 (N121–N126
+added), `test_open_block.py` 15/15, `audit_gates.py causality` PASS over
+the seven rope arms, `mech_selection.py smoke` unchanged
+(recall@k=0.3836/mass=0.3799), `validate_followup_design.py
+--verify-registry` reports only the intentional pre-freeze blockers, and
+`v12_supp.py plan` is untouched by the round.
+
 ## Repository layout
 
 The repository keeps only **source code, driver scripts and design

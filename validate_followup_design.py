@@ -230,6 +230,72 @@ def _registry_errors(plan: dict, repo: Path) -> list[str]:
                     errors.append(f"{sid}: declared pattern_seed={declared_ps} but the "
                                   f"variant resolves to {sorted(resolved)}")
 
+    for entry in design.get("segmentation_controls") or []:
+        # review-18: the dynamic-block attribution controls.  Same registry
+        # checks as a factorial arm: the declared variant must exist and must
+        # resolve the declared boundary-generation mechanism on every layer —
+        # a control that silently resolves to another segmentation mechanism
+        # answers a different question than the one declared.
+        if not isinstance(entry, dict):
+            continue
+        variant = entry.get("variant")
+        gid = entry.get("id")
+        if not isinstance(variant, str) or not variant or variant.startswith("TODO"):
+            errors.append(f"{gid}: segmentation-control variant is not an implemented "
+                          f"registry entry: {variant!r}")
+            continue
+        try:
+            cfgs = L.make_layer_cfgs(3, variant)
+        except Exception as exc:
+            errors.append(f"{gid}: make_layer_cfgs({variant!r}) failed: "
+                          f"{type(exc).__name__}: {exc}")
+            continue
+        mechanism = str(entry.get("mechanism", ""))
+        chunkings = {str(getattr(c, "chunking", "")) for c in cfgs}
+        policies = {str(getattr(c, "boundary_policy", "threshold")) for c in cfgs}
+        clmults = {float(getattr(c, "comp_lambda_mult", 1.0)) for c in cfgs}
+        dynamics = {bool(getattr(c, "dynamic", False)) for c in cfgs}
+        if not dynamics == {True}:
+            errors.append(f"{gid}: a segmentation control must be a dynamic arm "
+                          f"(resolved dynamic={sorted(dynamics)})")
+        if mechanism == "cosine_threshold_no_comp_reg":
+            if not chunkings == {"cosine_learnable"} or not policies == {"threshold"}:
+                errors.append(f"{gid}: mechanism cosine_threshold_no_comp_reg must resolve "
+                              f"chunking=cosine_learnable with boundary_policy=threshold "
+                              f"(got chunkings={sorted(chunkings)}, policies={sorted(policies)})")
+            if clmults != {0.0}:
+                errors.append(f"{gid}: mechanism cosine_threshold_no_comp_reg must zero the "
+                              f"compression regularizer on every layer (comp_lambda_mult="
+                              f"{sorted(clmults)})")
+        elif mechanism == "task_learned_boundary":
+            if not policies == {"reinforce"}:
+                errors.append(f"{gid}: mechanism task_learned_boundary must resolve "
+                              f"boundary_policy=reinforce on every layer (got {sorted(policies)}); "
+                              f"a threshold arm is not task-learned and must not carry this label")
+            if not chunkings == {"cosine_learnable"}:
+                errors.append(f"{gid}: mechanism task_learned_boundary requires the sampled "
+                              f"cosine gate (chunking=cosine_learnable, got {sorted(chunkings)})")
+        elif mechanism == "random_boundary":
+            if not chunkings == {"random"}:
+                errors.append(f"{gid}: mechanism random_boundary must resolve "
+                              f"chunking=random (content-keyed hash cuts) on every layer "
+                              f"(got {sorted(chunkings)})")
+        elif mechanism == "oracle_boundary":
+            if not chunkings == {"oracle"}:
+                errors.append(f"{gid}: mechanism oracle_boundary must resolve "
+                              f"chunking=oracle (token-id reference cuts) on every layer "
+                              f"(got {sorted(chunkings)})")
+            note = str(entry.get("note", ""))
+            if "boundary_token_ids" not in note and "punctuation" not in note:
+                errors.append(f"{gid}: an oracle_boundary control must document its reference "
+                              f"source (exp_lib.boundary_token_ids punctuation/eos set) and that "
+                              f"the id set must be registered via "
+                              f"model.set_boundary_token_ids before training/evaluation")
+        else:
+            errors.append(f"{gid}: unknown segmentation-control mechanism {mechanism!r}; "
+                          f"expected cosine_threshold_no_comp_reg / task_learned_boundary / "
+                          f"random_boundary / oracle_boundary")
+
     for entry in design.get("dense_controls") or []:
         if not isinstance(entry, dict):
             continue
@@ -373,6 +439,35 @@ def validate(plan: dict, require_ready: bool = False, *,
     need("same_backbone" in dense_kinds,
          "a same_backbone dense isolation control is required "
          "(FOLLOWUP mechanism-isolation: normalization/scale/sink/kernel-matched dense arm)")
+
+    # review-18: the external review's dynamic-block attribution table — a
+    # factorial that only contains dynamic arms cannot attribute a
+    # dynamic-vs-fixed gain to boundary placement, compression-rate change or
+    # the task signal itself.  A design with any dynamic segmentation arm
+    # must therefore also declare (a) a random-boundary control (rate-matched
+    # arbitrary placement) and (b) a task-learned boundary control (the
+    # REINFORCE arm whose discrete cuts receive the LM-loss gradient); the
+    # remaining ablations (cosine-without-comp-reg, oracle boundary) are
+    # strongly recommended and checked by the registry pass when declared.
+    seg_controls = object_list("segmentation_controls", design)
+    seg_mechanisms = set()
+    for entry in seg_controls:
+        if not isinstance(entry, dict):
+            need(False, "each segmentation control must be an object")
+            continue
+        mech = entry.get("mechanism")
+        try:
+            seg_mechanisms.add(mech)
+        except TypeError:
+            need(False, "segmentation control mechanism must be hashable")
+    need("random_boundary" in seg_mechanisms,
+         "a random_boundary segmentation control is required (rate-matched arbitrary "
+         "boundary placement; without it a dynamic-vs-fixed gain cannot be "
+         "distinguished from a compression-rate change)")
+    need("task_learned_boundary" in seg_mechanisms,
+         "a task_learned_boundary segmentation control is required (the REINFORCE "
+         "arm whose sampled cuts receive the LM-loss gradient; without it the design "
+         "cannot separate task-driven boundaries from the threshold heuristic)")
 
     seeds = design.get("seeds")
     need(isinstance(seeds, list) and len(seeds) >= 12,

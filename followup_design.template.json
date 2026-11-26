@@ -36,6 +36,23 @@
       {"id": "csa_nearest", "variant": "csa_fixed_rope_nearidx"},
       {"id": "csa_stride", "variant": "csa_fixed_rope_strideidx"}
     ],
+    "segmentation_controls": [
+      {"id": "csa_dynamic_nocomp", "variant": "csa_dynamic_nocomp_rope",
+       "mechanism": "cosine_threshold_no_comp_reg",
+       "note": "cosine-threshold dynamic boundaries with the compression-rate regularizer removed (comp_lambda_mult=0.0): identical architecture/optimizer/data to csa_dynamic_rope with only the reg term zeroed, so dynamic-vs-nocomp isolates what the comp_reg-trained delta_logit offset contributes"},
+      {"id": "csa_dynamic_task", "variant": "csa_dynamic_task_rope",
+       "mechanism": "task_learned_boundary",
+       "note": "the sampled-cut REINFORCE arm (boundary_policy='reinforce'): the ONLY dynamic arm whose discrete boundaries receive a task-loss gradient through exp_lib.boundary_policy_term; the default csa_dynamic_rope stays 'cosine threshold + comp-reg offset' and must never be described as task-learned"},
+      {"id": "hca_dynamic_task", "variant": "hca_dynamic_task_rope",
+       "mechanism": "task_learned_boundary",
+       "note": "the HCA-family twin of csa_dynamic_task (comp_lambda_mult=4.0 as hca_dynamic_rope plus the sampled-cut REINFORCE policy)"},
+      {"id": "csa_dynamic_randbnd", "variant": "csa_dynamic_randbnd_rope",
+       "mechanism": "random_boundary",
+       "note": "rate-matched random boundary placement: content-keyed hash cuts (exp_lib.random_boundary_cut_table, recompute-stable, no RNG stream) with the same target block rate and min/max clamping; no trainable segmentation parameters (dead delta_logit, disclosed like the randidx dead indexer projections) and no compression regularizer (the rate is matched by construction); a nonzero AttnCfg.pattern_seed reruns one training seed under different boundary patterns"},
+      {"id": "csa_dynamic_oraclebnd", "variant": "csa_dynamic_oraclebnd_rope",
+       "mechanism": "oracle_boundary",
+       "note": "reference-boundary control: cuts at the punctuation/eos token positions (exp_lib.boundary_token_ids — the same reference set the boundary-F1 analysis uses); the id set must be registered with model.set_boundary_token_ids(...) before training/evaluation (train_variant boundary_token_ids=...), and re-registered after a checkpoint load (not part of the state dict); a linguistically-motivated upper-REFERENCE, not a claimed-optimal boundary"}
+    ],
     "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
     "same_seed_data_order": true,
     "same_training_token_budget": true,

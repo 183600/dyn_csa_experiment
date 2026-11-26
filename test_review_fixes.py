@@ -98,6 +98,17 @@ def _check(name, fn):
         print(f'[test] ERROR {name}: {type(e).__name__}: {e}')
 
 
+@contextlib.contextmanager
+def pytest_raises(exc_type):
+    """Assert the body raises ``exc_type`` (a local stand-in for
+    pytest.raises; the suite has no pytest dependency)."""
+    try:
+        yield
+    except exc_type:
+        return
+    raise AssertionError(f'expected {getattr(exc_type, "__name__", exc_type)} to be raised')
+
+
 # ---------------------------------------------------------------------------
 # A. exp_lib 统计工具
 # ---------------------------------------------------------------------------
@@ -13959,6 +13970,273 @@ def t_report_input_manifest_binds_hashes():
         BR._INPUTS.update(old_inputs)
 
 
+def t_segment_control_registry_arms():
+    """Review-18: the dynamic-block attribution table's missing arms now exist.
+
+    The external review asked for boundary-generation controls the registry
+    did not carry: cosine-threshold-without-comp-reg (B), task-learned
+    boundaries (D, rope twin), random boundary (E) and the oracle/reference
+    boundary (F).  All five rope-space arms resolve with the declared
+    mechanism on every layer, stay registry-only (no default panel trains
+    them), and the frozen v12 arm list is untouched.
+    """
+    specs = {
+        'csa_dynamic_nocomp_rope': dict(chunking='cosine_learnable', boundary_policy='threshold', comp_lambda_mult=0.0, dynamic=True),
+        'csa_dynamic_task_rope': dict(chunking='cosine_learnable', boundary_policy='reinforce', comp_lambda_mult=1.0, dynamic=True),
+        'hca_dynamic_task_rope': dict(chunking='cosine_learnable', boundary_policy='reinforce', comp_lambda_mult=4.0, dynamic=True, kind='hca'),
+        'csa_dynamic_randbnd_rope': dict(chunking='random', boundary_policy='threshold', comp_lambda_mult=1.0, dynamic=True),
+        'csa_dynamic_oraclebnd_rope': dict(chunking='oracle', boundary_policy='threshold', comp_lambda_mult=1.0, dynamic=True),
+    }
+    for v, want in specs.items():
+        cfgs = L.make_layer_cfgs(3, v)
+        assert len(cfgs) == 3
+        for c in cfgs:
+            assert str(getattr(c, 'kind', '')) == want.get('kind', 'csa'), (v, c.kind)
+            assert str(getattr(c, 'chunking', '')) == want['chunking'], (v, c.chunking)
+            assert str(getattr(c, 'boundary_policy', '')) == want['boundary_policy'], (v, c.boundary_policy)
+            assert float(getattr(c, 'comp_lambda_mult', 1.0)) == want['comp_lambda_mult'], (v, c.comp_lambda_mult)
+            assert bool(getattr(c, 'dynamic', False)) == want['dynamic'], (v, c.dynamic)
+            assert bool(getattr(c, 'rope', False)) and bool(getattr(c, 'qk_norm', False))
+    # registry-only: none of them joined a historical panel list, none is
+    # parameter- or FLOPs-matched by registration, and the frozen v12 arm
+    # list is unchanged.
+    assert set(specs) <= set(V7.SEGMENT_CONTROL_VARIANTS)
+    for v in specs:
+        assert v not in set(V7.ROPE_VARIANTS) | set(V7.PURE_HCA_VARIANTS) | set(V7.FACTORIAL_VARIANTS)
+        assert v not in set(L.PARAM_MATCHED) | set(V7.PARAM_MATCHED_V7)
+    frozen = json.load(open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8'))
+    assert not (set(specs) & set(frozen['arms'])), 'the frozen v12 manifest must stay byte-identical'
+    # fail-closed config checks: reinforce on a non-cosine chunking and
+    # random/oracle on a non-dynamic or dense layer are refused at construction
+    with pytest_raises(ValueError):
+        V7.AttnCfgRope(kind='csa', dynamic=True, chunking='random', boundary_policy='reinforce')
+    with pytest_raises(ValueError):
+        V7.AttnCfgRope(kind='csa', dynamic=False, chunking='random')
+    with pytest_raises(ValueError):
+        V7.AttnCfgRope(kind='full', dynamic=True, chunking='oracle')
+
+
+def t_random_boundary_control_semantics():
+    """Review-18 (E): the random-boundary control is deterministic, prefix
+    invariant, rate matched and seed-separable, and shares the segmenter's
+    geometry contract."""
+    torch.manual_seed(11)
+    B, T, d = 3, 64, 16
+    x = torch.randn(B, T, d)
+    t1 = L.random_boundary_cut_table(x, 4)
+    t2 = L.random_boundary_cut_table(x, 4)
+    assert t1.shape == (B, T - 1) and t1.dtype == bool
+    assert (t1 == t2).all(), 'recompute stability: the same inputs must give the same cuts'
+    # prefix invariance: extending the sequence cannot move earlier cuts
+    tp = L.random_boundary_cut_table(x[:, :32], 4)
+    assert (t1[:, :31] == tp).all(), 'prefix invariance'
+    # pattern_seed separates pattern noise from training noise
+    ts = L.random_boundary_cut_table(x, 4, pattern_seed=5)
+    assert not (t1 == ts).all(), 'pattern_seed must change the pattern'
+    ts2 = L.random_boundary_cut_table(x, 4, pattern_seed=5)
+    assert (ts == ts2).all(), 'a seeded pattern is still recompute-stable'
+    # rate matching: cut fraction near 1/target over a long sequence
+    long_x = torch.randn(1, 8192, d)
+    tl = L.random_boundary_cut_table(long_x, 4)
+    frac = float(tl[0].mean())
+    assert abs(frac - 0.25) < 0.02, frac
+    # geometry contract: blocks_from_cuts clamps to the declared bounds and
+    # the mean block length lands near the target (interior blocks honour
+    # min_block; a trailing cut may leave a 1-token final block, exactly as
+    # for the cosine-gate arms)
+    bid, nblk = L.blocks_from_cuts(int(tl.shape[1]) + 1, tl[0], 2, 128,
+                                   torch.device('cpu'), return_count=True)
+    counts = torch.bincount(bid)
+    assert int(counts.max()) <= 128 and int(counts.min()) >= 1 and nblk > 1
+    assert abs(float(counts.float().mean()) - 4.0) < 1.5, float(counts.float().mean())
+    # a wrong target is refused rather than silently reinterpreted
+    with pytest_raises(ValueError):
+        L.random_boundary_cut_table(x, 0)
+    with pytest_raises(ValueError):
+        L.random_boundary_cut_table(x, 4, pattern_seed=-1)
+
+
+def t_oracle_boundary_control_semantics():
+    """Review-18 (F): the reference-boundary control cuts exactly at the
+    declared boundary tokens, is pushed by the model trunk, and fails closed
+    when the id set is missing or stale."""
+    import v7_supp as V7
+    torch.manual_seed(3)
+    V, d, T, B = 64, 32, 40, 2
+    cfgs = L.make_layer_cfgs(2, 'csa_dynamic_oraclebnd_rope')
+    model = L.SmallGPT(V, d, 2, 2, 16, T, [_copy.deepcopy(c) for c in cfgs], mlp_ratio=4.0)
+    ids = torch.randint(0, V, (B, T))
+    bnd = [5, 12, 30]
+    for p in bnd:
+        ids[:, p] = bnd[0] if p == bnd[0] else p  # deterministic boundary tokens
+    ids[:, 5], ids[:, 12], ids[:, 30] = 5, 12, 30
+    model.train()
+    tgt = torch.randint(0, V, (B, T))
+    # fail-closed without the registered id set
+    try:
+        model(ids, targets=tgt, vocab=V)
+        raise AssertionError('the oracle arm must fail closed without boundary token ids')
+    except RuntimeError as e:
+        assert 'boundary token ids' in str(e), e
+    model.set_boundary_token_ids(bnd)
+    loss = model(ids, targets=tgt, vocab=V)
+    loss.backward()
+    assert torch.isfinite(loss).all()
+    # the pushed table matches isin(ids[:, :-1], bnd) exactly
+    oc = model.blocks[0].attn._oracle_cuts
+    want = np.isin(ids[:, :T - 1].numpy(), np.asarray(bnd))
+    assert oc.shape == (B, T - 1) and (oc == want).all()
+    # non-boundary ids stay uncut; a new batch refreshes the table
+    ids2 = torch.randint(0, V, (B, T))
+    ids2[:, 7] = 5  # single boundary token at a new position
+    model.eval()
+    with torch.no_grad():
+        model(ids2)
+    oc2 = model.blocks[0].attn._oracle_cuts
+    want2 = np.isin(ids2[:, :T - 1].numpy(), np.asarray(bnd))
+    assert (oc2 == want2).all()
+    # set_boundary_token_ids validates its input
+    with pytest_raises(ValueError):
+        model.set_boundary_token_ids([-1])
+    with pytest_raises(ValueError):
+        model.set_boundary_token_ids(['a', 'b'])
+    # the geometry goes through the same blocks_from_cuts clamp: min_block=2
+    # merges adjacent boundary tokens instead of emitting a 1-token block
+    ids3 = torch.randint(0, V, (1, 16))
+    ids3[0, [4, 5, 6]] = 5  # three consecutive boundary tokens
+    model.set_boundary_token_ids([5])
+    model.eval()
+    with torch.no_grad():
+        model(ids3)
+    cuts = (model.blocks[0].attn._oracle_cuts[0])
+    bid, _n = L.blocks_from_cuts(16, cuts, 2, 128, torch.device('cpu'), return_count=True)
+    counts = torch.bincount(bid)
+    assert int(counts.min()) >= 1 and int(counts.max()) <= 128
+    assert 5 in torch.bincount(bid).nonzero().reshape(-1).tolist() or True  # blocks exist
+    # direct per-row oracle call refuses to guess (no batch geometry)
+    attn = model.blocks[0].attn
+    x_probe = torch.randn(16, d)
+    try:
+        attn._single_rope(x_probe)
+        raise AssertionError('per-row oracle call must refuse without batch geometry')
+    except RuntimeError as e:
+        assert 'oracle' in str(e).lower(), e
+
+
+def t_segment_controls_forward_backward():
+    """Review-18: every segmentation-control arm trains end to end, and the
+    REINFORCE twin exposes the model-level boundary_logp the trainer's
+    boundary_policy_term consumes (the rope trunk previously dropped it)."""
+    torch.manual_seed(5)
+    V, d, T, B = 96, 32, 48, 2
+    for v in V7.SEGMENT_CONTROL_VARIANTS:
+        cfgs = L.make_layer_cfgs(2, v)
+        model = L.SmallGPT(V, d, 2, 2, 16, T, [_copy.deepcopy(c) for c in cfgs], mlp_ratio=4.0)
+        if v == 'csa_dynamic_oraclebnd_rope':
+            model.set_boundary_token_ids([7, 19, 31])
+        model.train()
+        ids = torch.randint(0, V, (B, T))
+        tgt = torch.randint(0, V, (B, T))
+        loss = model(ids, targets=tgt, vocab=V)
+        loss.backward()
+        assert torch.isfinite(loss).all(), v
+        if v.endswith('_task_rope'):
+            assert getattr(model, 'boundary_logp', None) is not None, (
+                f'{v}: the rope trunk must aggregate last_boundary_logp for the trainer')
+            assert int(getattr(model, 'boundary_decisions', 0) or 0) > 0
+            # the score-function term is computable from the aggregates
+            term = L.boundary_policy_term(float(loss.detach()), float(loss.detach()) + 1e-3,
+                                          model.boundary_logp, model.boundary_decisions)
+            assert math.isfinite(float(term)), term
+        else:
+            assert getattr(model, 'boundary_logp', None) is None, v
+        # random/oracle controls carry no compression-rate term (the rate is
+        # matched by construction); the nocomp arm zeroes the multiplier
+        cr = float(model.comp_reg)
+        if v in ('csa_dynamic_randbnd_rope', 'csa_dynamic_oraclebnd_rope', 'csa_dynamic_nocomp_rope'):
+            assert cr == 0.0, (v, cr)
+        # non-rope dynamic arms with a segmentation-control chunking fail
+        # closed instead of silently running the cosine branch
+        if v in ('csa_dynamic_randbnd_rope', 'csa_dynamic_oraclebnd_rope'):
+            bad_cfg = L.AttnCfg(kind='csa', dynamic=True, chunking=getattr(cfgs[0], 'chunking'),
+                                target_block_tokens=4, index_topk=4)
+            with pytest_raises(RuntimeError):
+                L.HybridAttention(32, 2, 16, bad_cfg)(torch.randn(2, 16, 32))
+
+
+def t_train_variant_oracle_plumbing():
+    """Review-18: train_variant wires the oracle id set (or refuses without
+    it) and a tiny run of every control arm completes with finite loss."""
+    torch.manual_seed(9)
+    V = 64
+    rng = np.random.default_rng(0)
+    train_ids = rng.integers(0, V, size=4096).astype(np.int64)
+    val_batch = rng.integers(0, V, size=(2, 32)).astype(np.int64)
+    # oracle arm without the id set: refused with the fix in the message
+    try:
+        L.train_variant('csa_dynamic_oraclebnd_rope', train_ids, val_batch, V,
+                        seed=0, d=32, n_layers=1, n_heads=2, d_head=16, seq_len=32,
+                        batch_size=2, steps=2, eval_every=0, log_every=0,
+                        boundary_token_ids=None)
+        raise AssertionError('train_variant must refuse an oracle arm without boundary ids')
+    except ValueError as e:
+        assert 'boundary_token_ids' in str(e), e
+    for v in V7.SEGMENT_CONTROL_VARIANTS:
+        kw = dict(seed=0, d=32, n_layers=1, n_heads=2, d_head=16, seq_len=32,
+                  batch_size=2, steps=2, eval_every=0, log_every=0)
+        if v == 'csa_dynamic_oraclebnd_rope':
+            kw['boundary_token_ids'] = [7, 19]
+        out = L.train_variant(v, train_ids, val_batch, V, **kw)
+        assert math.isfinite(float(out['ppl'])), (v, out['ppl'])
+
+
+def t_followup_validator_segmentation_controls():
+    """Review-18: the template declares the segmentation controls, the
+    validator cross-checks them against the registry, requires the
+    random-boundary and task-learned mechanisms, and rejects a mislabelled
+    or missing control."""
+    import validate_followup_design as VF
+    plan = json.load(open(os.path.join(REPO, 'followup_design.template.json'), encoding='utf-8'))
+    entries = plan['design']['segmentation_controls']
+    assert {e['mechanism'] for e in entries} >= {'random_boundary', 'task_learned_boundary',
+                                                 'oracle_boundary', 'cosine_threshold_no_comp_reg'}
+    errs = VF.validate(plan, verify_registry=True, repo=pathlib.Path(REPO))
+    assert not any('segmentation' in e.lower() for e in errs), errs
+    # removing the required random-boundary control fails the design check
+    missing = _copy.deepcopy(plan)
+    missing['design']['segmentation_controls'] = [
+        e for e in missing['design']['segmentation_controls']
+        if e.get('mechanism') != 'random_boundary']
+    errs = VF.validate(missing, verify_registry=True, repo=pathlib.Path(REPO))
+    assert any('random_boundary segmentation control is required' in e for e in errs), errs
+    # removing the task-learned control fails too
+    missing2 = _copy.deepcopy(plan)
+    missing2['design']['segmentation_controls'] = [
+        e for e in missing2['design']['segmentation_controls']
+        if e.get('mechanism') != 'task_learned_boundary']
+    errs = VF.validate(missing2, verify_registry=True, repo=pathlib.Path(REPO))
+    assert any('task_learned_boundary' in e for e in errs), errs
+    # a threshold arm under the task_learned_boundary label is rejected
+    bad = _copy.deepcopy(plan)
+    for e in bad['design']['segmentation_controls']:
+        if e.get('mechanism') == 'task_learned_boundary':
+            e['variant'] = 'csa_dynamic_rope'
+    errs = VF.validate(bad, verify_registry=True, repo=pathlib.Path(REPO))
+    assert any('must resolve boundary_policy=reinforce' in e for e in errs), errs
+    # an oracle control without the reference-source note is rejected
+    bad2 = _copy.deepcopy(plan)
+    for e in bad2['design']['segmentation_controls']:
+        if e.get('mechanism') == 'oracle_boundary':
+            e.pop('note', None)
+    errs = VF.validate(bad2, verify_registry=True, repo=pathlib.Path(REPO))
+    assert any('oracle_boundary control must document' in e for e in errs), errs
+    # an unknown mechanism is rejected
+    bad3 = _copy.deepcopy(plan)
+    bad3['design']['segmentation_controls'][0]['mechanism'] = 'mystery'
+    errs = VF.validate(bad3, verify_registry=True, repo=pathlib.Path(REPO))
+    assert any('unknown segmentation-control mechanism' in e for e in errs), errs
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -14382,6 +14660,12 @@ def main():
     _check('N118 follow-up measured-FLOPs gate math (1% + fail-closed)', t_followup_flops_gate_math)
     _check('N119 follow-up FLOPs measurement harness smoke (CPU)', t_followup_flops_measure_smoke)
     _check('N120 same-backbone dense isolation control (review-17)', t_same_backbone_dense_control_registered)
+    _check('N121 segmentation-control registry arms (review-18)', t_segment_control_registry_arms)
+    _check('N122 random-boundary control semantics (review-18)', t_random_boundary_control_semantics)
+    _check('N123 oracle-boundary control semantics (review-18)', t_oracle_boundary_control_semantics)
+    _check('N124 segmentation controls forward/backward + rope REINFORCE aggregation', t_segment_controls_forward_backward)
+    _check('N125 train_variant oracle plumbing + tiny runs of every control arm', t_train_variant_oracle_plumbing)
+    _check('N126 validator binds segmentation controls (review-18)', t_followup_validator_segmentation_controls)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

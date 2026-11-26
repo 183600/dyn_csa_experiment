@@ -83,6 +83,16 @@ owner 退役 v12 证据作为主张依据（见顶部引注），follow-up 协�
 
 改动后的验证：`test_review_fixes.py` 421/421（新增 N120）、`test_open_block.py` 15/15、`audit_gates.py causality` 七个 rope 臂全过、`validate_followup_design.py --verify-registry` 接受模板（其余失败项均是有意的 pre-freeze 阻塞）、`v12_supp.py plan` 不受本轮影响。
 
+## 评审十八硬化（review 18）
+
+对同一份十一部分审查（其第二节的动态分块归因消融表）做核验优先的复核。审查的量化指控对照 HEAD **复算全部成立且与披露一致**（12 seed/Holm-4 功效 q=0.80 为 0.2749、精确符号翻转 p 下限 2/2^12=0.000488、randidx 死参数 202,752/1.83%、解析 FLOPs 1,229,824 vs 2,297,296/1.87x、FLOPs 匹配 mr=689/256=2.69140625）；逐项判定见 `docs/design_notes.md` §35。零训练、零 test 访问、冻结清单零字节改动、`CODE_SEMANTICS` 保持 `v11.128`、`v12_supp.py plan` 仍 48/48。仍可修的一个结构性缺口本轮关闭：
+
+- **分段（边界生成）对照族落地**：审查要求区分「dynamic 增益来自边界位置、压缩率变化还是任务信号」，但 HEAD 的 follow-up 注册表只有选择级对照、没有任何边界级对照（`csa_dyn_nocomp`/`csa_dynamic_task` 只有非 rope 孪生；随机边界与 oracle 边界完全不存在）。本轮注册五个 registry-only rope 臂（`v7_supp.SEGMENT_CONTROL_VARIANTS`）：`csa_dynamic_nocomp_rope`（消融 B，comp 正则归零）、`csa_dynamic_task_rope`/`hca_dynamic_task_rope`（消融 D，REINFORCE 臂——其采样离散切分是唯一拿到 LM 损失梯度的边界；默认 `csa_dynamic_rope` 仍必须描述为余弦阈值+comp-reg 偏移，不得称为任务学习）、`csa_dynamic_randbnd_rope`（消融 E，`exp_lib.random_boundary_cut_table` 内容键控哈希切分：可重算、无 RNG 流、构造性率匹配、`pattern_seed` 可分离模式噪声）、`csa_dynamic_oraclebnd_rope`（消融 F，在 boundary-F1 分析既有的标点/eos 参考位置切分：`set_boundary_token_ids`+trunk 级刷新，未注册即拒绝）。`AttnCfg` 对 random/oracle 作用在稠密或非动态层、reinforce 作用在非余弦门上均 fail-closed。
+- **修复一个 rope 路径真 bug**：`SmallGPTRoPE.trunk` 此前不把逐层 `last_boundary_logp` 聚合到训练器消费的模型级 `boundary_logp`——rope REINFORCE 臂的边界策略项会被静默丢弃（此前无 rope 臂使用 reinforce，故未暴露）。现在按基类同语义聚合（N124 锁定）。
+- **设计记录绑定对照**：模板新增 `design.segmentation_controls`（五臂+机制标签+披露 note）；`validate_followup_design.py` 逐条对照注册表核验（threshold 臂不得冒用 `task_learned_boundary` 标签、oracle 必须写明参考源与注册要求、未知机制拒绝），并**强制要求** `random_boundary` 与 `task_learned_boundary` 两类对照——没有它们，注册的 2×2 因子无法把 dynamic 增益归因到任何东西。
+
+改动后的验证：`test_review_fixes.py` 427/427（新增 N121–N126）、`test_open_block.py` 15/15、`audit_gates.py causality` PASS、`mech_selection.py smoke` 数值逐位不变、`validate_followup_design.py --verify-registry` 仅剩有意 pre-freeze 阻塞、`v12_supp.py plan` 不受影响。
+
 ## 仓库结构
 
 仓库只保留**源码、驱动脚本与设计文档**。所有实验结果目录（`results_*/`）、

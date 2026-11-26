@@ -2038,3 +2038,115 @@ label shift + 前缀不变性 + 严格可读门 + 解码一致性）；
 `validate_followup_design.py followup_design.template.json --verify-registry`
 零注册错误（剩余 8 项均为有意的 pre-freeze 阻塞：功效仿真未跑 + 六个
 算法门未记录）；`v12_supp.py plan` 不受本轮影响；冻结清单字节比对不变。
+
+## 35. review 18（外部方法学审查的逐项核验 + 分段对照落地）的逐项核验与代码处置
+
+时间：2026-11-26（review-17 同日）。性质：verification-first——先逐条复算
+审查的量化指控，再核对其定性指控与 HEAD 的差距，最后只修「代码层面仍可
+修」的缺口。零新训练面板、零测试集访问、冻结清单零字节改动、
+`CODE_SEMANTICS` 保持 `v11.128`，`v12_supp.py plan` 仍然 48/48 放行。
+
+### 35.1 量化指控复算（全部成立，与披露一致）
+
+| 审查数字 | 复算值 | 工具 |
+|---|---|---|
+| 12 seed/Holm-4 功效 q=0.80 为 27.5% | 0.2748779…（signflip_power） | `exp_lib.signflip_power(12,4,0.80)` |
+| 精确符号翻转最小双侧 p = 2/2^12 | 0.00048828125 | `exact_signflip_p([1.0]*12)` |
+| Holm 最小可达 p（m=4） | 0.001953125 | `holm_min_attainable_p` |
+| randidx 死参数 202,752（1.83%） | 202,752 = 6×(16384+16384+1024)，占比 1.83% | count_params 逐层核对 |
+| CSA/Dense 每层 FLOPs 1.23M vs 2.30M（1.87x） | 1,229,824 / 2,297,296 / 1.868x | `analytic_train_flops_token` |
+| FLOPs 匹配 mr = 689/256 | 2.69140625 | `flops_matched_mlp_ratio` |
+
+### 35.2 逐项定性处置（审查十一个问题 → HEAD 状态）
+
+| 审查问题 | 状态 | 处置 |
+|---|---|---|
+| 1.1 Dense 与 CSA 非单因素对照（mr/归一化/kernel/sink 差异） | 成立（v12 系统级对照，已披露）；same-backbone 臂已注册（review-17） | 本轮无代码改动；v12 证据已退役 |
+| 1.2 参数匹配 ≠ FLOPs 匹配 | 成立；flops_matched 臂 + 实测门已落地（review-15/16） | 无代码改动；1% profiler 门仍是唯一验收 |
+| 2 动态分块缺任务梯度（gate.detach()>0.5） | 成立（默认臂定义）；csa_dynamic_task 为 opt-in REINFORCE 臂 | **本轮补齐 rope 孪生与 B/E/F 对照（见 35.3）** |
+| 3.1 测试面板 16 窗口、功效 27.5% | 成立；v12 已退役；follow-up 要求 ≥64 文档 + 文档级 bootstrap | 无代码改动（工具已在） |
+| 3.2 符号翻转交换性假设 | 成立（已披露）；v6 门 + 功效仿真工具（review-16） | 无代码改动 |
+| 3.3 多重比较 / 选择性报告 | 成立；Holm/BH 已在各报告；v6-v11 标注 exploratory | 无代码改动 |
+| 4 v12 无 Dynamic/HCA 臂 | 成立；scope.not_covered 声明；follow-up 2×2 + 纯 HCA 臂已注册 | 无代码改动 |
+| 5 固定哈希随机对照 + 死参数 | 成立；四个选择对照 + pattern_seed 已注册（review-14/15） | 无代码改动 |
+| 6.1 单一 WikiText-103 | 成立（范围局限）；B-tier FineWeb-Edu 路径在 m0_supp | 无代码改动（PG-19 等留作范围决定） |
+| 6.2 长度外推解释受限 | 成立；报告已改 token-pooled + 标注 extrapolation probe | 无代码改动 |
+| 6.3 PPL 不足以验证机制 | 部分成立；mech_selection + NIAH 已有；**边界级对照缺失 → 本轮补** | 见 35.3 |
+| 7 结果未归档 | 成立（source-only 设计）；archive_release 就绪待 GPU 证据 | 无代码改动 |
+
+审查第十一节点名的三个文件（exp_lib.py / confirmation_frozen.json /
+FOLLOWUP_CONFIRMATORY_PROTOCOL.md）本轮全部复查：exp_lib 改动见 35.3；
+冻结清单字节不变；协议文档加了 segmentation-controls 小节。
+
+### 35.3 本轮代码改动（唯一仍可修的结构性缺口：分段对照族）
+
+审查第二节的消融表要求六种边界生成方式（A Fixed / B 纯余弦阈值 /
+C 余弦+comp-reg / D 任务学习 / E 随机边界 / F Oracle 边界）。HEAD 之前：
+A、C 在册；B、D 只有非 rope 孪生（csa_dyn_nocomp / csa_dynamic_task），
+follow-up（rope 空间）无法声明；E、F 完全不存在。本轮：
+
+- `exp_lib.AttnCfg`：chunking 白名单扩为 fixed/cosine_learnable/
+  cosine_abs/cosine_adaptive/**random/oracle**；新增交叉校验（random/
+  oracle 必须是 csa/hca 且 dynamic=True；reinforce 必须在 cosine 门上；
+  pattern_seed 现在也允许 chunking='random'）。
+- `exp_lib.random_boundary_cut_table(x, target_block_tokens, *,
+  pattern_seed)`：内容键控哈希切分表（与 random_each 同族 GLSL 哈希，
+  float64 归约 + 逐位置哈希 < 1/target），确定性可重算、无 RNG 流、
+  前缀不变；期望块长 = target（率匹配）；`blocks_from_cuts` 负责
+  min/max 截断——与余弦门控臂共享同一几何契约。
+- `exp_lib.SmallGPT.set_boundary_token_ids` / `_oracle_boundary_refresh`：
+  oracle 参考切分表从批 token ids 推导（cut after i ⟺ ids[b,i] ∈ 边界
+  token 集，即 boundary-F1 分析使用的标点/eos 参考），每次 trunk 调用
+  刷新并推送到 oracle 层；未注册 id 集或表陈旧均 fail-closed。非 state
+  dict 成员：checkpoint 重载后必须重注册（文档 + 错误消息均写明）。
+- `exp_lib.train_variant`：新增 `boundary_token_ids` 参数（oracle 臂缺
+  参即拒绝，错误消息给出修复方式）。
+- `exp_lib.HybridAttention.forward`：非 rope 层遇到 random/oracle
+  chunking fail-closed（防止静默落入余弦分支）。
+- `v7_supp.make_layer_cfgs_v7`：注册五个 registry-only 臂
+  `csa_dynamic_nocomp_rope`（B）/ `csa_dynamic_task_rope`（D- CSA）/
+  `hca_dynamic_task_rope`（D-HCA）/ `csa_dynamic_randbnd_rope`（E）/
+  `csa_dynamic_oraclebnd_rope`（F）；导出
+  `SEGMENT_CONTROL_VARIANTS`。E/F 无可训练分段参数（delta_logit 成为
+  死权重，按 randidx 死参数先例披露）、无压缩正则项（率由构造匹配）。
+- `v7_supp.HybridAttentionRoPE`：`_segment_control_blocks`（批级几何
+  hoist，want_honoured=False）+ forward 分发分支 + `_single_rope` 逐行
+  分支（random 可逐行重算；oracle 无批几何时拒绝猜测）。
+- **修复 rope 路径真 bug**：`SmallGPTRoPE.trunk` 此前不聚合
+  `last_boundary_logp`/`boundary_decisions`（无 rope 臂用过 reinforce，
+  故从未暴露）——rope REINFORCE 臂的训练项会被静默丢弃。现在按基类
+  trunk 同语义聚合；N124 锁定。
+- `validate_followup_design.py`：`design.segmentation_controls` 逐条
+  registry 核对（机制标签与解析 cfg 逐字段一致：threshold 臂不得冒用
+  task_learned 标签；oracle 必须写明参考源与注册要求；未知机制拒绝）；
+  并**要求**声明 random_boundary 与 task_learned_boundary 两类对照——
+  没有它们，注册的 2×2 因子无法把 dynamic 增益归因到任何东西。
+- `followup_design.template.json`：`segmentation_controls` 块（五臂 +
+  机制标签 + 披露 note）。
+- `FOLLOWUP_CONFIRMATORY_PROTOCOL.md`：机制隔离一节新增
+  「Segmentation (boundary-generation) controls」小节。
+- `test_review_fixes.py`：N121（注册表逐字段 + fail-closed 构造校验 +
+  冻结臂列表不变）/ N122（随机边界：重算稳定、前缀不变、pattern_seed
+  可分离、率匹配、几何契约）/ N123（oracle：切位精确、trunk 推送、
+  fail-closed、setter 校验）/ N124（五臂前向反向 + rope REINFORCE 聚合 +
+  非注册表路径 fail-closed）/ N125（train_variant 管道 + 每臂 2 步小跑）/
+  N126（验证器接受-缺失拒绝-冒用拒绝-未知机制拒绝）。
+
+### 35.4 改动后的验证记录
+
+`test_review_fixes.py` 427/427（N121–N126 新增，历史 421 项全绿无回归）；
+`test_open_block.py` 15/15；`audit_gates.py causality` PASS（七 rope 臂）；
+`mech_selection.py smoke` 数值逐位不变（recall@k=0.3836 / mass=0.3799 /
+base=0.1250）；`validate_followup_design.py --verify-registry` 零注册
+错误（剩余 8 项均为有意 pre-freeze 阻塞）；`v12_supp.py plan` 48/48
+不受影响；冻结清单 `confirmation_frozen.json` 字节比对不变。
+
+### 35.5 结论
+
+审查的十一个问题中：十个为「设计边界成立且已披露 / 既有工具已覆盖」；
+一个问题（第二节的消融表）存在真实可修缺口——分段对照族在 follow-up 的
+rope 空间完全缺失，且 rope trunk 的 REINFORCE 聚合 bug 恰好藏在该缺口
+后面。本轮以五臂注册 + 验证器强制 + N121–N126 关闭该缺口；其余各项维持
+「工具存在 ≠ 实验完成」的一贯口径：功效仿真、实测 FLOPs 门、算法门、
+正式训练与证据归档仍需 GPU 与真实数据运行，本仓库不因工具齐备而产生
+任何新的性能主张。

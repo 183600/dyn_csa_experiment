@@ -117,6 +117,37 @@ any mechanism wording:
   many connection patterns.  Declare the controls (and their pattern seeds)
   in `design.selection_controls`; the validator cross-checks each declared
   seed against the resolved registry cfgs.
+- **Segmentation (boundary-generation) controls.**  A dynamic-vs-fixed
+  factorial difference does not say WHERE the gain lives: boundary placement,
+  compression-rate change, or the task signal itself.  Before any
+  "dynamic segmentation helps" attribution, declare the boundary-generation
+  ablation family in `design.segmentation_controls`
+  (**implemented, review-18**): `csa_dynamic_nocomp_rope`
+  (cosine threshold with the compression regularizer removed — isolates what
+  the comp_reg-trained offset contributes), `csa_dynamic_task_rope` /
+  `hca_dynamic_task_rope` (`boundary_policy='reinforce'`, the ONLY arms whose
+  sampled discrete cuts receive the LM-loss gradient via
+  `exp_lib.boundary_policy_term` — the default `csa_dynamic_rope` stays
+  "cosine threshold + comp-reg offset" and must never be described as
+  task-learned), `csa_dynamic_randbnd_rope` (content-keyed random cuts via
+  `exp_lib.random_boundary_cut_table`, recompute-stable with no RNG stream,
+  rate-matched by construction, `AttnCfg.pattern_seed` reruns one training
+  seed under different boundary patterns; no trainable segmentation
+  parameters and no compression regularizer — the dead `delta_logit` is
+  disclosed like the randidx dead indexer projections) and
+  `csa_dynamic_oraclebnd_rope` (cuts at the punctuation/eos reference
+  boundary from `exp_lib.boundary_token_ids`; the id set must be registered
+  on the model with `set_boundary_token_ids(...)` — or passed to
+  `train_variant(boundary_token_ids=...)` — before training/evaluation and
+  re-registered after every checkpoint load, because it is not part of the
+  state dict; a linguistically-motivated upper REFERENCE, not a claimed
+  optimum).  The validator cross-checks each declared control against the
+  resolved registry cfgs and REQUIRES both a `random_boundary` and a
+  `task_learned_boundary` control: without the former a dynamic gain cannot
+  be distinguished from a compression-rate change, without the latter the
+  design cannot separate task-driven boundaries from the threshold
+  heuristic.  All five arms are registry-only: nothing trains them by
+  default and registering them creates no claim.
 - **Reading-scope controls.** A learned-top-k vs all-block contrast changes
   reading scope and the STE soft prior, not only selection; pair it with a
   same-scope learned-vs-random contrast, and report block/read counts.
@@ -269,10 +300,13 @@ variants, the four selection controls and their pattern-seeded twins are
 registered, the FLOPs-matched Dense arm now has a registry entry plus an
 ANALYTICAL capacity plan (`full_rope_flops_matched`; the run cfg routes it
 through `exp_lib.flops_matched_mlp_ratio`, whose frozen-config solution is
-mr = 689/256 = 2.69140625), and the same-backbone dense isolation arm
+mr = 689/256 = 2.69140625), the same-backbone dense isolation arm
 (`full_rope_cos_sink`, review-17) is registered and declared as the
-`dense_same_backbone` control, which the validator now requires.  The
-remaining blockers are the
+`dense_same_backbone` control, which the validator now requires, and the
+five segmentation (boundary-generation) controls are registered and
+declared in `design.segmentation_controls` (review-18), including the
+random-boundary and task-learned-boundary controls the validator requires.
+The remaining blockers are the
 profiler-MEASURED FLOPs verification (now runnable via
 `followup_flops_gate.py` on the certifying device; the analytical plan is
 never the certificate), the pre-test power simulation (now runnable via
