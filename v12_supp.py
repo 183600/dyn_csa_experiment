@@ -3999,6 +3999,79 @@ def _fmt_pm(cell):
         return f'{cell["mean"]:.2f} ±{cell.get("std", 0.0):.2f}'
     return f'{cell:.2f}'
 
+
+def _emit_compute_budget_audit(A, caveats, cbd):
+    """Re-derive and audit the ratios quoted in the frozen disclosure prose.
+
+    review 19: the frozen manifest's prose quotes "attention 3.2x at L512",
+    which no configuration in this repository reproduces (L512 gives 2.89x for
+    dense/csa and 3.77x for dense/hca; 3.2x only appears as dense@L512 over
+    hca@L2048, a cross-length mix — design_notes §36).  The manifest must stay
+    byte-identical (pre-registration), so the correction is printed here: the
+    numbers are recomputed from the analytical model and every quoted
+    ratio/percentage is audited against them.  Nothing here changes a
+    measurement; a mismatch is labelled a pre-registration erratum.
+
+    Kept as a module-level helper (not inline in ``build_report``) so the
+    rendering itself is unit-testable without a full analysis directory.
+    """
+    _rec = None
+    _aud = None
+    try:
+        _rec = L.compute_budget_recompute()
+        _aud = L.audit_compute_disclosure(
+            {'caveats': [_c.get('interpretation_caveat') for _c in (caveats or [])
+                         if isinstance(_c, dict)],
+             'compute_budget_disclosure': cbd or {}}, recompute=_rec)
+    except Exception as _e:
+        A(f'> ⚠ 口径复算不可用（{type(_e).__name__}: {_e}）；下列披露数字只能按清单原文引用，'
+          '不得声称已复算。')
+        A('')
+        return
+    if not (isinstance(_rec, dict) and _rec.get('status') == 'ok'):
+        _note = (_rec or {}).get('note') if isinstance(_rec, dict) else None
+        A('> ⚠ 口径复算不可用（解析模型在本次运行中不可用'
+          + (f'：{_note}' if _note else '') + '）；下列披露数字只能按清单原文引用，不得声称已复算。')
+        A('')
+        return
+    A('**口径复算（review 19；解析模型，非实测）**：')
+    A('')
+    A(f"- `csa_fixed_rope` = {_rec['csa_flops_per_token_layer']:,.0f} FLOPs/token/层"
+      f"（attention {_rec['csa_attn_flops_per_token']:,.0f}）；"
+      f"`full_rope`（mr={_rec['dense_mlp_ratio']:.8g}，hidden {_rec['dense_mlp_hidden']}）"
+      f"= {_rec['dense_flops_per_token_layer']:,.0f}"
+      f"（attention {_rec['dense_attn_flops_per_token']:,.0f}）。")
+    A(f"- 总比 {_rec['total_ratio']:.3f}x；attention 比 {_rec['attn_ratio']:.3f}x；"
+      f"MLP 宽度 {_rec['mlp_width_rel_gain']:+.1%}。")
+    if isinstance(_aud, dict) and _aud.get('status') == 'mismatch':
+        A('')
+        A('| 披露文本中的数字 | 归类 | 复算值 | 相对误差 | 判定 | 所在句 |')
+        A('|---|---|---|---|---|---|')
+        _mname = {'attn_ratio': 'attention 比', 'total_ratio': '总 FLOPs 比',
+                  'mlp_width_rel_gain': 'MLP 宽度'}
+        for _cl in _aud.get('claims') or []:
+            A(f"| `{_cl['claim']}` | {_mname.get(_cl['metric'], _cl['metric'])} | "
+              f"{_cl['expected']:.3f}{_cl['unit']} | {_cl['rel_err']:.2%} | "
+              f"{'⚠ mismatch' if _cl['verdict'] == 'mismatch' else 'ok'} | "
+              f"{(_cl['context'] or '').replace('|', '/')[:60]} |")
+        A('')
+        A('> ⚠ 上表 `mismatch` 行是**预注册文本勘误**，不是测量结果：冻结清单按纪律保持字节不变，'
+          '但任何引用都必须写复算值或标注勘误（`docs/design_notes.md` §36）。')
+        _erratum = [c for c in (_aud.get('claims') or [])
+                    if c.get('verdict') == 'mismatch' and c.get('metric') == 'attn_ratio']
+        if _erratum:
+            A('>')
+            A(f"> 具体地，L512 下 dense/csa 的 attention 比是 {_rec['attn_ratio']:.2f}x；"
+              f"清单里的 {_erratum[0]['claim']} 只在 dense@L512 与 hca@L2048 之间成立"
+              '（跨长度混算），本仓库没有任何 L512 配置给出该比值。')
+        A('')
+    elif isinstance(_aud, dict):
+        A('')
+        A(f"> 披露文本中可复算的 {_aud.get('n_claims', 0)} 个比值/百分比与解析模型一致（相对误差 ≤ "
+          f"{_aud.get('rel_tol', 0.01):.0%}）；无法归类的数字不参与审计。")
+        A('')
+
+
 def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     v12_analysis(out=stats_p)
     try:
@@ -4158,6 +4231,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
                 if _cbd_m.get(_ck):
                     A(f"- {_cl}：{_cbd_m[_ck]}")
             A('')
+            _emit_compute_budget_audit(A, _caveats, _cbd_m)
             A('> 因此确认结果只能表述为「该冻结配方下的**系统级**臂间差异」；不能表述为「学习选择机制导致优势」的单因素结论，也不是「等计算预算下的稀疏 vs dense」。具体地：CSA 的 q/k 先 L2-normalize、再 RMSNorm，attention scale=1.0；dense 只做 RMSNorm，scale=1/sqrt(d_head)，且无 KV 压缩、sink 与滑窗分支——这些都与臂标签一起变化。机制归因还需要选择归因工件（selection recall/mass）与同骨干、同投影、同归一化、同 kernel 的隔离对照。')
             A('')
         _act_rows = [(k, v) for k, v in comps.items() if isinstance(v, dict)

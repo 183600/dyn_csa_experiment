@@ -23036,10 +23036,18 @@ def flops_matched_mlp_ratio(dense_variant, ref_variant, vocab, *, d=256, n_layer
 
     Frozen-config cross-check (the self-test in test_review_fixes.py locks
     it): csa_fixed_rope at mr=4 gives 1,229,824 FLOPs/token/layer, full_rope
-    at the param-matched mr=6.76348876953125 gives 2,297,523 (1.87x), and the
+    at the param-matched mr=6.76348876953125 gives 2,297,296 (1.87x), and the
     solved FLOPs-matched dense ratio is exactly 689/256 = 2.69140625
     (attention saving 524,288 - 181,248 = 343,040 buys back an MLP hidden of
     689 instead of 1024).
+
+    The attention-only ratio at L512 is 524,288 / 181,248 = 2.8927x, not the
+    "attention 3.2x" printed in the frozen manifest's prose (review 19: that
+    number is dense-attention@L512 divided by hca-attention@L2048, a
+    cross-length mix; the manifest stays byte-identical and the erratum is
+    recorded in docs/design_notes.md §36 — ``compute_budget_recompute`` /
+    ``audit_compute_disclosure`` below recompute every quoted ratio so the
+    report can flag such claims instead of repeating them).
     """
     _mkey = (str(dense_variant), str(ref_variant), int(vocab), int(d), int(n_layers),
              int(n_heads), int(d_head), int(seq_len), float(ref_mlp_ratio))
@@ -23072,6 +23080,188 @@ def flops_matched_mlp_ratio(dense_variant, ref_variant, vocab, *, d=256, n_layer
           f'(analytical {ref_f:.0f} vs dense-attn {dense_attn:.0f} FLOPs/token/layer '
           f'@ seq {seq_len}, ref {ref_variant}; measured-FLOPs gate still required)')
     return ratio
+
+
+def compute_budget_recompute(*, seq_len=512, d=256, n_heads=8, d_head=32,
+                             csa_variant='csa_fixed_rope', dense_variant='full_rope',
+                             csa_mlp_ratio=4.0, dense_mlp_ratio=6.76348876953125):
+    """Recompute the frozen compute-budget disclosure from the analytical model.
+
+    Review 19 found that the frozen manifest's prose quotes one ratio the
+    repository cannot reproduce ("attention 3.2x at L512"; the analytical
+    model gives 524,288 / 181,248 = 2.8927x at L512 — see design_notes §36).
+    A quoted number that no code path reproduces is a disclosure defect even
+    when the pre-registration itself is frozen byte-identical, so the numbers
+    are re-derived here and audited by ``audit_compute_disclosure`` instead of
+    being copied from prose.
+
+    This is the *analytical* accounting used by the frozen disclosure
+    (per-token, per-layer, forward attention + training MLP), NOT a measured
+    FLOPs count: ``followup_flops_gate.py`` remains the only acceptance path
+    for an "equal compute" claim.
+
+    Returns a dict; ``status`` is ``'ok'`` when every field was computed and
+    ``'variant_unavailable'`` when the registry variant cannot be built in
+    this process (e.g. ``v7_supp`` not imported), in which case the numeric
+    fields stay ``None`` rather than being guessed.
+    """
+    out = {'status': 'ok', 'seq_len': int(seq_len), 'd': int(d),
+           'n_heads': int(n_heads), 'd_head': int(d_head),
+           'csa_variant': str(csa_variant), 'dense_variant': str(dense_variant),
+           'csa_mlp_ratio': float(csa_mlp_ratio),
+           'dense_mlp_ratio': float(dense_mlp_ratio),
+           'csa_flops_per_token_layer': None, 'dense_flops_per_token_layer': None,
+           'total_ratio': None, 'csa_attn_flops_per_token': None,
+           'dense_attn_flops_per_token': None, 'attn_ratio': None,
+           'csa_mlp_hidden': None, 'dense_mlp_hidden': None,
+           'mlp_width_rel_gain': None, 'note': ''}
+    try:
+        csa_cfgs = make_layer_cfgs(1, csa_variant)
+        dense_cfgs = make_layer_cfgs(1, dense_variant)
+    except Exception as exc:  # registry not loaded / unknown variant
+        out['status'] = 'variant_unavailable'
+        out['note'] = f'{type(exc).__name__}: {exc}'
+        return out
+    if len(csa_cfgs) != 1 or len(dense_cfgs) != 1:
+        out['status'] = 'variant_unavailable'
+        out['note'] = 'compute_budget_recompute needs single-layer probe cfgs'
+        return out
+    csa_f = analytic_train_flops_token(csa_cfgs[0], csa_mlp_ratio, d=d, seq_len=seq_len,
+                                       n_heads=n_heads, d_head=d_head)
+    dense_f = analytic_train_flops_token(dense_cfgs[0], dense_mlp_ratio, d=d, seq_len=seq_len,
+                                         n_heads=n_heads, d_head=d_head)
+    csa_a = analytic_attn_flops_token(csa_cfgs[0], seq_len, n_heads=n_heads, d_head=d_head)
+    dense_a = analytic_attn_flops_token(dense_cfgs[0], seq_len, n_heads=n_heads, d_head=d_head)
+    _h_csa = max(1, int(round(int(d) * float(csa_mlp_ratio))))
+    _h_dense = max(1, int(round(int(d) * float(dense_mlp_ratio))))
+    out.update({
+        'csa_flops_per_token_layer': float(csa_f),
+        'dense_flops_per_token_layer': float(dense_f),
+        'total_ratio': (float(dense_f) / float(csa_f)) if csa_f else None,
+        'csa_attn_flops_per_token': float(csa_a),
+        'dense_attn_flops_per_token': float(dense_a),
+        'attn_ratio': (float(dense_a) / float(csa_a)) if csa_a else None,
+        'csa_mlp_hidden': _h_csa,
+        'dense_mlp_hidden': _h_dense,
+        'mlp_width_rel_gain': (float(_h_dense) / float(_h_csa) - 1.0) if _h_csa else None,
+    })
+    return out
+
+
+_CLAIM_RATIO_RE = re.compile(r'(?<![\w.])(\d+(?:\.\d+)?)\s*[x×](?![\w])')
+_CLAIM_PCT_RE = re.compile(r'(?<![\w.])([+-]?\d+(?:\.\d+)?)\s*%')
+_CLAIM_DELIMS = ';,.()'
+
+
+def _iter_claim_texts(obj, _depth=0):
+    """Yield every string inside ``obj`` (str / list / tuple / dict values)."""
+    if _depth > 6:
+        return
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for _v in obj.values():
+            yield from _iter_claim_texts(_v, _depth + 1)
+    elif isinstance(obj, (list, tuple)):
+        for _v in obj:
+            yield from _iter_claim_texts(_v, _depth + 1)
+
+
+def _claim_clause(text, start, end):
+    """The clause around a claim: prose is split on ; , . ( ) boundaries so a
+    nearby but unrelated keyword in another clause cannot misclassify it."""
+    _l = start
+    while _l > 0 and text[_l - 1] not in _CLAIM_DELIMS:
+        _l -= 1
+    _r = end
+    while _r < len(text) and text[_r] not in _CLAIM_DELIMS:
+        _r += 1
+    return _l, _r
+
+
+def _claim_metric(text, start, end):
+    """Classify a numeric claim by the keywords of its own clause (None = not
+    auditable).  Within the clause the keyword closest to the claim wins, so
+    "MLP +69%, attention 3.2x" classifies each number by its own word."""
+    l, r = _claim_clause(text, start, end)
+    clause = text[l:r].lower()
+    if not clause:
+        return None
+    mid = (start + end) / 2.0 - l
+    best = None
+    for kw, metric in (('attention', 'attn_ratio'), ('attn', 'attn_ratio'),
+                       ('flops', 'total_ratio'), ('mlp', 'mlp_width_rel_gain')):
+        pos = clause.find(kw)
+        while pos >= 0:
+            dist = abs(pos + len(kw) / 2.0 - mid)
+            if best is None or dist < best[0]:
+                best = (dist, metric)
+            pos = clause.find(kw, pos + 1)
+    return None if best is None else best[1]
+
+
+def audit_compute_disclosure(texts, *, recompute=None, rel_tol=0.01):
+    """Audit the ratio/percentage claims in disclosure prose against the model.
+
+    ``texts`` may be a string, a list, or a nested dict (e.g. the frozen
+    manifest's ``primary_comparisons`` + ``compute_budget_disclosure``).  Each
+    ``<number>x`` / ``<number>%`` claim is classified by its surrounding words
+    (attention / FLOPs / MLP width) and compared with
+    ``compute_budget_recompute``; a claim whose recomputed value differs by
+    more than ``rel_tol`` (relative) is reported as ``mismatch``.  Claims with
+    no classifiable context are returned as ``unclassified`` and never make
+    the audit fail — the audit only judges what the model can actually
+    reproduce.
+
+    Returns ``{'status': 'ok'|'mismatch'|'unavailable', 'claims': [...],
+    'recomputed': {...}}``.  Duplicate (metric, claim) pairs are collapsed.
+    """
+    rec = recompute if recompute is not None else compute_budget_recompute()
+    if not isinstance(rec, dict) or rec.get('status') != 'ok':
+        return {'status': 'unavailable', 'claims': [], 'recomputed': rec,
+                'note': 'the analytical recompute is unavailable in this process'}
+    try:
+        _tol = float(rel_tol)
+    except (TypeError, ValueError, OverflowError):
+        _tol = 0.01
+    if not (_tol > 0):
+        _tol = 0.01
+    claims = []
+    seen = set()
+    for text in _iter_claim_texts(texts):
+        if not isinstance(text, str):
+            continue
+        for regex, is_pct in ((_CLAIM_RATIO_RE, False), (_CLAIM_PCT_RE, True)):
+            for m in regex.finditer(text):
+                metric = _claim_metric(text, m.start(), m.end())
+                if metric is None:
+                    continue
+                try:
+                    claim = float(m.group(1))
+                except (TypeError, ValueError):
+                    continue
+                expected = rec.get(metric)
+                if expected is None:
+                    continue
+                expected = float(expected) * (100.0 if is_pct else 1.0)
+                _key = (metric, round(claim, 6), bool(is_pct))
+                if _key in seen:
+                    continue
+                seen.add(_key)
+                rel = abs(claim - expected) / max(abs(expected), 1e-12)
+                _cl = _claim_clause(text, m.start(), m.end())
+                claims.append({
+                    'claim': m.group(0).strip(), 'metric': metric,
+                    'value': claim, 'unit': '%' if is_pct else 'x',
+                    'expected': expected, 'rel_err': rel,
+                    'verdict': 'ok' if rel <= _tol else 'mismatch',
+                    'context': text[_cl[0]:_cl[1]].strip(),
+                })
+    claims.sort(key=lambda c: (c['verdict'] != 'mismatch', c['metric']))
+    bad = [c for c in claims if c['verdict'] == 'mismatch']
+    return {'status': 'mismatch' if bad else 'ok', 'claims': claims,
+            'recomputed': rec, 'rel_tol': _tol,
+            'n_claims': len(claims), 'n_mismatch': len(bad)}
 
 
 def variant_mlp_ratio(variant, vocab, *, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, matched=None, ref_variant='csa_dynamic', flops_matched=None, flops_match_ref=None):

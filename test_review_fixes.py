@@ -14237,6 +14237,86 @@ def t_followup_validator_segmentation_controls():
     assert any('unknown segmentation-control mechanism' in e for e in errs), errs
 
 
+def t_compute_budget_recompute_matches_frozen_numbers():
+    """Review-19: the compute-budget numbers quoted in the frozen manifest are
+    re-derived from the analytical model (no prose copying), and the docstring
+    typo that made one of them unreproducible (2,297,523) stays fixed."""
+    rec = L.compute_budget_recompute()
+    assert rec['status'] == 'ok', rec
+    assert rec['csa_flops_per_token_layer'] == 1229824, rec
+    assert rec['dense_flops_per_token_layer'] == 2297296, rec
+    assert abs(rec['total_ratio'] - 1.8680) < 5e-4, rec
+    assert rec['csa_attn_flops_per_token'] == 181248, rec
+    assert rec['dense_attn_flops_per_token'] == 524288, rec
+    assert abs(rec['attn_ratio'] - 2.8927) < 5e-4, rec
+    assert (rec['csa_mlp_hidden'], rec['dense_mlp_hidden']) == (1024, 1731), rec
+    assert abs(rec['mlp_width_rel_gain'] - (1731 / 1024 - 1)) < 1e-9, rec
+    # the FLOPs-matched solver is unchanged and independent of the recompute
+    assert L.flops_matched_mlp_ratio('full_rope', 'csa_fixed_rope', 8192) == 689 / 256
+    # the old typo must not come back into the docstring that defines the model
+    doc = (L.flops_matched_mlp_ratio.__doc__ or '') + (L.analytic_attn_flops_token.__doc__ or '')
+    assert '2,297,523' not in doc, doc[-400:]
+    assert '2,297,296' in doc, doc[-400:]
+    # an unknown/unloaded variant is reported, never guessed
+    bad = L.compute_budget_recompute(csa_variant='__no_such_variant__')
+    assert bad['status'] == 'variant_unavailable' and bad['total_ratio'] is None, bad
+    assert bad.get('note'), bad
+
+
+def t_disclosure_audit_flags_the_attention_erratum():
+    """Review-19: every ratio/percentage in the frozen disclosure prose is
+    audited against the recomputed model.  The manifest's "attention 3.2x at
+    L512" is the one claim this repository cannot reproduce (L512 gives 2.89x
+    for dense/csa and 3.77x for dense/hca; 3.2x is dense@L512 over hca@L2048),
+    so the audit must flag exactly that claim and accept the rest."""
+    mf = json.load(open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8'))
+    aud = L.audit_compute_disclosure(
+        {'caveats': [c.get('interpretation_caveat') for c in mf['primary_comparisons']],
+         'compute_budget_disclosure': mf['compute_budget_disclosure']})
+    assert aud['status'] == 'mismatch', aud
+    bad = [c for c in aud['claims'] if c['verdict'] == 'mismatch']
+    assert len(bad) == 1, bad
+    assert bad[0]['claim'].replace(' ', '') == '3.2x', bad
+    assert bad[0]['metric'] == 'attn_ratio', bad
+    assert bad[0]['rel_err'] > 0.05, bad
+    ok = {c['claim'].replace(' ', ''): c for c in aud['claims'] if c['verdict'] == 'ok'}
+    assert '1.87x' in ok and ok['1.87x']['metric'] == 'total_ratio', ok
+    assert '+69%' in ok and ok['+69%']['metric'] == 'mlp_width_rel_gain', ok
+    # the erratum is arithmetic, not opinion: 3.2x only appears across lengths
+    hca512 = L.compute_budget_recompute(csa_variant='hca_fixed_rope', seq_len=512)
+    hca2048 = L.compute_budget_recompute(csa_variant='hca_fixed_rope', seq_len=2048)
+    assert abs(hca512['attn_ratio'] - 3.7654) < 5e-3, hca512
+    cross = 524288 / hca2048['csa_attn_flops_per_token']
+    assert abs(cross - 3.2) < 1e-6, cross
+    # numbers with no classifiable context are not audited (no invented claims)
+    plain = L.audit_compute_disclosure('the allblocks arm reads about 32x more blocks '
+                                       'and dense reads 100% of them')
+    assert plain['status'] == 'ok' and plain['n_claims'] == 0, plain
+    # an unavailable recompute yields no verdict at all
+    none = L.audit_compute_disclosure('attention 3.2x at L512',
+                                      recompute={'status': 'variant_unavailable'})
+    assert none['status'] == 'unavailable' and none['claims'] == [], none
+    # the report renders the erratum next to the caveats it belongs to
+    lines = []
+    V12._emit_compute_budget_audit(lines.append, mf['primary_comparisons'],
+                                   mf['compute_budget_disclosure'])
+    text = '\n'.join(lines)
+    assert '3.2x' in text and 'mismatch' in text and '2.893' in text, text
+    assert '1,229,824' in text and '2,297,296' in text, text
+    # and stays silent about errata when the recompute is unavailable
+    lines = []
+    _orig = L.compute_budget_recompute
+    try:
+        L.compute_budget_recompute = lambda *a, **k: {'status': 'variant_unavailable',
+                                                      'note': 'registry not loaded'}
+        V12._emit_compute_budget_audit(lines.append, mf['primary_comparisons'],
+                                       mf['compute_budget_disclosure'])
+    finally:
+        L.compute_budget_recompute = _orig
+    text = '\n'.join(lines)
+    assert '不可用' in text and 'mismatch' not in text, text
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -14666,6 +14746,10 @@ def main():
     _check('N124 segmentation controls forward/backward + rope REINFORCE aggregation', t_segment_controls_forward_backward)
     _check('N125 train_variant oracle plumbing + tiny runs of every control arm', t_train_variant_oracle_plumbing)
     _check('N126 validator binds segmentation controls (review-18)', t_followup_validator_segmentation_controls)
+    _check('N127 compute-budget recompute matches the frozen numbers (review-19)',
+           t_compute_budget_recompute_matches_frozen_numbers)
+    _check('N128 disclosure audit flags the attention-ratio erratum (review-19)',
+           t_disclosure_audit_flags_the_attention_erratum)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

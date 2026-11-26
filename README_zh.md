@@ -93,6 +93,15 @@ owner 退役 v12 证据作为主张依据（见顶部引注），follow-up 协�
 
 改动后的验证：`test_review_fixes.py` 427/427（新增 N121–N126）、`test_open_block.py` 15/15、`audit_gates.py causality` PASS、`mech_selection.py smoke` 数值逐位不变、`validate_followup_design.py --verify-registry` 仅剩有意 pre-freeze 阻塞、`v12_supp.py plan` 不受影响。
 
+## 评审十九硬化（review 19）
+
+对「等计算量 / 动态分段 / 统计功效」十一部分审查做核验优先的复核。审查的量化指控对照 HEAD **复算基本全部成立**（12 seed/Holm-4 功效 q=0.80 为 0.2749、q=0.85/0.90/0.95 → 0.4435/0.6590/0.8816；精确符号翻转 p 下限 2/2^12=0.000488、Holm 下限 0.001953125；randidx 死参数 202,752/1.8283%；参数总量 11,089,904 vs 11,088,512；MLP 隐藏 1024 vs 1731/+69.04%；解析 FLOPs 1,229,824 vs 2,297,296/1.868x；冻结面板 16 窗口 = 8,192 token）；设计边界结论（dense 是参数匹配而非等计算、动态分块是余弦阈值+压缩正则、固定哈希随机选择器带死参数、27.5% 功效、窗口为评估单位、STE 选择、单一数据集、结果未归档）**全部成立且此前已披露**；逐项判定见 `docs/design_notes.md` §36。零训练、零 test 访问、冻结清单零字节改动、`CODE_SEMANTICS` 保持 `v11.128`、`v12_supp.py plan` 仍 48/48。本轮找到并关闭的是**披露缺陷**（不是测量缺陷）：
+
+- **冻结散文里有一个本仓库复现不出来的比值**：`compute_budget_disclosure.flops` 与主比较的 `interpretation_caveat` 都写「attention 3.2x at L512」，但解析模型在 L512 下给出 dense/csa = 524,288/181,248 = **2.8927x**（dense/hca 为 3.7654x）；3.2x 的真实来源是 dense@L512 除以 hca@L2048（524,288/163,840），属**跨长度混算**，本仓库没有任何 L512 配置给出 3.2x。清单按预注册纪律字节不变，勘误进文档与报告：`exp_lib.compute_budget_recompute` 逐项重算披露数字，`exp_lib.audit_compute_disclosure` 按句（`; , . ( )` 切分）与句内最近关键词（attention/FLOPs/MLP）给每个 `Nx`/`N%` 归类并与复算值比对（>1% 即 mismatch），`v12_supp._emit_compute_budget_audit` 在 caveat 之后打印「口径复算」段与 mismatch 表，把 3.2x 标为**预注册文本勘误**。无法归类的数字（"32x more blocks"、"100%"、"0.013% apart"）不参与审计；复算不可用时整份审计返回 `unavailable`，不猜数。
+- **一处 docstring 数字笔误**：`flops_matched_mlp_ratio` 的 docstring 写 2,297,523（比解析值多 227），改为 2,297,296，并补记 attention 比 2.8927x。
+
+改动后的验证：新增 N127（复算逐项等于冻结清单、2,297,523 笔误不再出现、未注册变体 fail-closed）与 N128（审计必须且只能标出 3.2x 一条 mismatch、1.87x 与 +69% 通过、跨长度 3.2x 算术、不可归类数字不产生结论、复算不可用时不打印勘误、报告端渲染）**均通过**；受影响子集复跑全绿（N115/N118/N119、L1/L3*/L7*/L10/L12、N86/N96/N97/N99、C6/C20b/J4c/A6d）。本次沙箱对单次调用有时限，长训练回路用例（C5b、N103 等）未能在一次调用内跑完，故**未**声称全绿。其余仍需 GPU 的项（Triton 路径 custom_op + `register_flop` 的实测等计算量、任务驱动分段的训练证据、≥64 文档面板与文档级 bootstrap、≥20 种子的 80% 功效、真实 checkpoint 上的选择归因、能耗）不产生任何新的性能主张。
+
 ## 仓库结构
 
 仓库只保留**源码、驱动脚本与设计文档**。所有实验结果目录（`results_*/`）、

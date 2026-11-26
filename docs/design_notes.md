@@ -2150,3 +2150,92 @@ rope 空间完全缺失，且 rope trunk 的 REINFORCE 聚合 bug 恰好藏在�
 「工具存在 ≠ 实验完成」的一贯口径：功效仿真、实测 FLOPs 门、算法门、
 正式训练与证据归档仍需 GPU 与真实数据运行，本仓库不因工具齐备而产生
 任何新的性能主张。
+
+## 36. review 19（等计算量/动态分段/统计功效审查）的逐项核验与代码处置
+
+时间：2026-11-26（review-18 同日）。性质与 §35 相同：verification-first——
+先在 HEAD 上复算审查的每一个量化指控，再判定定性指控是否成立，最后只修
+「代码层面仍可修」的部分。零新训练面板、零测试集访问、冻结清单零字节改动、
+`CODE_SEMANTICS` 保持 `v11.128`，`v12_supp.py plan` 仍然 48/48 放行。
+
+### 36.1 量化指控复算（工具：`compute_budget_recompute` / `audit_compute_disclosure`）
+
+| 审查数字 | HEAD 复算值 | 工具 |
+|---|---|---|
+| 12 seed/Holm-4 功效 q=0.80 为 27.5% | 0.2749（q=0.85/0.90/0.95 → 0.4435/0.6590/0.8816） | `signflip_power(12,4,q)` |
+| 精确符号翻转 p 下限 ≈0.001 | 2/2^12 = 0.00048828125；Holm 最小可达 0.001953125 | `exact_signflip_p` / `holm_min_attainable_p` |
+| randidx 死参数 202,752（1.83%） | 202,752 = 6×(16,384+16,384+1,024)，占 1.8283% | `param_breakdown` |
+| 参数总量 11,089,904 vs 11,088,512 | 完全一致（A=C=D=11,089,904，B=11,088,512，差 1,392 = 0.013%） | `count_params` |
+| MLP 隐藏维 1024 vs 1731（+69%） | 1024 / 1731（mr=6.76348876953125），宽度 +69.04% | `compute_budget_recompute` |
+| 每 token/层 FLOPs 1.23M vs 2.30M（1.87x） | 1,229,824 / 2,297,296 = 1.868x | `analytic_train_flops_token` |
+| 16 个测试窗口 | 16 × 512 = 8,192 token | 冻结清单 `eval.n_seqs_clean` |
+| **「attention 3.2x at L512」** | **无法复现：L512 下 dense/csa = 2.8927x（524,288 vs 181,248），dense/hca = 3.7654x** | `analytic_attn_flops_token` |
+
+唯一不复现的数字是冻结清单散文里的 attention 比值。3.2x 的真实来源是
+**跨长度混算**：dense@L512 的 524,288 除以 hca@L2048 的 163,840 恰好等于
+3.2；本仓库没有任何 L512 配置给出 3.2x。清单按预注册纪律保持字节不变，
+勘误记录在本节，并由报告端自动打印（见 36.3）。
+
+### 36.2 逐项定性处置（审查十一条 → HEAD 状态）
+
+| 审查问题 | 状态 | 处置 |
+|---|---|---|
+| 1.1 Dense 对照只做参数匹配，且同时改动 MLP 宽度/归一化/kernel/sink | 成立（v12 是系统级对照，已披露）；same-backbone 臂 review-17 已注册 | 无代码改动；等计算量**证据**仍需 GPU 实测 |
+| 1.2 CSA 读取 32/128 块、Dense 读 100%，不是等计算 | 成立；解析比 1.868x、attention 2.8927x；flops_matched 臂 + 1% 实测门已落地 | 本轮补上**可复算**与**勘误**（36.3） |
+| 1.3 12 个种子估计训练噪声，不等于语料代表性 | 成立；`per_document` 披露 + 两级 CI 工具已在 | 无代码改动 |
+| 2 动态分块是 cosine 阈值 + 压缩正则，不是任务驱动 | 成立（默认臂定义如此）；REINFORCE 臂（`*_task_rope`）已注册，本轮验证梯度确实到达 `delta_logit` | 无代码改动；任务驱动**证据**需 GPU 训练 |
+| 3.1 只有 PPL，没有选择归因工件 | 成立；`mech_selection.py` 可产出 recall/mass，但冻结臂上未跑 | 无代码改动（工具存在 ≠ 实验完成） |
+| 3.2 随机选择器是固定哈希、且带 202,752 死参数 | 成立；`random_each`/`random_dist`/`nearest`/`stride` 已注册为 follow-up 对照 | 无代码改动 |
+| 3.3 16 个窗口 ≠ 16 篇文档（伪重复） | 成立；`load_wikitest(with_doc_ids=True)` + `eval_ppl(doc_index=)` 已支持文档簇，但 P5T 未启用 | 无代码改动（需 ≥64 文档面板重跑） |
+| 4 12 种子下功效仅 27.5% | 成立；`signflip_power` 复算一致；最小可确认种子数 8 已在清单 | 无代码改动（≥20 种子才到 80%） |
+| 5 硬 top-k + STE 使梯度路径与推理路径不一致 | 成立（设计如此）；本轮验证软先验承载梯度、硬索引不带梯度、W_DQ/H 均非零 | 无代码改动；`mech_selection` 可量化 |
+| 6.1 单一数据集、小规模 | 成立（范围局限） | 无代码改动 |
+| 6.2 结果未归档 | 成立（source-only）；`archive_release.py` 就绪待 GPU 证据 | 无代码改动 |
+| 7 Triton kernel 路径下无法做等计算量实测 | 成立；`followup_flops_gate.py` 检测到 kernel 路径即拒发证书 | 无代码改动（正确路径是 custom_op + `register_flop`，CPU 沙箱无法验证，见 36.5） |
+
+### 36.3 本轮代码改动（唯一真实缺陷：披露文本里不可复现的比值）
+
+改动全部是「复算 + 审计 + 勘误」，不触碰任何测量语义：
+
+- `exp_lib.compute_budget_recompute(...)`：从解析模型重算冻结披露的每一个
+  数字（csa/dense 的 total 与 attention FLOPs、总比、attention 比、MLP 隐藏
+  维与宽度增益）。registry 变体不可用时返回 `variant_unavailable`，绝不猜数。
+- `exp_lib.audit_compute_disclosure(texts, recompute=..., rel_tol=1e-2)`：
+  把披露散文按 `; , . ( )` 切句，按句内最近的关键词（attention / FLOPs /
+  MLP）给每个 `Nx` / `N%` 归类，再与复算值比对；无法归类的数字
+  （如 "32x more blocks"、"100%"、"0.013% apart"）不参与审计，也不会被
+  伪造成结论。复算不可用时整份审计返回 `unavailable`，不给任何判定。
+- `v12_supp._emit_compute_budget_audit()`：报告在冻结 caveat 之后打印
+  「口径复算」段与 mismatch 表，把 `attention 3.2x at L512` 标成
+  **预注册文本勘误**，并给出 2.89x / 3.77x 与 3.2x 的跨长度来源。
+- `exp_lib.flops_matched_mlp_ratio` docstring：`2,297,523` → `2,297,296`
+  （旧值比解析值多 227，是全仓库唯一写错的地方；README/DECISION_LOG/
+  test 一直是 2,297,296），并补上 attention 比 2.8927x 的说明。
+- `test_review_fixes.py`：N127（复算数字与冻结清单逐项相等、docstring
+  不再出现 2,297,523、未知变体 fail-closed）/ N128（审计必须且只能标出
+  3.2x 一条 mismatch、1.87x 与 +69% 通过、跨长度 3.2x 的算术、不可归类
+  数字不产生结论、复算不可用时不打印勘误、报告端渲染）。
+
+### 36.4 改动后的验证记录
+
+- `test_review_fixes.py`：N127、N128 通过；受影响子集复跑全绿
+  （N115/N118/N119 analytic-FLOPs 与实测门、L1/L3*/L7*/L10/L12 报告与统计、
+  N86/N96/N97/N99 v12 冻结规则、C6/C20b/J4c/A6d manifest 与审计）。
+  本次沙箱对单次调用有时限，长训练回路的用例（如 C5b、N103）无法在一次
+  调用内跑完，故**未**声称 416/416 全绿——这一点如实记录，不当作已通过。
+- `v12_supp.py plan`：48/48 放行，四个冻结臂参数与 mr 不变。
+- 冻结清单 `confirmation_frozen.json`：字节未改（勘误只进文档与报告）。
+- `CODE_SEMANTICS` 保持 `v11.128`（新增函数与报告渲染，不改任何数值路径）。
+
+### 36.5 结论
+
+审查的十一条中，十条为「设计边界成立且已披露 / 既有工具已覆盖」，本轮
+逐项复算确认（§36.1/§36.2）；一条存在真实可修的**披露缺陷**——冻结清单
+散文里的 attention 3.2x 在本仓库任何 L512 配置下都复现不出来（真实值
+2.89x，3.2x 是 dense@L512 与 hca@L2048 的跨长度混算），另有一处 docstring
+数字笔误。本轮以「解析复算 + 文本审计 + 报告勘误 + N127/N128」关闭该缺陷，
+同时保持「工具存在 ≠ 实验完成」的口径：等计算量实测（含 Triton kernel 的
+custom_op + `register_flop` 计数）、任务驱动分段的训练证据、≥64 文档面板与
+文档级 bootstrap、≥20 种子的 80% 功效、真实 checkpoint 上的选择归因、
+能耗测量，全部仍需 GPU 与真实数据运行，本仓库不因本轮改动产生任何新的
+性能主张。

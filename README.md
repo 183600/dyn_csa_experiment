@@ -417,6 +417,68 @@ the seven rope arms, `mech_selection.py smoke` unchanged
 --verify-registry` reports only the intentional pre-freeze blockers, and
 `v12_supp.py plan` is untouched by the round.
 
+## Review-19 hardening (what changed)
+
+Verification-first pass over the eleven-part methodological review of the
+equal-compute / dynamic-segmentation / statistical-power claims.  Every
+quantitative claim was recomputed at HEAD and holds as disclosed: power at
+12 seeds/Holm-4 is 0.2749 (0.4435 / 0.6590 / 0.8816 at q = 0.85 / 0.90 /
+0.95), the exact p floor is 2/2^12 = 0.000488 with a Holm floor of
+0.001953125, the randidx arm carries 202,752 dead indexer parameters
+(1.8283%), total parameters are 11,089,904 (A=C=D) vs 11,088,512 (B) with
+MLP hidden 1024 vs 1731 (+69.04%), per-token training FLOPs are 1,229,824
+vs 2,297,296 (1.868x) and the frozen panel is 16 windows = 8,192 tokens.
+The design-boundary findings (parameter-matched rather than compute-matched
+dense control, cosine-threshold rather than task-learned segmentation,
+fixed-hash random selector with dead parameters, 27.5% power, window-unit
+panel, STE selection, single dataset, unarchived results) are the retired-v12
+limitations the follow-up protocol exists to remove; the item-by-item
+disposition is `docs/design_notes.md` §36.  No new training panel, no
+test-split access, no frozen-manifest byte change, no measurement-semantics
+change (`CODE_SEMANTICS` stays `v11.128`), `v12_supp.py plan` still admits
+48/48 records.  The one genuine defect this round found is a **disclosure**
+defect, and it is closed:
+
+- **The frozen prose quoted a ratio no code path reproduces.**
+  `compute_budget_disclosure.flops` and the main comparison's
+  `interpretation_caveat` both say "attention 3.2x at L512", but the
+  analytical model gives 524,288 / 181,248 = **2.8927x** for dense/csa at
+  L512 (and 3.7654x for dense/hca).  3.2x is dense-attention@L512 over
+  hca-attention@L2048 (524,288 / 163,840) — a cross-length mix; no L512
+  configuration in this repository yields it.  The manifest is frozen
+  byte-identical by discipline, so the correction lives in the docs and in
+  the report: `exp_lib.compute_budget_recompute` re-derives every number of
+  the disclosure, `exp_lib.audit_compute_disclosure` classifies each `Nx` /
+  `N%` claim by its own clause (attention / FLOPs / MLP) and flags anything
+  more than 1% off, and `v12_supp._emit_compute_budget_audit` prints the
+  recompute plus a mismatch table that labels the 3.2x claim a
+  **pre-registration erratum**.  Unclassifiable numbers ("32x more blocks",
+  "100%", "0.013% apart") are not audited, and an unavailable recompute
+  yields no verdict at all rather than a guessed one.
+- **A docstring number was wrong.**  `flops_matched_mlp_ratio`'s docstring
+  said the param-matched dense arm costs 2,297,523 FLOPs/token/layer; the
+  model (and every other document, test and the frozen manifest) says
+  2,297,296.  Fixed, and the docstring now also records the 2.8927x
+  attention ratio.
+
+Verification after the change: N127 (recompute equals the frozen numbers
+item by item, the old 2,297,523 typo stays gone, an unloaded variant is
+reported rather than guessed) and N128 (the audit flags exactly the 3.2x
+claim, accepts 1.87x / +69%, reproduces the cross-length arithmetic,
+invents no claim for unclassifiable numbers, and prints no erratum when the
+recompute is unavailable) pass, together with the affected subset (N115 /
+N118 / N119 analytic FLOPs + measured-FLOPs gate, L1 / L3* / L7* / L10 /
+L12 report and statistics, N86 / N96 / N97 / N99 v12 frozen-rule helpers,
+C6 / C20b / J4c / A6d manifest and audit checks).  The review sandbox caps a
+single call's runtime, so the long training-loop checks (e.g. C5b, N103)
+could not be completed end-to-end here; that is recorded as *not run* rather
+than claimed green.  The remaining items — measured equal-compute evidence
+(including custom-op `register_flop` accounting for the Triton path),
+task-learned segmentation evidence, a ≥64-document panel with
+document-level bootstrap, ≥20 seeds for 80% power, selection attribution on
+real checkpoints and energy measurement — need GPU runs and produce no new
+performance claim from this round.
+
 ## Repository layout
 
 The repository keeps only **source code, driver scripts and design

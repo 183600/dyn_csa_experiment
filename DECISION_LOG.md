@@ -843,3 +843,54 @@ existence is not evidence; the follow-up `--require-ready` blockers are
 unchanged, and the review's remaining items (single dataset, length-
 extrapolation semantics, evidence archiving) stay documented scope
 limitations until the GPU work runs.
+
+---
+
+## 2026-11-26 (later) — review 19: equal-compute / segmentation / power review verified; the unreproducible "attention 3.2x" disclosure corrected
+
+Context: an eleven-part methodological review of the equal-compute claim, the
+dynamic-segmentation mechanism, the statistical power and the evidence
+release. Baseline before this round: the follow-up protocol already carries
+the compute-matched arm, the segmentation-control family (review-18), the
+power simulation and the measured-FLOPs gate (review-16), and the frozen
+manifest discloses the confounds — but the prose was never audited against
+the analytical model, so a quoted ratio could drift.
+
+1. **Every quantitative claim re-verified at HEAD and holds** (power
+   0.2749 at q=0.80 with 0.4435/0.6590/0.8816 at q=0.85/0.90/0.95, exact p
+   floor 2/2^12=0.000488, Holm floor 0.001953125, randidx dead params 202,752
+   = 1.8283%, total params 11,089,904 vs 11,088,512, MLP hidden 1024 vs 1731
+   = +69.04%, analytic FLOPs 1,229,824 vs 2,297,296 = 1.868x, frozen panel
+   16 windows = 8,192 tokens). `docs/design_notes.md` §36.1 records the
+   tool used for each number.
+2. **One number did not hold: "attention 3.2x at L512".** The analytical
+   model gives 524,288/181,248 = 2.8927x at L512 (dense/hca: 3.7654x); 3.2x
+   is dense@L512 over hca@L2048 (524,288/163,840), a cross-length mix that no
+   L512 configuration in this repository reproduces. The manifest stays
+   byte-identical (pre-registration), so the correction is code-side:
+   `exp_lib.compute_budget_recompute` re-derives the disclosure,
+   `exp_lib.audit_compute_disclosure` classifies every `Nx`/`N%` claim by its
+   own clause and flags >1% deviations (unclassifiable numbers are not
+   audited; an unavailable recompute yields no verdict), and
+   `v12_supp._emit_compute_budget_audit` prints the recompute plus a mismatch
+   table labelling the claim a pre-registration erratum.
+3. **One docstring typo fixed:** `flops_matched_mlp_ratio` said 2,297,523
+   where the model (and every other document/test) says 2,297,296.
+4. **Tests:** N127 (recompute == frozen numbers item by item, the old typo
+   stays gone, an unregistered variant is reported not guessed) and N128
+   (exactly one mismatch — 3.2x — with 1.87x and +69% accepted, the
+   cross-length arithmetic reproduced, no claim invented for unclassifiable
+   numbers, no erratum printed when the recompute is unavailable).
+5. **Frozen surfaces untouched:** v12 manifest byte-identical, no arm list
+   changed, `CODE_SEMANTICS` stays `v11.128`, `v12_supp.py plan` still admits
+   48/48 records.
+
+**What this does NOT do.** It trains nothing, runs no measured-FLOPs
+certificate (the Triton path is still refused by `followup_flops_gate.py`;
+the correct fix is a `torch.library.custom_op` wrapper with
+`register_flop`, which this CPU sandbox cannot validate), runs no power
+simulation, produces no selection-attribution reading on real checkpoints,
+measures no energy and never touches the test split. The verification record
+is honest about coverage: N127/N128 plus the affected subset pass, but the
+long training-loop checks (C5b, N103, ...) exceeded the review sandbox's
+per-call limit and are recorded as *not run*, not as green.
