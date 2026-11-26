@@ -257,6 +257,26 @@ def _registry_errors(plan: dict, repo: Path) -> list[str]:
                     f"planning source (run-cfg flops_matched set -> flops_matched_mlp_ratio) "
                     f"and that the 1% profiler gate, not the analytical equality, accepts "
                     f"the arm as compute-matched")
+        # review-17: a declared same_backbone control must really resolve to
+        # the isolation arm — cosine-normalized q/k (scale 1.0), a sink, the
+        # shared qk RMSNorm and RoPE.  A plain dense variant under this
+        # `matching` label would silently re-create the confound the control
+        # exists to remove, so the resolved cfg is checked field by field.
+        if str(entry.get("matching", "")) == "same_backbone":
+            _bad = [f for f in (
+                "full_cosine", "full_sink", "qk_norm", "rope") if not all(bool(getattr(c, f, False)) for c in cfgs)]
+            if _bad:
+                errors.append(
+                    f"{eid}: a same_backbone control must resolve {variant!r} with "
+                    f"full_cosine/full_sink/qk_norm/rope all true on every layer; "
+                    f"missing {sorted(_bad)} — a plain dense arm cannot carry the "
+                    f"same-backbone isolation label")
+            _note = str(entry.get("note", ""))
+            if "scale" not in _note or "sink" not in _note:
+                errors.append(
+                    f"{eid}: a same_backbone control must document what it matches "
+                    f"(cosine normalization at scale 1.0, the sink, the kernel family) "
+                    f"and that the remaining deltas are the mechanism under test")
     return errors
 
 
@@ -345,6 +365,14 @@ def validate(plan: dict, require_ready: bool = False, *,
             need(False, "dense control matching must be hashable")
     need({"parameter_count", "measured_training_flops"} <= dense_kinds,
          "separate parameter-matched and measured-FLOPs-matched Dense controls are required")
+    # review-17: the protocol's mechanism-isolation section requires a
+    # single-factor ("same-backbone") version of the dense comparison before
+    # any mechanism wording, so the design record must declare one — a plan
+    # that only carries the two capacity-matched references cannot support
+    # the selector-only/mechanism contrasts the protocol promises.
+    need("same_backbone" in dense_kinds,
+         "a same_backbone dense isolation control is required "
+         "(FOLLOWUP mechanism-isolation: normalization/scale/sink/kernel-matched dense arm)")
 
     seeds = design.get("seeds")
     need(isinstance(seeds, list) and len(seeds) >= 12,

@@ -75,6 +75,14 @@ owner 退役 v12 证据作为主张依据（见顶部引注），follow-up 协�
 - **验证器绑定功效工件（N117）**：`power_simulation_completed = true` 必须携带 `power_simulation_artifact`（工具输出 JSON），study/假设族/种子面板/alpha/目标/min_power 六项对账，篡改即拒——布尔位不再能拍脑袋置。
 - **`followup_flops_gate.py`——实测 FLOPs 接受门**：测量用 `torch.utils.flop_counter.FlopCounterMode`（aten 调度层，唯一能归因 `scaled_dot_product_attention` 的计数器——`torch.profiler(with_flops=True)` 只覆盖 mm/bmm/addmm，注意力内核一律静默漏计，profiler 通道降级为披露表）；重复块必须逐位复现；自定义 CSA Triton 内核路径拒绝测量；`gate` 对总训练 FLOPs 施加 1% 容差，CPU 冒烟永不签证书。CPU 冒烟实测已给出诚实的理由：tiny 几何下逐行 eager CSA 实现的 op 级计算量约为 dense SDPA 路径的 3 倍——解析规划模型看不到的实现开销。
 
+## 评审十七硬化（review 17）
+
+对一份十一部分的外部方法学审查（实现正确性 / 实验设计 / 统计推断）做核验优先的复核。审查的设计边界结论对照 HEAD 复核后**全部成立且已披露**（v12 覆盖缺口、v6-v11 验证集复用、稠密臂混杂、动态分块非任务学习、12 种子功效、冻结面板以窗口为单位、固定哈希随机对照、能耗未测）；逐项判定见 `docs/design_notes.md` §34。零训练、零 test 访问、冻结清单零字节改动、`CODE_SEMANTICS` 保持 `v11.128`。仍可在代码层面修复的一个缺口本轮关闭：
+
+- **同骨架稠密隔离对照注册为正式臂**：follow-up 协议的机制隔离一节要求稠密对照的「单因素版本」，但此前只有两个容量参照（`full_rope` 参数匹配、`full_rope_flops_matched` 算力规划），v12 式混杂（q/k 归一化、注意力缩放、sink、kernel）没有对照臂能移除。`full_rope_cos_sink`（registry-only，不训练任何面板）是携带 CSA 臂 q/k 管线策略的稠密注意力：共享 qk RMSNorm、scale 1.0 的余弦归一化 q/k、可学习的逐头 sink 与 RoPE；稠密层**没有 sink 才走 SDPA**，因此 sink 同时把它路由到与 CSA 各层相同的手写 eager `_sink_attn_loop` kernel 族。残余差异（逐 token K/V 对比压缩块 KV 管线、q/k 归一化次序、逐 token 滑窗分支、投影结构）即被检验的机制本身，随臂披露而非隐藏。follow-up 模板以 `dense_same_backbone` 控制项声明之，`validate_followup_design.py` **强制要求**存在 `same_backbone` 稠密对照并逐字段核验声明的变体在每层真的解析出 `full_cosine/full_sink/qk_norm/rope`——普通稠密臂不再能冒用该隔离标签（N120）。
+
+改动后的验证：`test_review_fixes.py` 421/421（新增 N120）、`test_open_block.py` 15/15、`audit_gates.py causality` 七个 rope 臂全过、`validate_followup_design.py --verify-registry` 接受模板（其余失败项均是有意的 pre-freeze 阻塞）、`v12_supp.py plan` 不受本轮影响。
+
 ## 仓库结构
 
 仓库只保留**源码、驱动脚本与设计文档**。所有实验结果目录（`results_*/`）、

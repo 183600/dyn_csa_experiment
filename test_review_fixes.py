@@ -4051,6 +4051,72 @@ def t_followup_flops_measure_smoke():
     assert bad['status'] == 'refused' and any('make_layer_cfgs' in p for p in bad['problems'])
 
 
+def t_same_backbone_dense_control_registered():
+    """Review-17: the protocol's same-backbone (single-factor isolation)
+    dense control exists as a registry arm and is bound into the follow-up
+    design: every layer resolves to a full-attention cfg carrying the CSA
+    arm's cosine normalization at scale 1.0, the learned sink, the shared
+    qk RMSNorm and RoPE (the sink also routes the dense path through the
+    manual eager kernel family instead of SDPA); the template declares it
+    under matching=same_backbone; the validator requires the control and
+    rejects a plain dense variant carrying that label."""
+    import pathlib
+    import torch
+    import validate_followup_design as VF
+
+    cfgs = L.make_layer_cfgs(3, 'full_rope_cos_sink')
+    assert len(cfgs) == 3
+    for c in cfgs:
+        assert str(getattr(c, 'kind', '')) == 'full'
+        assert bool(getattr(c, 'full_cosine', False)), 'cosine q/k at scale 1.0 is the point of the arm'
+        assert bool(getattr(c, 'full_sink', False)), 'the sink is the confound this arm removes'
+        assert bool(getattr(c, 'qk_norm', False)), 'the shared qk RMSNorm'
+        assert bool(getattr(c, 'rope', False)), 'the shared position encoding'
+    # the built module really carries the learned sink + qk RMSNorm on every
+    # layer, and a finite forward/backward exists (training mode takes the
+    # manual sink row kernel, not SDPA)
+    torch.manual_seed(7)
+    model = L.SmallGPT(64, 32, 2, 2, 16, 96, [_copy.deepcopy(c) for c in cfgs], mlp_ratio=4.0)
+    for blk in model.blocks:
+        assert blk.attn.sink is not None
+        assert blk.attn.q_norm is not None and blk.attn.kv_norm is not None
+    model.train()
+    ids = torch.randint(0, 64, (2, 96))
+    tgt = torch.randint(0, 64, (2, 96))
+    loss = model(ids, targets=tgt, vocab=64)
+    loss.backward()
+    assert torch.isfinite(loss).all(), 'the same-backbone dense arm must train'
+    # plain full_rope stays sink-free: the frozen arm's semantics are untouched
+    plain = L.make_layer_cfgs(2, 'full_rope')
+    model2 = L.SmallGPT(64, 32, 2, 2, 16, 96, [_copy.deepcopy(c) for c in plain], mlp_ratio=4.0)
+    assert all(blk.attn.sink is None for blk in model2.blocks)
+    # the arm is registry-only: it stays in the aligned-dense family, not in
+    # any historical panel list, and is not parameter- or FLOPs-matched by
+    # registration alone
+    assert 'full_rope_cos_sink' in V7.ALIGNED_DENSE_VARIANTS
+    assert 'full_rope_cos_sink' not in V7.ROPE_VARIANTS
+    assert 'full_rope_cos_sink' not in (set(L.PARAM_MATCHED) | set(V7.PARAM_MATCHED_V7))
+    # the template declares the control and the validator accepts it
+    plan = json.load(open(os.path.join(REPO, 'followup_design.template.json'), encoding='utf-8'))
+    entries = [d for d in plan['design']['dense_controls'] if d.get('matching') == 'same_backbone']
+    assert entries and entries[0]['variant'] == 'full_rope_cos_sink'
+    errs = VF.validate(plan, verify_registry=True, repo=pathlib.Path(REPO))
+    assert not any('same_backbone' in e for e in errs), errs
+    # removing the control fails the design check
+    missing = _copy.deepcopy(plan)
+    missing['design']['dense_controls'] = [d for d in missing['design']['dense_controls']
+                                           if d.get('matching') != 'same_backbone']
+    errs = VF.validate(missing, verify_registry=True, repo=pathlib.Path(REPO))
+    assert any('a same_backbone dense isolation control is required' in e for e in errs), errs
+    # a plain dense variant under the same_backbone label is rejected
+    bad = _copy.deepcopy(plan)
+    for d in bad['design']['dense_controls']:
+        if d.get('matching') == 'same_backbone':
+            d['variant'] = 'full_rope'
+    errs = VF.validate(bad, verify_registry=True, repo=pathlib.Path(REPO))
+    assert any('same_backbone control must resolve' in e for e in errs), errs
+
+
 def t_refreeze_round_cannot_confirm():
     """Review 10, issue 15: a post-test re-freeze cannot issue CONFIRMED
     labels (the same held-out slice was already observed)."""
@@ -14315,6 +14381,7 @@ def main():
     _check('N117 validator binds the power-simulation artifact', t_followup_validator_binds_power_artifact)
     _check('N118 follow-up measured-FLOPs gate math (1% + fail-closed)', t_followup_flops_gate_math)
     _check('N119 follow-up FLOPs measurement harness smoke (CPU)', t_followup_flops_measure_smoke)
+    _check('N120 same-backbone dense isolation control (review-17)', t_same_backbone_dense_control_registered)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

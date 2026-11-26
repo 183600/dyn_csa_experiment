@@ -1970,3 +1970,71 @@ full_rope 403M FLOPs/步、csa_fixed_rope 1.17G FLOPs/步——**逐行 eager
 
 `CODE_SEMANTICS` 保持 `v11.128`；`v12_supp.py plan` 48/48 与
 `test_open_block.py` 15/15 未受影响（本轮零核心库改动）。
+
+## 34. review 17（外部方法学审查：实现正确性 / 实验设计 / 统计推断）的逐项核验与代码处置
+
+审查分三个层面（实现正确性、实验设计有效性、统计推断有效性），共十一个主要部分。
+本轮立场与历次一致：核验优先，设计边界如实成立则保持披露，只有代码层面
+可修的缺口才动手。零训练、零 test 访问、冻结清单零字节改动、
+`CODE_SEMANTICS` 保持 `v11.128`。
+
+### 34.1 十一部分逐项判定（对照 HEAD 复核）
+
+| # | 审查主张 | 复核结论 | 现状 |
+|---|---|---|---|
+| 1 | v12 确认轮未覆盖 Dynamic CSA / HCA；v12 的 CONFIRMED 不能外推 | 成立（设计边界，已披露） | `confirmation_frozen.json` arms = csa_fixed_rope / full_rope / randidx / allblocks，scope.not_covered 原文即声明 dynamic/HCA 不在冻结范围；2026-11-26 owner 决策已退役 v12 作为主张依据（README 引注），Dynamic/HCA 证据只能出自 follow-up 协议的 2×2 全因子 + 双 Dense 参照（模板已声明四臂） |
+| 2 | v6-v11 同一验证集重复使用 → 自适应过拟合风险 | 成立（已披露） | README「Evidence levels」明示 v6-v11 为 exploratory；探索/确认分离 + P5T 冻结锁 + 单次访问策略是现行机制；审查建议的「先冻结再访问 test」正是 follow-up 协议 §Freeze and reporting rules 的条目 1-9 |
+| 3 | Dense 对照非单因素（Q/K 归一化、scale、KV、sink 均不同）；参数量匹配 ≠ FLOPs 匹配 | 成立（已披露），**本轮关闭最后一个可修缺口** | 三对照中：原始 Dense（`full_rope`，参数匹配）与 FLOPs 匹配（`full_rope_flops_matched` + 实测门）已在；**同骨架 Dense 此前缺失** —— 仅有 `full_rope_cos`（余弦归一化、无 sink、SDPA kernel）。本轮注册 `full_rope_cos_sink`（见 34.2），模板声明 `dense_same_backbone`，验证器强制要求并逐字段核验（N120） |
+| 4 | `csa_dynamic` 的边界由余弦阈值 + 压缩正则决定，LM 交叉熵不经由离散切分反传；`csa_dynamic_task` 才是任务损失路线 | 成立（已披露且命名已分离） | gate = sigmoid(前缀均值 + delta_logit)（纯因果前缀统计），硬切分 detach，LM 梯度不可达；`make_layer_cfgs` 注释与 README 明示 threshold 臂「must not be described as task-learned」；`boundary_policy='reinforce'` 臂经 `boundary_policy_term`（REINFORCE，EMA baseline，符号由 N120 前的符号锁测试锁定）把 (CE-baseline)*logp/n 并入训练损失；`train_objective` 描述符逐层记录 comp_lambda_mult |
+| 5 | 12 种子 Holm 保守功效 ≈0.275；p_min=2/2^12 ≠ 功效 | 成立（已披露且已工具化） | v6 修订的 minimum-power gate（q=0.80）在 P5T 加载期强制执行；`followup_power_sim.py`（review-16）用与确认性分析同源的 `exact_signflip_p`+`holm_adjust` 做预冻结功效仿真 + `--seed-sweep` 推荐最小种子数；验证器把功效工件六项对账绑定进 `--require-ready`（N117）。审查建议「功效模拟先行、按需加种子」即协议现状 |
+| 6 | 16 窗口面板把窗口当独立样本；应按文档聚类 | 成立（已披露，路径已具备） | P5T 记录单位 = 评估窗口（README v12 行明示）；`eval_ppl(doc_index=...)` 支持真文档级 NLL/token 聚类（t_doc_index_eval_aggregates_real_documents 锁定，含采样评估与截断/错位 fail-closed）；follow-up 协议 §Evaluation population 明确 64 文档下限、文档级 bootstrap ≥10k 次、窗口不得当独立文档——v12 冻结面板不改（预注册不可变），文档级统计由 follow-up 承接 |
+| 7 | PPL 应 token-pooled，不应窗口算术平均 | 成立（已修复：review-3/12） | `aggregate` 以 `ppl_pooled=exp(ΣNLL/Σtok)` 为 `ppl_primary`，种子均值/中位/IQR 并列；记录携带 nll_sum/n_tokens/逐行 NLL（doc_index 时逐文档）；review-12 起 v7/v10 长度节同样统一 pooled 并标注回退 |
+| 8 | 固定哈希随机对照 ≠ 一般随机稀疏基线；死参数 1.83% | 成立（已披露；对照族已补齐） | `lightning_indexer` 的 'random' 模式 = (row*12.9898+col*78.233) 冻结哈希（本仓复核实测在 exp_lib.py）；review-14 补齐 `random_each`/`random_dist`/`nearest`/`stride` 四模式，review-15 加 `pattern_seed`（连接模式种子独立于训练种子）；Oracle/recall = `mech_selection.py`（review-14/15，mass_covered 分母 bug 已修，N114 锁定），真实面板工件待 GPU 运行（README 明示 not_verifiable_locally） |
+| 9 | 效率结论需实测：FLOPs/吞吐/延迟/显存/KV/能耗分开测 | 成立（部分已工具化；能耗未测是硬件边界） | `followup_flops_gate.py`（review-16）：FlopCounterMode 实测 + 1% 门 + 自定义内核拒绝 + CPU 永不签证书；`measure_efficiency(_sweep)` 记录吞吐/时延；`audit_gates.efficiency_pairs` 的同形/同设备/KV 语义配对门；能耗未测持续披露 |
+| 10 | 动态分块需边界语义对齐、Fixed-vs-Dynamic 消融矩阵、长度泛化三层证据 | 成立（协议承接；探针已有） | 边界对齐：`fuse_analysis.py`/boundary-F1（v7/v10 已跑，结论保持探索性措辞）；审查的 A-F 六格矩阵由 follow-up 2×2 全因子 + `dense_same_backbone`/`allblocks`/随机对照/Oracle 承接；长度外推 = v7 P1L / v10 P3M（README 明示为 512 训练长度外推探针，非长上下文训练） |
+| 11 | 逐函数代码审计（分段器因果性 / CSA-HCA 前向 / top-k 梯度 / 池化 / 训练目标 / 评估 token 集 / 统计） | 复核未见新缺陷（既有审计链完整） | 分段器：gate 为前缀均值（只依赖 ≤i 的相似度），`audit_gates causality` 前缀不变性 + 未来扰动 + 严格不等式门、`test_open_block` 前缀不变性/未来梯度；CSA/HCA 前向：`csa_kernels.py` torch 参考孪生 + G0 统计等价门 + 行分块等价契约；HCA = 每层读全部粗块（`pool_blocks_single`、无 top-k）+ 滑窗 + sink，与 CSA（变长块、overlap 池化、top-k）机制不同；top-k 硬选择的 STE 软先验在前向值中抵消、反向重建对偶 Jacob（README M0/G0 节）；训练目标：review-12 已修 comp_lambda_mult 记录；评估 token 集：P5T 准入门（同切片指纹/配方签名）+ `ce_loss`/`eval_ppl` 目标列契约；统计：N1-N119 全链回归 |
+
+### 34.2 本轮唯一的代码改动：同骨架稠密隔离对照
+
+- `v7_supp.py`：注册 `full_rope_cos_sink` =
+  `AttnCfgRope(kind='full', rope=True, rope_dim=16, qk_norm=True,
+  full_cosine=True, full_sink=True)`（registry-only；不进任何历史面板）。
+  控制变量：共享 qk RMSNorm、余弦归一化 q/k @ scale 1.0、可学习逐头 sink、
+  RoPE；sink 的存在使稠密路径必然走手写 `_sink_attn_loop`（无 sink 才走
+  SDPA），kernel 族与 CSA 对齐。残余差异（逐 token K/V vs 压缩块 KV 管线、
+  q/k 归一化次序、逐 token 滑窗分支、投影结构）= 被检验机制本身，随臂注释
+  披露。`ALIGNED_DENSE_VARIANTS` 增补该臂。
+- `followup_design.template.json`：`dense_controls` 新增
+  `{"id": "dense_same_backbone", "matching": "same_backbone",
+  "variant": "full_rope_cos_sink", ...note 披露控制项与残余项...}`。
+- `validate_followup_design.py`：设计层新增「必须声明 same_backbone 稠密
+  对照」；registry 层对该 matching 逐字段核验 full_cosine/full_sink/qk_norm/
+  rope 全真，且 note 必须写明匹配内容（scale/sink/kernel）与残余机制项——
+  普通稠密臂不能冒用隔离标签。
+- `test_review_fixes.py`：N120（注册解析/模块 sink+qk_norm 实建/前向反向
+  有限/full_rope 语义不变/模板声明/验证器接受-缺失拒绝-冒用拒绝）。
+- `FOLLOWUP_CONFIRMATORY_PROTOCOL.md`：Required arms 表加 same-backbone
+  行；机制隔离一节标注「已注册」并列出残余差异清单；验证器一节同步。
+- `README.md` / `README_zh.md`：review-17 hardening 节。
+- 冻结清单 `confirmation_frozen.json` 零字节改动；`v12_supp.py` / P5T /
+  历史面板 arm 列表零改动（`full_rope` 保持无 sink，冻结语义不受影响）。
+
+### 34.3 结论
+
+审查的十一部分中，十个属于「设计边界成立且已披露 / 既有工具已覆盖」；
+本轮独立复核未发现新的实现缺陷；唯一可修缺口（协议要求单因素稠密对照但
+注册表与模板均无该臂）本轮以 `full_rope_cos_sink` + 模板声明 + 验证器强制
++ N120 回归关闭。审查建议的 P0 三项（区分研究假设、公平对照组、四因素
+矩阵）中，第 1、3 项在仓库现状与 follow-up 协议中已满足，第 2 项的最后一
+个空洞（Same-backbone Dense）至此补齐；P1/P2 各项分别由 mech_selection /
+followup_power_sim / followup_flops_gate / archive_release 承接，均需 GPU
+与真实数据运行后才能产生证据（工具存在 ≠ 实验完成，README 一贯口径不变）。
+
+### 34.4 改动后的验证记录
+
+`test_review_fixes.py` 421/421（N120 新增，历史 420 项全绿无回归）；
+`test_open_block.py` 15/15；`audit_gates.py causality` PASS（七个 rope 臂：
+label shift + 前缀不变性 + 严格可读门 + 解码一致性）；
+`validate_followup_design.py followup_design.template.json --verify-registry`
+零注册错误（剩余 8 项均为有意的 pre-freeze 阻塞：功效仿真未跑 + 六个
+算法门未记录）；`v12_supp.py plan` 不受本轮影响；冻结清单字节比对不变。

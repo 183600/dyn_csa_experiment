@@ -23,7 +23,9 @@
     "dense_controls": [
       {"id": "dense_param_matched", "matching": "parameter_count", "variant": "full_rope"},
       {"id": "dense_flops_matched", "matching": "measured_training_flops", "variant": "full_rope_flops_matched",
-       "note": "capacity planning is analytical via exp_lib.flops_matched_mlp_ratio (run-cfg flops_matched set + flops_match_ref; frozen-config solution mr=689/256=2.69140625); the arm is compute-matched ONLY when the profiler-measured total training FLOPs fall within 1% of the reference — the analytical equality is never the certificate"}
+       "note": "capacity planning is analytical via exp_lib.flops_matched_mlp_ratio (run-cfg flops_matched set + flops_match_ref; frozen-config solution mr=689/256=2.69140625); the arm is compute-matched ONLY when the profiler-measured total training FLOPs fall within 1% of the reference — the analytical equality is never the certificate"},
+      {"id": "dense_same_backbone", "matching": "same_backbone", "variant": "full_rope_cos_sink",
+       "note": "same-backbone isolation reference (FOLLOWUP mechanism-isolation): q/k RMSNorm + cosine normalization at scale 1.0, the CSA sink, RoPE, and the manual eager sink-attention kernel family — the dense path only takes SDPA when the layer has no sink, so with full_sink=True it shares the CSA kernel family. Remaining deltas ARE the mechanism under test and must stay disclosed: per-token K/V vs the compressed-block KV pipeline, q/k normalization order (dense RMSNorm->RoPE->L2 vs CSA L2->RMSNorm->RoPE), the per-token sliding-window branch, and the projection structure. Capacity is a declared knob, not a fixed one: mr=4 for an unscaled isolation look, or the run-cfg matched set solves parameter equality against the reference sparse arm. It is a system-level isolation reference, never an equal-compute or equal-parameter claim"}
     ],
     "selection_controls": [
       {"id": "csa_random_fixed_hash", "variant": "csa_fixed_rope_randidx", "pattern_seed": 0},

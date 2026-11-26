@@ -316,6 +316,46 @@ change, `CODE_SEMANTICS` stays `v11.128`, `v12_supp.py plan` still 48/48,
   ~3x the op-level FLOPs of the dense SDPA path at a tiny geometry — an
   implementation cost the analytical planning model does not see.
 
+## Review-17 hardening (what changed)
+
+Verification-first pass over an eleven-part external methodological review
+(implementation correctness / experiment design / statistical inference).  The
+review's design-boundary findings were re-verified against HEAD and all hold
+as disclosed (v12 coverage gap, validation-split reuse in v6-v11, dense-arm
+confounds, threshold-not-task-learned dynamic chunking, 12-seed power,
+window-unit frozen panel, fixed-hash random control, unmeasured energy);
+the item-by-item disposition is `docs/design_notes.md` §34.  No new training
+panel, no test-split access, no frozen-manifest byte change, no
+measurement-semantics change (`CODE_SEMANTICS` stays `v11.128`).  The one gap
+that was still fixable in code is closed:
+
+- **The same-backbone dense isolation control is now a registered arm.**
+  The follow-up protocol's mechanism-isolation section requires a
+  single-factor version of the dense comparison, but until now only the two
+  capacity references existed (`full_rope` parameter-matched,
+  `full_rope_flops_matched` compute-planned) — the v12-style confounds
+  (q/k normalization, attention scale, sink, kernel) had no arm that removed
+  them.  `full_rope_cos_sink` (registry-only, trains nothing) is dense
+  attention carrying the CSA arm's q/k pipeline policy: the shared qk
+  RMSNorm, cosine-normalized q/k at scale 1.0, the learned per-head sink and
+  RoPE; because a dense layer only takes SDPA when it has NO sink, the sink
+  also routes this arm through the same manual eager `_sink_attn_loop`
+  kernel family the CSA layers use.  The residual deltas (per-token K/V vs
+  the compressed-block KV pipeline, the q/k normalization ORDER, the
+  per-token sliding-window branch, the projection structure) are the
+  mechanism under test and are documented on the arm, not hidden.  The
+  follow-up template declares it as the `dense_same_backbone` control and
+  `validate_followup_design.py` now both REQUIRES a `same_backbone` dense
+  control and verifies field-by-field that the declared variant really
+  resolves `full_cosine/full_sink/qk_norm/rope` on every layer — a plain
+  dense arm can no longer wear the isolation label (N120).
+
+Verification after the change: `test_review_fixes.py` 421/421 (N120 added),
+`test_open_block.py` 15/15, `audit_gates.py causality` PASS over the seven
+rope arms, `validate_followup_design.py --verify-registry` accepts the
+template (its remaining blockers are the intentional pre-freeze ones), and
+`v12_supp.py plan` is untouched by the round.
+
 ## Repository layout
 
 The repository keeps only **source code, driver scripts and design

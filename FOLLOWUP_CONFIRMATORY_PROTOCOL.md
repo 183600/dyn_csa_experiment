@@ -25,6 +25,7 @@ fixed/dynamic mismatch, a missing variant, or a Dense control that is not a
 | Segmentation | dynamic | online/causal dynamic boundaries |
 | Reference | Dense, parameter matched | match trainable parameter count |
 | Reference | Dense, FLOPs matched | match measured training FLOPs |
+| Reference | Dense, same-backbone | match normalization/scale/sink/kernel; the reading rule is the only structural treatment left |
 
 Required factorial cells:
 
@@ -33,8 +34,11 @@ Required factorial cells:
 3. HCA + fixed segmentation
 4. HCA + dynamic segmentation
 
-Add two distinct Dense reference arms. Parameter matching and compute matching
-are different estimands and must never be conflated. A parameter-matched Dense
+Add two distinct Dense capacity references and one same-backbone isolation
+reference. Parameter matching and compute matching are different estimands and
+must never be conflated; the same-backbone arm is neither — it exists to isolate
+the reading-rule mechanism from the normalization/scale/sink/kernel policy
+around it. A parameter-matched Dense
 arm does not establish equal-compute efficiency; a FLOPs-matched Dense arm
 need not have equal parameter count.
 
@@ -70,6 +74,25 @@ any mechanism wording:
   SDPA), and dtype identical. A single-factor version of the current frozen
   dense comparison is required; the v12 dense arm differs in MLP width, FLOPs,
   kernel, q/kv normalization and sink, so it is a system-level reference only.
+  **The same-backbone dense arm is now registered** (review-17):
+  `full_rope_cos_sink` — dense attention carrying the CSA arm's q/k pipeline
+  policy (shared qk RMSNorm, cosine-normalized q/k at scale 1.0), the learned
+  per-head sink, and RoPE; the sink additionally routes the dense path through
+  the manual eager `_sink_attn_loop` kernel family (SDPA is only taken when a
+  dense layer has no sink), so the dense-vs-CSA kernel confound is closed too.
+  Declare it in `design.dense_controls` with `matching = "same_backbone"`
+  (the template entry is `dense_same_backbone`); the validator both REQUIRES
+  such a control and checks the resolved cfg really carries
+  `full_cosine/full_sink/qk_norm/rope` on every layer, so a plain dense arm
+  cannot silently wear the label.  The residual deltas (per-token K/V vs the
+  compressed-block KV pipeline, the q/k normalization ORDER, the per-token
+  sliding-window branch, the projection structure) ARE the mechanism under
+  test and stay disclosed: this arm is a single-factor isolation reference
+  between the reading rule and everything around it, not an equal-compute or
+  equal-parameter claim; its capacity knob is declared by the study (mr=4, or
+  the run-cfg `matched` set for parameter equality with the reference sparse
+  arm).  `full_rope_cos` (review-14's cosine-only twin, no sink) remains
+  registered for the normalization-only reading.
 - **Random-selection variants.** The current random-indexer control is a FIXED
   deterministic hash pattern (identical for every seed/layer/step) and its
   indexer projections are dead parameters (~1.8% capacity), so it supports only
@@ -243,10 +266,13 @@ python followup_flops_gate.py gate measure_csa.json measure_dense.json
 
 The template is intentionally a draft.  The pure-HCA entries are real
 variants, the four selection controls and their pattern-seeded twins are
-registered, and the FLOPs-matched Dense arm now has a registry entry plus an
+registered, the FLOPs-matched Dense arm now has a registry entry plus an
 ANALYTICAL capacity plan (`full_rope_flops_matched`; the run cfg routes it
 through `exp_lib.flops_matched_mlp_ratio`, whose frozen-config solution is
-mr = 689/256 = 2.69140625).  The remaining blockers are the
+mr = 689/256 = 2.69140625), and the same-backbone dense isolation arm
+(`full_rope_cos_sink`, review-17) is registered and declared as the
+`dense_same_backbone` control, which the validator now requires.  The
+remaining blockers are the
 profiler-MEASURED FLOPs verification (now runnable via
 `followup_flops_gate.py` on the certifying device; the analytical plan is
 never the certificate), the pre-test power simulation (now runnable via

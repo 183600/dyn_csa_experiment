@@ -718,3 +718,68 @@ validation panel, then be bound into the design); it does not run the FLOPs
 measurement on the certifying device (GPU access required for a certificate);
 it does not run the algorithmic gates; and it does not freeze the follow-up
 manifest. All four remain preconditions for `--require-ready`, by design.
+
+## Review 17 (2026-11-26): eleven-part methodology review verified item by item; the same-backbone dense isolation control registered
+
+**Trigger.** An external methodological review split the findings into
+implementation correctness / experiment-design validity / statistical-inference
+validity and asked for per-item verification plus fixes where real. The
+repository had already absorbed sixteen review rounds; the honest question is
+therefore not "are the disclosed boundaries real" (they are, and this round
+re-verified each one against HEAD: the frozen manifest's arms still contain no
+Dynamic/HCA arm, the fixed-hash random control is still
+(row*12.9898+col*78.233), the CSA/dense q/k normalization, scale, sink and
+kernel still differ, `csa_dynamic`'s cuts are still threshold+comp_reg driven
+with the LM gradient unable to reach them, and the 12-seed Holm power is still
+0.275) but "which requirement of the follow-up protocol is still unimplemented".
+Exactly one: the mechanism-isolation section requires a single-factor
+("same-backbone") version of the dense comparison, and no registry arm,
+template entry or validator rule provided it.
+
+**Decisions.**
+
+1. **`full_rope_cos_sink` is registered as that arm (registry-only).**
+   Dense attention with the CSA arm's reading policy around it: shared qk
+   RMSNorm, cosine-normalized q/k at scale 1.0, the learned per-head sink and
+   RoPE. The sink is not decoration: a dense layer only takes SDPA when it
+   has NO sink, so `full_sink=True` routes this arm through the same manual
+   eager `_sink_attn_loop` kernel family the CSA layers use — the kernel
+   confound closes together with normalization, scale and sink. The residual
+   deltas (per-token K/V vs the compressed-block KV pipeline, the q/k
+   normalization ORDER, the per-token sliding-window branch, the projection
+   structure) are the mechanism under test and are documented on the arm.
+   Capacity stays a declared knob (mr=4, or the run-cfg `matched` set for
+   parameter equality with the reference sparse arm) — the arm is an isolation
+   reference, never an equal-compute or equal-parameter claim.
+2. **The template declares it and the validator enforces it.**
+   `followup_design.template.json` gains the `dense_same_backbone` control
+   (`matching: "same_backbone"`); `validate_followup_design.py` now (a)
+   requires such a control to exist in every declared design and (b) verifies
+   field-by-field that the declared variant resolves
+   `full_cosine/full_sink/qk_norm/rope` on every layer, with a note that must
+   state what is matched and that the residual deltas are the mechanism under
+   test — a plain dense arm can no longer wear the isolation label.
+3. **The frozen and historical surfaces are untouched.** `full_rope` keeps
+   its no-sink semantics; the v12 manifest is byte-identical; no panel trains
+   the new arm; `CODE_SEMANTICS` stays `v11.128`; N120 locks the whole chain
+   (registry resolution, built-module sink/qk-norm, finite fwd/bwd, template
+   declaration, validator accept/require/reject).
+4. **All other review items are recorded as verified-and-disclosed, not
+   re-fixed**: v12 coverage gap + retirement (item 1), v6-v11 validation-split
+   reuse (2), param-vs-FLOPs matching separation (3b — already two distinct
+   estimands with a measured gate), threshold-vs-task boundary naming (4),
+   power simulation tooling (5), document-level evaluation units in the
+   follow-up (6), token-pooled PPL (7 — primary since review-3/12), the
+   random-control family incl. pattern seeds and oracle/recall probe (8),
+   efficiency gates (9), the 2x2 factorial + mechanism controls (10), and the
+   per-function code audit (11 — segmenter causality, CSA/HCA forward,
+   top-k gradient path, pooling, objective recording, eval token set and
+   statistics all re-checked, no new defect found; the existing audit chain
+   `audit_gates causality` / `test_open_block` / csa_kernels reference twins
+   / N1-N119 covers them).
+
+**What this does NOT do.** It does not train the control (registry-only until
+the follow-up manifest is frozen), does not run the power simulation, the
+FLOPs measurement or the algorithmic gates, and does not touch the test split.
+Tooling existence is still not evidence; the follow-up protocol's
+`--require-ready` blockers are unchanged.

@@ -924,6 +924,35 @@ def make_layer_cfgs_v7(n_layers, variant):
         # per-token K/V, RMSNorm-only ordering, no sink and no window branch.
         # Registered for the follow-up factorial; no panel trains it yet.
         return [AttnCfgRope(kind='full', rope=True, rope_dim=16, qk_norm=True, full_cosine=True) for _ in range(n_layers)]
+    if variant == 'full_rope_cos_sink':
+        # Same-backbone dense isolation control (review-17; the follow-up
+        # protocol's "same-backbone isolation" requirement).  It closes the
+        # two confounds that full_rope_cos still carried against the CSA arm:
+        #   * sink: full_sink=True gives the dense layer the same learned
+        #     per-head sink (zero-initialised, trained) the CSA layers read;
+        #   * kernel: WITH a sink the dense path necessarily goes through the
+        #     manual eager _sink_attn_loop row kernel (SDPA is only taken when
+        #     the layer has no sink), i.e. the same kernel family the CSA
+        #     layers use, so a dense-vs-CSA delta can no longer be a
+        #     fused-kernel vs eager-kernel system property.
+        # Together with full_cosine (L2-normalized q/k at scale 1.0) and the
+        # rope arms' shared qk_norm RMSNorm, the arm matches csa_fixed_rope on
+        # normalization family, attention scale, sink policy, position
+        # encoding (RoPE) and kernel family.  What remains different IS the
+        # mechanism under test and is disclosed rather than hidden: per-token
+        # K/V vs the compressed-block KV pipeline (A/B-lane pooling +
+        # W_kvhead + top-k selection), the q/k normalization ORDER (dense:
+        # RMSNorm -> RoPE -> L2; CSA: L2 -> RMSNorm -> RoPE), the per-token
+        # sliding-window branch, and the projection structure — a dense twin
+        # cannot share the compression projections without ceasing to be
+        # dense.  Capacity (mlp_ratio) is NOT fixed here: the study design
+        # must declare it (mr=4 for an unscaled isolation look, or list the
+        # arm in the run cfg's `matched` set to auto-solve parameter
+        # equality with the reference sparse arm via variant_mlp_ratio).
+        # Registry-only, like the other follow-up controls; no panel trains
+        # it and no claim is created by registering it.
+        return [AttnCfgRope(kind='full', rope=True, rope_dim=16, qk_norm=True,
+                            full_cosine=True, full_sink=True) for _ in range(n_layers)]
     if variant == 'full_sw128_matched_rope':
         return [AttnCfgRope(kind='full', window=128, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'csa_fix_m1':
@@ -992,8 +1021,12 @@ def _v7_knobs_fp(device=None, batch_size=None):
 
 ROPE_VARIANTS = ['full_rope', 'csa_fixed_rope', 'hybrid_fixed_rope', 'csa_dynamic_rope', 'csa_fixed']
 # Optional closer-but-not-exact dense control.  Kept out of ROPE_VARIANTS so the
-# historical P0R arm list (and its results) is unchanged.
-ALIGNED_DENSE_VARIANTS = ['full_rope_cos']
+# historical P0R arm list (and its results) is unchanged.  `full_rope_cos_sink`
+# (review-17) additionally carries the CSA arm's sink, which also routes the
+# dense path through the manual _sink_attn_loop kernel; it is the same-backbone
+# isolation arm the follow-up protocol's mechanism-isolation section requires.
+# Neither is trained by any historical panel.
+ALIGNED_DENSE_VARIANTS = ['full_rope_cos', 'full_rope_cos_sink']
 # Pure-HCA arms (every layer is HCA).  Kept separate from ROPE_VARIANTS so the
 # historical P0R panel keeps its exact arm list; the follow-up factorial uses
 # these.  `hybrid_fixed_rope` is NOT an HCA arm.
