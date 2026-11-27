@@ -2150,3 +2150,103 @@ rope 空间完全缺失，且 rope trunk 的 REINFORCE 聚合 bug 恰好藏在�
 「工具存在 ≠ 实验完成」的一贯口径：功效仿真、实测 FLOPs 门、算法门、
 正式训练与证据归档仍需 GPU 与真实数据运行，本仓库不因工具齐备而产生
 任何新的性能主张。
+
+## 36. review 19（同一外部审查的收尾核验：两个可修缺口 + 一个执行发现的真缺陷）
+
+时间：2026-11-27。性质：verification-first——逐项核实外部审查的九项指控
+（v12 覆盖缺口 / Dense 混杂 / 功效 27.5% / 16 窗口伪重复 / 动态分块机制
+归因 / 单一数据集 / 证据归档缺失 / 等 FLOPs 对照 / 推理性能与能耗），
+全部「成立且已披露」，与 review-16/17/18 的处置一致；本轮只修代码层面
+仍可修的缺口，外加一个只有真正**运行**验证入口才会暴露的缺陷。
+
+### 36.1 执行发现的真缺陷（csa_kernels 批处理守卫）
+
+`_check_contiguous_bid` 在扁平化数组上检查「连续非递减 0..Bm-1」，但所有
+批处理调用方（模型级 `sparse_layer_forward` 的 `bid_full`、
+`selfcheck_operators`、`selfcheck_model`）传入的 `[R, T]` 逐 token 表中
+**每一行都各自从 0 重新编号**（分段器输出契约；行间块数还可能不同）。
+跨行边界必然出现负跳变 → 守卫必然误报 → 参考后端整体不可用 →
+README 里的 G0 入口 `python m0_supp.py kernel` 在任何 CPU 上直接
+ValueError 崩溃。既有 427 项测试没抓到它：N95 只测了 1-D 表的接受与
+拒绝，从未测批处理布局。修复：守卫改为**逐行**校验（行内 0 起始、
+连续非递减、行尾 ≤ Bm-1）；1-D 表保持原语义。修复后 `m0_supp.py kernel`
+数值判据 PASS（ref 后端）。N127 锁定：批处理布局接受、行内非单调拒绝、
+越界拒绝、1-D 契约不变、selfcheck_operators 端到端回归。
+
+教训记录：这条缺陷不是审查读出来的，是「把 README 里的验证命令真正
+跑一遍」暴露的——审查声明与可执行入口之间存在差距时，以执行为准。
+
+### 36.2 缺口 A：算法验收门控无生产者（橡皮图章）
+
+协议「Algorithmic acceptance gates before training」要求七项正确性门，
+此前只以散落测试 + 模板里七个**手填布尔**存在。review-16 的 N117 已经
+把 `power_simulation_completed` 绑定到 `followup_power_sim.py` 工件
+（「布尔值本身不是证据」），但 `algorithmic_gates` 与冻结文档 ID 两个
+状态布尔一直没有等价绑定——正是 N117 要消灭的橡皮图章形态。
+
+`followup_gate_runner.py`（新工具）：CPU 微型几何上对 follow-up rope 臂
+（四个因子格 + 同骨干 Dense 隔离臂）跑全部七门——
+1 前缀不变性（复用 audit_causality，覆盖七臂）；
+2 未来扰动**前向+梯度**（K4 式梯度泄漏探针，此前只有 open-block 家族有）；
+3 全块等价（batched vs 逐行未分块契约 + topk 截断臂 == 显式全块臂）；
+4 fp32/bf16 前向反向（有限梯度 + 重跑确定性 + 声明容差表 fp32 1e-5 /
+bf16 相对 1e-1，与 m0 G0 同分级）；
+5 全平局 top-k 无重复（有效 lane 去重；无效 lane 的哨兵填充语义已甄别）
++ 开块/窗口不重叠 + 严格不等表；
+6 纯 HCA 注册表（每层 kind='hca' + hybrid 负对照）；
+7 eager/reference 内核对照（三算子 + 模型级，ref 后端；工件披露
+backends_tested=['ref']，CPU 工件不冒充 CUDA/Triton 全量）。
+验证器新绑定 `_gates_artifact_errors`：门布尔为 true 时必须指向真工件
+（工具名、study id、七门全覆盖、逐门 pass）。N128/N129 锁定。
+
+### 36.3 缺口 B：冻结文档面板无生产者（橡皮图章）
+
+协议「Evaluation population」要求 ≥64 篇按长度分层、在测试访问前冻结的
+文档，但仓库没有任何工具生产它；`freeze.test_document_ids_frozen` 同样
+是手填布尔。`followup_doc_panel.py`（新工具）：**只读**测试侧车
+（test_doc_ids_*.npy + test_doc_lengths_*.npy——绝不加载 token 流，
+元数据访问按文件 SHA-256 记录可审计），长度排序等数分层 + 比例配额
+（每层 ≥1）+ 记录种子的无放回抽样；与 train/val 侧车求交，任何重叠
+fail-closed（泄漏文档永不入冻结面板）；全量分支（文档数 ≤ 请求数时
+取整 split）；`--synthetic` 供测试（工件标注 SYNTHETIC，永不作真证书）。
+验证器新绑定 `_doc_panel_artifact_errors`：挂在**状态**布尔
+`freeze.test_document_ids_frozen` 上（设计承诺字段
+`evaluation.document_ids_frozen_before_test_access` 故意不挂——模板必须
+以 true 通过 --verify-registry，不能因绑定产生新误报）。N130/N131 锁定，
+N132 锁定模板新槽位 + 八项有意阻断数不变。
+
+### 36.4 改动清单
+
+- `csa_kernels.py`：`_check_contiguous_bid` 逐行化（真缺陷修复）。
+- `followup_gate_runner.py`（新）：七门 CPU 运行器 + JSON 工件。
+- `followup_doc_panel.py`（新）：分层冻结文档面板采样器 + 工件。
+- `validate_followup_design.py`：`REQUIRED_GATE_KEYS` 常量、
+  `_read_artifact` / `_gates_artifact_errors` / `_doc_panel_artifact_errors`
+  两个新绑定；`validate()` 接线。
+- `followup_design.template.json`：`algorithmic_gates.artifact` 与
+  `evaluation.document_panel_artifact` 两个 null 槽位。
+- `FOLLOWUP_CONFIRMATORY_PROTOCOL.md`：算法门与评估总体两节登记新工具
+  与绑定；运行示例更新。
+- `test_review_fixes.py`：N127–N132。
+- `README.md`：review-19 段落。
+
+### 36.5 改动后的验证记录
+
+`test_review_fixes.py` 433/433（N127–N132 新增，历史 427 项全绿无回归）；
+`test_open_block.py` 15/15；`m0_supp.py kernel` 数值判据 PASS（CPU ref，
+修复前该入口崩溃）；`audit_gates.py causality` PASS（七 rope 臂）；
+`mech_selection.py smoke` 数值不变；`followup_gate_runner.py` 七门全
+PASS 且工件可被验证器绑定接受；`followup_doc_panel.py`（synthetic 模式）
+64 篇 / 4 层分层采样端到端可用；`validate_followup_design.py
+--verify-registry` 仍恰好八项有意 pre-freeze 阻塞；`v12_supp.py plan`
+48/48 不受影响；冻结清单 `confirmation_frozen.json` 字节比对不变。
+
+### 36.6 结论
+
+外部审查的九项指控全部「成立且已披露」——其中六项（四因子训练、实测
+FLOPs 门、真实验证集功效仿真、正式训练与证据归档、第二数据集、能耗）
+依旧需要 GPU 与真实数据，本轮不触碰。本轮可修的三项全部落地：一个
+执行发现的内核批处理守卫真缺陷（连同 G0 入口崩溃）、算法门控的
+生产者与反橡皮图章绑定、冻结文档面板的生产者与绑定。至此模板里
+每一个「已完成」状态声明都必须有可验证工件支撑；「工具存在 ≠ 实验
+完成」的口径不变，本仓库不因工具齐备而产生任何新的性能主张。

@@ -70,6 +70,7 @@
     "minimum_distinct_documents": 64,
     "use_full_test_split_when_feasible": true,
     "document_ids_frozen_before_test_access": true,
+    "document_panel_artifact": null,
     "document_level_bootstrap_replicates": 10000,
     "primary_metric": "pooled_nll_per_token",
     "secondary_metrics": ["PPL", "document_level_NLL", "throughput", "peak_memory"],
@@ -104,6 +105,7 @@
     "fp32_and_bf16_forward_backward": false,
     "duplicate_selection_and_overlap_tests": false,
     "pure_hca_layer_registry_verified": false,
-    "eager_and_kernel_parity": false
+    "eager_and_kernel_parity": false,
+    "artifact": null
   }
 }

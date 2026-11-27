@@ -417,6 +417,65 @@ the seven rope arms, `mech_selection.py smoke` unchanged
 --verify-registry` reports only the intentional pre-freeze blockers, and
 `v12_supp.py plan` is untouched by the round.
 
+## Review-19 hardening (what changed)
+
+Verification-first pass over the same eleven-part external methodological
+review (the audit/verification tooling gap it left behind). All nine
+disclosed design-boundary findings were re-verified against HEAD and hold
+exactly as disclosed (v12 coverage gap retired, dense-arm confounds,
+threshold-not-task-learned dynamic chunking, 12-seed power, 16-window
+panel, single dataset, unmeasured energy); the item-by-item disposition is
+`docs/design_notes.md` §36. No new training panel, no test-split access,
+no frozen-manifest byte change, no measurement-semantics change
+(`CODE_SEMANTICS` stays `v11.128`). Two real gaps were still fixable in
+code and are closed, plus one genuine defect found by actually RUNNING the
+verification entry points:
+
+- **A real kernel-path defect fixed (found by execution, not by review).**
+  `csa_kernels._check_contiguous_bid` validated the block-id table on the
+  FLATTENED array, but every batched caller (the model-level
+  `sparse_layer_forward`, `selfcheck_operators`, `selfcheck_model`) passes a
+  `[R, T]` per-token table in which each row independently enumerates its
+  own blocks from 0 — the row-boundary restart-to-zero made the guard
+  reject every legitimate batched input, so the entire torch-reference
+  backend was unusable and the documented G0 entry point
+  `python m0_supp.py kernel` crashed with a ValueError before any check
+  ran. The guard now checks the contiguity invariant per row (1-D tables
+  keep the original single-row contract); `m0_supp.py kernel` passes its
+  numeric criteria on CPU after the fix (N127).
+- **The algorithmic acceptance gates have a producer now.** The protocol
+  requires seven correctness gates before any confirmatory training, but
+  they existed only as scattered tests plus seven hand-settable booleans in
+  the design template. `followup_gate_runner.py` runs all seven on CPU over
+  the follow-up rope arms (the four factorial cells + the same-backbone
+  dense isolation arm): label shift / prefix invariance / strict
+  readability / decode consistency, future-token perturbation forward AND
+  gradient, batched-vs-per-row and all-blocks-selected equivalence, fp32
+  and bf16 forward/backward with a declared tolerance table, adversarial
+  all-tie top-k duplicate-freeness + open-block/window non-overlap, the
+  pure-HCA registry check with a hybrid negative control, and eager-vs-ref
+  kernel parity. `validate_followup_design.py` binds the booleans to the
+  artifact (tool, study id, full seven-gate coverage, per-gate pass) — a
+  hand-set flag is no longer evidence (N128/N129).
+- **The frozen document panel has a producer now.** The protocol requires
+  ≥64 length-stratified documents frozen BEFORE test access, but nothing
+  produced or bound one. `followup_doc_panel.py` samples the stratified
+  panel from the test-split SIDECARS ONLY (document ids and lengths — the
+  held-out token stream is never read; the access is recorded with
+  per-file SHA-256s), refuses panels that overlap train/val sidecars, and
+  marks synthetic runs so they can never certify a real freeze.
+  `validate_followup_design.py` binds `freeze.test_document_ids_frozen` to
+  the artifact (non-synthetic, ≥ the declared minimum, unique ids, zero
+  overlap, digest present) — the last hand-settable state flag in the
+  template is now evidence-checked (N130/N131).
+
+Verification after the change: `test_review_fixes.py` 433/433 (N127–N132
+added), `test_open_block.py` 15/15, `m0_supp.py kernel` numeric criteria
+PASS on CPU (ref backend), `audit_gates.py causality` PASS over the seven
+rope arms, `mech_selection.py smoke` unchanged, `validate_followup_design.py
+--verify-registry` still reports exactly the eight intentional pre-freeze
+blockers, and `v12_supp.py plan` still admits 48/48 records.
+
 ## Repository layout
 
 The repository keeps only **source code, driver scripts and design

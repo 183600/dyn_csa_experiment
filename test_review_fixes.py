@@ -14237,6 +14237,295 @@ def t_followup_validator_segmentation_controls():
     assert any('unknown segmentation-control mechanism' in e for e in errs), errs
 
 
+def t_kernel_pool_batched_bid_guard():
+    """Review-19 (real defect): _check_contiguous_bid flattened the [R, T]
+    per-token block table across row boundaries, so EVERY legitimate batched
+    caller (selfcheck_operators / selfcheck_model / sparse_layer_forward's
+    bid_full, where each row independently enumerates its own blocks from 0)
+    hit the ValueError and the whole reference backend — including
+    ``m0_supp.py kernel`` — crashed before this fix.  The guard must check
+    the contiguity invariant PER ROW; the 1-D single-row contract keeps its
+    original semantics."""
+    import csa_kernels as K
+    import numpy as np
+    dev = torch.device('cpu')
+    T = 16
+    # (a) the batched layout the real callers build: rows restart at 0 and
+    # may carry different block counts — must be ACCEPTED now.
+    row_a = np.concatenate([np.full(4, 0), np.full(6, 1), np.full(6, 2)]).astype(np.int32)
+    row_b = np.concatenate([np.full(5, 0), np.full(5, 1), np.full(6, 2)]).astype(np.int32)
+    batched = torch.from_numpy(np.stack([row_a, row_b]))
+    geom = type('G', (), {'Bm': 3})()
+    K._check_contiguous_bid(batched, geom)  # must not raise
+    # (b) a non-monotone row inside the batch is still refused.
+    bad = batched.clone()
+    bad[1] = torch.from_numpy(np.concatenate([np.full(4, 1), np.full(5, 0), np.full(7, 2)]).astype(np.int32))
+    try:
+        K._check_contiguous_bid(bad, geom)
+    except ValueError as e:
+        assert 'within every row' in str(e), e
+    else:
+        raise AssertionError('a non-monotone row inside a batched bid table '
+                             'must be refused')
+    # (c) a row that runs past the roster is refused.
+    over = batched.clone()
+    over[0] = torch.from_numpy(np.concatenate(
+        [np.full(5, 0), np.full(5, 1), np.full(6, 2)]).astype(np.int32)) + 1  # 0..3
+    over[0, 0] = 0  # start at 0 but reach block 3 > Bm-1
+    try:
+        K._check_contiguous_bid(over, geom)
+    except ValueError as e:
+        assert 'beyond the geometry roster' in str(e), e
+    else:
+        raise AssertionError('a row reaching past Bm must be refused')
+    # (d) the 1-D single-row contract is unchanged: contiguous full roster
+    # passes, non-monotone or short rosters still fail.
+    K._check_contiguous_bid(torch.tensor([0, 0, 0, 1, 1, 2], dtype=torch.int32),
+                            type('G', (), {'Bm': 3})())
+    for bad1d in (torch.tensor([1, 1, 2, 2], dtype=torch.int32),
+                   torch.tensor([0, 0, 1, 1], dtype=torch.int32)):
+        try:
+            K._check_contiguous_bid(bad1d, type('G', (), {'Bm': 3})())
+        except ValueError:
+            continue
+        raise AssertionError(f'1-D contract violated: {bad1d}')
+    # (e) regression of the actual crash: the operator self-check (ref
+    # backend, CPU) must run end-to-end now.
+    res = K.selfcheck_operators(device=dev, dtype=torch.float32, impl='ref',
+                                seed=0, verbose=False)
+    assert res and max(res.values()) < 1e-3, max(res.values())
+
+
+def t_followup_gate_runner_contract():
+    """Review-19: the algorithmic acceptance gates now have a producer.
+    followup_gate_runner.py runs all seven protocol gates on CPU (factorial
+    rope arms + the same-backbone isolation arm), writes a bindable JSON
+    artifact, and fails closed when a gate fails."""
+    import followup_gate_runner as GR
+    art = GR.run_gates('dynamic-csa-hca-followup-v1', pathlib.Path(REPO))
+    assert art['tool'] == 'followup_gate_runner.py'
+    assert art['status'] == 'ok' and not art['failed_gates'], art['failed_gates']
+    assert set(art['gates']) == set(GR.GATE_KEYS)
+    for k, v in art['gates'].items():
+        assert v['status'] == 'pass', (k, v)
+        assert v.get('failures') in (None, []), (k, v)
+    # the gate family covers the four factorial arms and the isolation arm
+    g2 = art['gates']['future_perturbation_and_gradient']
+    assert set(GR.FACTORIAL_ARMS) <= set(g2['arms'])
+    assert GR.DENSE_ISOLATION_ARM in g2['arms']
+    # a crash inside a gate is a FAIL, never a silent skip
+    def _boom(L, repo):
+        raise RuntimeError('gate crashed')
+    saved = dict(GR.GATE_RUNNERS)
+    try:
+        GR.GATE_RUNNERS['prefix_invariance'] = _boom
+        art_bad = GR.run_gates('x', pathlib.Path(REPO))
+        assert art_bad['status'] == 'fail' and 'prefix_invariance' in art_bad['failed_gates']
+        assert art_bad['gates']['prefix_invariance']['status'] == 'fail'
+        assert any('gate crashed' in f for f in art_bad['gates']['prefix_invariance']['failures'])
+    finally:
+        GR.GATE_RUNNERS.clear()
+        GR.GATE_RUNNERS.update(saved)
+    # study id binding: the artifact records the plan it certifies
+    art2 = GR.run_gates('another-study', pathlib.Path(REPO))
+    assert art2['study_id'] == 'another-study'
+
+
+def t_followup_validator_binds_gates_artifact():
+    """Review-19 (anti-rubber-stamp): ``algorithmic_gates.<name> = true``
+    without a real followup_gate_runner.py artifact is an error — the same
+    fail-closed binding N117 established for the power simulation.  A real
+    artifact passes; null/tampered/study-mismatched/partial artifacts fail."""
+    import validate_followup_design as VF
+    import followup_gate_runner as GR
+    plan = json.load(open(os.path.join(REPO, 'followup_design.template.json'), encoding='utf-8'))
+    # run the real gates and write the artifact into a temp manifest dir
+    with tempfile.TemporaryDirectory() as td:
+        art = GR.run_gates(plan['study_id'], pathlib.Path(REPO))
+        p_art = pathlib.Path(td) / 'gates.json'
+        p_art.write_text(json.dumps(art), encoding='utf-8')
+        good = _copy.deepcopy(plan)
+        for k in VF.REQUIRED_GATE_KEYS:
+            good['algorithmic_gates'][k] = True
+        good['algorithmic_gates']['artifact'] = 'gates.json'
+        errs = VF.validate(good, verify_registry=True, repo=pathlib.Path(REPO),
+                           manifest_dir=pathlib.Path(td))
+        assert not any('algorithmic_gates.artifact' in e for e in errs), errs
+        # null artifact with true flags -> error
+        bad = _copy.deepcopy(good)
+        bad['algorithmic_gates']['artifact'] = None
+        errs = VF.validate(bad, repo=pathlib.Path(REPO), manifest_dir=pathlib.Path(td))
+        assert any('algorithmic_gates.artifact must name' in e for e in errs), errs
+        # tampered: one gate reports fail
+        tampered = _copy.deepcopy(art)
+        tampered['gates']['fp32_and_bf16_forward_backward']['status'] = 'fail'
+        p_bad = pathlib.Path(td) / 'bad.json'
+        p_bad.write_text(json.dumps(tampered), encoding='utf-8')
+        bad2 = _copy.deepcopy(good)
+        bad2['algorithmic_gates']['artifact'] = 'bad.json'
+        errs = VF.validate(bad2, repo=pathlib.Path(REPO), manifest_dir=pathlib.Path(td))
+        assert any('is declared true but the artifact reports status' in e for e in errs), errs
+        # study mismatch
+        mismatch = _copy.deepcopy(art)
+        mismatch['study_id'] = 'not-this-study'
+        p_bad2 = pathlib.Path(td) / 'bad2.json'
+        p_bad2.write_text(json.dumps(mismatch), encoding='utf-8')
+        bad3 = _copy.deepcopy(good)
+        bad3['algorithmic_gates']['artifact'] = 'bad2.json'
+        errs = VF.validate(bad3, repo=pathlib.Path(REPO), manifest_dir=pathlib.Path(td))
+        assert any("does not match the plan's" in e for e in errs), errs
+        # partial coverage (a gate missing from the artifact table)
+        partial = _copy.deepcopy(art)
+        partial['gates'].pop('pure_hca_layer_registry_verified')
+        p_bad3 = pathlib.Path(td) / 'bad3.json'
+        p_bad3.write_text(json.dumps(partial), encoding='utf-8')
+        bad4 = _copy.deepcopy(good)
+        bad4['algorithmic_gates']['artifact'] = 'bad3.json'
+        errs = VF.validate(bad4, repo=pathlib.Path(REPO), manifest_dir=pathlib.Path(td))
+        assert any('does not cover every required gate' in e for e in errs), errs
+        # all-false flags (the template state) demand no artifact
+        errs = VF.validate(plan, repo=pathlib.Path(REPO))
+        assert not any('algorithmic_gates.artifact' in e for e in errs), errs
+
+
+def t_followup_doc_panel_sampler():
+    """Review-19: the frozen stratified document panel now has a producer.
+    followup_doc_panel.py samples >= min-docs stratified by length from the
+    test-split SIDECARS ONLY (no token content read), is deterministic under
+    the recorded seed, refuses panels that overlap train/val sidecars, and
+    marks synthetic runs so they can never certify a real freeze."""
+    import followup_doc_panel as DP
+    with tempfile.TemporaryDirectory() as td:
+        side = pathlib.Path(td) / 'side'
+        side.mkdir()
+        DP._write_synthetic_sidecars(side, n_docs=96, seed=5)
+        # (a) stratified sampling end-to-end
+        art = DP.freeze_panel('study-x', side, min_docs=64, n_strata=4,
+                              seed=20261127, synthetic=True)
+        assert art['tool'] == 'followup_doc_panel.py' and art['status'] == 'ok'
+        assert art['panel_documents'] == 64
+        assert len(art['doc_ids']) == 64 and len(set(art['doc_ids'])) == 64
+        assert len(art['strata']) == 4
+        assert sum(s['sampled'] for s in art['strata']) == 64
+        assert all(s['sampled'] >= 1 for s in art['strata'])
+        # strata are length-ordered (stratification is real, not nominal)
+        medians = [s['length_median'] for s in art['strata']]
+        assert medians == sorted(medians), medians
+        # the token stream is never read: only the two sidecar files
+        assert set(art['read_files']) == {'test_doc_ids_synthetic.npy',
+                                          'test_doc_lengths_synthetic.npy'}
+        # (b) determinism: same seed -> byte-identical panel
+        art_b = DP.freeze_panel('study-x', side, min_docs=64, n_strata=4,
+                                seed=20261127, synthetic=True)
+        assert art_b['doc_ids'] == art['doc_ids']
+        assert art_b['panel_sha256_uint64_le'] == art['panel_sha256_uint64_le']
+        # a different seed moves the panel (a real sampler, not a constant)
+        art_c = DP.freeze_panel('study-x', side, min_docs=64, n_strata=4,
+                                seed=99, synthetic=True)
+        assert art_c['doc_ids'] != art['doc_ids']
+        # (c) the full-split case: requesting more docs than exist takes all
+        art_full = DP.freeze_panel('study-x', side, min_docs=128, n_strata=4,
+                                   seed=7, synthetic=True)
+        assert art_full['full_split_taken'] is True
+        assert art_full['panel_documents'] == art_full['split_documents'] == 96
+        # (d) train/val overlap is refused fail-closed
+        import numpy as np
+        ids = np.load(side / 'test_doc_ids_synthetic.npy')
+        np.save(side / 'train_doc_ids_v5_x.npy', ids[:10])
+        try:
+            DP.freeze_panel('study-x', side, min_docs=64, n_strata=4,
+                            seed=20261127, synthetic=True)
+        except RuntimeError as e:
+            assert 'leaked' in str(e) or 'overlap' in str(e).lower(), e
+        else:
+            raise AssertionError('a panel containing train documents must be refused')
+        # (e) missing sidecars fail closed with the remediation hint
+        empty = pathlib.Path(td) / 'empty'
+        empty.mkdir()
+        try:
+            DP.freeze_panel('study-x', empty, min_docs=64, n_strata=4,
+                            seed=1, synthetic=False)
+        except RuntimeError as e:
+            assert 'test_doc_ids' in str(e), e
+        else:
+            raise AssertionError('missing sidecars must be refused')
+        # (f) synthetic marking is honest
+        assert art['synthetic'] is True
+        assert any('SYNTHETIC' in n for n in art['notes'])
+
+
+def t_followup_validator_binds_doc_panel():
+    """Review-19 (anti-rubber-stamp): ``freeze.test_document_ids_frozen =
+    true`` without a real, non-synthetic, big-enough followup_doc_panel.py
+    artifact is an error; a real-shaped artifact passes; the design PROMISE
+    field (evaluation.document_ids_frozen_before_test_access) is NOT the
+    binding hook (the template must keep passing --verify-registry with it
+    true)."""
+    import validate_followup_design as VF
+    import followup_doc_panel as DP
+    plan = json.load(open(os.path.join(REPO, 'followup_design.template.json'), encoding='utf-8'))
+    with tempfile.TemporaryDirectory() as td:
+        side = pathlib.Path(td) / 'side'
+        side.mkdir()
+        DP._write_synthetic_sidecars(side, n_docs=96, seed=5)
+        art = DP.freeze_panel(plan['study_id'], side, min_docs=64, n_strata=4,
+                              seed=20261127, synthetic=True)
+        p = pathlib.Path(td) / 'panel.json'
+        p.write_text(json.dumps(art), encoding='utf-8')
+        # synthetic panel is refused for a real freeze
+        claiming = _copy.deepcopy(plan)
+        claiming['freeze']['test_document_ids_frozen'] = True
+        claiming['evaluation']['document_panel_artifact'] = 'panel.json'
+        errs = VF.validate(claiming, repo=pathlib.Path(REPO),
+                           manifest_dir=pathlib.Path(td))
+        assert any('SYNTHETIC' in e for e in errs), errs
+        # a real-shaped panel (synthetic flag cleared) passes the binding
+        real_shaped = _copy.deepcopy(art)
+        real_shaped['synthetic'] = False
+        p2 = pathlib.Path(td) / 'panel_real.json'
+        p2.write_text(json.dumps(real_shaped), encoding='utf-8')
+        ok = _copy.deepcopy(claiming)
+        ok['evaluation']['document_panel_artifact'] = 'panel_real.json'
+        errs = VF.validate(ok, repo=pathlib.Path(REPO), manifest_dir=pathlib.Path(td))
+        assert not any('document_panel_artifact' in e for e in errs), errs
+        # below-minimum panel is refused
+        small = _copy.deepcopy(real_shaped)
+        small['panel_documents'] = 32
+        small['doc_ids'] = small['doc_ids'][:32]
+        p3 = pathlib.Path(td) / 'small.json'
+        p3.write_text(json.dumps(small), encoding='utf-8')
+        bad = _copy.deepcopy(claiming)
+        bad['evaluation']['document_panel_artifact'] = 'small.json'
+        errs = VF.validate(bad, repo=pathlib.Path(REPO), manifest_dir=pathlib.Path(td))
+        assert any('below the declared minimum' in e for e in errs), errs
+        # missing artifact with the state flag true is refused
+        no_art = _copy.deepcopy(claiming)
+        no_art['evaluation']['document_panel_artifact'] = None
+        errs = VF.validate(no_art, repo=pathlib.Path(REPO), manifest_dir=pathlib.Path(td))
+        assert any('document_panel_artifact must name' in e for e in errs), errs
+        # the design PROMISE field alone (template state) demands no artifact
+        errs = VF.validate(plan, repo=pathlib.Path(REPO))
+        assert not any('document_panel_artifact' in e for e in errs), errs
+
+
+def t_template_carries_artifact_fields():
+    """Review-19: the template declares the two new artifact slots
+    (algorithmic_gates.artifact, evaluation.document_panel_artifact) as null,
+    so a future fill-in is an explicit act; and the template still fails
+    --verify-registry with EXACTLY the eight intentional pre-freeze blockers
+    (no new false positives from the bindings)."""
+    import validate_followup_design as VF
+    plan = json.load(open(os.path.join(REPO, 'followup_design.template.json'), encoding='utf-8'))
+    assert 'artifact' in plan['algorithmic_gates']
+    assert plan['algorithmic_gates']['artifact'] is None
+    assert plan['evaluation']['document_panel_artifact'] is None
+    errs = VF.validate(plan, verify_registry=True, repo=pathlib.Path(REPO))
+    blockers = [e for e in errs if 'algorithmic gate is not passed' in e
+                or 'power analysis' in e]
+    assert len(blockers) == 8, blockers
+    assert not any('artifact' in e for e in errs), errs
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -14666,6 +14955,12 @@ def main():
     _check('N124 segmentation controls forward/backward + rope REINFORCE aggregation', t_segment_controls_forward_backward)
     _check('N125 train_variant oracle plumbing + tiny runs of every control arm', t_train_variant_oracle_plumbing)
     _check('N126 validator binds segmentation controls (review-18)', t_followup_validator_segmentation_controls)
+    _check('N127 kernel pool batched-bid guard regression (review-19)', t_kernel_pool_batched_bid_guard)
+    _check('N128 algorithmic gate runner contract (review-19)', t_followup_gate_runner_contract)
+    _check('N129 validator binds the gates artifact (review-19)', t_followup_validator_binds_gates_artifact)
+    _check('N130 frozen stratified document-panel sampler (review-19)', t_followup_doc_panel_sampler)
+    _check('N131 validator binds the frozen doc panel (review-19)', t_followup_validator_binds_doc_panel)
+    _check('N132 template carries the new artifact slots (review-19)', t_template_carries_artifact_fields)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

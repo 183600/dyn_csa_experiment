@@ -843,3 +843,60 @@ existence is not evidence; the follow-up `--require-ready` blockers are
 unchanged, and the review's remaining items (single dataset, length-
 extrapolation semantics, evidence archiving) stay documented scope
 limitations until the GPU work runs.
+
+## 2026-11-27 — review 19: close the two remaining unbindable booleans; fix the batched-bid guard defect found by execution
+
+Context: the same eleven-part external methodological review, taken one step
+further — after reviews 16/17/18 registered every arm family the review asked
+for, the template still carried three state declarations that a hand could set
+without evidence: the seven `algorithmic_gates` booleans, and
+`freeze.test_document_ids_frozen`. The power boolean had already lost that
+status in review-16 (N117: boolean must bind to a `followup_power_sim.py`
+artifact). This round gives the remaining two the same treatment, and the
+verification pass actually EXECUTED the documented entry points, which found
+one real defect.
+
+1. **Defect found by execution (not by reading):**
+   `csa_kernels._check_contiguous_bid` validated the block-id table on the
+   FLATTENED array, but every batched caller passes a `[R, T]` per-token
+   table whose rows each restart at 0 — the row-boundary jump made the guard
+   reject every legitimate batched input, so the reference backend was
+   unusable and `python m0_supp.py kernel` (the documented G0 entry point)
+   crashed on any CPU. The guard now checks the invariant per row (1-D tables
+   keep the original single-row contract); after the fix the G0 numeric
+   criteria pass on the ref backend. N127 locks the batched layout, the
+   per-row refusals and the operator self-check regression.
+2. **`followup_gate_runner.py` (new):** runs the protocol's seven
+   algorithmic acceptance gates on CPU over the follow-up rope arms (four
+   factorial cells + `full_rope_cos_sink`): label shift / prefix invariance /
+   strict readability / decode consistency (reuses `audit_causality`),
+   future-token perturbation forward AND backward (the gradient probe the
+   rope arms never had), batched-vs-per-row equivalence plus the
+   topk-clamped-equals-all-blocks arm check, fp32 and bf16 forward/backward
+   with a declared tolerance table, adversarial all-tie top-k
+   duplicate-freeness (valid lanes only — the sentinel padding semantics are
+   part of the contract), open-block/window non-overlap, the pure-HCA
+   registry check with a hybrid negative control, and eager-vs-ref kernel
+   parity (backends_tested disclosed; CPU cannot certify the Triton layer).
+   `validate_followup_design.py` now binds the gate booleans to that
+   artifact (tool, study id, seven-gate coverage, per-gate pass) — N128/N129.
+3. **`followup_doc_panel.py` (new):** freezes the ≥64 length-stratified
+   document panel from the test-split SIDECARS ONLY (document ids + lengths;
+   the held-out token stream is never read, and the access is recorded with
+   per-file SHA-256s), proportional allocation with every stratum ≥1,
+   deterministic under the recorded seed, full-split case included,
+   train/val overlap refused fail-closed, synthetic mode marked so it can
+   never certify a real freeze. The validator binds
+   `freeze.test_document_ids_frozen` (the STATE flag) to the artifact; the
+   design PROMISE field stays unhooked so the template keeps passing
+   `--verify-registry` with exactly its eight intentional blockers — N130–N132.
+4. **Frozen surfaces untouched:** v12 manifest byte-identical, no arm list
+   changed, `CODE_SEMANTICS` stays `v11.128`, `v12_supp.py plan` still
+   48/48.
+
+**What this does NOT do.** No training, no test-split access, no power
+simulation on real inputs, no measured FLOPs on CUDA, no Triton parity, no
+evidence release — the review's GPU-bound items stay exactly where reviews
+16–18 left them. The change is narrow: every state declaration in the
+follow-up template now needs a checkable artifact, and the documented
+verification entry points actually run.

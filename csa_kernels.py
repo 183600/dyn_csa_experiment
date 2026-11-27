@@ -811,8 +811,8 @@ class FusedPool(torch.autograd.Function):
 
 
 def _check_contiguous_bid(bid, geom):
-    """Fail closed unless ``bid`` is the contiguous non-decreasing run table
-    the kernel pools assume.
+    """Fail closed unless ``bid`` is the contiguous block-id table the kernel
+    pools assume — evaluated PER ROW, not on the flattened array.
 
     The Triton/reference pool never reads ``bid``: it pools the runs encoded
     in ``geom.counts/starts``.  Eager ``pool_variable_blocks`` also accepts
@@ -821,22 +821,57 @@ def _check_contiguous_bid(bid, geom):
     refuses instead of guessing.  ``CSA_KERNEL_ASSUME_MONOTONE=1`` skips the
     check for callers that can prove the precondition (the segmenters emit
     contiguous monotone ids by construction).
+
+    Layout contract (fix for the batched callers): a 1-D ``[T]`` table is a
+    single segmenter row and must be one contiguous 0..Bm-1 run; a 2-D
+    ``[R, T]`` table is the BATCHED per-token table every batched caller
+    builds (`selfcheck_operators`/`selfcheck_model`, the model-level
+    `sparse_layer_forward`), in which EACH ROW independently enumerates its
+    own blocks from 0 — rows may carry different block counts, so a row may
+    legitimately end before ``geom.Bm-1`` and the row boundary restarts at
+    zero.  Flattening across row boundaries (the pre-fix behaviour) turns
+    every legitimate batched input into a violation, which made the whole
+    reference backend (and ``m0_supp.py kernel``) crash before this fix.
     """
     if os.environ.get('CSA_KERNEL_ASSUME_MONOTONE', '').strip().lower() in ('1', 'true', 'yes', 'on'):
         return
-    b = bid.reshape(-1).to(torch.int64)
-    if b.numel() == 0:
-        return
-    d = b[1:] - b[:-1]
-    if bool(((d == 0) | (d == 1)).all()) and int(b[0]) == 0 and int(b[-1]) == int(geom.Bm) - 1:
-        return
-    raise ValueError(
-        'kernel pool requires contiguous non-decreasing block ids 0..Bm-1; '
-        'the eager reference also accepts arbitrary ids (it sorts them), but '
-        'the fused pool would silently pool the wrong tokens.  Call the eager '
-        'path for arbitrary ids, or set CSA_KERNEL_ASSUME_MONOTONE=1 only when '
-        'the ids are provably contiguous (which every segmenter in this repo '
-        'guarantees).')
+    if bid.dim() == 1:
+        rows = [bid.to(torch.int64)]
+        single_row_must_span_roster = True
+    elif bid.dim() == 2:
+        rows = [bid[i].to(torch.int64) for i in range(bid.shape[0])]
+        single_row_must_span_roster = False
+    else:
+        raise ValueError(
+            f'kernel pool bid must be a [T] or [R, T] block-id table, '
+            f'got shape {tuple(bid.shape)}')
+    for r in rows:
+        if r.numel() == 0:
+            continue
+        d = r[1:] - r[:-1]
+        if not (bool(((d == 0) | (d == 1)).all()) and int(r[0]) == 0):
+            raise ValueError(
+                'kernel pool requires contiguous non-decreasing block ids '
+                'starting at 0 within every row; the eager reference also '
+                'accepts arbitrary ids (it sorts them), but the fused pool '
+                'would silently pool the wrong tokens.  Call the eager path '
+                'for arbitrary ids, or set CSA_KERNEL_ASSUME_MONOTONE=1 only '
+                'when the ids are provably contiguous (which every segmenter '
+                'in this repo guarantees).')
+        if int(r[-1]) >= int(geom.Bm):
+            raise ValueError(
+                f'kernel pool row reaches block id {int(r[-1])} beyond the '
+                f'geometry roster Bm={int(geom.Bm)}')
+    if single_row_must_span_roster:
+        b = rows[0]
+        if b.numel() and int(b[-1]) != int(geom.Bm) - 1:
+            raise ValueError(
+                'kernel pool requires contiguous non-decreasing block ids '
+                '0..Bm-1; the eager reference also accepts arbitrary ids '
+                '(it sorts them), but the fused pool would silently pool the '
+                'wrong tokens.  Call the eager path for arbitrary ids, or set '
+                'CSA_KERNEL_ASSUME_MONOTONE=1 only when the ids are provably '
+                'contiguous (which every segmenter in this repo guarantees).')
 
 
 def pool_variable_blocks_kernel(Xa, Xb, Za, Zb, bid, geom, B_pos_a, B_pos_b, impl=None):

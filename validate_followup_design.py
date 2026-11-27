@@ -33,6 +33,32 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # ("power_simulation_completed": true) stops being acceptable evidence.
 POWER_ARTIFACT_TOOL = "followup_power_sim.py"
 
+# Same discipline for the algorithmic acceptance gates (review-19): a
+# hand-set ``algorithmic_gates.<name> = true`` is not evidence — it must bind
+# to a ``followup_gate_runner.py`` artifact whose tool, study id and every
+# gate status match the plan.  Before this binding the seven booleans were
+# exactly the rubber stamp N117 removed for the power flag.
+GATES_ARTIFACT_TOOL = "followup_gate_runner.py"
+
+# And the same for the frozen document panel (review-19): declaring
+# ``document_ids_frozen_before_test_access`` / ``test_document_ids_frozen``
+# without a real, non-synthetic, stratified, big-enough panel produced by
+# ``followup_doc_panel.py`` is not evidence either.
+DOC_PANEL_TOOL = "followup_doc_panel.py"
+
+# The protocol's seven algorithmic acceptance gates (FOLLOWUP_CONFIRMATORY_
+# PROTOCOL.md, "Algorithmic acceptance gates before training").  The gate
+# flags and the runner's artifact must agree on this exact family.
+REQUIRED_GATE_KEYS = (
+    "prefix_invariance",
+    "future_perturbation_and_gradient",
+    "all_block_reference_equivalence",
+    "fp32_and_bf16_forward_backward",
+    "duplicate_selection_and_overlap_tests",
+    "pure_hca_layer_registry_verified",
+    "eager_and_kernel_parity",
+)
+
 
 def _power_artifact_errors(stats: dict, study_id, seeds, alpha, target_power, *,
                             repo: Path | None, manifest_dir: Path | None) -> list[str]:
@@ -117,6 +143,160 @@ def _power_artifact_errors(stats: dict, study_id, seeds, alpha, target_power, *,
         errors.append(f"power_simulation_artifact min_power {min_power!r} does not clear "
                       f"the declared target power {target_power!r} — increase the seed "
                       f"count or revise the design, do not shrink the target")
+    return errors
+
+
+def _read_artifact(rel_path, plan, repo, manifest_dir, *, tool_field, label):
+    """Resolve an artifact path against the manifest dir and the repo.
+
+    Returns (payload_or_None, errors).  A non-string/TODO/empty path, or an
+    unreadable file, is an error — never a silent skip.
+    """
+    errors: list[str] = []
+    if not isinstance(rel_path, str) or not rel_path.strip() or rel_path.startswith("TODO"):
+        errors.append(f"{label} must name the producing tool's output JSON")
+        return None, errors
+    candidates = []
+    for base in (manifest_dir, repo):
+        if base is not None:
+            p = (Path(base) / rel_path).resolve()
+            if p not in candidates:
+                candidates.append(p)
+    for p in candidates:
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                return payload, []
+        except Exception:
+            continue
+    errors.append(f"{label} {rel_path!r} is not a readable JSON object "
+                  f"(searched: {[str(c) for c in candidates]})")
+    return None, errors
+
+
+def _gates_artifact_errors(gates: dict, plan: dict, *, repo: Path | None,
+                           manifest_dir: Path | None) -> list[str]:
+    """Bind every true algorithmic-gate flag to a real runner artifact.
+
+    Fail-closed: ``algorithmic_gates.<name> = true`` without a matching
+    ``algorithmic_gates.artifact`` produced by ``followup_gate_runner.py``
+    is an error.  The artifact must cover ALL required gates (a partial run
+    certifies nothing), every gate must be ``pass`` (a single failing gate
+    fails the plan), and the study id must match.  Device/backend coverage
+    is disclosed by the artifact itself (a CPU artifact records the
+    reference backend and cannot masquerade as the CUDA/Triton parity run).
+    """
+    errors: list[str] = []
+    study_id = plan.get("study_id")
+    declared_true = [k for k in REQUIRED_GATE_KEYS if gates.get(k) is True]
+    if not declared_true:
+        return errors
+    art = gates.get("artifact")
+    payload, read_errors = _read_artifact(
+        art, plan, repo, manifest_dir,
+        tool_field="tool", label="algorithmic_gates.artifact")
+    errors.extend(read_errors)
+    if payload is None:
+        return errors
+    if payload.get("tool") != GATES_ARTIFACT_TOOL:
+        errors.append(f"algorithmic_gates.artifact was not produced by "
+                      f"{GATES_ARTIFACT_TOOL} (tool={payload.get('tool')!r})")
+    if payload.get("status") != "ok":
+        errors.append(f"algorithmic_gates.artifact status is {payload.get('status')!r}, "
+                      f"not 'ok' (failed_gates={payload.get('failed_gates')!r})")
+    if payload.get("study_id") != study_id:
+        errors.append(f"algorithmic_gates.artifact study_id "
+                      f"{payload.get('study_id')!r} does not match the plan's "
+                      f"{study_id!r}")
+    art_gates = payload.get("gates")
+    if not isinstance(art_gates, dict):
+        errors.append("algorithmic_gates.artifact carries no per-gate table")
+        return errors
+    missing = [k for k in REQUIRED_GATE_KEYS if k not in art_gates]
+    if missing:
+        errors.append(f"algorithmic_gates.artifact does not cover every required "
+                      f"gate (missing: {sorted(missing)}) — a partial gate run "
+                      "certifies nothing")
+    for k in REQUIRED_GATE_KEYS:
+        entry = art_gates.get(k)
+        gstatus = entry.get("status") if isinstance(entry, dict) else None
+        if k in declared_true and gstatus != "pass":
+            errors.append(f"algorithmic_gates.{k} is declared true but the "
+                          f"artifact reports status {gstatus!r}")
+        elif isinstance(entry, dict) and gstatus != "pass":
+            errors.append(f"algorithmic_gates.artifact gate {k} reports "
+                          f"{gstatus!r} — the gate family fails as a whole")
+    return errors
+
+
+def _doc_panel_artifact_errors(plan: dict, evaluation: dict, freeze: dict, *,
+                               repo: Path | None,
+                               manifest_dir: Path | None) -> list[str]:
+    """Bind the frozen-document-ID STATE flag to a real frozen panel artifact.
+
+    Fail-closed: ``freeze.test_document_ids_frozen`` set true without a
+    ``followup_doc_panel.py`` artifact (non-synthetic, big enough for the
+    declared minimum, unique ids, zero train/val overlap) is an error.
+    ``evaluation.document_ids_frozen_before_test_access`` is a DESIGN PROMISE
+    (the template must declare it true) and is deliberately NOT the binding
+    hook — the binding fires on the state claim that the panel is already
+    frozen, which is exactly where a rubber stamp would live.  A synthetic
+    panel is test machinery and can never certify a real freeze.
+    """
+    errors: list[str] = []
+    study_id = plan.get("study_id")
+    claimed = freeze.get("test_document_ids_frozen") is True
+    if not claimed:
+        return errors
+    art = evaluation.get("document_panel_artifact") or freeze.get("document_panel_artifact")
+    payload, read_errors = _read_artifact(
+        art, plan, repo, manifest_dir,
+        tool_field="tool", label="evaluation.document_panel_artifact")
+    errors.extend(read_errors)
+    if payload is None:
+        return errors
+    if payload.get("tool") != DOC_PANEL_TOOL:
+        errors.append(f"document_panel_artifact was not produced by "
+                      f"{DOC_PANEL_TOOL} (tool={payload.get('tool')!r})")
+    if payload.get("status") != "ok":
+        errors.append(f"document_panel_artifact status is {payload.get('status')!r}")
+    if payload.get("study_id") != study_id:
+        errors.append(f"document_panel_artifact study_id "
+                      f"{payload.get('study_id')!r} does not match the plan's "
+                      f"{study_id!r}")
+    if payload.get("synthetic") is not False:
+        errors.append("document_panel_artifact is SYNTHETIC — synthetic panels "
+                      "are test machinery and can never certify a real frozen "
+                      "evaluation population")
+    min_docs = evaluation.get("minimum_distinct_documents")
+    panel_n = payload.get("panel_documents")
+    if not isinstance(panel_n, int) or isinstance(panel_n, bool):
+        errors.append(f"document_panel_artifact panel_documents {panel_n!r} is "
+                      "not an integer")
+    elif isinstance(min_docs, int) and not isinstance(min_docs, bool) and panel_n < min_docs:
+        errors.append(f"document_panel_artifact panel has {panel_n} documents, "
+                      f"below the declared minimum {min_docs}")
+    doc_ids = payload.get("doc_ids")
+    if not isinstance(doc_ids, list) or not doc_ids:
+        errors.append("document_panel_artifact carries no doc_ids list")
+    elif isinstance(panel_n, int) and len(doc_ids) != panel_n:
+        errors.append(f"document_panel_artifact doc_ids count {len(doc_ids)} does "
+                      f"not match panel_documents {panel_n}")
+    elif len(set(map(str, doc_ids))) != len(doc_ids):
+        errors.append("document_panel_artifact doc_ids contains duplicates")
+    overlap = ((payload.get("overlap_check") or {}).get("overlapping_documents")
+               if isinstance(payload.get("overlap_check"), dict) else None)
+    if overlap is None:
+        errors.append("document_panel_artifact lacks the train/val overlap "
+                      "check block")
+    elif overlap != 0:
+        errors.append(f"document_panel_artifact panel overlaps train/validation "
+                      f"with {overlap} documents — leaked documents can never "
+                      "enter a frozen evaluation panel")
+    if not payload.get("panel_sha256_uint64_le"):
+        errors.append("document_panel_artifact lacks the panel content digest")
+    if not payload.get("read_files") or not isinstance(payload.get("read_files"), dict):
+        errors.append("document_panel_artifact lacks the sidecar read manifest")
     return errors
 
 
@@ -558,17 +738,19 @@ def validate(plan: dict, require_ready: bool = False, *,
     need(stats.get("interim_analysis_planned") is False,
          "interim_analysis_planned must be false for a single-look design")
 
-    required_gates = (
-        "prefix_invariance",
-        "future_perturbation_and_gradient",
-        "all_block_reference_equivalence",
-        "fp32_and_bf16_forward_backward",
-        "duplicate_selection_and_overlap_tests",
-        "pure_hca_layer_registry_verified",
-        "eager_and_kernel_parity",
-    )
+    required_gates = REQUIRED_GATE_KEYS
     for key in required_gates:
         need(gates.get(key) is True, f"algorithmic gate is not passed: {key}")
+    # review-19: the gate booleans bind to the runner artifact exactly the
+    # way the power boolean binds to its simulation artifact (N117) — the
+    # flags alone stopped being acceptable evidence.
+    errors.extend(_gates_artifact_errors(gates, plan, repo=repo,
+                                         manifest_dir=manifest_dir))
+    # review-19: the frozen-document-ID flags bind to a real frozen panel
+    # artifact; a hand-set "document_ids_frozen" boolean is not evidence.
+    errors.extend(_doc_panel_artifact_errors(plan, evaluation, freeze,
+                                             repo=repo,
+                                             manifest_dir=manifest_dir))
 
     if require_ready:
         need(plan.get("status") == "preregistered", "status must be preregistered")

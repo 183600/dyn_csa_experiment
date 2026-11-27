@@ -188,6 +188,17 @@ length, and freeze the document IDs before model evaluation. The 64-document
 floor is a minimum population gate, not a claim that 64 documents are always
 sufficient for every effect size.
 
+**The panel freezer is wired** (review-19): `followup_doc_panel.py` samples the
+length-stratified panel from the test-split SIDECARS ONLY (document ids and
+document lengths; the held-out token stream is never read — the metadata access
+is recorded with per-file SHA-256s so it is auditable, not silent), refuses any
+panel that overlaps the train/validation sidecars, and writes the frozen panel
+artifact. `validate_followup_design.py` binds `freeze.test_document_ids_frozen`
+to that artifact (non-synthetic, at least the declared minimum, unique ids,
+zero train/val overlap, content digest present) — declaring the panel frozen
+without the artifact is now an error. `--synthetic` exists for tests only and
+can never certify a real freeze.
+
 Do not treat multiple windows from one document as independent documents.
 Aggregate token NLL within document, then report:
 
@@ -268,6 +279,17 @@ Before any confirmatory training:
 
 These are correctness tests, not evidence that one method is better.
 
+**The gate runner is wired** (review-19): `followup_gate_runner.py` runs all
+seven gates on CPU over the follow-up rope arms (the four factorial cells plus
+the same-backbone dense isolation arm) at tiny geometry and writes the JSON
+artifact that `validate_followup_design.py` binds field-by-field: setting
+`algorithmic_gates.<name> = true` now REQUIRES `algorithmic_gates.artifact` to
+name a real artifact whose tool, study id, seven-gate coverage and per-gate
+pass status all match — the booleans alone stopped being acceptable evidence,
+exactly like the power boolean before review-16's N117. A CPU artifact
+discloses its device and the reference backend (it cannot certify the
+CUDA/Triton parity layer, which needs the same runner on a GPU box).
+
 ## Freeze and reporting rules
 
 1. Implement missing pure-HCA variants and tests first.
@@ -290,6 +312,10 @@ These are correctness tests, not evidence that one method is better.
 python validate_followup_design.py followup_design.template.json --verify-registry
 python validate_followup_design.py followup_design.json --require-ready --repo .
 python followup_power_sim.py power_sim_spec.json --seed-sweep 12,16,20,24,32
+python followup_gate_runner.py --study-id dynamic-csa-hca-followup-v1 \
+    --out analysis_followup/algorithmic_gates.json
+python followup_doc_panel.py --study-id dynamic-csa-hca-followup-v1 \
+    --min-docs 64 --out analysis_followup/doc_panel.json
 python followup_flops_gate.py measure --variant full_rope_flops_matched \
     --mlp-ratio 2.69140625 --device cuda:0 --out measure_dense.json
 python followup_flops_gate.py gate measure_csa.json measure_dense.json
